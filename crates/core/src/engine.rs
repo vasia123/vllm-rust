@@ -4,7 +4,7 @@ use candle_core::{Device, Tensor};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::kv_cache::{BlockTable, KVCacheManager};
+use crate::kv_cache::{BlockId, BlockTable, KVCacheManager};
 use crate::request::{FinishReason, RequestId, RequestStatus, SequenceState};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::tokenizer::TokenizerWrapper;
@@ -28,6 +28,13 @@ pub enum StreamEvent {
 
 // ─── ModelForward trait ────────────────────────────────────────────────────
 
+/// Per-sequence metadata for batched decode (one token per sequence).
+pub struct DecodeSequenceMetadata {
+    pub seqlen_offset: usize,
+    pub block_ids: Vec<BlockId>,
+    pub slot_mapping: Vec<usize>,
+}
+
 pub trait ModelForward: Send + 'static {
     fn forward(
         &self,
@@ -37,6 +44,27 @@ pub trait ModelForward: Send + 'static {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor>;
+
+    /// Batched decode: process multiple sequences each generating one token.
+    /// Default implementation falls back to sequential forward calls.
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &KVCacheManager,
+    ) -> candle_core::Result<Tensor> {
+        let batch_size = sequences.len();
+        let mut outputs = Vec::with_capacity(batch_size);
+        for (i, seq) in sequences.iter().enumerate() {
+            let token = input_ids.narrow(0, i, 1)?;
+            let block_table =
+                BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
+            let logits =
+                self.forward(&token, seq.seqlen_offset, kv_cache_mgr, &block_table, &seq.slot_mapping)?;
+            outputs.push(logits);
+        }
+        Tensor::cat(&outputs, 0)
+    }
 
     fn device(&self) -> &Device;
 }
@@ -51,6 +79,15 @@ impl ModelForward for Box<dyn ModelForward> {
         slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor> {
         (**self).forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &KVCacheManager,
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_decode_batch(input_ids, sequences, kv_cache_mgr)
     }
 
     fn device(&self) -> &Device {
@@ -94,6 +131,9 @@ pub struct EngineConfig {
     pub scheduler_config: SchedulerConfig,
     pub block_size: usize,
     pub speculative_config: Option<SpeculativeConfig>,
+    /// Run N decode steps per scheduler invocation to amortize scheduling overhead.
+    /// Sequences that finish mid-step break early. Default: 1 (no multi-step).
+    pub multi_step_count: usize,
 }
 
 // ─── Engine commands (internal) ────────────────────────────────────────────
@@ -286,12 +326,46 @@ async fn engine_loop<M: ModelForward>(
             }
         }
 
-        // Phase 6: Execute decode steps
-        for &req_id in &output.decode_requests {
-            if let Err(e) = execute_decode(req_id, &model, &mut kv_cache_mgr, &mut requests) {
-                finish_request_with_error(req_id, e, &mut scheduler, &mut requests);
-            } else {
-                send_stream_token(req_id, &tokenizer, &mut requests);
+        // Phase 6: Execute batched decode (multi-step)
+        if !output.decode_requests.is_empty() {
+            let num_steps = config.multi_step_count.max(1);
+            let mut active_decode_ids = output.decode_requests.clone();
+
+            for _step in 0..num_steps {
+                if active_decode_ids.is_empty() {
+                    break;
+                }
+
+                let failed = execute_batched_decode(
+                    &active_decode_ids,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut requests,
+                );
+                for req_id in failed {
+                    active_decode_ids.retain(|&id| id != req_id);
+                    finish_request_with_error(
+                        req_id,
+                        EngineError::Model("batched decode failed".to_string()),
+                        &mut scheduler,
+                        &mut requests,
+                    );
+                }
+
+                // Remove sequences that finished (EOS or max_tokens)
+                active_decode_ids.retain(|&id| {
+                    requests
+                        .get(&id)
+                        .map(|r| check_finished(&r.state).is_none())
+                        .unwrap_or(false)
+                });
+            }
+
+            // Send all accumulated stream tokens
+            for &req_id in &output.decode_requests {
+                if requests.contains_key(&req_id) {
+                    send_stream_token(req_id, &tokenizer, &mut requests);
+                }
             }
         }
 
@@ -878,6 +952,112 @@ fn execute_decode<M: ModelForward>(
     Ok(())
 }
 
+/// Execute batched decode for multiple sequences in a single forward pass.
+/// Returns IDs of requests that failed (caller should remove them).
+fn execute_batched_decode<M: ModelForward>(
+    decode_request_ids: &[RequestId],
+    model: &M,
+    kv_cache_mgr: &mut KVCacheManager,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+) -> Vec<RequestId> {
+    let mut failed = Vec::new();
+    let mut batch_ids: Vec<RequestId> = Vec::with_capacity(decode_request_ids.len());
+
+    // Step 1: Allocate blocks for each sequence
+    for &req_id in decode_request_ids {
+        let req = requests.get_mut(&req_id).unwrap();
+        if kv_cache_mgr
+            .allocate_for_request(&mut req.state.block_table, 1)
+            .is_err()
+        {
+            failed.push(req_id);
+        } else {
+            batch_ids.push(req_id);
+        }
+    }
+
+    if batch_ids.is_empty() {
+        return failed;
+    }
+
+    // Step 2: Collect input tokens and per-sequence metadata
+    let mut token_ids: Vec<u32> = Vec::with_capacity(batch_ids.len());
+    let mut sequences: Vec<DecodeSequenceMetadata> = Vec::with_capacity(batch_ids.len());
+
+    for &req_id in &batch_ids {
+        let req = requests.get(&req_id).unwrap();
+        let last_token = *req.state.generated_token_ids.last().unwrap();
+        let slot_mapping = req
+            .state
+            .block_table
+            .slot_mapping(req.state.seqlen_offset, 1);
+        token_ids.push(last_token);
+        sequences.push(DecodeSequenceMetadata {
+            seqlen_offset: req.state.seqlen_offset,
+            block_ids: req.state.block_table.block_ids().to_vec(),
+            slot_mapping,
+        });
+    }
+
+    // Step 3: Batched forward pass
+    let batch_size = batch_ids.len();
+    let input = match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
+        Ok(t) => t,
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
+        }
+    };
+
+    let logits = match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
+        Ok(l) => l,
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
+        }
+    };
+
+    // Step 4: Batched argmax — single GPU kernel + single GPU→CPU copy
+    let seq_dim = logits.dims()[1];
+    let last_logits = match logits.narrow(1, seq_dim - 1, 1) {
+        Ok(l) => match l.squeeze(1) {
+            Ok(l) => l, // [batch, vocab]
+            Err(_) => {
+                failed.extend(&batch_ids);
+                return failed;
+            }
+        },
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
+        }
+    };
+    let token_ids_tensor = match last_logits.argmax(1) {
+        Ok(t) => t, // [batch] — single kernel
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
+        }
+    };
+    let sampled_tokens: Vec<u32> = match token_ids_tensor.to_vec1() {
+        Ok(v) => v, // single GPU→CPU transfer
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
+        }
+    };
+
+    // Step 5: Update state with sampled tokens
+    for (i, &req_id) in batch_ids.iter().enumerate() {
+        let req = requests.get_mut(&req_id).unwrap();
+        req.state.block_table.advance(1);
+        req.state.seqlen_offset += 1;
+        req.state.generated_token_ids.push(sampled_tokens[i]);
+    }
+
+    failed
+}
+
 fn check_finished(state: &SequenceState) -> Option<FinishReason> {
     let last_token = state.generated_token_ids.last()?;
     if *last_token == state.eos_token_id {
@@ -1188,6 +1368,7 @@ mod tests {
             },
             block_size: 16,
             speculative_config: None,
+            multi_step_count: 1,
         }
     }
 
@@ -1258,9 +1439,14 @@ mod tests {
                     let _ = execute_prefill(req_id, &model, &mut kv_cache_mgr, &mut active);
                 }
 
-                // Decodes
-                for &req_id in &output.decode_requests {
-                    let _ = execute_decode(req_id, &model, &mut kv_cache_mgr, &mut active);
+                // Decodes (batched)
+                if !output.decode_requests.is_empty() {
+                    let _failed = execute_batched_decode(
+                        &output.decode_requests,
+                        &model,
+                        &mut kv_cache_mgr,
+                        &mut active,
+                    );
                 }
 
                 // Check finished
@@ -1417,6 +1603,7 @@ mod tests {
             },
             block_size: 4,
             speculative_config: None,
+            multi_step_count: 1,
         };
 
         // 3 requests each needing 2 tokens prompt → 1 block each
@@ -1628,6 +1815,7 @@ mod tests {
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
+            multi_step_count: 1,
         };
 
         let handle =
@@ -1671,6 +1859,7 @@ mod tests {
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
+            multi_step_count: 1,
         };
 
         let handle =
@@ -1714,6 +1903,7 @@ mod tests {
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
+            multi_step_count: 1,
         };
 
         let handle =
@@ -1754,6 +1944,7 @@ mod tests {
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
+            multi_step_count: 1,
         };
 
         let handle =

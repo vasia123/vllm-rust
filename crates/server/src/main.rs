@@ -51,6 +51,10 @@ enum Command {
         /// Maximum concurrent requests
         #[arg(long, default_value_t = 8)]
         max_requests: usize,
+
+        /// Decode steps per scheduler invocation (amortizes scheduling overhead)
+        #[arg(long, default_value_t = 4)]
+        multi_step_count: usize,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -73,6 +77,10 @@ enum Command {
         /// Maximum tokens to generate per prompt
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
+
+        /// Decode steps per scheduler invocation
+        #[arg(long, default_value_t = 4)]
+        multi_step_count: usize,
     },
 }
 
@@ -89,8 +97,9 @@ async fn main() -> anyhow::Result<()> {
             host,
             num_blocks,
             max_requests,
+            multi_step_count,
         } => {
-            run_server(model, draft_model, num_speculative_tokens, host, port, num_blocks, max_requests).await
+            run_server(model, draft_model, num_speculative_tokens, host, port, num_blocks, max_requests, multi_step_count).await
         }
         Command::Generate {
             model,
@@ -98,17 +107,19 @@ async fn main() -> anyhow::Result<()> {
             num_speculative_tokens,
             prompt,
             max_tokens,
+            multi_step_count,
         } => {
             let prompts = if prompt.is_empty() {
                 vec!["Hello, world".to_string()]
             } else {
                 prompt
             };
-            run_generate(model, draft_model, num_speculative_tokens, prompts, max_tokens).await
+            run_generate(model, draft_model, num_speculative_tokens, prompts, max_tokens, multi_step_count).await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server(
     model_id: String,
     draft_model_id: Option<String>,
@@ -117,6 +128,7 @@ async fn run_server(
     port: u16,
     num_blocks: usize,
     max_requests: usize,
+    multi_step_count: usize,
 ) -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -199,6 +211,7 @@ async fn run_server(
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
+            multi_step_count: 1,
         };
 
         eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
@@ -218,9 +231,10 @@ async fn run_server(
             },
             block_size: 16,
             speculative_config: None,
+            multi_step_count,
         };
 
-        eprintln!("Starting engine...");
+        eprintln!("Starting engine (multi-step={multi_step_count})...");
         start_engine(model, engine_tokenizer, kv_cache_mgr, engine_config)
     };
 
@@ -249,6 +263,7 @@ async fn run_generate(
     num_speculative_tokens: usize,
     prompts: Vec<String>,
     max_tokens: usize,
+    multi_step_count: usize,
 ) -> anyhow::Result<()> {
     eprintln!("Loading model: {model_id}");
     let files = loader::fetch_model(&model_id)?;
@@ -321,6 +336,7 @@ async fn run_generate(
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
+            multi_step_count: 1,
         };
 
         eprintln!(
@@ -345,12 +361,14 @@ async fn run_generate(
             },
             block_size: 16,
             speculative_config: None,
+            multi_step_count,
         };
 
         eprintln!(
-            "Starting engine ({} prompts, max {} tokens each)...",
+            "Starting engine ({} prompts, max {} tokens each, multi-step={})...",
             prompts.len(),
-            max_tokens
+            max_tokens,
+            multi_step_count
         );
         start_engine(model, tokenizer, kv_cache_mgr, engine_config)
     };

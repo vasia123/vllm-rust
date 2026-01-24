@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 candle-core = { version = "0.9", features = ["cuda"] }
 candle-nn = { version = "0.9", features = ["cuda"] }
+candle-flash-attn = "0.9"
 hf-hub = "0.4"
 tokenizers = "0.22"
 ahash = "0.8"
@@ -22,6 +23,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio-stream = "0.1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
+half = "2.5"
 minijinja = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

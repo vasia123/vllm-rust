@@ -39,6 +39,16 @@ impl CacheEngine {
         })
     }
 
+    /// Raw K cache tensor: [num_blocks, block_size, num_kv_heads, head_dim].
+    pub fn k_cache(&self) -> &Tensor {
+        &self.k_cache
+    }
+
+    /// Raw V cache tensor: [num_blocks, block_size, num_kv_heads, head_dim].
+    pub fn v_cache(&self) -> &Tensor {
+        &self.v_cache
+    }
+
     /// Write K, V for new tokens into their assigned slots.
     ///
     /// k, v shape: [num_kv_heads, new_tokens, head_dim]
@@ -74,6 +84,84 @@ impl CacheEngine {
         v_cache_flat.scatter_set(&indices, &v_src, 0)?;
 
         Ok(())
+    }
+
+    /// Write K, V tokens in [new_tokens, kv_heads, head_dim] layout.
+    /// Used by batched decode where tokens from different sequences are concatenated.
+    pub fn write_batch(
+        &self,
+        k: &Tensor,
+        v: &Tensor,
+        slot_mapping: &[usize],
+    ) -> Result<(), CacheError> {
+        let new_tokens = slot_mapping.len();
+        let total_slots = self.num_blocks * self.block_size;
+
+        let k_cache_flat = self
+            .k_cache
+            .reshape((total_slots, self.num_kv_heads, self.head_dim))?;
+        let v_cache_flat = self
+            .v_cache
+            .reshape((total_slots, self.num_kv_heads, self.head_dim))?;
+
+        // Input already in [new_tokens, kv_heads, head_dim]
+        let k_src = k.contiguous()?;
+        let v_src = v.contiguous()?;
+
+        let indices = Tensor::from_vec(
+            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
+            (new_tokens,),
+            k_cache_flat.device(),
+        )?;
+        let indices = indices
+            .reshape((new_tokens, 1, 1))?
+            .expand((new_tokens, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+
+        k_cache_flat.scatter_set(&indices, &k_src, 0)?;
+        v_cache_flat.scatter_set(&indices, &v_src, 0)?;
+
+        Ok(())
+    }
+
+    /// Read K, V for multiple sequences concatenated contiguously.
+    /// Returns (k, v) each with shape [total_tokens, num_kv_heads, head_dim].
+    /// sequences: list of (block_ids, num_tokens) for each sequence.
+    pub fn read_contiguous_multi(
+        &self,
+        sequences: &[(&[BlockId], usize)],
+    ) -> Result<(Tensor, Tensor), CacheError> {
+        let mut k_parts = Vec::with_capacity(sequences.len());
+        let mut v_parts = Vec::with_capacity(sequences.len());
+
+        for &(block_ids, num_tokens) in sequences {
+            if num_tokens == 0 {
+                continue;
+            }
+            let num_blocks_used = block_ids.len();
+            let indices = Tensor::from_vec(
+                block_ids.iter().map(|&b| b as u32).collect::<Vec<_>>(),
+                (num_blocks_used,),
+                self.k_cache.device(),
+            )?;
+
+            let k = self.k_cache.index_select(&indices, 0)?;
+            let v = self.v_cache.index_select(&indices, 0)?;
+
+            let total_capacity = num_blocks_used * self.block_size;
+            let k = k.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
+            let v = v.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
+
+            let k = k.narrow(0, 0, num_tokens)?;
+            let v = v.narrow(0, 0, num_tokens)?;
+
+            k_parts.push(k);
+            v_parts.push(v);
+        }
+
+        let k = Tensor::cat(&k_parts, 0)?;
+        let v = Tensor::cat(&v_parts, 0)?;
+        Ok((k, v))
     }
 
     /// Read K, V for all tokens of a request.

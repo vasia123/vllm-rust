@@ -16,6 +16,22 @@ impl BlockTable {
         }
     }
 
+    /// Reconstruct a BlockTable from existing block IDs and stored token count.
+    /// Used by the default `forward_decode_batch` fallback.
+    pub fn from_block_ids(blocks: Vec<BlockId>, num_tokens_stored: usize) -> Self {
+        let block_size = if blocks.is_empty() {
+            16
+        } else {
+            // Infer block_size: at least ceil(num_tokens / num_blocks)
+            num_tokens_stored.div_ceil(blocks.len()).max(1)
+        };
+        Self {
+            blocks,
+            num_tokens_stored,
+            block_size,
+        }
+    }
+
     /// Total tokens currently stored.
     pub fn num_tokens(&self) -> usize {
         self.num_tokens_stored

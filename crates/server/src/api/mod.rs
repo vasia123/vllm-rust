@@ -95,6 +95,7 @@ mod tests {
             },
             block_size: 16,
             speculative_config: None,
+            multi_step_count: 1,
         };
         let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
 

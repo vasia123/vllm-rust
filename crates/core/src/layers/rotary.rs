@@ -43,4 +43,39 @@ impl RotaryEmbedding {
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q, k))
     }
+
+    /// Apply RoPE to variable-length batched tokens with per-token positions.
+    /// q: [total_tokens, num_heads, head_dim]
+    /// k: [total_tokens, num_kv_heads, head_dim]
+    /// positions: position offset for each token (length = total_tokens)
+    pub fn apply_varlen(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let total_tokens = positions.len();
+
+        let pos_tensor = Tensor::from_vec(
+            positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
+            (total_tokens,),
+            self.sin.device(),
+        )?;
+        // cos, sin: [total_tokens, head_dim/2]
+        let cos = self.cos.index_select(&pos_tensor, 0)?;
+        let sin = self.sin.index_select(&pos_tensor, 0)?;
+
+        // rope expects 4D input [b, h, t, d]
+        // [total_tokens, heads, head_dim] → [1, heads, total_tokens, head_dim]
+        let q = q.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let k = k.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+
+        let q = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
+        let k = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
+
+        // Back to [total_tokens, heads, head_dim]
+        let q = q.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let k = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        Ok((q, k))
+    }
 }

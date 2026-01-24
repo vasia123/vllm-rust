@@ -2,6 +2,7 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding, SwiGluMlp};
 
@@ -84,7 +85,7 @@ impl LlamaAttention {
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table,
+            block_table.block_ids(),
             slot_mapping,
             self.num_heads,
             self.num_kv_heads,
@@ -92,6 +93,124 @@ impl LlamaAttention {
         )?;
 
         attn_output.apply(&self.o_proj)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        cache_engine: &CacheEngine,
+    ) -> Result<Tensor> {
+        let batch_size = sequences.len();
+
+        // Batched Q/K/V projections: [batch, 1, hidden] → [batch, 1, proj_dim]
+        let q = self.q_proj.forward(xs)?;
+        let k = self.k_proj.forward(xs)?;
+        let v = self.v_proj.forward(xs)?;
+
+        // Reshape to [batch, heads, 1, head_dim]
+        let q = q
+            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        #[cfg(feature = "cuda-kernels")]
+        {
+            // Squeeze seq_len=1 dim: [batch, heads, 1, head_dim] → [batch, heads, head_dim]
+            let q = q.squeeze(2)?;
+            let k = k.squeeze(2)?;
+            let v = v.squeeze(2)?;
+
+            // Batched RoPE with per-sequence positions
+            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
+            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
+
+            // Write new K/V to cache
+            let all_slot_mapping: Vec<usize> = sequences
+                .iter()
+                .flat_map(|s| s.slot_mapping.iter().copied())
+                .collect();
+            cache_engine
+                .write_batch(&k, &v, &all_slot_mapping)
+                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+
+            // Build block_tables: [num_seqs, max_blocks_per_seq] u32
+            let max_blocks_per_seq = sequences
+                .iter()
+                .map(|s| s.block_ids.len())
+                .max()
+                .unwrap_or(1);
+            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
+            for (i, seq) in sequences.iter().enumerate() {
+                for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
+                }
+            }
+            let block_tables =
+                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
+
+            // Build seq_lens: total KV length per sequence (including new token)
+            let seq_lens_data: Vec<u32> = sequences
+                .iter()
+                .map(|s| (s.seqlen_offset + 1) as u32)
+                .collect();
+            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
+            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+            let attn_output = crate::cuda_kernels::paged_attention_cuda(
+                &q,
+                cache_engine.k_cache(),
+                cache_engine.v_cache(),
+                &block_tables,
+                &seq_lens,
+                scale,
+                self.num_heads,
+                self.num_kv_heads,
+                max_blocks_per_seq,
+                max_seq_len,
+            )?;
+
+            // [batch, hidden] → [batch, 1, hidden] to match residual shape
+            attn_output.apply(&self.o_proj)?.unsqueeze(1)
+        }
+
+        #[cfg(not(feature = "cuda-kernels"))]
+        {
+            // Per-sequence: RoPE (position-dependent) + cache write/read + attention
+            let mut outputs = Vec::with_capacity(batch_size);
+            for (i, seq) in sequences.iter().enumerate() {
+                let q_i = q.narrow(0, i, 1)?;
+                let k_i = k.narrow(0, i, 1)?;
+                let v_i = v.narrow(0, i, 1)?;
+
+                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
+
+                let attn_out = paged_attention(
+                    &q_i,
+                    &k_i,
+                    &v_i,
+                    None, // no causal mask for single-token decode
+                    seq.seqlen_offset,
+                    cache_engine,
+                    &seq.block_ids,
+                    &seq.slot_mapping,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )?;
+                outputs.push(attn_out);
+            }
+
+            let attn_output = Tensor::cat(&outputs, 0)?;
+            attn_output.apply(&self.o_proj)
+        }
     }
 }
 
@@ -143,6 +262,29 @@ impl LlamaDecoderLayer {
             kv_cache_mgr.engine(layer_idx),
             block_table,
             slot_mapping,
+        )?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = self
+            .post_attention_layernorm
+            .forward(&xs)?
+            .apply(&self.mlp)?;
+        residual + xs
+    }
+
+    fn forward_decode_batch(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &KVCacheManager,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward_decode_batch(
+            &xs,
+            sequences,
+            kv_cache_mgr.engine(layer_idx),
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
@@ -246,6 +388,23 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &KVCacheManager,
+    ) -> Result<Tensor> {
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
+        }
+
+        let xs = self.norm.forward(&xs)?;
+        let logits = xs.apply(&self.lm_head)?;
+        Ok(logits)
     }
 
     fn device(&self) -> &Device {
