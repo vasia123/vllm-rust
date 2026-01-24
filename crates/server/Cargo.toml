@@ -1,0 +1,9 @@
+[package]
+name = "vllm-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+vllm-core = { path = "../core" }
+tokio.workspace = true
+anyhow.workspace = true
