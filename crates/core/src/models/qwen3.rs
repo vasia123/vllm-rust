@@ -1,18 +1,117 @@
-mod attention;
-mod mlp;
-
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, rms_norm, Embedding, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::config::ModelConfig;
-use crate::kv_cache::{BlockTable, KVCacheManager};
+use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
+use crate::layers::{apply_per_head_norm, paged_attention, RotaryEmbedding, SwiGluMlp};
 
-use self::attention::Qwen3Attention;
-use self::mlp::Qwen3Mlp;
+// ─── Attention ───────────────────────────────────────────────────────────────
+
+struct Qwen3Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
+    rotary_emb: RotaryEmbedding,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl Qwen3Attention {
+    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let num_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+
+        let q_proj = linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
+        let k_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
+        let v_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+
+        let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+
+        let rotary_emb = RotaryEmbedding::new(
+            head_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            vb.dtype(),
+            vb.device(),
+        )?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            rotary_emb,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+        cache_engine: &CacheEngine,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+
+        let q = self.q_proj.forward(xs)?;
+        let k = self.k_proj.forward(xs)?;
+        let v = self.v_proj.forward(xs)?;
+
+        let q = q
+            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // Qwen3-specific: per-head RMSNorm on Q and K
+        let q = apply_per_head_norm(&q, &self.q_norm)?;
+        let k = apply_per_head_norm(&k, &self.k_norm)?;
+
+        // RoPE
+        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
+
+        // Paged attention (cache write/read + GQA + matmul)
+        let attn_output = paged_attention(
+            &q,
+            &k,
+            &v,
+            attention_mask,
+            seqlen_offset,
+            cache_engine,
+            block_table,
+            slot_mapping,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )?;
+
+        attn_output.apply(&self.o_proj)
+    }
+}
+
+// ─── Decoder Layer ───────────────────────────────────────────────────────────
 
 struct Qwen3DecoderLayer {
     self_attn: Qwen3Attention,
-    mlp: Qwen3Mlp,
+    mlp: SwiGluMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -20,7 +119,7 @@ struct Qwen3DecoderLayer {
 impl Qwen3DecoderLayer {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let self_attn = Qwen3Attention::new(cfg, vb.pp("self_attn"))?;
-        let mlp = Qwen3Mlp::new(cfg, vb.pp("mlp"))?;
+        let mlp = SwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -66,6 +165,8 @@ impl Qwen3DecoderLayer {
         residual + xs
     }
 }
+
+// ─── Model ───────────────────────────────────────────────────────────────────
 
 pub struct Qwen3ForCausalLM {
     embed_tokens: Embedding,
@@ -117,7 +218,12 @@ impl Qwen3ForCausalLM {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            Some(self.causal_mask(seq_len, seqlen_offset)?)
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
         };
 
         let mut xs = self.embed_tokens.forward(input_ids)?;
@@ -140,23 +246,6 @@ impl Qwen3ForCausalLM {
     pub fn device(&self) -> &Device {
         &self.device
     }
-
-    fn causal_mask(&self, seq_len: usize, seqlen_offset: usize) -> Result<Tensor> {
-        let total_len = seq_len + seqlen_offset;
-        let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..total_len).map(move |j| {
-                    if j > i + seqlen_offset {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.0
-                    }
-                })
-            })
-            .collect();
-        let mask = Tensor::from_vec(mask, (1, 1, seq_len, total_len), &self.device)?;
-        mask.to_dtype(self.dtype)
-    }
 }
 
 impl crate::engine::ModelForward for Qwen3ForCausalLM {
@@ -168,13 +257,7 @@ impl crate::engine::ModelForward for Qwen3ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(
-            input_ids,
-            seqlen_offset,
-            kv_cache_mgr,
-            block_table,
-            slot_mapping,
-        )
+        self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
     }
 
     fn device(&self) -> &Device {

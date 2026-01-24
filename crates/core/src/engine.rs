@@ -41,6 +41,23 @@ pub trait ModelForward: Send + 'static {
     fn device(&self) -> &Device;
 }
 
+impl ModelForward for Box<dyn ModelForward> {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+    }
+
+    fn device(&self) -> &Device {
+        (**self).device()
+    }
+}
+
 // ─── Engine API types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -941,8 +958,8 @@ impl Default for GenerationParams {
     }
 }
 
-pub fn generate(
-    model: &crate::model::Qwen3ForCausalLM,
+pub fn generate<M: ModelForward>(
+    model: &M,
     tokenizer: &TokenizerWrapper,
     prompt: &str,
     _config: &crate::config::ModelConfig,
@@ -956,8 +973,8 @@ pub fn generate(
     Ok(output)
 }
 
-pub fn generate_tokens(
-    model: &crate::model::Qwen3ForCausalLM,
+pub fn generate_tokens<M: ModelForward>(
+    model: &M,
     prompt_ids: &[u32],
     params: &GenerationParams,
     kv_cache_mgr: &mut KVCacheManager,
@@ -1778,7 +1795,7 @@ mod tests {
         let files = loader::fetch_model("Qwen/Qwen3-0.6B").expect("fetch model");
         let device = Device::Cpu;
         let vb = loader::load_weights(&files.weights, DType::F32, &device).expect("load weights");
-        let model = crate::model::Qwen3ForCausalLM::new(&files.config, vb).expect("build model");
+        let model = crate::models::Qwen3ForCausalLM::new(&files.config, vb).expect("build model");
         let tokenizer = TokenizerWrapper::from_file(&files.tokenizer).expect("load tokenizer");
 
         let cache_config = CacheConfig {

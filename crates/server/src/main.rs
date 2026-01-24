@@ -6,7 +6,7 @@ use vllm_core::{
     engine::{start_engine, start_engine_with_draft, EngineConfig, GenerationRequest, SpeculativeConfig},
     kv_cache::{config::CacheConfig, KVCacheManager},
     loader,
-    model::Qwen3ForCausalLM,
+    models,
     scheduler::SchedulerConfig,
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
 };
@@ -133,7 +133,7 @@ async fn run_server(
         "Building model ({} layers)...",
         files.config.num_hidden_layers
     );
-    let model = Qwen3ForCausalLM::new(&files.config, vb)?;
+    let model = models::from_config(&files.config, vb)?;
 
     let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
     let tokenizer = Arc::new(tokenizer);
@@ -173,7 +173,7 @@ async fn run_server(
             "Building draft model ({} layers)...",
             draft_files.config.num_hidden_layers
         );
-        let draft_model = Qwen3ForCausalLM::new(&draft_files.config, draft_vb)?;
+        let draft_model = models::from_config(&draft_files.config, draft_vb)?;
 
         let draft_cache_config = CacheConfig {
             block_size: 16,
@@ -263,7 +263,7 @@ async fn run_generate(
         "Building model ({} layers)...",
         files.config.num_hidden_layers
     );
-    let model = Qwen3ForCausalLM::new(&files.config, vb)?;
+    let model = models::from_config(&files.config, vb)?;
 
     let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
 
@@ -295,7 +295,7 @@ async fn run_generate(
             "Building draft model ({} layers)...",
             draft_files.config.num_hidden_layers
         );
-        let draft_model = Qwen3ForCausalLM::new(&draft_files.config, draft_vb)?;
+        let draft_model = models::from_config(&draft_files.config, draft_vb)?;
 
         let draft_cache_config = CacheConfig {
             block_size: 16,

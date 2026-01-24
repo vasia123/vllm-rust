@@ -17,6 +17,14 @@ pub struct ModelConfig {
     pub tie_word_embeddings: bool,
     pub bos_token_id: u32,
     pub eos_token_id: u32,
+
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub attention_bias: Option<bool>,
+
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(test)]
