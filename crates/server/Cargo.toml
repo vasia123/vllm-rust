@@ -7,3 +7,18 @@ edition.workspace = true
 vllm-core = { path = "../core" }
 tokio.workspace = true
 anyhow.workspace = true
+candle-core.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+vllm-core = { path = "../core", features = ["test-utils"] }
+tower.workspace = true
