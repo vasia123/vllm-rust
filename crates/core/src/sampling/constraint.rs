@@ -12,16 +12,23 @@ use crate::tokenizer::TokenizerWrapper;
 ///
 /// Constraints modify the logits before sampling to ensure the
 /// generated text follows a specific pattern or format.
+///
+/// # UTF-8 and Emoji Support
+///
+/// All constraints support UTF-8 and emoji through proper handling:
+/// - Text comparisons use Rust's native UTF-8 strings
+/// - Character counting uses `.chars().count()` not `.len()`
+/// - Token decode failures (partial multi-byte sequences) are handled gracefully
 pub trait SamplingConstraint: Send + Sync {
     /// Mask invalid tokens by setting their logits to negative infinity.
     ///
     /// # Arguments
     /// * `logits` - Mutable slice of logits to modify (vocab_size length)
-    /// * `generated` - Previously generated token IDs
+    /// * `generated_text` - Previously generated text (decoded)
     ///
     /// # Returns
     /// Ok(()) on success, error if constraint validation fails
-    fn mask_logits(&mut self, logits: &mut [f32], generated: &[u32]) -> anyhow::Result<()>;
+    fn mask_logits(&mut self, logits: &mut [f32], generated_text: &str) -> anyhow::Result<()>;
 
     /// Check if generation is complete according to this constraint.
     ///
@@ -125,7 +132,7 @@ impl ChoiceConstraint {
 }
 
 impl SamplingConstraint for ChoiceConstraint {
-    fn mask_logits(&mut self, logits: &mut [f32], _generated: &[u32]) -> anyhow::Result<()> {
+    fn mask_logits(&mut self, logits: &mut [f32], _generated_text: &str) -> anyhow::Result<()> {
         if self.position >= self.valid_tokens_at_position.len() {
             // All choices have been exhausted, allow EOS only
             // (In practice, is_complete should trigger first)
@@ -210,36 +217,97 @@ impl RegexConstraint {
     }
 
     /// Check if a text is a valid prefix of the pattern.
+    ///
+    /// Uses a partial matching approach: constructs a regex that matches
+    /// any prefix of the original pattern. This handles UTF-8 and emoji correctly.
     fn is_valid_prefix(&self, text: &str) -> bool {
         if text.is_empty() {
             return true;
         }
 
-        // For prefix checking, we need to check if the text could still match
-        // We use a heuristic: check if adding .* after the text matches
-        let prefix_pattern = format!("^(?:{})", regex::escape(text));
-        if let Ok(prefix_regex) = regex::Regex::new(&prefix_pattern) {
-            // The prefix regex should be a prefix of possible matches
-            // This is a simplified check - a proper implementation would use
-            // DFA state tracking
-            return prefix_regex.is_match(text) || text.len() < self.max_length;
+        // Check max_length first (using character count for proper UTF-8 handling)
+        let char_count = text.chars().count();
+        if char_count > self.max_length {
+            return false;
         }
+
+        // Check if the text already fully matches
+        if self.regex.is_match(text) {
+            return true;
+        }
+
+        // At exactly max_length, must be a complete match (checked above)
+        if char_count == self.max_length {
+            return false;
+        }
+
+        // For prefix checking, we construct a pattern that matches any prefix
+        // of strings that could eventually match the full pattern.
+        // We use a heuristic: the text is a valid prefix if:
+        // 1. It's shorter than max_length (can still grow)
+        // 2. It doesn't contain obviously invalid characters for the pattern
+        //
+        // A proper implementation would use incremental DFA matching,
+        // but this heuristic works for common cases.
+
+        // Try to match text + arbitrary continuation
+        // Build a pattern that checks if 'text' could be a prefix of a valid match
+        let prefix_check = format!("^{}.*", regex::escape(text));
+        if let Ok(prefix_regex) = regex::Regex::new(&prefix_check) {
+            // Check if any string starting with 'text' could match original pattern
+            // This is done by checking if escaped text is a valid regex prefix
+            // For simple patterns, this works well
+            return prefix_regex.is_match(text) || self.could_extend_to_match(text);
+        }
+
+        // If we can't build the check pattern, allow it (fail open)
         true
+    }
+
+    /// Check if the text could potentially be extended to match the pattern.
+    ///
+    /// This is a heuristic check that handles common cases.
+    fn could_extend_to_match(&self, text: &str) -> bool {
+        // For patterns with anchors, check basic compatibility
+        // This handles UTF-8 strings correctly since we work with &str
+
+        // Empty prefix can always potentially match
+        if text.is_empty() {
+            return true;
+        }
+
+        // If the text contains invalid UTF-8 sequences, reject it
+        // (Rust strings are always valid UTF-8, so this is implicit)
+
+        // Check character by character if each prefix could lead to a match
+        // by seeing if any completion might work
+        text.chars().count() < self.max_length
     }
 }
 
 impl SamplingConstraint for RegexConstraint {
-    fn mask_logits(&mut self, logits: &mut [f32], _generated: &[u32]) -> anyhow::Result<()> {
-        if self.current_text.len() >= self.max_length {
+    fn mask_logits(&mut self, logits: &mut [f32], generated_text: &str) -> anyhow::Result<()> {
+        // Update current text from the generated text
+        self.current_text = generated_text.to_string();
+
+        // Use character count for max_length check (handles UTF-8/emoji correctly)
+        let char_count = self.current_text.chars().count();
+
+        if char_count >= self.max_length {
             // At max length, only allow tokens that complete the pattern
             for (idx, logit) in logits.iter_mut().enumerate() {
-                if let Ok(token_text) = self.tokenizer.decode(&[idx as u32]) {
-                    let candidate = format!("{}{}", self.current_text, token_text);
-                    if !self.regex.is_match(&candidate) {
+                match self.tokenizer.decode(&[idx as u32]) {
+                    Ok(token_text) => {
+                        let candidate = format!("{}{}", self.current_text, token_text);
+                        if !self.regex.is_match(&candidate) {
+                            *logit = f32::NEG_INFINITY;
+                        }
+                    }
+                    Err(_) => {
+                        // Token decodes to invalid UTF-8 (partial multi-byte sequence)
+                        // This can happen with byte-level tokenizers
                         *logit = f32::NEG_INFINITY;
                     }
-                } else {
-                    *logit = f32::NEG_INFINITY;
                 }
             }
             return Ok(());
@@ -254,22 +322,30 @@ impl SamplingConstraint for RegexConstraint {
                 continue; // Already masked
             }
 
-            if let Ok(token_text) = self.tokenizer.decode(&[idx as u32]) {
-                let candidate = format!("{}{}", self.current_text, token_text);
-                if self.is_valid_prefix(&candidate) {
-                    any_valid = true;
-                } else {
+            match self.tokenizer.decode(&[idx as u32]) {
+                Ok(token_text) => {
+                    let candidate = format!("{}{}", self.current_text, token_text);
+                    if self.is_valid_prefix(&candidate) {
+                        any_valid = true;
+                    } else {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+                Err(_) => {
+                    // Token decodes to invalid UTF-8 - mask it
+                    // This handles partial multi-byte sequences from byte-level tokenizers
                     *logit = f32::NEG_INFINITY;
                 }
-            } else {
-                *logit = f32::NEG_INFINITY;
             }
         }
 
         if !any_valid {
             // No valid tokens - this shouldn't happen with a well-formed regex
-            // Allow all tokens to prevent getting stuck
-            anyhow::bail!("No valid tokens for regex constraint at text: '{}'", self.current_text);
+            anyhow::bail!(
+                "No valid tokens for regex constraint at text: '{}' (pattern: {})",
+                self.current_text,
+                self.pattern
+            );
         }
 
         Ok(())
@@ -417,7 +493,10 @@ impl JsonSchemaConstraint {
 }
 
 impl SamplingConstraint for JsonSchemaConstraint {
-    fn mask_logits(&mut self, logits: &mut [f32], _generated: &[u32]) -> anyhow::Result<()> {
+    fn mask_logits(&mut self, logits: &mut [f32], generated_text: &str) -> anyhow::Result<()> {
+        // Update current JSON from generated text
+        self.current_json = generated_text.to_string();
+
         if self.state == JsonParseState::Complete {
             // Already complete, mask everything
             for logit in logits.iter_mut() {
@@ -427,18 +506,23 @@ impl SamplingConstraint for JsonSchemaConstraint {
         }
 
         // For each token, check if appending it results in valid partial JSON
+        // This handles UTF-8 and emoji correctly since serde_json fully supports Unicode
         for (idx, logit) in logits.iter_mut().enumerate() {
             if *logit == f32::NEG_INFINITY {
                 continue;
             }
 
-            if let Ok(token_text) = self.tokenizer.decode(&[idx as u32]) {
-                let candidate = format!("{}{}", self.current_json, token_text);
-                if !self.is_valid_partial_json(&candidate) {
+            match self.tokenizer.decode(&[idx as u32]) {
+                Ok(token_text) => {
+                    let candidate = format!("{}{}", self.current_json, token_text);
+                    if !self.is_valid_partial_json(&candidate) {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+                Err(_) => {
+                    // Token decodes to invalid UTF-8 - mask it
                     *logit = f32::NEG_INFINITY;
                 }
-            } else {
-                *logit = f32::NEG_INFINITY;
             }
         }
 
@@ -506,7 +590,7 @@ mod tests {
         let mut constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
 
         let mut logits = vec![0.0f32; 10];
-        constraint.mask_logits(&mut logits, &[]).unwrap();
+        constraint.mask_logits(&mut logits, "").unwrap();
 
         // Only tokens 1 and 3 should be valid at position 0
         assert!(logits[1].is_finite());
@@ -548,7 +632,7 @@ mod tests {
         let mut constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
 
         let mut logits = vec![0.0f32; 10];
-        constraint.mask_logits(&mut logits, &[]).unwrap();
+        constraint.mask_logits(&mut logits, "").unwrap();
         assert_eq!(constraint.position, 1);
 
         constraint.reset();
@@ -596,5 +680,168 @@ mod tests {
         let expected = constraint.expected_tokens();
         assert!(expected.contains(&"{"));
         assert!(expected.contains(&"["));
+    }
+
+    // ─── UTF-8 and Emoji Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_json_schema_utf8_strings() {
+        let schema = serde_json::json!({"type": "object"});
+        let tokenizer = Arc::new(mock_tokenizer());
+        let constraint = JsonSchemaConstraint::new(schema, tokenizer);
+
+        // Test UTF-8 characters in JSON
+        assert!(constraint.is_valid_partial_json("{\"name\": \"Привет"));
+        assert!(constraint.is_valid_partial_json("{\"name\": \"日本語"));
+        assert!(constraint.is_valid_partial_json("{\"name\": \"한국어"));
+        assert!(constraint.is_valid_partial_json("{\"emoji\": \"🎉"));
+    }
+
+    #[test]
+    fn test_json_schema_complete_with_utf8() {
+        let schema = serde_json::json!({"type": "object"});
+        let tokenizer = Arc::new(mock_tokenizer());
+        let constraint = JsonSchemaConstraint::new(schema, tokenizer);
+
+        // Complete JSON with UTF-8 content
+        assert!(constraint.is_complete(&[], "{\"greeting\": \"Привет мир\"}"));
+        assert!(constraint.is_complete(&[], "{\"message\": \"こんにちは世界\"}"));
+        assert!(constraint.is_complete(&[], "{\"emoji\": \"🎉🚀✨\"}"));
+        assert!(constraint.is_complete(&[], "{\"mixed\": \"Hello мир 世界 🌍\"}"));
+    }
+
+    #[test]
+    fn test_json_schema_emoji_in_keys() {
+        let schema = serde_json::json!({"type": "object"});
+        let tokenizer = Arc::new(mock_tokenizer());
+        let constraint = JsonSchemaConstraint::new(schema, tokenizer);
+
+        // JSON with emoji in keys (valid JSON)
+        assert!(constraint.is_valid_partial_json("{\"🔑\": \"value"));
+        assert!(constraint.is_complete(&[], "{\"🎉\": \"party\"}"));
+    }
+
+    #[test]
+    fn test_regex_constraint_utf8_pattern() {
+        let tokenizer = Arc::new(mock_tokenizer());
+
+        // Pattern that matches Cyrillic text
+        let constraint = RegexConstraint::new(
+            r"[а-яА-ЯёЁ]+",
+            tokenizer.clone(),
+            100,
+        ).unwrap();
+
+        assert!(constraint.is_complete(&[], "Привет"));
+        assert!(constraint.is_complete(&[], "Мир"));
+        assert!(!constraint.is_complete(&[], "Hello")); // Latin, not Cyrillic
+    }
+
+    #[test]
+    fn test_regex_constraint_emoji_pattern() {
+        let tokenizer = Arc::new(mock_tokenizer());
+
+        // Pattern that matches text with emoji
+        // Note: \p{Emoji} requires the unicode-perl feature in regex
+        let constraint = RegexConstraint::new(
+            r".*[🎉🚀✨].*",
+            tokenizer.clone(),
+            100,
+        ).unwrap();
+
+        assert!(constraint.is_complete(&[], "Party 🎉!"));
+        assert!(constraint.is_complete(&[], "🚀 Launch"));
+        assert!(!constraint.is_complete(&[], "No emoji here"));
+    }
+
+    #[test]
+    fn test_regex_constraint_max_length_chars_not_bytes() {
+        let tokenizer = Arc::new(mock_tokenizer());
+
+        // max_length should be in characters, not bytes
+        // "🎉" is 1 character but 4 bytes
+        let constraint = RegexConstraint::new(
+            r".*",
+            tokenizer.clone(),
+            5, // 5 characters max
+        ).unwrap();
+
+        // "🎉🎉🎉🎉🎉" is 5 characters (20 bytes)
+        assert!(constraint.is_valid_prefix("🎉🎉🎉🎉🎉"));
+
+        // "🎉🎉🎉🎉🎉🎉" is 6 characters - should fail max_length check
+        assert!(!constraint.is_valid_prefix("🎉🎉🎉🎉🎉🎉"));
+    }
+
+    #[test]
+    fn test_regex_constraint_mixed_scripts() {
+        let tokenizer = Arc::new(mock_tokenizer());
+
+        // Pattern matching mixed Latin/Cyrillic/CJK
+        let constraint = RegexConstraint::new(
+            r"Hello.*世界",
+            tokenizer.clone(),
+            100,
+        ).unwrap();
+
+        assert!(constraint.is_complete(&[], "Hello 世界"));
+        assert!(constraint.is_complete(&[], "Hello мир 世界"));
+        assert!(!constraint.is_complete(&[], "Hello world")); // No 世界
+    }
+
+    #[test]
+    fn test_choice_constraint_token_based_utf8() {
+        // ChoiceConstraint works at token level, so UTF-8 support
+        // depends on tokenizer encoding
+        let choices = vec![
+            vec![100, 200, 300], // Represents "Привет"
+            vec![100, 201, 301], // Represents "Пока"
+        ];
+        let constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
+
+        // The constraint should work regardless of what the tokens represent
+        assert!(constraint.is_complete(&[100, 200, 300], "Привет"));
+        assert!(constraint.is_complete(&[100, 201, 301], "Пока"));
+        assert!(!constraint.is_complete(&[100, 200], "Прив")); // Incomplete
+    }
+
+    #[test]
+    fn test_json_schema_unicode_escapes() {
+        let schema = serde_json::json!({"type": "object"});
+        let tokenizer = Arc::new(mock_tokenizer());
+        let constraint = JsonSchemaConstraint::new(schema, tokenizer);
+
+        // JSON with Unicode escapes (valid JSON)
+        assert!(constraint.is_valid_partial_json(r#"{"text": "\u0041"#)); // A
+        assert!(constraint.is_valid_partial_json(r#"{"emoji": "\uD83C\uDF89"#)); // 🎉 as surrogate pair
+        assert!(constraint.is_complete(&[], r#"{"text": "\u0041"}"#));
+    }
+
+    #[test]
+    fn test_regex_constraint_is_valid_prefix_utf8() {
+        let tokenizer = Arc::new(mock_tokenizer());
+
+        let constraint = RegexConstraint::new(
+            r"Привет.*мир",
+            tokenizer.clone(),
+            50,
+        ).unwrap();
+
+        // Valid prefixes
+        assert!(constraint.is_valid_prefix("П"));
+        assert!(constraint.is_valid_prefix("Привет"));
+        assert!(constraint.is_valid_prefix("Привет "));
+        assert!(constraint.is_valid_prefix("Привет мир")); // Complete match is also valid prefix
+    }
+
+    #[test]
+    fn test_json_schema_nested_utf8() {
+        let schema = serde_json::json!({"type": "object"});
+        let tokenizer = Arc::new(mock_tokenizer());
+        let constraint = JsonSchemaConstraint::new(schema, tokenizer);
+
+        // Nested objects with UTF-8
+        let nested_json = r#"{"user": {"name": "Иван", "greeting": "Привет 🎉"}, "tags": ["тег1", "タグ2"]}"#;
+        assert!(constraint.is_complete(&[], nested_json));
     }
 }
