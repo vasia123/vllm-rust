@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod chat;
 pub mod completions;
 pub mod error;
@@ -11,6 +12,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use vllm_core::engine::EngineHandle;
 use vllm_core::tokenizer::{ChatTemplateEngine, TokenizerWrapper};
+
+pub use admin::{create_admin_router, AdminState};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +30,16 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/completions", post(completions::create_completion))
         .route("/v1/chat/completions", post(chat::create_chat_completion))
         .with_state(state)
+}
+
+/// Create the full router including admin endpoints.
+pub fn create_full_router(app_state: AppState, admin_state: AdminState) -> Router {
+    Router::new()
+        .route("/v1/models", get(models::list_models))
+        .route("/v1/completions", post(completions::create_completion))
+        .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .with_state(app_state)
+        .nest("/admin", create_admin_router(admin_state))
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //!
 //! Tracks allocation, eviction, and prefix cache hit rates.
 
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Statistics for KV cache operations.
@@ -146,7 +147,7 @@ impl KVCacheMetrics {
 }
 
 /// Snapshot of metrics at a point in time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MetricsSnapshot {
     pub allocations: u64,
     pub blocks_allocated: u64,

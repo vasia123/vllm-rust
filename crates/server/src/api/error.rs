@@ -8,6 +8,7 @@ pub enum ApiError {
     InvalidRequest(String),
     ModelNotFound(String),
     TemplateError(String),
+    InternalError(String),
 }
 
 #[derive(Serialize)]
@@ -39,6 +40,9 @@ impl IntoResponse for ApiError {
             ),
             ApiError::TemplateError(msg) => {
                 (StatusCode::BAD_REQUEST, "invalid_request_error", None, msg)
+            }
+            ApiError::InternalError(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "server_error", None, msg)
             }
         };
 

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::kv_cache::prefix_cache::PrefixCache;
-use crate::kv_cache::{BlockId, BlockTable, KVCacheManager};
+use crate::kv_cache::{BlockId, BlockTable, KVCacheManager, MetricsSnapshot};
 use crate::request::{FinishReason, RequestId, RequestStatus, SequenceState};
 use crate::sampling::{self, SamplerState, SamplingParams};
 use crate::scheduler::{Scheduler, SchedulerConfig};
@@ -182,6 +183,27 @@ pub struct EngineConfig {
     pub enable_prefix_caching: bool,
 }
 
+// ─── Engine Stats ──────────────────────────────────────────────────────────
+
+/// Runtime statistics from the engine for monitoring and admin API.
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineStats {
+    /// Number of requests currently being processed.
+    pub num_running_requests: usize,
+    /// Number of requests waiting in queue.
+    pub num_waiting_requests: usize,
+    /// Number of free KV cache blocks available.
+    pub num_free_blocks: usize,
+    /// Total number of KV cache blocks.
+    pub num_total_blocks: usize,
+    /// Block size in tokens.
+    pub block_size: usize,
+    /// KV cache metrics snapshot.
+    pub kv_cache_metrics: MetricsSnapshot,
+    /// Prefix cache statistics: (cached_blocks, evictable_blocks).
+    pub prefix_cache_stats: Option<(usize, usize)>,
+}
+
 // ─── Engine commands (internal) ────────────────────────────────────────────
 
 enum ResponseChannel {
@@ -197,6 +219,9 @@ enum EngineCommand {
     GenerateStream {
         request: GenerationRequest,
         stream_tx: mpsc::Sender<StreamEvent>,
+    },
+    GetStats {
+        response_tx: oneshot::Sender<EngineStats>,
     },
     Shutdown,
 }
@@ -241,6 +266,18 @@ impl EngineHandle {
             .send(EngineCommand::Shutdown)
             .await
             .map_err(|_| EngineError::Shutdown)
+    }
+
+    /// Get current engine statistics for monitoring.
+    pub async fn get_stats(&self) -> Result<EngineStats, EngineError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::GetStats {
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+        resp_rx.await.map_err(|_| EngineError::Shutdown)
     }
 }
 
@@ -326,6 +363,7 @@ async fn engine_loop<M: ModelForward>(
                         &mut requests,
                         config.block_size,
                         &mut prefix_cache,
+                        &kv_cache_mgr,
                     ) {
                         return; // shutdown
                     }
@@ -347,6 +385,7 @@ async fn engine_loop<M: ModelForward>(
                         &mut requests,
                         config.block_size,
                         &mut prefix_cache,
+                        &kv_cache_mgr,
                     ) {
                         return;
                     }
@@ -577,6 +616,7 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
                         &mut requests,
                         config.block_size,
                         &mut prefix_cache,
+                        &target_kv_cache,
                     ) {
                         return;
                     }
@@ -598,6 +638,7 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
                         &mut requests,
                         config.block_size,
                         &mut prefix_cache,
+                        &target_kv_cache,
                     ) {
                         return;
                     }
@@ -920,6 +961,7 @@ fn execute_speculative_decode<M: ModelForward, D: ModelForward>(
 // ─── Helper functions ──────────────────────────────────────────────────────
 
 /// Returns true if shutdown was requested.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     cmd: EngineCommand,
     next_id: &mut RequestId,
@@ -928,6 +970,7 @@ fn handle_command(
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
     prefix_cache: &mut Option<PrefixCache>,
+    kv_cache_mgr: &KVCacheManager,
 ) -> bool {
     match cmd {
         EngineCommand::Generate {
@@ -957,6 +1000,19 @@ fn handle_command(
                 block_size,
                 prefix_cache,
             );
+            false
+        }
+        EngineCommand::GetStats { response_tx } => {
+            let stats = EngineStats {
+                num_running_requests: scheduler.num_running(),
+                num_waiting_requests: scheduler.num_waiting(),
+                num_free_blocks: kv_cache_mgr.num_free_blocks(),
+                num_total_blocks: kv_cache_mgr.num_total_blocks(),
+                block_size,
+                kv_cache_metrics: kv_cache_mgr.metrics().snapshot(),
+                prefix_cache_stats: kv_cache_mgr.prefix_cache_stats(),
+            };
+            let _ = response_tx.send(stats);
             false
         }
         EngineCommand::Shutdown => true,
