@@ -3,6 +3,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use vllm_core::engine::GenerationRequest;
+use vllm_core::sampling::SamplingParams;
 
 use super::error::ApiError;
 use super::streaming::completion_sse_stream;
@@ -27,6 +28,17 @@ pub async fn create_completion(
         prompt: req.prompt.clone(),
         max_new_tokens: req.max_tokens,
         eos_token_id: state.eos_token_id,
+        sampling_params: SamplingParams {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            repetition_penalty: req.repetition_penalty,
+            min_p: req.min_p,
+            seed: req.seed,
+        },
+        stop_strings: req.stop,
+        stop_token_ids: req.stop_token_ids,
+        include_stop_str_in_output: req.include_stop_str_in_output,
     };
 
     if req.stream {

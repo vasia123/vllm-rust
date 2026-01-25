@@ -22,3 +22,4 @@ minijinja.workspace = true
 ahash.workspace = true
 candle-flash-attn = { workspace = true, optional = true }
 half.workspace = true
+rand.workspace = true

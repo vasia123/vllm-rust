@@ -26,5 +26,6 @@ uuid = { version = "1", features = ["v4"] }
 half = "2.5"
 minijinja = "2"
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

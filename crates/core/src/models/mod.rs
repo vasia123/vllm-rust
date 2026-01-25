@@ -19,10 +19,7 @@ pub enum ModelError {
 }
 
 /// Construct the appropriate model from config.architectures[0].
-pub fn from_config(
-    cfg: &ModelConfig,
-    vb: VarBuilder,
-) -> Result<Box<dyn ModelForward>, ModelError> {
+pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelForward>, ModelError> {
     let arch = cfg
         .architectures
         .first()

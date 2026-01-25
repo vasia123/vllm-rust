@@ -39,13 +39,21 @@ pub fn batched_paged_attention_decode(
         let (k_full, v_full) = cache_engine
             .read_contiguous_multi(&seq_infos)
             .map_err(|e| candle_core::Error::Msg(format!("cache read_contiguous_multi: {e}")))?;
-        flash_decode(q, &k_full, &v_full, kv_lengths, batch_size, num_heads, head_dim)
+        flash_decode(
+            q, &k_full, &v_full, kv_lengths, batch_size, num_heads, head_dim,
+        )
     }
 
     #[cfg(not(feature = "flash-attn"))]
     {
         per_seq_decode(
-            q, cache_engine, seq_block_ids, kv_lengths, batch_size, num_heads, num_kv_heads,
+            q,
+            cache_engine,
+            seq_block_ids,
+            kv_lengths,
+            batch_size,
+            num_heads,
+            num_kv_heads,
             head_dim,
         )
     }

@@ -11,6 +11,24 @@ pub struct CompletionRequest {
     pub max_tokens: usize,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub top_k: u32,
+    #[serde(default = "default_repetition_penalty")]
+    pub repetition_penalty: f32,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub stop: Vec<String>,
+    #[serde(default)]
+    pub stop_token_ids: Vec<u32>,
+    #[serde(default)]
+    pub include_stop_str_in_output: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +75,24 @@ pub struct ChatCompletionRequest {
     pub max_tokens: usize,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub top_k: u32,
+    #[serde(default = "default_repetition_penalty")]
+    pub repetition_penalty: f32,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub stop: Vec<String>,
+    #[serde(default)]
+    pub stop_token_ids: Vec<u32>,
+    #[serde(default)]
+    pub include_stop_str_in_output: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,10 +172,23 @@ fn default_max_tokens() -> usize {
     64
 }
 
+fn default_temperature() -> f32 {
+    1.0
+}
+
+fn default_top_p() -> f32 {
+    1.0
+}
+
+fn default_repetition_penalty() -> f32 {
+    1.0
+}
+
 pub fn finish_reason_str(reason: &vllm_core::request::FinishReason) -> String {
     match reason {
         vllm_core::request::FinishReason::Eos => "stop".to_string(),
         vllm_core::request::FinishReason::Length => "length".to_string(),
+        vllm_core::request::FinishReason::Stop => "stop".to_string(),
     }
 }
 

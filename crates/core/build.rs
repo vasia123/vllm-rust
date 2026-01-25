@@ -32,7 +32,9 @@ fn main() {
             panic!("nvcc failed with exit code: {s}. Ensure CUDA toolkit is installed.");
         }
         Err(e) => {
-            panic!("Failed to run nvcc: {e}. Ensure CUDA toolkit is installed and nvcc is in PATH.");
+            panic!(
+                "Failed to run nvcc: {e}. Ensure CUDA toolkit is installed and nvcc is in PATH."
+            );
         }
     }
 }

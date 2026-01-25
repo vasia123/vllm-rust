@@ -281,11 +281,9 @@ impl LlamaDecoderLayer {
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward_decode_batch(
-            &xs,
-            sequences,
-            kv_cache_mgr.engine(layer_idx),
-        )?;
+        let xs =
+            self.self_attn
+                .forward_decode_batch(&xs, sequences, kv_cache_mgr.engine(layer_idx))?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = self
@@ -387,7 +385,13 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        self.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     fn forward_decode_batch(

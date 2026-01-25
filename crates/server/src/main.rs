@@ -3,10 +3,11 @@ use std::sync::Arc;
 use candle_core::{DType, Device};
 use clap::{Parser, Subcommand};
 use vllm_core::{
-    engine::{start_engine, start_engine_with_draft, EngineConfig, GenerationRequest, SpeculativeConfig},
+    engine::{
+        start_engine, start_engine_with_draft, EngineConfig, GenerationRequest, SpeculativeConfig,
+    },
     kv_cache::{config::CacheConfig, KVCacheManager},
-    loader,
-    models,
+    loader, models,
     scheduler::SchedulerConfig,
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
 };
@@ -99,7 +100,17 @@ async fn main() -> anyhow::Result<()> {
             max_requests,
             multi_step_count,
         } => {
-            run_server(model, draft_model, num_speculative_tokens, host, port, num_blocks, max_requests, multi_step_count).await
+            run_server(
+                model,
+                draft_model,
+                num_speculative_tokens,
+                host,
+                port,
+                num_blocks,
+                max_requests,
+                multi_step_count,
+            )
+            .await
         }
         Command::Generate {
             model,
@@ -114,7 +125,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 prompt
             };
-            run_generate(model, draft_model, num_speculative_tokens, prompts, max_tokens, multi_step_count).await
+            run_generate(
+                model,
+                draft_model,
+                num_speculative_tokens,
+                prompts,
+                max_tokens,
+                multi_step_count,
+            )
+            .await
         }
     }
 }
@@ -206,12 +225,14 @@ async fn run_server(
             scheduler_config: SchedulerConfig {
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
@@ -228,10 +249,12 @@ async fn run_server(
             scheduler_config: SchedulerConfig {
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: None,
             multi_step_count,
+            enable_prefix_caching: false,
         };
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
@@ -331,12 +354,14 @@ async fn run_generate(
             scheduler_config: SchedulerConfig {
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         eprintln!(
@@ -358,10 +383,12 @@ async fn run_generate(
             scheduler_config: SchedulerConfig {
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: None,
             multi_step_count,
+            enable_prefix_caching: false,
         };
 
         eprintln!(
@@ -380,6 +407,7 @@ async fn run_generate(
             prompt: prompt.clone(),
             max_new_tokens: max_tokens,
             eos_token_id,
+            ..Default::default()
         };
         tasks.push(tokio::spawn(async move {
             (req.prompt.clone(), h.generate(req).await)

@@ -1,4 +1,5 @@
 use crate::kv_cache::BlockTable;
+use crate::sampling::{SamplerState, SamplingParams};
 
 pub type RequestId = u64;
 
@@ -26,6 +27,7 @@ impl RequestStatus {
 pub enum FinishReason {
     Eos,
     Length,
+    Stop,
 }
 
 pub struct SequenceState {
@@ -38,6 +40,13 @@ pub struct SequenceState {
     pub eos_token_id: u32,
     pub seqlen_offset: usize,
     pub arrival_order: u64,
+    pub sampling_params: SamplingParams,
+    pub sampler_state: SamplerState,
+    pub stop_token_ids: Vec<u32>,
+    pub stop_strings: Vec<String>,
+    pub include_stop_str_in_output: bool,
+    /// Number of prompt tokens already processed (for chunked prefill).
+    pub num_computed_tokens: usize,
 }
 
 impl SequenceState {
@@ -59,6 +68,12 @@ impl SequenceState {
             eos_token_id,
             seqlen_offset: 0,
             arrival_order,
+            sampling_params: SamplingParams::default(),
+            sampler_state: SamplerState::new(None),
+            stop_token_ids: Vec::new(),
+            stop_strings: Vec::new(),
+            include_stop_str_in_output: false,
+            num_computed_tokens: 0,
         }
     }
 

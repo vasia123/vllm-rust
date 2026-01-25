@@ -7,5 +7,6 @@ pub mod layers;
 pub mod loader;
 pub mod models;
 pub mod request;
+pub mod sampling;
 pub mod scheduler;
 pub mod tokenizer;

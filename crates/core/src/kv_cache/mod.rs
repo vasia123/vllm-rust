@@ -3,6 +3,7 @@ mod block_table;
 mod cache_engine;
 pub mod config;
 mod error;
+pub mod prefix_cache;
 
 pub use block_pool::BlockId;
 pub use block_table::BlockTable;

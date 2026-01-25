@@ -4,8 +4,10 @@ use candle_core::{Device, Tensor};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::kv_cache::prefix_cache::PrefixCache;
 use crate::kv_cache::{BlockId, BlockTable, KVCacheManager};
 use crate::request::{FinishReason, RequestId, RequestStatus, SequenceState};
+use crate::sampling::{self, SamplerState, SamplingParams};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::tokenizer::TokenizerWrapper;
 
@@ -57,10 +59,14 @@ pub trait ModelForward: Send + 'static {
         let mut outputs = Vec::with_capacity(batch_size);
         for (i, seq) in sequences.iter().enumerate() {
             let token = input_ids.narrow(0, i, 1)?;
-            let block_table =
-                BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
-            let logits =
-                self.forward(&token, seq.seqlen_offset, kv_cache_mgr, &block_table, &seq.slot_mapping)?;
+            let block_table = BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
+            let logits = self.forward(
+                &token,
+                seq.seqlen_offset,
+                kv_cache_mgr,
+                &block_table,
+                &seq.slot_mapping,
+            )?;
             outputs.push(logits);
         }
         Tensor::cat(&outputs, 0)
@@ -78,7 +84,13 @@ impl ModelForward for Box<dyn ModelForward> {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor> {
-        (**self).forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        (**self).forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     fn forward_decode_batch(
@@ -113,6 +125,24 @@ pub struct GenerationRequest {
     pub prompt: String,
     pub max_new_tokens: usize,
     pub eos_token_id: u32,
+    pub sampling_params: SamplingParams,
+    pub stop_token_ids: Vec<u32>,
+    pub stop_strings: Vec<String>,
+    pub include_stop_str_in_output: bool,
+}
+
+impl Default for GenerationRequest {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            max_new_tokens: 128,
+            eos_token_id: 0,
+            sampling_params: SamplingParams::greedy(),
+            stop_token_ids: Vec::new(),
+            stop_strings: Vec::new(),
+            include_stop_str_in_output: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +164,8 @@ pub struct EngineConfig {
     /// Run N decode steps per scheduler invocation to amortize scheduling overhead.
     /// Sequences that finish mid-step break early. Default: 1 (no multi-step).
     pub multi_step_count: usize,
+    /// Enable automatic prefix caching for KV cache block reuse.
+    pub enable_prefix_caching: bool,
 }
 
 // ─── Engine commands (internal) ────────────────────────────────────────────
@@ -261,6 +293,11 @@ async fn engine_loop<M: ModelForward>(
     let mut scheduler = Scheduler::new(config.scheduler_config);
     let mut requests: HashMap<RequestId, ActiveRequest> = HashMap::new();
     let mut next_id: RequestId = 0;
+    let mut prefix_cache = if config.enable_prefix_caching {
+        Some(PrefixCache::new(config.block_size))
+    } else {
+        None
+    };
 
     loop {
         // Phase 1: Drain incoming commands (non-blocking)
@@ -274,6 +311,7 @@ async fn engine_loop<M: ModelForward>(
                         &mut scheduler,
                         &mut requests,
                         config.block_size,
+                        &mut prefix_cache,
                     ) {
                         return; // shutdown
                     }
@@ -294,6 +332,7 @@ async fn engine_loop<M: ModelForward>(
                         &mut scheduler,
                         &mut requests,
                         config.block_size,
+                        &mut prefix_cache,
                     ) {
                         return;
                     }
@@ -318,8 +357,15 @@ async fn engine_loop<M: ModelForward>(
         }
 
         // Phase 5: Execute prefills
-        for &req_id in &output.prefill_requests {
-            if let Err(e) = execute_prefill(req_id, &model, &mut kv_cache_mgr, &mut requests) {
+        for schedule in &output.prefill_requests {
+            let req_id = schedule.request_id;
+            if let Err(e) = execute_prefill(
+                req_id,
+                schedule.chunk_size,
+                &model,
+                &mut kv_cache_mgr,
+                &mut requests,
+            ) {
                 finish_request_with_error(req_id, e, &mut scheduler, &mut requests);
             } else {
                 send_stream_token(req_id, &tokenizer, &mut requests);
@@ -352,11 +398,11 @@ async fn engine_loop<M: ModelForward>(
                     );
                 }
 
-                // Remove sequences that finished (EOS or max_tokens)
+                // Remove sequences that finished (EOS, stop, or max_tokens)
                 active_decode_ids.retain(|&id| {
                     requests
                         .get(&id)
-                        .map(|r| check_finished(&r.state).is_none())
+                        .map(|r| check_finished(&r.state, &tokenizer).is_none())
                         .unwrap_or(false)
                 });
             }
@@ -371,27 +417,49 @@ async fn engine_loop<M: ModelForward>(
 
         // Phase 7: Check completion and notify
         let mut finished = Vec::new();
-        for &req_id in output
+        let scheduled_ids: Vec<RequestId> = output
             .prefill_requests
             .iter()
-            .chain(output.decode_requests.iter())
-        {
+            .map(|s| s.request_id)
+            .chain(output.decode_requests.iter().copied())
+            .collect();
+        for &req_id in &scheduled_ids {
             if let Some(req) = requests.get(&req_id) {
-                if let Some(reason) = check_finished(&req.state) {
-                    finished.push((req_id, reason));
+                if let Some(check) = check_finished(&req.state, &tokenizer) {
+                    finished.push((req_id, check));
                 }
             }
         }
 
-        for (req_id, reason) in finished {
-            let req = requests.remove(&req_id).unwrap();
+        for (req_id, check) in finished {
+            let mut req = requests.remove(&req_id).unwrap();
             scheduler.remove_request(req_id);
-            let mut block_table = req.state.block_table;
-            let _ = kv_cache_mgr.free_request(&mut block_table);
+            let block_ids = req.state.block_table.release();
+            if let Some(cache) = prefix_cache.as_mut() {
+                cache.register_blocks(&req.state.prompt_token_ids, &block_ids);
+                let to_free = cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+                if !to_free.is_empty() {
+                    let _ = kv_cache_mgr.free_blocks(&to_free);
+                }
+            } else if !block_ids.is_empty() {
+                let _ = kv_cache_mgr.free_blocks(&block_ids);
+            }
 
-            let text = tokenizer
+            let mut text = tokenizer
                 .decode(&req.state.generated_token_ids)
                 .unwrap_or_default();
+            if check.trim_bytes > 0 {
+                let new_len = text.len().saturating_sub(check.trim_bytes);
+                text.truncate(new_len);
+            }
+
+            if check.reason == FinishReason::Stop && !req.state.stop_token_ids.is_empty() {
+                if let Some(&last) = req.state.generated_token_ids.last() {
+                    if req.state.stop_token_ids.contains(&last) {
+                        req.state.generated_token_ids.pop();
+                    }
+                }
+            }
 
             match req.response {
                 ResponseChannel::Complete(tx) => {
@@ -399,13 +467,13 @@ async fn engine_loop<M: ModelForward>(
                         request_id: req_id,
                         generated_text: text,
                         generated_token_ids: req.state.generated_token_ids,
-                        finish_reason: reason,
+                        finish_reason: check.reason,
                     };
                     let _ = tx.send(Ok(result));
                 }
                 ResponseChannel::Stream(tx) => {
                     let _ = tx.try_send(StreamEvent::Done {
-                        finish_reason: reason,
+                        finish_reason: check.reason,
                         generated_text: text,
                     });
                 }
@@ -435,6 +503,11 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
     let mut scheduler = Scheduler::new(config.scheduler_config);
     let mut requests: HashMap<RequestId, ActiveRequest> = HashMap::new();
     let mut next_id: RequestId = 0;
+    let mut prefix_cache = if config.enable_prefix_caching {
+        Some(PrefixCache::new(config.block_size))
+    } else {
+        None
+    };
 
     loop {
         // Phase 1: Drain incoming commands
@@ -448,6 +521,7 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
                         &mut scheduler,
                         &mut requests,
                         config.block_size,
+                        &mut prefix_cache,
                     ) {
                         return;
                     }
@@ -468,6 +542,7 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
                         &mut scheduler,
                         &mut requests,
                         config.block_size,
+                        &mut prefix_cache,
                     ) {
                         return;
                     }
@@ -497,19 +572,21 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
         }
 
         // Phase 5: Prefills (target + draft)
-        for &req_id in &output.prefill_requests {
-            if let Err(e) =
-                execute_prefill(req_id, &target_model, &mut target_kv_cache, &mut requests)
-            {
+        for schedule in &output.prefill_requests {
+            let req_id = schedule.request_id;
+            if let Err(e) = execute_prefill(
+                req_id,
+                schedule.chunk_size,
+                &target_model,
+                &mut target_kv_cache,
+                &mut requests,
+            ) {
                 finish_request_with_error(req_id, e, &mut scheduler, &mut requests);
                 continue;
             }
-            if let Err(e) = execute_draft_prefill(
-                req_id,
-                &draft_model,
-                &mut draft_kv_cache,
-                &mut requests,
-            ) {
+            if let Err(e) =
+                execute_draft_prefill(req_id, &draft_model, &mut draft_kv_cache, &mut requests)
+            {
                 finish_request_with_error(req_id, e, &mut scheduler, &mut requests);
                 continue;
             }
@@ -535,31 +612,53 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
 
         // Phase 7: Check completion
         let mut finished = Vec::new();
-        for &req_id in output
+        let scheduled_ids: Vec<RequestId> = output
             .prefill_requests
             .iter()
-            .chain(output.decode_requests.iter())
-        {
+            .map(|s| s.request_id)
+            .chain(output.decode_requests.iter().copied())
+            .collect();
+        for &req_id in &scheduled_ids {
             if let Some(req) = requests.get(&req_id) {
-                if let Some(reason) = check_finished(&req.state) {
-                    finished.push((req_id, reason));
+                if let Some(check) = check_finished(&req.state, &tokenizer) {
+                    finished.push((req_id, check));
                 }
             }
         }
 
-        for (req_id, reason) in finished {
-            let req = requests.remove(&req_id).unwrap();
+        for (req_id, check) in finished {
+            let mut req = requests.remove(&req_id).unwrap();
             scheduler.remove_request(req_id);
-            let mut block_table = req.state.block_table;
-            let _ = target_kv_cache.free_request(&mut block_table);
+            let block_ids = req.state.block_table.release();
+            if let Some(cache) = prefix_cache.as_mut() {
+                cache.register_blocks(&req.state.prompt_token_ids, &block_ids);
+                let to_free = cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+                if !to_free.is_empty() {
+                    let _ = target_kv_cache.free_blocks(&to_free);
+                }
+            } else if !block_ids.is_empty() {
+                let _ = target_kv_cache.free_blocks(&block_ids);
+            }
             if let Some(mut ds) = req.draft_state {
                 let freed = ds.block_table.release();
                 let _ = draft_kv_cache.free_blocks(&freed);
             }
 
-            let text = tokenizer
+            let mut text = tokenizer
                 .decode(&req.state.generated_token_ids)
                 .unwrap_or_default();
+            if check.trim_bytes > 0 {
+                let new_len = text.len().saturating_sub(check.trim_bytes);
+                text.truncate(new_len);
+            }
+
+            if check.reason == FinishReason::Stop && !req.state.stop_token_ids.is_empty() {
+                if let Some(&last) = req.state.generated_token_ids.last() {
+                    if req.state.stop_token_ids.contains(&last) {
+                        req.state.generated_token_ids.pop();
+                    }
+                }
+            }
 
             match req.response {
                 ResponseChannel::Complete(tx) => {
@@ -567,13 +666,13 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
                         request_id: req_id,
                         generated_text: text,
                         generated_token_ids: req.state.generated_token_ids,
-                        finish_reason: reason,
+                        finish_reason: check.reason,
                     };
                     let _ = tx.send(Ok(result));
                 }
                 ResponseChannel::Stream(tx) => {
                     let _ = tx.try_send(StreamEvent::Done {
-                        finish_reason: reason,
+                        finish_reason: check.reason,
                         generated_text: text,
                     });
                 }
@@ -777,6 +876,7 @@ fn handle_command(
     scheduler: &mut Scheduler,
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
+    prefix_cache: &mut Option<PrefixCache>,
 ) -> bool {
     match cmd {
         EngineCommand::Generate {
@@ -791,6 +891,7 @@ fn handle_command(
                 scheduler,
                 requests,
                 block_size,
+                prefix_cache,
             );
             false
         }
@@ -803,6 +904,7 @@ fn handle_command(
                 scheduler,
                 requests,
                 block_size,
+                prefix_cache,
             );
             false
         }
@@ -810,6 +912,7 @@ fn handle_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn admit_request(
     request: GenerationRequest,
     response: ResponseChannel,
@@ -818,6 +921,7 @@ fn admit_request(
     scheduler: &mut Scheduler,
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
+    prefix_cache: &mut Option<PrefixCache>,
 ) {
     let prompt_ids = match tokenizer.encode(&request.prompt) {
         Ok(ids) => ids,
@@ -830,7 +934,7 @@ fn admit_request(
     let id = *next_id;
     *next_id += 1;
 
-    let state = SequenceState::new(
+    let mut state = SequenceState::new(
         id,
         prompt_ids,
         request.max_new_tokens,
@@ -838,6 +942,32 @@ fn admit_request(
         block_size,
         id,
     );
+    state.sampler_state = SamplerState::new(request.sampling_params.seed);
+    state.sampling_params = request.sampling_params;
+    state.stop_token_ids = request.stop_token_ids;
+    state.stop_strings = request.stop_strings;
+    state.include_stop_str_in_output = request.include_stop_str_in_output;
+
+    // Check prefix cache for reusable blocks
+    if let Some(cache) = prefix_cache.as_mut() {
+        let (cached_blocks, _) = cache.match_prefix(&state.prompt_token_ids);
+        if !cached_blocks.is_empty() {
+            // Always leave at least 1 token for prefill to produce first decode logits.
+            // Only use full blocks that fit within (prompt_len - 1) tokens.
+            let max_cached = state.prompt_token_ids.len().saturating_sub(1);
+            let blocks_to_use = (max_cached / block_size).min(cached_blocks.len());
+            if blocks_to_use > 0 {
+                let tokens_covered = blocks_to_use * block_size;
+                state
+                    .block_table
+                    .append_blocks(&cached_blocks[..blocks_to_use]);
+                state.block_table.advance(tokens_covered);
+                state.num_computed_tokens = tokens_covered;
+                state.seqlen_offset = tokens_covered;
+            }
+        }
+    }
+
     scheduler.add_request(id);
     requests.insert(
         id,
@@ -866,45 +996,53 @@ fn send_error(response: ResponseChannel, error: EngineError) {
 
 fn execute_prefill<M: ModelForward>(
     req_id: RequestId,
+    chunk_size: usize,
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
 ) -> Result<(), EngineError> {
     let req = requests.get_mut(&req_id).unwrap();
     let prompt_len = req.state.prompt_token_ids.len();
+    let offset = req.state.num_computed_tokens;
+    let chunk_end = (offset + chunk_size).min(prompt_len);
+    let actual_chunk = chunk_end - offset;
+    let is_final_chunk = chunk_end == prompt_len;
 
     kv_cache_mgr
-        .allocate_for_request(&mut req.state.block_table, prompt_len)
+        .allocate_for_request(&mut req.state.block_table, actual_chunk)
         .map_err(|e| EngineError::Cache(e.to_string()))?;
-    let slot_mapping = req.state.block_table.slot_mapping(0, prompt_len);
+    let slot_mapping = req.state.block_table.slot_mapping(offset, actual_chunk);
 
-    let input = Tensor::from_vec(
-        req.state.prompt_token_ids.clone(),
-        (1, prompt_len),
-        model.device(),
-    )
-    .map_err(|e| EngineError::Model(e.to_string()))?;
+    let chunk_tokens = &req.state.prompt_token_ids[offset..chunk_end];
+    let input = Tensor::from_vec(chunk_tokens.to_vec(), (1, actual_chunk), model.device())
+        .map_err(|e| EngineError::Model(e.to_string()))?;
 
     let logits = model
         .forward(
             &input,
-            0,
+            offset,
             kv_cache_mgr,
             &req.state.block_table,
             &slot_mapping,
         )
         .map_err(|e| EngineError::Model(e.to_string()))?;
 
-    req.state.block_table.advance(prompt_len);
-    req.state.seqlen_offset = prompt_len;
-    req.state.status = RequestStatus::Decoding;
+    req.state.block_table.advance(actual_chunk);
+    req.state.num_computed_tokens = chunk_end;
+    req.state.seqlen_offset = chunk_end;
 
-    let seq_dim = logits.dims()[1];
-    let logits = logits
-        .narrow(1, seq_dim - 1, 1)
-        .map_err(|e| EngineError::Model(e.to_string()))?;
-    let next_token = greedy_sample(&logits).map_err(|e| EngineError::Model(e.to_string()))?;
-    req.state.generated_token_ids.push(next_token);
+    if is_final_chunk {
+        req.state.status = RequestStatus::Decoding;
+
+        let seq_dim = logits.dims()[1];
+        let logits = logits
+            .narrow(1, seq_dim - 1, 1)
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+        let next_token = sample_token(&logits, &mut req.state)?;
+        req.state.generated_token_ids.push(next_token);
+    } else {
+        req.state.status = RequestStatus::Prefilling;
+    }
 
     Ok(())
 }
@@ -946,7 +1084,7 @@ fn execute_decode<M: ModelForward>(
     let logits = logits
         .narrow(1, seq_dim - 1, 1)
         .map_err(|e| EngineError::Model(e.to_string()))?;
-    let next_token = greedy_sample(&logits).map_err(|e| EngineError::Model(e.to_string()))?;
+    let next_token = sample_token(&logits, &mut req.state)?;
     req.state.generated_token_ids.push(next_token);
 
     Ok(())
@@ -1017,7 +1155,7 @@ fn execute_batched_decode<M: ModelForward>(
         }
     };
 
-    // Step 4: Batched argmax — single GPU kernel + single GPU→CPU copy
+    // Step 4: Extract logits and sample per-sequence
     let seq_dim = logits.dims()[1];
     let last_logits = match logits.narrow(1, seq_dim - 1, 1) {
         Ok(l) => match l.squeeze(1) {
@@ -1032,19 +1170,54 @@ fn execute_batched_decode<M: ModelForward>(
             return failed;
         }
     };
-    let token_ids_tensor = match last_logits.argmax(1) {
-        Ok(t) => t, // [batch] — single kernel
-        Err(_) => {
-            failed.extend(&batch_ids);
-            return failed;
+
+    // Check if all sequences use greedy sampling for fast-path
+    let all_greedy = batch_ids.iter().all(|&id| {
+        requests
+            .get(&id)
+            .map(|r| r.state.sampling_params.is_greedy())
+            .unwrap_or(true)
+    });
+
+    let sampled_tokens: Vec<u32> = if all_greedy {
+        // Fast path: single argmax kernel
+        let token_ids_tensor = match last_logits.argmax(1) {
+            Ok(t) => t,
+            Err(_) => {
+                failed.extend(&batch_ids);
+                return failed;
+            }
+        };
+        match token_ids_tensor.to_vec1() {
+            Ok(v) => v,
+            Err(_) => {
+                failed.extend(&batch_ids);
+                return failed;
+            }
         }
-    };
-    let sampled_tokens: Vec<u32> = match token_ids_tensor.to_vec1() {
-        Ok(v) => v, // single GPU→CPU transfer
-        Err(_) => {
-            failed.extend(&batch_ids);
-            return failed;
+    } else {
+        // Per-sequence sampling: transfer logits to CPU, sample individually
+        let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
+            Ok(v) => v.into_iter().flatten().collect(),
+            Err(_) => {
+                failed.extend(&batch_ids);
+                return failed;
+            }
+        };
+        let vocab_size = last_logits.dims()[1];
+        let mut tokens = Vec::with_capacity(batch_ids.len());
+        for (i, &req_id) in batch_ids.iter().enumerate() {
+            let req = requests.get_mut(&req_id).unwrap();
+            let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];
+            let token = sampling::sample(
+                logit_slice,
+                &req.state.sampling_params,
+                &req.state.generated_token_ids,
+                &mut req.state.sampler_state,
+            );
+            tokens.push(token);
         }
+        tokens
     };
 
     // Step 5: Update state with sampled tokens
@@ -1058,14 +1231,78 @@ fn execute_batched_decode<M: ModelForward>(
     failed
 }
 
-fn check_finished(state: &SequenceState) -> Option<FinishReason> {
-    let last_token = state.generated_token_ids.last()?;
-    if *last_token == state.eos_token_id {
-        Some(FinishReason::Eos)
-    } else if state.num_generated() >= state.max_new_tokens {
-        Some(FinishReason::Length)
+/// Result of checking if generation should stop, including optional text trim length.
+struct FinishCheck {
+    reason: FinishReason,
+    /// Number of bytes to trim from generated text (for stop string not included in output).
+    trim_bytes: usize,
+}
+
+fn check_finished(state: &SequenceState, tokenizer: &TokenizerWrapper) -> Option<FinishCheck> {
+    let last_token = *state.generated_token_ids.last()?;
+
+    // Check EOS
+    if last_token == state.eos_token_id {
+        return Some(FinishCheck {
+            reason: FinishReason::Eos,
+            trim_bytes: 0,
+        });
+    }
+
+    // Check stop token IDs
+    if state.stop_token_ids.contains(&last_token) {
+        return Some(FinishCheck {
+            reason: FinishReason::Stop,
+            trim_bytes: 0,
+        });
+    }
+
+    // Check stop strings
+    if !state.stop_strings.is_empty() {
+        if let Ok(text) = tokenizer.decode(&state.generated_token_ids) {
+            for stop_str in &state.stop_strings {
+                if text.ends_with(stop_str.as_str()) {
+                    let trim = if state.include_stop_str_in_output {
+                        0
+                    } else {
+                        stop_str.len()
+                    };
+                    return Some(FinishCheck {
+                        reason: FinishReason::Stop,
+                        trim_bytes: trim,
+                    });
+                }
+            }
+        }
+    }
+
+    // Check max length
+    if state.num_generated() >= state.max_new_tokens {
+        return Some(FinishCheck {
+            reason: FinishReason::Length,
+            trim_bytes: 0,
+        });
+    }
+
+    None
+}
+
+/// Sample a single token from logits tensor using the sequence's sampling params.
+fn sample_token(logits: &Tensor, state: &mut SequenceState) -> Result<u32, EngineError> {
+    if state.sampling_params.is_greedy() {
+        greedy_sample(logits).map_err(|e| EngineError::Model(e.to_string()))
     } else {
-        None
+        let logits_vec: Vec<f32> = logits
+            .squeeze(0)
+            .and_then(|t| t.squeeze(0))
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+        Ok(sampling::sample(
+            &logits_vec,
+            &state.sampling_params,
+            &state.generated_token_ids,
+            &mut state.sampler_state,
+        ))
     }
 }
 
@@ -1365,10 +1602,12 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: None,
             multi_step_count: 1,
+            enable_prefix_caching: false,
         }
     }
 
@@ -1385,6 +1624,7 @@ mod tests {
 
         let initial_free_blocks = kv_cache_mgr.num_free_blocks();
         let handle = tokio::spawn(async move {
+            let tokenizer = TokenizerWrapper::for_testing(1000);
             let mut scheduler = Scheduler::new(config.scheduler_config);
             let mut active: HashMap<RequestId, ActiveRequest> = HashMap::new();
             let mut kv_cache_mgr = kv_cache_mgr;
@@ -1399,7 +1639,6 @@ mod tests {
                     id,
                 );
                 scheduler.add_request(id);
-                // We'll collect results via the results vec
                 let (tx, _rx) = oneshot::channel();
                 active.insert(
                     id,
@@ -1415,7 +1654,6 @@ mod tests {
 
             let mut results: HashMap<RequestId, GenerationResult> = HashMap::new();
 
-            // Run until all done (with safety limit)
             for _ in 0..10000 {
                 if scheduler.is_idle() {
                     break;
@@ -1425,7 +1663,6 @@ mod tests {
                     active.iter().map(|(&id, r)| (id, &r.state)).collect();
                 let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
 
-                // Preemptions
                 for &req_id in &output.preempted_requests {
                     let req = active.get_mut(&req_id).unwrap();
                     let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
@@ -1434,12 +1671,16 @@ mod tests {
                     req.state.seqlen_offset = 0;
                 }
 
-                // Prefills
-                for &req_id in &output.prefill_requests {
-                    let _ = execute_prefill(req_id, &model, &mut kv_cache_mgr, &mut active);
+                for schedule in &output.prefill_requests {
+                    let _ = execute_prefill(
+                        schedule.request_id,
+                        schedule.chunk_size,
+                        &model,
+                        &mut kv_cache_mgr,
+                        &mut active,
+                    );
                 }
 
-                // Decodes (batched)
                 if !output.decode_requests.is_empty() {
                     let _failed = execute_batched_decode(
                         &output.decode_requests,
@@ -1449,21 +1690,22 @@ mod tests {
                     );
                 }
 
-                // Check finished
                 let mut finished = Vec::new();
-                for &req_id in output
+                let scheduled_ids: Vec<RequestId> = output
                     .prefill_requests
                     .iter()
-                    .chain(output.decode_requests.iter())
-                {
+                    .map(|s| s.request_id)
+                    .chain(output.decode_requests.iter().copied())
+                    .collect();
+                for &req_id in &scheduled_ids {
                     if let Some(req) = active.get(&req_id) {
-                        if let Some(reason) = check_finished(&req.state) {
-                            finished.push((req_id, reason));
+                        if let Some(check) = check_finished(&req.state, &tokenizer) {
+                            finished.push((req_id, check));
                         }
                     }
                 }
 
-                for (req_id, reason) in finished {
+                for (req_id, check) in finished {
                     let req = active.remove(&req_id).unwrap();
                     scheduler.remove_request(req_id);
                     let mut bt = req.state.block_table;
@@ -1474,7 +1716,7 @@ mod tests {
                             request_id: req_id,
                             generated_text: String::new(),
                             generated_token_ids: req.state.generated_token_ids,
-                            finish_reason: reason,
+                            finish_reason: check.reason,
                         },
                     );
                 }
@@ -1600,10 +1842,12 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 4,
             speculative_config: None,
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         // 3 requests each needing 2 tokens prompt → 1 block each
@@ -1645,6 +1889,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 5,
             eos_token_id: 999,
+            ..Default::default()
         };
         let mut rx = handle.generate_stream(req).await.unwrap();
 
@@ -1686,6 +1931,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 10,
             eos_token_id: 999,
+            ..Default::default()
         };
         let mut rx = handle.generate_stream(req).await.unwrap();
 
@@ -1722,6 +1968,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 100,
             eos_token_id: 999,
+            ..Default::default()
         };
         let rx = handle.generate_stream(req).await.unwrap();
         // Drop the receiver immediately — engine should not crash
@@ -1732,6 +1979,7 @@ mod tests {
             prompt: "t4 t5".to_string(),
             max_new_tokens: 3,
             eos_token_id: 999,
+            ..Default::default()
         };
         let result = handle.generate(req2).await.unwrap();
         assert_eq!(result.generated_token_ids.len(), 3);
@@ -1756,6 +2004,7 @@ mod tests {
                 prompt: "t1 t2".to_string(),
                 max_new_tokens: 4,
                 eos_token_id: 999,
+                ..Default::default()
             };
             let mut rx = h1.generate_stream(req).await.unwrap();
             let mut count = 0;
@@ -1776,6 +2025,7 @@ mod tests {
                 prompt: "t3 t4 t5".to_string(),
                 max_new_tokens: 3,
                 eos_token_id: 999,
+                ..Default::default()
             };
             h2.generate(req).await.unwrap()
         });
@@ -1810,12 +2060,14 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         let handle =
@@ -1825,6 +2077,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 5,
             eos_token_id: 999,
+            ..Default::default()
         };
         let result = handle.generate(req).await.unwrap();
 
@@ -1854,12 +2107,14 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         let handle =
@@ -1869,6 +2124,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 5,
             eos_token_id: 999,
+            ..Default::default()
         };
         let result = handle.generate(req).await.unwrap();
 
@@ -1898,12 +2154,14 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         let handle =
@@ -1913,6 +2171,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 5,
             eos_token_id: 999,
+            ..Default::default()
         };
         let result = handle.generate(req).await.unwrap();
 
@@ -1939,12 +2198,14 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens: 3,
             }),
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
 
         let handle =
@@ -1954,6 +2215,7 @@ mod tests {
             prompt: "t1 t2 t3".to_string(),
             max_new_tokens: 5,
             eos_token_id: 999,
+            ..Default::default()
         };
         let mut rx = handle.generate_stream(req).await.unwrap();
 
@@ -1974,6 +2236,461 @@ mod tests {
         assert_eq!(done_reason, Some(FinishReason::Length));
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_generates_output() {
+        // A 25-token prompt with budget 10 requires multiple prefill chunks
+        let seq = vec![0u32; 25]
+            .into_iter()
+            .chain(vec![10, 20, 30])
+            .collect::<Vec<_>>();
+        let model = SequenceMockModel::new(seq, 1000);
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+
+        let config = EngineConfig {
+            scheduler_config: SchedulerConfig {
+                max_running_requests: 4,
+                max_tokens_per_step: 10,
+                enable_chunked_prefill: true,
+            },
+            block_size: 16,
+            speculative_config: None,
+            multi_step_count: 1,
+            enable_prefix_caching: false,
+        };
+
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(vec![0u32; 25], 3, 999)],
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids.len(), 3);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_with_concurrent_decode() {
+        // Submit two requests: one already decoding, one new with long prompt
+        let seq = vec![0u32; 30]
+            .into_iter()
+            .chain(vec![10, 20, 30, 40, 50])
+            .collect::<Vec<_>>();
+        let model = SequenceMockModel::new(seq, 1000);
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+
+        let config = EngineConfig {
+            scheduler_config: SchedulerConfig {
+                max_running_requests: 4,
+                max_tokens_per_step: 15,
+                enable_chunked_prefill: true,
+            },
+            block_size: 16,
+            speculative_config: None,
+            multi_step_count: 1,
+            enable_prefix_caching: false,
+        };
+
+        // Two requests: one short (completes prefill in one step) and one long
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![
+                (vec![0u32; 5], 3, 999),  // short: fits in one chunk
+                (vec![0u32; 25], 3, 999), // long: needs multiple chunks
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            let result = r.as_ref().unwrap();
+            assert_eq!(result.generated_token_ids.len(), 3);
+            assert_eq!(result.finish_reason, FinishReason::Length);
+        }
+    }
+
+    // ─── Prefix caching tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prefix_cache_skips_cached_prefix() {
+        use crate::kv_cache::prefix_cache::PrefixCache;
+
+        let cache_config = test_cache_config(); // block_size=16
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let block_size = cache_config.block_size;
+
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 512,
+            enable_chunked_prefill: false,
+        });
+        let mut active: HashMap<RequestId, ActiveRequest> = HashMap::new();
+        let mut prefix_cache = PrefixCache::new(block_size);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+
+        // Request 1: prompt of 32 tokens (2 full blocks)
+        let prompt = vec![1u32; 32];
+        let state = SequenceState::new(0, prompt.clone(), 3, 999, block_size, 0);
+        scheduler.add_request(0);
+        let (tx, _rx) = oneshot::channel();
+        active.insert(
+            0,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                draft_state: None,
+            },
+        );
+
+        // Run request 1 to completion
+        for _ in 0..100 {
+            if scheduler.is_idle() {
+                break;
+            }
+            let states: HashMap<RequestId, &SequenceState> =
+                active.iter().map(|(&id, r)| (id, &r.state)).collect();
+            let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
+
+            for schedule in &output.prefill_requests {
+                let _ = execute_prefill(
+                    schedule.request_id,
+                    schedule.chunk_size,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                );
+            }
+            if !output.decode_requests.is_empty() {
+                let _ = execute_batched_decode(
+                    &output.decode_requests,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                );
+            }
+
+            let scheduled_ids: Vec<RequestId> = output
+                .prefill_requests
+                .iter()
+                .map(|s| s.request_id)
+                .chain(output.decode_requests.iter().copied())
+                .collect();
+            let mut finished = Vec::new();
+            for &req_id in &scheduled_ids {
+                if let Some(req) = active.get(&req_id) {
+                    if let Some(check) = check_finished(&req.state, &tokenizer) {
+                        finished.push((req_id, check));
+                    }
+                }
+            }
+            for (req_id, _check) in finished {
+                let mut req = active.remove(&req_id).unwrap();
+                scheduler.remove_request(req_id);
+                // Register blocks in prefix cache, then free uncached
+                let block_ids = req.state.block_table.release();
+                prefix_cache.register_blocks(&req.state.prompt_token_ids, &block_ids);
+                let to_free = prefix_cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+                if !to_free.is_empty() {
+                    let _ = kv_cache_mgr.free_blocks(&to_free);
+                }
+            }
+        }
+
+        // Verify prefix cache has entries
+        assert_eq!(prefix_cache.num_cached_blocks(), 2); // 32 tokens / 16 block_size = 2 full blocks
+
+        // Request 2: same prompt prefix → should reuse 1 cached block (leave last block for prefill)
+        let mut state2 = SequenceState::new(1, prompt.clone(), 3, 999, block_size, 1);
+
+        // Simulate what admit_request does with prefix cache
+        let (cached_blocks, num_cached) = prefix_cache.match_prefix(&state2.prompt_token_ids);
+        assert_eq!(cached_blocks.len(), 2);
+        assert_eq!(num_cached, 32);
+
+        // Apply the same logic as admit_request: leave at least 1 token for prefill
+        let max_cached = state2.prompt_token_ids.len().saturating_sub(1);
+        let blocks_to_use = (max_cached / block_size).min(cached_blocks.len());
+        assert_eq!(blocks_to_use, 1); // 31/16 = 1 block
+
+        let tokens_covered = blocks_to_use * block_size;
+        state2
+            .block_table
+            .append_blocks(&cached_blocks[..blocks_to_use]);
+        state2.block_table.advance(tokens_covered);
+        state2.num_computed_tokens = tokens_covered;
+        state2.seqlen_offset = tokens_covered;
+
+        // 16 tokens cached, 16 remaining for prefill
+        assert_eq!(state2.num_computed_tokens, 16);
+
+        scheduler.add_request(1);
+        let (tx2, _rx2) = oneshot::channel();
+        active.insert(
+            1,
+            ActiveRequest {
+                state: state2,
+                response: ResponseChannel::Complete(tx2),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                draft_state: None,
+            },
+        );
+
+        // Run request 2 — needs prefill for remaining 16 tokens, then decode
+        let mut saw_prefill = false;
+        let mut saw_decode = false;
+        for _ in 0..100 {
+            if scheduler.is_idle() {
+                break;
+            }
+            let states: HashMap<RequestId, &SequenceState> =
+                active.iter().map(|(&id, r)| (id, &r.state)).collect();
+            let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
+
+            if !output.prefill_requests.is_empty() {
+                saw_prefill = true;
+                for schedule in &output.prefill_requests {
+                    let _ = execute_prefill(
+                        schedule.request_id,
+                        schedule.chunk_size,
+                        &model,
+                        &mut kv_cache_mgr,
+                        &mut active,
+                    );
+                }
+            }
+            if !output.decode_requests.is_empty() {
+                saw_decode = true;
+                let _ = execute_batched_decode(
+                    &output.decode_requests,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                );
+            }
+
+            let scheduled_ids: Vec<RequestId> = output
+                .prefill_requests
+                .iter()
+                .map(|s| s.request_id)
+                .chain(output.decode_requests.iter().copied())
+                .collect();
+            let mut finished = Vec::new();
+            for &req_id in &scheduled_ids {
+                if let Some(req) = active.get(&req_id) {
+                    if let Some(check) = check_finished(&req.state, &tokenizer) {
+                        finished.push((req_id, check));
+                    }
+                }
+            }
+            for (req_id, _check) in finished {
+                let mut req = active.remove(&req_id).unwrap();
+                scheduler.remove_request(req_id);
+                let block_ids = req.state.block_table.release();
+                let to_free = prefix_cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+                if !to_free.is_empty() {
+                    let _ = kv_cache_mgr.free_blocks(&to_free);
+                }
+            }
+        }
+
+        // Partial prefix means some prefill was still needed
+        assert!(saw_prefill);
+        assert!(saw_decode);
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_partial_prefix_match() {
+        use crate::kv_cache::prefix_cache::PrefixCache;
+
+        let cache_config = test_cache_config(); // block_size=16
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let block_size = cache_config.block_size;
+
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 512,
+            enable_chunked_prefill: false,
+        });
+        let mut active: HashMap<RequestId, ActiveRequest> = HashMap::new();
+        let mut prefix_cache = PrefixCache::new(block_size);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+
+        // Request 1: 32 token prompt
+        let prompt1: Vec<u32> = (0..32).collect();
+        let state = SequenceState::new(0, prompt1.clone(), 2, 999, block_size, 0);
+        scheduler.add_request(0);
+        let (tx, _rx) = oneshot::channel();
+        active.insert(
+            0,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                draft_state: None,
+            },
+        );
+
+        // Run to completion
+        for _ in 0..100 {
+            if scheduler.is_idle() {
+                break;
+            }
+            let states: HashMap<RequestId, &SequenceState> =
+                active.iter().map(|(&id, r)| (id, &r.state)).collect();
+            let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
+            for schedule in &output.prefill_requests {
+                let _ = execute_prefill(
+                    schedule.request_id,
+                    schedule.chunk_size,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                );
+            }
+            if !output.decode_requests.is_empty() {
+                let _ = execute_batched_decode(
+                    &output.decode_requests,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                );
+            }
+            let scheduled_ids: Vec<RequestId> = output
+                .prefill_requests
+                .iter()
+                .map(|s| s.request_id)
+                .chain(output.decode_requests.iter().copied())
+                .collect();
+            let mut finished = Vec::new();
+            for &req_id in &scheduled_ids {
+                if let Some(req) = active.get(&req_id) {
+                    if let Some(check) = check_finished(&req.state, &tokenizer) {
+                        finished.push((req_id, check));
+                    }
+                }
+            }
+            for (req_id, _check) in finished {
+                let mut req = active.remove(&req_id).unwrap();
+                scheduler.remove_request(req_id);
+                let block_ids = req.state.block_table.release();
+                prefix_cache.register_blocks(&req.state.prompt_token_ids, &block_ids);
+                let to_free = prefix_cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+                if !to_free.is_empty() {
+                    let _ = kv_cache_mgr.free_blocks(&to_free);
+                }
+            }
+        }
+
+        assert_eq!(prefix_cache.num_cached_blocks(), 2);
+
+        // Request 2: same first 16 tokens, different second block
+        let mut prompt2: Vec<u32> = (0..16).collect(); // same first block
+        prompt2.extend(100..116u32); // different second block
+        prompt2.extend(200..210u32); // extra tokens (partial third block)
+
+        let mut state2 = SequenceState::new(1, prompt2.clone(), 2, 999, block_size, 1);
+        let (cached_blocks, num_cached) = prefix_cache.match_prefix(&state2.prompt_token_ids);
+
+        // Only first block matches (second block has different tokens)
+        assert_eq!(cached_blocks.len(), 1);
+        assert_eq!(num_cached, 16);
+
+        state2.block_table.append_blocks(&cached_blocks);
+        state2.block_table.advance(num_cached);
+        state2.num_computed_tokens = num_cached;
+        state2.seqlen_offset = num_cached;
+
+        // Still needs prefill for remaining 26 tokens (16 + 10 uncached)
+        assert_eq!(state2.num_computed_tokens, 16);
+        assert_eq!(state2.prompt_token_ids.len(), 42);
+
+        scheduler.add_request(1);
+        let (tx2, _rx2) = oneshot::channel();
+        active.insert(
+            1,
+            ActiveRequest {
+                state: state2,
+                response: ResponseChannel::Complete(tx2),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                draft_state: None,
+            },
+        );
+
+        // Run request 2 — should prefill remaining tokens then decode
+        let mut saw_prefill = false;
+        for _ in 0..100 {
+            if scheduler.is_idle() {
+                break;
+            }
+            let states: HashMap<RequestId, &SequenceState> =
+                active.iter().map(|(&id, r)| (id, &r.state)).collect();
+            let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
+
+            if !output.prefill_requests.is_empty() {
+                saw_prefill = true;
+                for schedule in &output.prefill_requests {
+                    let _ = execute_prefill(
+                        schedule.request_id,
+                        schedule.chunk_size,
+                        &model,
+                        &mut kv_cache_mgr,
+                        &mut active,
+                    );
+                }
+            }
+            if !output.decode_requests.is_empty() {
+                let _ = execute_batched_decode(
+                    &output.decode_requests,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                );
+            }
+            let scheduled_ids: Vec<RequestId> = output
+                .prefill_requests
+                .iter()
+                .map(|s| s.request_id)
+                .chain(output.decode_requests.iter().copied())
+                .collect();
+            let mut finished = Vec::new();
+            for &req_id in &scheduled_ids {
+                if let Some(req) = active.get(&req_id) {
+                    if let Some(check) = check_finished(&req.state, &tokenizer) {
+                        finished.push((req_id, check));
+                    }
+                }
+            }
+            for (req_id, _check) in finished {
+                let mut req = active.remove(&req_id).unwrap();
+                scheduler.remove_request(req_id);
+                let block_ids = req.state.block_table.release();
+                let to_free = prefix_cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+                if !to_free.is_empty() {
+                    let _ = kv_cache_mgr.free_blocks(&to_free);
+                }
+            }
+        }
+
+        // With partial match, remaining tokens needed prefill
+        assert!(saw_prefill);
+        assert!(active.is_empty());
     }
 
     // ─── Legacy API test (requires model, ignored) ─────────────────────────

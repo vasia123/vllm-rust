@@ -92,10 +92,12 @@ mod tests {
             scheduler_config: SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
             },
             block_size: 16,
             speculative_config: None,
             multi_step_count: 1,
+            enable_prefix_caching: false,
         };
         let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
 

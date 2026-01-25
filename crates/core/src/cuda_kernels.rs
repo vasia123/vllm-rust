@@ -83,11 +83,8 @@ impl CustomOp1 for PagedAttnOp {
         let elem_count = num_seqs * self.num_heads * HEAD_DIM;
         let output_slice = dev.alloc_zeros::<bf16>(elem_count)?;
 
-        let func = dev.get_or_load_custom_func(
-            "paged_attention_v1_bf16",
-            "paged_attention",
-            PTX,
-        )?;
+        let func =
+            dev.get_or_load_custom_func("paged_attention_v1_bf16", "paged_attention", PTX)?;
 
         // Shared memory: q_smem[128] + reduce_smem[4] + logits[max_seq_len], all f32
         let shared_mem_bytes =
