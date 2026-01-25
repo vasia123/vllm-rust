@@ -3396,12 +3396,14 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "rand 0.8.5",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

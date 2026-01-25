@@ -2,6 +2,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use vllm_core::tokenizer::ChatMessage;
+pub use vllm_core::tool_parser::{
+    FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolChoiceAuto,
+    ToolChoiceFunction, ToolChoiceSpecific, ToolDefinition,
+};
 
 // ─── Prompt (string, array of strings, token IDs, or array of token IDs) ─
 
@@ -78,6 +82,9 @@ pub struct CompletionRequest {
     /// If true, include prompt tokens in output with their logprobs.
     #[serde(default)]
     pub echo: bool,
+    /// Response format for structured output (JSON schema, etc.)
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +164,15 @@ pub struct ChatCompletionRequest {
     pub stop_token_ids: Vec<u32>,
     #[serde(default)]
     pub include_stop_str_in_output: bool,
+    /// Response format for structured output (JSON schema, etc.)
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    /// Available tools for the model to use
+    #[serde(default)]
+    pub tools: Option<Vec<ToolDefinition>>,
+    /// Controls how the model uses tools
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,7 +195,10 @@ pub struct ChatCompletionChoice {
 #[derive(Debug, Serialize)]
 pub struct ChatMessageResponse {
     pub role: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +265,45 @@ fn default_top_p() -> f32 {
 
 fn default_repetition_penalty() -> f32 {
     1.0
+}
+
+// ─── Structured Output / Response Format ─────────────────────────────────
+
+/// Response format specification for structured output.
+///
+/// Supports text (default), JSON object, or JSON schema constraints.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum ResponseFormat {
+    /// Plain text output (default, no constraints)
+    #[default]
+    #[serde(rename = "text")]
+    Text,
+    /// JSON object output (valid JSON required)
+    #[serde(rename = "json_object")]
+    JsonObject,
+    /// JSON output conforming to a specific schema
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        /// The JSON schema specification
+        json_schema: JsonSchemaSpec,
+    },
+}
+
+/// JSON schema specification for structured output.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsonSchemaSpec {
+    /// Optional name for the schema
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The actual JSON schema
+    pub schema: serde_json::Value,
+    /// Whether to enforce strict schema validation
+    #[serde(default)]
+    pub strict: bool,
 }
 
 pub fn finish_reason_str(reason: &vllm_core::request::FinishReason) -> String {

@@ -1,3 +1,15 @@
+//! Sampling and constrained generation infrastructure.
+//!
+//! This module provides:
+//! - Token sampling with temperature, top-k, top-p, and repetition penalty
+//! - Constrained generation with choice, regex, and JSON schema constraints
+
+mod constraint;
+
+pub use constraint::{
+    ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, SamplingConstraint,
+};
+
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 

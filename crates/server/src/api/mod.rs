@@ -617,4 +617,52 @@ mod tests {
         assert!(json["error"]["message"].is_string());
         assert!(json["error"]["type"].is_string());
     }
+
+    #[tokio::test]
+    async fn chat_completions_with_tools() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "What is the weather in NYC?"}],
+            "max_tokens": 3,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string", "description": "The city name"}
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "auto"
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response format is correct
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        // The mock model doesn't produce tool calls, so content should be present
+        // In a real scenario with a tool-calling model, tool_calls would be populated
+        assert!(json["choices"][0]["message"].is_object());
+    }
 }

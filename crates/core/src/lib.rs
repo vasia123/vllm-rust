@@ -12,3 +12,4 @@ pub mod request;
 pub mod sampling;
 pub mod scheduler;
 pub mod tokenizer;
+pub mod tool_parser;

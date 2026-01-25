@@ -118,17 +118,39 @@ impl ChatTemplateEngine {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> anyhow::Result<String> {
+        self.apply_with_tools(messages, None, add_generation_prompt)
+    }
+
+    /// Apply the chat template with optional tool definitions.
+    ///
+    /// Many chat templates support a `tools` variable that includes function/tool
+    /// definitions for function calling models.
+    pub fn apply_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[crate::tool_parser::ToolDefinition]>,
+        add_generation_prompt: bool,
+    ) -> anyhow::Result<String> {
         let mut env = minijinja::Environment::new();
         // Add Python-compatible string methods (startswith, endswith, etc.)
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template("chat", &self.template_source)?;
         let tmpl = env.get_template("chat")?;
+
+        // Convert tools to JSON-serializable format
+        let tools_json: Option<Vec<serde_json::Value>> = tools.map(|t| {
+            t.iter()
+                .filter_map(|tool| serde_json::to_value(tool).ok())
+                .collect()
+        });
+
         let rendered = tmpl.render(minijinja::context! {
             messages => messages,
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
             add_generation_prompt => add_generation_prompt,
+            tools => tools_json,
         })?;
         Ok(rendered)
     }

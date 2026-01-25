@@ -27,6 +27,31 @@ pub struct ModelConfig {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            architectures: vec!["LlamaForCausalLM".to_string()],
+            hidden_size: 4096,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_hidden_layers: 32,
+            intermediate_size: 11008,
+            vocab_size: 32000,
+            max_position_embeddings: 4096,
+            head_dim: 128,
+            hidden_act: "silu".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            sliding_window: None,
+            attention_bias: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

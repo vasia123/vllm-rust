@@ -4,6 +4,7 @@ use axum::Json;
 
 use vllm_core::engine::GenerationRequest;
 use vllm_core::sampling::SamplingParams;
+use vllm_core::tool_parser::{HermesToolParser, ToolCallParser};
 
 use super::error::ApiError;
 use super::streaming::chat_completion_sse_stream;
@@ -29,9 +30,13 @@ pub async fn create_chat_completion(
         .as_ref()
         .ok_or_else(|| ApiError::TemplateError("no chat template available".to_string()))?;
 
+    // Apply template with tools if provided
     let prompt = chat_template
-        .apply(&req.messages, true)
+        .apply_with_tools(&req.messages, req.tools.as_deref(), true)
         .map_err(|e| ApiError::TemplateError(e.to_string()))?;
+
+    // Determine if we should parse tool calls from the output
+    let has_tools = req.tools.is_some();
 
     let gen_req = GenerationRequest {
         prompt: prompt.clone(),
@@ -77,6 +82,24 @@ pub async fn create_chat_completion(
             .unwrap_or(0);
         let completion_tokens = result.generated_token_ids.len();
 
+        // Parse tool calls if tools were provided
+        let (content, tool_calls, finish_reason) = if has_tools {
+            let parser = HermesToolParser::new();
+            if let Ok(calls) = parser.parse(&result.generated_text) {
+                if !calls.is_empty() {
+                    // Extract non-tool-call content
+                    let content = parser.extract_content(&result.generated_text);
+                    (content, Some(calls), "tool_calls".to_string())
+                } else {
+                    (Some(result.generated_text), None, finish_reason_str(&result.finish_reason))
+                }
+            } else {
+                (Some(result.generated_text), None, finish_reason_str(&result.finish_reason))
+            }
+        } else {
+            (Some(result.generated_text), None, finish_reason_str(&result.finish_reason))
+        };
+
         let response = ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: "chat.completion",
@@ -85,10 +108,11 @@ pub async fn create_chat_completion(
             choices: vec![ChatCompletionChoice {
                 message: ChatMessageResponse {
                     role: "assistant".to_string(),
-                    content: result.generated_text,
+                    content,
+                    tool_calls,
                 },
                 index: 0,
-                finish_reason: Some(finish_reason_str(&result.finish_reason)),
+                finish_reason: Some(finish_reason),
             }],
             usage: Usage {
                 prompt_tokens,

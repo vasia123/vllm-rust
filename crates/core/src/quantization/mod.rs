@@ -23,6 +23,7 @@
 //! let linear = config.create_linear(4096, 4096, false, &device)?;
 //! ```
 
+pub mod awq;
 mod config;
 mod detection;
 pub mod fp8;
@@ -31,8 +32,10 @@ pub mod fp8_cuda;
 pub mod gptq;
 #[cfg(feature = "cuda-kernels")]
 pub mod gptq_cuda;
+pub mod weight_loader;
 
 // Re-export public types
+pub use awq::{AwqConfig, AwqLinear, AwqVersion};
 pub use config::{
     ActivationScheme, NoQuantizationConfig, QuantizationConfig, QuantizationMethod,
     QuantizedLinear, UnquantizedLinear,
@@ -44,6 +47,11 @@ pub use fp8_cuda::{fp8_dequantize, fp8_gemm, fp8_quantize_dynamic_per_token, fp8
 pub use gptq::GptqConfig;
 #[cfg(feature = "cuda-kernels")]
 pub use gptq_cuda::{gptq_dequantize, gptq_gemm};
+pub use weight_loader::{
+    create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
+    AwqWeightLoader, Fp8WeightLoader, GptqWeightLoader, QuantizedWeightLoader,
+    UnquantizedWeightLoader,
+};
 
 use std::path::Path;
 
@@ -67,15 +75,11 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             detected.desc_act,
             &detected.raw_config,
         )),
-        QuantizationMethod::Awq => {
-            // AWQ uses similar config to GPTQ
-            Box::new(GptqConfig::from_detected(
-                detected.bits,
-                detected.group_size,
-                None,
-                &detected.raw_config,
-            ))
-        }
+        QuantizationMethod::Awq => Box::new(AwqConfig::from_detected(
+            detected.bits,
+            detected.group_size,
+            &detected.raw_config,
+        )),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }

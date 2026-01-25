@@ -26,3 +26,5 @@ half.workspace = true
 rand.workspace = true
 libloading.workspace = true
 tracing.workspace = true
+regex.workspace = true
+uuid.workspace = true
