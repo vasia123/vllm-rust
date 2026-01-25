@@ -53,6 +53,10 @@ impl BlockPool {
         self.free_list.len()
     }
 
+    pub fn num_total(&self) -> usize {
+        self.num_blocks
+    }
+
     #[cfg(test)]
     pub fn num_used(&self) -> usize {
         self.num_blocks - self.free_list.len()

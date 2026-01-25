@@ -102,6 +102,10 @@ impl KVCacheManager {
         self.block_pool.num_free()
     }
 
+    pub fn num_total_blocks(&self) -> usize {
+        self.block_pool.num_total()
+    }
+
     /// Free specific blocks back to the pool (used during speculative decode rollback).
     pub fn free_blocks(&mut self, block_ids: &[BlockId]) -> Result<(), CacheError> {
         if !block_ids.is_empty() {

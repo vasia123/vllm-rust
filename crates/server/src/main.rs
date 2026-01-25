@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::{DType, Device};
 use clap::{Parser, Subcommand};
@@ -12,7 +13,8 @@ use vllm_core::{
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
 };
 
-use vllm_server::api::{self, AppState};
+use vllm_server::api::{self, admin::types::RuntimeConfig, AdminState, AppState};
+use vllm_server::config::ServerConfig;
 
 #[derive(Parser)]
 #[command(name = "vllm-server", about = "Rust LLM inference engine")]
@@ -87,6 +89,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load config from file first
+    let file_config = ServerConfig::load();
+    if let Some(path) = ServerConfig::default_path() {
+        if path.exists() {
+            eprintln!("Loaded config from: {}", path.display());
+        }
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -100,6 +110,44 @@ async fn main() -> anyhow::Result<()> {
             max_requests,
             multi_step_count,
         } => {
+            // Merge CLI args with file config (CLI takes precedence)
+            let model = if model == "Qwen/Qwen3-0.6B" {
+                file_config.model.unwrap_or(model)
+            } else {
+                model
+            };
+            let draft_model = draft_model.or(file_config.draft_model);
+            let num_speculative_tokens = if num_speculative_tokens == 3 {
+                file_config.num_speculative_tokens.unwrap_or(num_speculative_tokens)
+            } else {
+                num_speculative_tokens
+            };
+            let port = if port == 8000 {
+                file_config.port.unwrap_or(port)
+            } else {
+                port
+            };
+            let host = if host == "0.0.0.0" {
+                file_config.host.unwrap_or(host)
+            } else {
+                host
+            };
+            let num_blocks = if num_blocks == 512 {
+                file_config.num_blocks.unwrap_or(num_blocks)
+            } else {
+                num_blocks
+            };
+            let max_requests = if max_requests == 8 {
+                file_config.max_requests.unwrap_or(max_requests)
+            } else {
+                max_requests
+            };
+            let multi_step_count = if multi_step_count == 4 {
+                file_config.multi_step_count.unwrap_or(multi_step_count)
+            } else {
+                multi_step_count
+            };
+
             run_server(
                 model,
                 draft_model,
@@ -269,10 +317,32 @@ async fn run_server(
         eos_token_id,
     };
 
-    let app = api::create_router(state);
+    let start_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let runtime_config = RuntimeConfig {
+        model: model_id.clone(),
+        draft_model: draft_model_id.clone(),
+        num_speculative_tokens,
+        num_blocks,
+        block_size: 16,
+        max_requests,
+        max_tokens_per_step: 2048,
+        enable_chunked_prefill: false,
+        multi_step_count,
+        enable_prefix_caching: false,
+        dtype: "bf16".to_string(),
+        device: "cuda:0".to_string(),
+    };
+
+    let admin_state = AdminState::new(handle.clone(), model_id.clone(), start_time, runtime_config);
+
+    let app = api::create_full_router(state, admin_state);
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("Serving on http://{addr}/v1");
+    eprintln!("Admin panel: http://{addr}/admin/");
 
     axum::serve(listener, app).await?;
 
