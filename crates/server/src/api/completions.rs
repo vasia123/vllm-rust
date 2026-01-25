@@ -60,6 +60,7 @@ pub async fn create_completion(
 
         let rx = state
             .engine
+            .get()
             .generate_stream(gen_req)
             .await
             .map_err(|e| ApiError::EngineError(e.to_string()))?;
@@ -96,6 +97,7 @@ pub async fn create_completion(
 
             let result = state
                 .engine
+                .get()
                 .generate(gen_req)
                 .await
                 .map_err(|e| ApiError::EngineError(e.to_string()))?;

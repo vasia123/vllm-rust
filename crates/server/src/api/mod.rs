@@ -2,42 +2,82 @@ pub mod admin;
 pub mod chat;
 pub mod completions;
 pub mod error;
+pub mod middleware;
 pub mod models;
 pub mod streaming;
 pub mod types;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::routing::{get, post};
 use axum::Router;
-use vllm_core::engine::EngineHandle;
 use vllm_core::tokenizer::{ChatTemplateEngine, TokenizerWrapper};
 
+pub use admin::restart::{
+    AtomicEngineHandle, EngineBuilder, EngineController, ProductionEngineBuilder,
+};
 pub use admin::{create_admin_router, AdminState};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub engine: EngineHandle,
+    pub engine: AtomicEngineHandle,
     pub model_id: String,
     pub tokenizer: Arc<TokenizerWrapper>,
     pub chat_template: Option<Arc<ChatTemplateEngine>>,
     pub eos_token_id: u32,
+    /// Whether the server is accepting new requests.
+    accepting: Arc<AtomicBool>,
+}
+
+impl AppState {
+    pub fn new(
+        engine: AtomicEngineHandle,
+        model_id: String,
+        tokenizer: Arc<TokenizerWrapper>,
+        chat_template: Option<Arc<ChatTemplateEngine>>,
+        eos_token_id: u32,
+        accepting: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            engine,
+            model_id,
+            tokenizer,
+            chat_template,
+            eos_token_id,
+            accepting,
+        }
+    }
+
+    pub fn accepting_requests(&self) -> bool {
+        self.accepting.load(Ordering::SeqCst)
+    }
 }
 
 pub fn create_router(state: AppState) -> Router {
+    let accepting = state.accepting.clone();
     Router::new()
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .layer(axum::middleware::from_fn_with_state(
+            accepting,
+            middleware::reject_during_restart,
+        ))
         .with_state(state)
 }
 
 /// Create the full router including admin endpoints.
 pub fn create_full_router(app_state: AppState, admin_state: AdminState) -> Router {
+    let accepting = app_state.accepting.clone();
     Router::new()
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .layer(axum::middleware::from_fn_with_state(
+            accepting,
+            middleware::reject_during_restart,
+        ))
         .with_state(app_state)
         .nest("/admin", create_admin_router(admin_state))
 }
@@ -113,6 +153,7 @@ mod tests {
             enable_prefix_caching: false,
         };
         let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
+        let (atomic_handle, _controller) = AtomicEngineHandle::new(handle);
 
         let api_tokenizer = TokenizerWrapper::for_testing(1000);
         let chat_template = ChatTemplateEngine::new(
@@ -125,13 +166,15 @@ mod tests {
             "".to_string(),
         );
 
-        AppState {
-            engine: handle,
-            model_id: "test-model".to_string(),
-            tokenizer: Arc::new(api_tokenizer),
-            chat_template: Some(Arc::new(chat_template)),
-            eos_token_id: 999,
-        }
+        let accepting = Arc::new(AtomicBool::new(true));
+        AppState::new(
+            atomic_handle,
+            "test-model".to_string(),
+            Arc::new(api_tokenizer),
+            Some(Arc::new(chat_template)),
+            999,
+            accepting,
+        )
     }
 
     #[tokio::test]

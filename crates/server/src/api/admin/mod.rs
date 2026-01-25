@@ -1,6 +1,7 @@
 //! Admin API for monitoring and management.
 
 pub mod metrics;
+pub mod restart;
 pub mod static_files;
 pub mod types;
 
@@ -10,40 +11,63 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use vllm_core::engine::EngineHandle;
+use tokio::sync::RwLock;
 
-use self::types::{ConfigSaveRequest, ConfigSaveResponse, HealthResponse, HealthStatus, RuntimeConfig};
+use self::restart::{
+    restart_handler, restart_status_stream, AtomicEngineHandle, EngineBuilder, EngineController,
+    RestartCoordinator, RestartState,
+};
+use self::types::{
+    ConfigSaveRequest, ConfigSaveResponse, HealthResponse, HealthStatus, RuntimeConfig,
+};
 use crate::api::error::ApiError;
 use crate::config::ServerConfig;
 
 /// Shared state for admin endpoints.
 #[derive(Clone)]
 pub struct AdminState {
-    pub engine: EngineHandle,
-    pub model_id: String,
+    pub engine: AtomicEngineHandle,
+    pub model_id: Arc<RwLock<String>>,
     /// Server start time as duration since UNIX_EPOCH.
     pub start_time: Duration,
-    /// Configuration snapshot.
-    pub config: Arc<RuntimeConfig>,
+    /// Configuration snapshot (mutable via restart).
+    pub config: Arc<RwLock<RuntimeConfig>>,
     /// Whether the server is accepting new requests.
     accepting: Arc<AtomicBool>,
+    /// Restart coordinator for graceful restarts.
+    restart_coordinator: Arc<RestartCoordinator>,
+    /// Engine builder for creating new engines.
+    engine_builder: Arc<dyn EngineBuilder>,
 }
 
 impl AdminState {
+    /// Create a new AdminState with atomic engine handle and restart coordinator.
     pub fn new(
-        engine: EngineHandle,
+        engine: AtomicEngineHandle,
+        engine_controller: EngineController,
         model_id: String,
         start_time: Duration,
         config: RuntimeConfig,
+        accepting: Arc<AtomicBool>,
+        engine_builder: Arc<dyn EngineBuilder>,
     ) -> Self {
+        let restart_coordinator = Arc::new(RestartCoordinator::new(
+            engine_controller,
+            engine.clone(),
+            config.clone(),
+            accepting.clone(),
+        ));
+
         Self {
             engine,
-            model_id,
+            model_id: Arc::new(RwLock::new(model_id)),
             start_time,
-            config: Arc::new(config),
-            accepting: Arc::new(AtomicBool::new(true)),
+            config: Arc::new(RwLock::new(config)),
+            accepting,
+            restart_coordinator,
+            engine_builder,
         }
     }
 
@@ -54,24 +78,42 @@ impl AdminState {
     pub fn set_accepting(&self, accepting: bool) {
         self.accepting.store(accepting, Ordering::SeqCst);
     }
+
+    /// Get the accepting flag for sharing with other components.
+    pub fn accepting_flag(&self) -> Arc<AtomicBool> {
+        self.accepting.clone()
+    }
+
+    fn restart_state(&self) -> RestartState {
+        RestartState {
+            coordinator: self.restart_coordinator.clone(),
+            engine_builder: self.engine_builder.clone(),
+        }
+    }
 }
 
 /// Create admin router with all admin endpoints.
 pub fn create_admin_router(state: AdminState) -> Router {
+    let restart_state = state.restart_state();
+
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics::get_metrics))
         .route("/metrics/stream", get(metrics::metrics_stream))
         .route("/config", get(get_config).post(save_config))
+        .with_state(state)
+        .route("/restart", post(restart_handler))
+        .route("/restart/status", get(restart_status_stream))
+        .with_state(restart_state)
         .route("/", get(static_files::index_handler))
         .route("/{*path}", get(static_files::static_handler))
-        .with_state(state)
 }
 
 /// GET /admin/health - Health check endpoint.
 async fn health(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
     let stats = state
         .engine
+        .get()
         .get_stats()
         .await
         .map_err(|e| ApiError::EngineError(e.to_string()))?;
@@ -92,14 +134,14 @@ async fn health(State(state): State<AdminState>) -> Result<impl IntoResponse, Ap
 
     Ok(Json(HealthResponse {
         status,
-        model_id: state.model_id.clone(),
+        model_id: state.model_id.read().await.clone(),
         uptime_seconds: uptime,
     }))
 }
 
 /// GET /admin/config - Get current runtime configuration.
 async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.config.as_ref().clone())
+    Json(state.config.read().await.clone())
 }
 
 /// POST /admin/config - Save configuration to file.

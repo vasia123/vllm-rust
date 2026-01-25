@@ -226,6 +226,66 @@ enum EngineCommand {
     Shutdown,
 }
 
+// ─── Test utilities ────────────────────────────────────────────────────────
+
+/// Engine command for testing purposes. Exposed with test-utils feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testing {
+    use super::*;
+
+    /// Create an EngineHandle from an mpsc sender for testing.
+    pub fn engine_handle_from_sender(tx: mpsc::Sender<TestEngineCommand>) -> EngineHandle {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(16);
+
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    EngineCommand::GetStats { response_tx } => {
+                        let (test_tx, test_rx) = oneshot::channel();
+                        if tx
+                            .send(TestEngineCommand::GetStats {
+                                response_tx: test_tx,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            if let Ok(stats) = test_rx.await {
+                                let _ = response_tx.send(stats);
+                            }
+                        }
+                    }
+                    EngineCommand::Shutdown => {
+                        let (test_tx, test_rx) = oneshot::channel();
+                        if tx
+                            .send(TestEngineCommand::Shutdown {
+                                response_tx: test_tx,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            let _ = test_rx.await;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        EngineHandle { cmd_tx }
+    }
+
+    /// Test-friendly engine command enum.
+    pub enum TestEngineCommand {
+        GetStats {
+            response_tx: oneshot::Sender<EngineStats>,
+        },
+        Shutdown {
+            response_tx: oneshot::Sender<Result<(), EngineError>>,
+        },
+    }
+}
+
 // ─── EngineHandle (public, cloneable) ──────────────────────────────────────
 
 #[derive(Clone)]

@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,10 @@ use vllm_core::{
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
 };
 
-use vllm_server::api::{self, admin::types::RuntimeConfig, AdminState, AppState};
+use vllm_server::api::{
+    self, admin::types::RuntimeConfig, AdminState, AppState, AtomicEngineHandle,
+    ProductionEngineBuilder,
+};
 use vllm_server::config::ServerConfig;
 
 #[derive(Parser)]
@@ -118,7 +122,9 @@ async fn main() -> anyhow::Result<()> {
             };
             let draft_model = draft_model.or(file_config.draft_model);
             let num_speculative_tokens = if num_speculative_tokens == 3 {
-                file_config.num_speculative_tokens.unwrap_or(num_speculative_tokens)
+                file_config
+                    .num_speculative_tokens
+                    .unwrap_or(num_speculative_tokens)
             } else {
                 num_speculative_tokens
             };
@@ -309,13 +315,18 @@ async fn run_server(
         start_engine(model, engine_tokenizer, kv_cache_mgr, engine_config)
     };
 
-    let state = AppState {
-        engine: handle.clone(),
-        model_id: model_id.clone(),
+    let (atomic_engine, engine_controller) = AtomicEngineHandle::new(handle);
+    let accepting = Arc::new(AtomicBool::new(true));
+    let engine_builder: Arc<ProductionEngineBuilder> = Arc::new(ProductionEngineBuilder);
+
+    let state = AppState::new(
+        atomic_engine.clone(),
+        model_id.clone(),
         tokenizer,
         chat_template,
         eos_token_id,
-    };
+        accepting.clone(),
+    );
 
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -336,7 +347,15 @@ async fn run_server(
         device: "cuda:0".to_string(),
     };
 
-    let admin_state = AdminState::new(handle.clone(), model_id.clone(), start_time, runtime_config);
+    let admin_state = AdminState::new(
+        atomic_engine.clone(),
+        engine_controller,
+        model_id.clone(),
+        start_time,
+        runtime_config,
+        accepting,
+        engine_builder,
+    );
 
     let app = api::create_full_router(state, admin_state);
     let addr = format!("{host}:{port}");
@@ -346,7 +365,7 @@ async fn run_server(
 
     axum::serve(listener, app).await?;
 
-    handle.shutdown().await?;
+    atomic_engine.get().shutdown().await?;
     Ok(())
 }
 

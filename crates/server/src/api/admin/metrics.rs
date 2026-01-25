@@ -17,6 +17,7 @@ use crate::api::error::ApiError;
 pub async fn get_metrics(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
     let engine_stats = state
         .engine
+        .get()
         .get_stats()
         .await
         .map_err(|e| ApiError::EngineError(e.to_string()))?;
@@ -41,7 +42,7 @@ pub async fn get_metrics(State(state): State<AdminState>) -> Result<impl IntoRes
         kv_cache: engine_stats.kv_cache_metrics,
         running_requests: engine_stats.num_running_requests,
         waiting_requests: engine_stats.num_waiting_requests,
-        model_id: state.model_id.clone(),
+        model_id: state.model_id.read().await.clone(),
         uptime_seconds: uptime,
         accepting_requests: state.accepting_requests(),
         timestamp_ms: now.as_millis() as u64,
@@ -61,7 +62,8 @@ pub async fn metrics_stream(
     let stream = stream::unfold(state, |state| async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let metrics = match state.engine.get_stats().await {
+        let engine = state.engine.get();
+        let metrics = match engine.get_stats().await {
             Ok(stats) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -79,11 +81,13 @@ pub async fn metrics_stream(
                             evictable_blocks: evictable,
                         });
 
+                let model_id = state.model_id.read().await.clone();
+
                 AdminMetrics {
                     kv_cache: stats.kv_cache_metrics,
                     running_requests: stats.num_running_requests,
                     waiting_requests: stats.num_waiting_requests,
-                    model_id: state.model_id.clone(),
+                    model_id,
                     uptime_seconds: uptime,
                     accepting_requests: state.accepting_requests(),
                     timestamp_ms: now.as_millis() as u64,

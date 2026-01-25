@@ -147,7 +147,7 @@ impl KVCacheMetrics {
 }
 
 /// Snapshot of metrics at a point in time.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MetricsSnapshot {
     pub allocations: u64,
     pub blocks_allocated: u64,

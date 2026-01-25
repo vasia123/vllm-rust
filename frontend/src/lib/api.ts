@@ -1,4 +1,4 @@
-import type { AdminMetrics, RuntimeConfig, HealthResponse } from './types'
+import type { AdminMetrics, RuntimeConfig, HealthResponse, RestartStatus } from './types'
 
 const BASE_URL = '/admin'
 
@@ -74,6 +74,25 @@ export function createMetricsStream(onMessage: (metrics: AdminMetrics) => void, 
 
   eventSource.onerror = () => {
     onError?.(new Error('SSE connection error'))
+  }
+
+  return () => eventSource.close()
+}
+
+export function createRestartStatusStream(onMessage: (status: RestartStatus) => void, onError?: (error: Error) => void): () => void {
+  const eventSource = new EventSource(`${BASE_URL}/restart/status`)
+
+  eventSource.addEventListener('status', (event) => {
+    try {
+      const status = JSON.parse(event.data) as RestartStatus
+      onMessage(status)
+    } catch (e) {
+      onError?.(e as Error)
+    }
+  })
+
+  eventSource.onerror = () => {
+    onError?.(new Error('Restart status SSE connection error'))
   }
 
   return () => eventSource.close()

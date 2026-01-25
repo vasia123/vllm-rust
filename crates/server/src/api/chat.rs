@@ -55,6 +55,7 @@ pub async fn create_chat_completion(
     if req.stream {
         let rx = state
             .engine
+            .get()
             .generate_stream(gen_req)
             .await
             .map_err(|e| ApiError::EngineError(e.to_string()))?;
@@ -64,6 +65,7 @@ pub async fn create_chat_completion(
     } else {
         let result = state
             .engine
+            .get()
             .generate(gen_req)
             .await
             .map_err(|e| ApiError::EngineError(e.to_string()))?;
