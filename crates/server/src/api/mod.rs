@@ -245,4 +245,319 @@ mod tests {
         assert!(body_str.contains("data: "));
         assert!(body_str.contains("[DONE]"));
     }
+
+    #[tokio::test]
+    async fn chat_completions_streaming() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "t1 t2"}],
+            "max_tokens": 3,
+            "stream": true
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream"));
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(body_str.contains("data: "));
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_multi_turn() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+                {"role": "user", "content": "How are you?"}
+            ],
+            "max_tokens": 3
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_wrong_model() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "wrong-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 3
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn completions_batch_prompts() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": ["t1 t2", "t3 t4 t5"],
+            "max_tokens": 2
+        });
+        let req = Request::post("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][1]["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn completions_with_sampling_params() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": "t1 t2",
+            "max_tokens": 3,
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "top_k": 50,
+            "repetition_penalty": 1.1
+        });
+        let req = Request::post("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn completions_token_ids_input() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        // Token IDs as prompt input
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "max_tokens": 2
+        });
+        let req = Request::post("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn completions_usage_tokens_counted() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": "t1 t2 t3 t4",
+            "max_tokens": 5
+        });
+        let req = Request::post("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let prompt_tokens = json["usage"]["prompt_tokens"].as_u64().unwrap();
+        let completion_tokens = json["usage"]["completion_tokens"].as_u64().unwrap();
+        let total_tokens = json["usage"]["total_tokens"].as_u64().unwrap();
+
+        assert!(prompt_tokens > 0);
+        assert_eq!(completion_tokens, 5);
+        assert_eq!(total_tokens, prompt_tokens + completion_tokens);
+    }
+
+    #[tokio::test]
+    async fn completions_response_format() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": "t1",
+            "max_tokens": 1
+        });
+        let req = Request::post("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify OpenAI-compatible response format
+        assert!(json["id"].as_str().unwrap().starts_with("cmpl-"));
+        assert_eq!(json["object"], "text_completion");
+        assert!(json["created"].as_u64().is_some());
+        assert_eq!(json["model"], "test-model");
+        assert!(json["choices"].is_array());
+        assert!(json["usage"].is_object());
+    }
+
+    #[tokio::test]
+    async fn chat_completions_response_format() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 1
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify OpenAI-compatible response format
+        assert!(json["id"].as_str().unwrap().starts_with("chatcmpl-"));
+        assert_eq!(json["object"], "chat.completion");
+        assert!(json["created"].as_u64().is_some());
+        assert_eq!(json["model"], "test-model");
+        assert!(json["choices"].is_array());
+        assert!(json["usage"].is_object());
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_with_system_message() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello"}
+            ],
+            "max_tokens": 3
+        });
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+    }
+
+    #[tokio::test]
+    async fn error_response_format() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "nonexistent-model",
+            "prompt": "test",
+            "max_tokens": 1
+        });
+        let req = Request::post("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // OpenAI-compatible error format
+        assert!(json["error"].is_object());
+        assert!(json["error"]["message"].is_string());
+        assert!(json["error"]["type"].is_string());
+    }
 }

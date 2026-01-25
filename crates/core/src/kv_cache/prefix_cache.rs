@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use super::block_pool::BlockId;
+use super::metrics::KVCacheMetrics;
 
 /// Hash-based prefix cache for KV cache block reuse.
 ///
@@ -15,6 +17,8 @@ pub struct PrefixCache {
     cache: HashMap<u64, CachedBlock>,
     /// Monotonic access counter for LRU eviction
     access_counter: u64,
+    /// Optional metrics tracking
+    metrics: Option<Arc<KVCacheMetrics>>,
 }
 
 struct CachedBlock {
@@ -29,6 +33,17 @@ impl PrefixCache {
             block_size,
             cache: HashMap::new(),
             access_counter: 0,
+            metrics: None,
+        }
+    }
+
+    /// Create a PrefixCache with metrics tracking enabled.
+    pub fn with_metrics(block_size: usize, metrics: Arc<KVCacheMetrics>) -> Self {
+        Self {
+            block_size,
+            cache: HashMap::new(),
+            access_counter: 0,
+            metrics: Some(metrics),
         }
     }
 
@@ -53,6 +68,14 @@ impl PrefixCache {
             }
         }
 
+        // Record metrics: hits = matched blocks, misses = total needed - matched
+        if let Some(ref m) = self.metrics {
+            let total_full_blocks = hashes.len();
+            let hits = matched_blocks.len();
+            let misses = total_full_blocks.saturating_sub(hits);
+            m.record_cache_query(hits, misses);
+        }
+
         let num_cached = matched_blocks.len() * self.block_size;
         (matched_blocks, num_cached)
     }
@@ -61,6 +84,10 @@ impl PrefixCache {
     ///
     /// Only full blocks are registered (the partial last block is excluded).
     /// `prompt_tokens` is the full prompt, `block_ids` are the allocated blocks.
+    ///
+    /// The registering request has an implicit ownership reference (ref_count = 1).
+    /// When another request matches, ref_count increases. When requests release,
+    /// ref_count decreases. Blocks are evictable when ref_count = 0.
     pub fn register_blocks(&mut self, prompt_tokens: &[u32], block_ids: &[BlockId]) {
         let hashes = compute_block_hashes(prompt_tokens, self.block_size);
 
@@ -72,7 +99,7 @@ impl PrefixCache {
                 self.access_counter += 1;
                 CachedBlock {
                     block_id: block_ids[i],
-                    ref_count: 0,
+                    ref_count: 1, // Owner has a reference
                     last_access: self.access_counter,
                 }
             });
@@ -131,6 +158,10 @@ impl PrefixCache {
             self.cache.remove(&hash);
             evicted.push(block_id);
         }
+
+        // Note: eviction metrics are recorded by the caller (KVCacheManager)
+        // to avoid double-counting when the manager coordinates eviction.
+
         evicted
     }
 
@@ -177,6 +208,7 @@ fn hash_block(prev_hash: u64, tokens: &[u32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn empty_prompt_no_match() {
@@ -233,14 +265,19 @@ mod tests {
         let mut cache = PrefixCache::new(4);
         let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8];
         cache.register_blocks(&prompt, &[10, 20]);
+        // After register: ref_count = 1 (owner)
 
-        // Match increments ref_count
+        // Match increments ref_count (ref_count = 2)
         cache.match_prefix(&prompt);
         assert_eq!(cache.num_evictable_blocks(), 0);
 
-        // Release decrements ref_count
+        // Release once (ref_count = 1) - still not evictable
         let to_free = cache.release_blocks(&prompt, &[10, 20]);
-        assert!(to_free.is_empty()); // cached blocks not freed
+        assert!(to_free.is_empty());
+        assert_eq!(cache.num_evictable_blocks(), 0);
+
+        // Release again (ref_count = 0) - now evictable
+        cache.release_blocks(&prompt, &[10, 20]);
         assert_eq!(cache.num_evictable_blocks(), 2);
     }
 
@@ -258,16 +295,21 @@ mod tests {
     #[test]
     fn evict_lru_order() {
         let mut cache = PrefixCache::new(4);
-        // Register two different prefixes
+        // Register two different prefixes (ref_count = 1 each)
         cache.register_blocks(&[1, 2, 3, 4], &[10]);
         cache.register_blocks(&[5, 6, 7, 8], &[20]);
 
-        // Access second one to make it more recent
+        // Access second one to make it more recent (ref_count = 2)
         cache.match_prefix(&[5, 6, 7, 8]);
-        // Release so it's evictable
-        cache.release_blocks(&[5, 6, 7, 8], &[20]);
 
-        // Evict 1 → should be block 10 (LRU)
+        // Release first prefix's owner reference (block 10: ref_count = 0)
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+
+        // Release second prefix's references (match + owner)
+        cache.release_blocks(&[5, 6, 7, 8], &[20]); // ref_count = 1
+        cache.release_blocks(&[5, 6, 7, 8], &[20]); // ref_count = 0
+
+        // Both are evictable, block 10 is LRU (registered first, not accessed)
         let evicted = cache.evict(1);
         assert_eq!(evicted, vec![10]);
         assert_eq!(cache.num_cached_blocks(), 1);
@@ -302,18 +344,23 @@ mod tests {
         let mut cache = PrefixCache::new(4);
         let prefix = vec![1, 2, 3, 4, 5, 6, 7, 8];
         cache.register_blocks(&prefix, &[10, 20]);
+        // ref_count = 1 (owner)
 
         // Two requests match the same prefix
-        let (m1, _) = cache.match_prefix(&prefix);
-        let (m2, _) = cache.match_prefix(&prefix);
+        let (m1, _) = cache.match_prefix(&prefix); // ref_count = 2
+        let (m2, _) = cache.match_prefix(&prefix); // ref_count = 3
         assert_eq!(m1, vec![10, 20]);
         assert_eq!(m2, vec![10, 20]);
 
-        // Release one → still not evictable (ref_count=1)
+        // Release one match → ref_count = 2, still not evictable
         cache.release_blocks(&prefix, &[10, 20]);
         assert_eq!(cache.num_evictable_blocks(), 0);
 
-        // Release second → now evictable
+        // Release second match → ref_count = 1, still not evictable
+        cache.release_blocks(&prefix, &[10, 20]);
+        assert_eq!(cache.num_evictable_blocks(), 0);
+
+        // Release owner → ref_count = 0, now evictable
         cache.release_blocks(&prefix, &[10, 20]);
         assert_eq!(cache.num_evictable_blocks(), 2);
     }
@@ -329,5 +376,117 @@ mod tests {
         let hashes3 = compute_block_hashes(&[1, 2, 3, 4, 9, 9, 9, 9], 4);
         assert_eq!(hashes[0], hashes3[0]); // first block same
         assert_ne!(hashes[1], hashes3[1]); // second block different
+    }
+
+    // ─── Metrics integration tests ────────────────────────────────────────────
+
+    #[test]
+    fn metrics_cache_hit() {
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut cache = PrefixCache::with_metrics(4, Arc::clone(&metrics));
+
+        // Register prefix
+        let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 full blocks
+        cache.register_blocks(&prompt, &[10, 20]);
+
+        // Match prefix → 2 hits, 0 misses
+        cache.match_prefix(&prompt);
+
+        assert_eq!(metrics.cache_queries(), 1);
+        assert_eq!(metrics.cache_hits(), 2);
+        assert_eq!(metrics.cache_misses(), 0);
+        assert_eq!(metrics.hit_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn metrics_cache_miss() {
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut cache = PrefixCache::with_metrics(4, Arc::clone(&metrics));
+
+        // Query empty cache → 0 hits, 2 misses
+        cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        assert_eq!(metrics.cache_queries(), 1);
+        assert_eq!(metrics.cache_hits(), 0);
+        assert_eq!(metrics.cache_misses(), 2);
+        assert_eq!(metrics.hit_rate(), Some(0.0));
+    }
+
+    #[test]
+    fn metrics_partial_hit() {
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut cache = PrefixCache::with_metrics(4, Arc::clone(&metrics));
+
+        // Register only first block
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+
+        // Query with 2 blocks → 1 hit, 1 miss
+        cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        assert_eq!(metrics.cache_hits(), 1);
+        assert_eq!(metrics.cache_misses(), 1);
+        let rate = metrics.hit_rate().unwrap();
+        assert!((rate - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn metrics_eviction_tracked_by_caller() {
+        // Note: eviction metrics are recorded by the caller (KVCacheManager),
+        // not by PrefixCache itself, to avoid double-counting.
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut cache = PrefixCache::with_metrics(4, Arc::clone(&metrics));
+
+        // Register two prefixes (ref_count = 1 each)
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        cache.register_blocks(&[5, 6, 7, 8], &[20]);
+
+        // Release owner references so blocks are evictable
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+        cache.release_blocks(&[5, 6, 7, 8], &[20]);
+
+        assert_eq!(metrics.blocks_evicted(), 0);
+
+        // Evict 1 block - caller records metrics
+        let evicted = cache.evict(1);
+        metrics.record_eviction(evicted.len()); // simulating what manager does
+        assert_eq!(metrics.blocks_evicted(), 1);
+
+        // Evict remaining - caller records metrics
+        let evicted = cache.evict(1);
+        metrics.record_eviction(evicted.len());
+        assert_eq!(metrics.blocks_evicted(), 2);
+    }
+
+    #[test]
+    fn metrics_accumulate_across_queries() {
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut cache = PrefixCache::with_metrics(4, Arc::clone(&metrics));
+
+        // Register prefix
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+
+        // First query: 2 hits
+        cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        cache.release_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+
+        // Second query with different prompt: 0 hits, 2 misses
+        cache.match_prefix(&[9, 9, 9, 9, 9, 9, 9, 9]);
+
+        assert_eq!(metrics.cache_queries(), 2);
+        assert_eq!(metrics.cache_hits(), 2); // only first query hit
+        assert_eq!(metrics.cache_misses(), 2); // second query missed
+        let rate = metrics.hit_rate().unwrap();
+        assert!((rate - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn no_metrics_works() {
+        // Without metrics, should still work
+        let mut cache = PrefixCache::new(4);
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        let (blocks, _) = cache.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!(blocks, vec![10]);
+        let evicted = cache.evict(1);
+        assert_eq!(evicted.len(), 0); // still referenced
     }
 }

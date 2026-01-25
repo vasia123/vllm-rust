@@ -1,6 +1,7 @@
 pub mod config;
 #[cfg(feature = "cuda-kernels")]
 pub mod cuda_kernels;
+pub mod distributed;
 pub mod engine;
 pub mod kv_cache;
 pub mod layers;

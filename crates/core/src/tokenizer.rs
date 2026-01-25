@@ -119,6 +119,9 @@ impl ChatTemplateEngine {
         add_generation_prompt: bool,
     ) -> anyhow::Result<String> {
         let mut env = minijinja::Environment::new();
+        // Add Python-compatible string methods (startswith, endswith, etc.)
+        minijinja_contrib::add_to_environment(&mut env);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template("chat", &self.template_source)?;
         let tmpl = env.get_template("chat")?;
         let rendered = tmpl.render(minijinja::context! {
