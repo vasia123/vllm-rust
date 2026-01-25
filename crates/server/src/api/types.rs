@@ -1,12 +1,55 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use vllm_core::tokenizer::ChatMessage;
+
+// ─── Prompt (string, array of strings, token IDs, or array of token IDs) ─
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Prompt {
+    Single(String),
+    MultipleStrings(Vec<String>),
+    TokenIds(Vec<u32>),
+    MultipleTokenIds(Vec<Vec<u32>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum PromptInput {
+    Text(String),
+    TokenIds(Vec<u32>),
+}
+
+impl Prompt {
+    pub fn into_inputs(self) -> Vec<PromptInput> {
+        match self {
+            Prompt::Single(s) => vec![PromptInput::Text(s)],
+            Prompt::MultipleStrings(v) => v.into_iter().map(PromptInput::Text).collect(),
+            Prompt::TokenIds(ids) => vec![PromptInput::TokenIds(ids)],
+            Prompt::MultipleTokenIds(v) => v.into_iter().map(PromptInput::TokenIds).collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Prompt::Single(_) => 1,
+            Prompt::MultipleStrings(v) => v.len(),
+            Prompt::TokenIds(_) => 1,
+            Prompt::MultipleTokenIds(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 // ─── Completions ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
-    pub prompt: String,
+    pub prompt: Prompt,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     #[serde(default)]
@@ -29,6 +72,12 @@ pub struct CompletionRequest {
     pub stop_token_ids: Vec<u32>,
     #[serde(default)]
     pub include_stop_str_in_output: bool,
+    /// Number of top logprobs to return per token (None = no logprobs).
+    #[serde(default)]
+    pub logprobs: Option<u32>,
+    /// If true, include prompt tokens in output with their logprobs.
+    #[serde(default)]
+    pub echo: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +95,21 @@ pub struct CompletionChoice {
     pub text: String,
     pub index: u32,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<CompletionLogProbs>,
+}
+
+/// Log probabilities for completion tokens, following OpenAI format.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionLogProbs {
+    /// Byte offsets in the text for each token.
+    pub text_offset: Vec<usize>,
+    /// Log probability of each token (None for prompt tokens without logprobs).
+    pub token_logprobs: Vec<Option<f32>>,
+    /// String representation of each token.
+    pub tokens: Vec<String>,
+    /// Top-k logprobs for each position (token string -> logprob).
+    pub top_logprobs: Vec<Option<HashMap<String, f32>>>,
 }
 
 #[derive(Debug, Serialize)]

@@ -47,6 +47,16 @@ pub struct SequenceState {
     pub include_stop_str_in_output: bool,
     /// Number of prompt tokens already processed (for chunked prefill).
     pub num_computed_tokens: usize,
+    /// Number of top logprobs to return (None = no logprobs).
+    pub num_top_logprobs: Option<usize>,
+    /// Log probability of each generated token.
+    pub token_logprobs: Vec<f32>,
+    /// Top-k logprobs for each generated token.
+    pub top_logprobs: Vec<Vec<(u32, f32)>>,
+    /// Log probability of each prompt token (for echo mode).
+    pub prompt_logprobs: Vec<Option<f32>>,
+    /// Whether to include prompt tokens and their logprobs in output.
+    pub echo: bool,
 }
 
 impl SequenceState {
@@ -74,6 +84,11 @@ impl SequenceState {
             stop_strings: Vec::new(),
             include_stop_str_in_output: false,
             num_computed_tokens: 0,
+            num_top_logprobs: None,
+            token_logprobs: Vec::new(),
+            top_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
+            echo: false,
         }
     }
 

@@ -53,6 +53,7 @@ bash run_comparison.sh
 | File | Purpose |
 |------|---------|
 | `bench_serving.py` | Benchmark client — sends requests, parses SSE, computes metrics |
+| `quality_eval.py` | Model quality evaluation — accuracy comparison using lm-eval-harness |
 | `run_comparison.sh` | Orchestration — builds, starts servers, runs benchmarks, compares |
 | `prompts.json` | Fixed prompts at known lengths (short/medium/long) |
 | `results/` | Output directory for JSON results (created by run_comparison.sh) |
@@ -147,3 +148,106 @@ Ratios < 1.0 for TTFT/Latency mean rust is faster. Ratios > 1.0 for Throughput m
 - **Fixed prompts** — deterministic text at controlled lengths for reproducibility
 - **Greedy decoding** — both servers use argmax by default, eliminating sampling variance
 - **Warmup** — discards initial requests to account for CUDA kernel JIT and memory allocation
+
+---
+
+## Quality Evaluation
+
+Detect model degradation by running standardized NLP benchmarks and comparing results between vllm-rust and Python vLLM.
+
+### Prerequisites
+
+```bash
+pip install lm-eval
+```
+
+### Architecture
+
+Uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) (EleutherAI) with the `local-completions` backend, which works with any OpenAI-compatible API. No Rust code changes needed — the existing `/v1/completions` endpoint works out of the box.
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ lm-eval-harness │────▶│ /v1/completions  │────▶│ vllm-rust       │
+│ (Python)        │     │ OpenAI API       │     │ or Python vLLM  │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+### Benchmark Suites
+
+| Suite | Benchmarks | Description |
+|-------|------------|-------------|
+| `quick` | hellaswag | Common-sense reasoning (10K samples) |
+| `standard` | hellaswag, arc_easy, truthfulqa_mc2 | Reasoning + science + truthfulness |
+| `full` | + mmlu | Full evaluation with 57-subject knowledge test |
+
+### Usage
+
+```bash
+# Start vllm-rust server
+cargo run --release -p vllm-server -- serve --model Qwen/Qwen3-0.6B --port 8000
+
+# Quick check (~10 min)
+python benchmarks/quality_eval.py --model Qwen/Qwen3-0.6B --suite quick
+
+# Fast iteration (100 samples, ~1 min)
+python benchmarks/quality_eval.py --model Qwen/Qwen3-0.6B --limit 100
+
+# Rust-only baseline (no comparison)
+python benchmarks/quality_eval.py --model Qwen/Qwen3-0.6B --rust-only
+
+# Full comparison against Python vLLM
+# (requires Python vLLM running on port 8001)
+python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --port 8001 &
+python benchmarks/quality_eval.py --model Qwen/Qwen3-0.6B --suite standard
+
+# Save results to JSON
+python benchmarks/quality_eval.py --model Qwen/Qwen3-0.6B --output results.json
+```
+
+### quality_eval.py Options
+
+```
+--rust-url      vllm-rust server URL (default: http://localhost:8000/v1/completions)
+--vllm-url      Python vLLM server URL (default: http://localhost:8001/v1/completions)
+--model         Model name (required)
+--suite         Benchmark suite: quick, standard, full (default: quick)
+--limit         Limit samples per task (for fast testing)
+--tolerance     Maximum accuracy difference before failing (default: 0.02 = 2%)
+--rust-only     Only evaluate vllm-rust, skip comparison
+--output        Save comparison results to JSON file
+--work-dir      Working directory for lm-eval output (default: /tmp/lm_eval_quality)
+```
+
+### Output
+
+Comparison mode:
+
+```
+======================================================================
+QUALITY COMPARISON: vllm-rust vs Python vLLM
+======================================================================
+Task                           Rust       vLLM       Diff     Status
+----------------------------------------------------------------------
+hellaswag                    0.3842     0.3845    -0.0003         OK
+arc_easy                     0.5124     0.5130    -0.0006         OK
+truthfulqa_mc2               0.4521     0.4515    +0.0006         OK
+======================================================================
+Result: PASS - All benchmarks within tolerance
+```
+
+Rust-only mode:
+
+```
+==================================================
+EVALUATION RESULTS
+==================================================
+Task                          Accuracy
+--------------------------------------------------
+hellaswag                         0.3842
+==================================================
+```
+
+### Exit Codes
+
+- `0` — All benchmarks pass (within tolerance)
+- `1` — At least one benchmark degraded beyond tolerance, or error occurred

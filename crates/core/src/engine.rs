@@ -129,6 +129,10 @@ pub struct GenerationRequest {
     pub stop_token_ids: Vec<u32>,
     pub stop_strings: Vec<String>,
     pub include_stop_str_in_output: bool,
+    /// Number of top logprobs to return per token (None = no logprobs).
+    pub logprobs: Option<u32>,
+    /// If true, include prompt tokens in output with their logprobs.
+    pub echo: bool,
 }
 
 impl Default for GenerationRequest {
@@ -141,6 +145,8 @@ impl Default for GenerationRequest {
             stop_token_ids: Vec::new(),
             stop_strings: Vec::new(),
             include_stop_str_in_output: false,
+            logprobs: None,
+            echo: false,
         }
     }
 }
@@ -151,6 +157,14 @@ pub struct GenerationResult {
     pub generated_text: String,
     pub generated_token_ids: Vec<u32>,
     pub finish_reason: FinishReason,
+    /// Log probability of each generated token.
+    pub token_logprobs: Option<Vec<f32>>,
+    /// Top-k logprobs for each generated token.
+    pub top_logprobs: Option<Vec<Vec<(u32, f32)>>>,
+    /// Prompt token IDs (only when echo=true).
+    pub prompt_token_ids: Option<Vec<u32>>,
+    /// Log probability of each prompt token (only when echo=true).
+    pub prompt_logprobs: Option<Vec<Option<f32>>>,
 }
 
 pub struct SpeculativeConfig {
@@ -463,12 +477,8 @@ async fn engine_loop<M: ModelForward>(
 
             match req.response {
                 ResponseChannel::Complete(tx) => {
-                    let result = GenerationResult {
-                        request_id: req_id,
-                        generated_text: text,
-                        generated_token_ids: req.state.generated_token_ids,
-                        finish_reason: check.reason,
-                    };
+                    let result =
+                        build_generation_result(req_id, text, &mut req.state, check.reason);
                     let _ = tx.send(Ok(result));
                 }
                 ResponseChannel::Stream(tx) => {
@@ -481,6 +491,51 @@ async fn engine_loop<M: ModelForward>(
         }
 
         tokio::task::yield_now().await;
+    }
+}
+
+/// Build a GenerationResult from sequence state, extracting logprobs if available.
+fn build_generation_result(
+    request_id: RequestId,
+    generated_text: String,
+    state: &mut SequenceState,
+    finish_reason: FinishReason,
+) -> GenerationResult {
+    let has_logprobs = state.num_top_logprobs.is_some();
+
+    let token_logprobs = if has_logprobs && !state.token_logprobs.is_empty() {
+        Some(std::mem::take(&mut state.token_logprobs))
+    } else {
+        None
+    };
+
+    let top_logprobs = if has_logprobs && !state.top_logprobs.is_empty() {
+        Some(std::mem::take(&mut state.top_logprobs))
+    } else {
+        None
+    };
+
+    let prompt_token_ids = if has_logprobs {
+        Some(state.prompt_token_ids.clone())
+    } else {
+        None
+    };
+
+    let prompt_logprobs = if has_logprobs && !state.prompt_logprobs.is_empty() {
+        Some(std::mem::take(&mut state.prompt_logprobs))
+    } else {
+        None
+    };
+
+    GenerationResult {
+        request_id,
+        generated_text,
+        generated_token_ids: std::mem::take(&mut state.generated_token_ids),
+        finish_reason,
+        token_logprobs,
+        top_logprobs,
+        prompt_token_ids,
+        prompt_logprobs,
     }
 }
 
@@ -662,12 +717,8 @@ async fn engine_loop_speculative<M: ModelForward, D: ModelForward>(
 
             match req.response {
                 ResponseChannel::Complete(tx) => {
-                    let result = GenerationResult {
-                        request_id: req_id,
-                        generated_text: text,
-                        generated_token_ids: req.state.generated_token_ids,
-                        finish_reason: check.reason,
-                    };
+                    let result =
+                        build_generation_result(req_id, text, &mut req.state, check.reason);
                     let _ = tx.send(Ok(result));
                 }
                 ResponseChannel::Stream(tx) => {
@@ -947,6 +998,8 @@ fn admit_request(
     state.stop_token_ids = request.stop_token_ids;
     state.stop_strings = request.stop_strings;
     state.include_stop_str_in_output = request.include_stop_str_in_output;
+    state.num_top_logprobs = request.logprobs.map(|n| n as usize);
+    state.echo = request.echo;
 
     // Check prefix cache for reusable blocks
     if let Some(cache) = prefix_cache.as_mut() {
@@ -1030,6 +1083,42 @@ fn execute_prefill<M: ModelForward>(
     req.state.block_table.advance(actual_chunk);
     req.state.num_computed_tokens = chunk_end;
     req.state.seqlen_offset = chunk_end;
+
+    // Compute prompt logprobs if echo mode is enabled with logprobs
+    let compute_prompt_logprobs = req.state.echo && req.state.num_top_logprobs.is_some();
+    if compute_prompt_logprobs {
+        // First token has no conditioning, so logprob is None
+        if offset == 0 {
+            req.state.prompt_logprobs.push(None);
+        }
+
+        // For positions 0..actual_chunk-1, compute logprob of the next token
+        // Position i predicts token at offset + i + 1
+        let prompt_token_ids = &req.state.prompt_token_ids;
+        let last_pos = if is_final_chunk {
+            actual_chunk - 1 // Last position is for sampling, not prompt logprob
+        } else {
+            actual_chunk
+        };
+
+        for i in 0..last_pos {
+            let target_token_idx = offset + i + 1;
+            if target_token_idx < prompt_len {
+                let target_token = prompt_token_ids[target_token_idx];
+                let pos_logits = logits
+                    .narrow(1, i, 1)
+                    .and_then(|t| t.squeeze(0))
+                    .and_then(|t| t.squeeze(0))
+                    .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map_err(|e| EngineError::Model(e.to_string()))?;
+
+                let log_probs = sampling::log_softmax(&pos_logits);
+                let logprob = log_probs.get(target_token as usize).copied();
+                req.state.prompt_logprobs.push(logprob);
+            }
+        }
+    }
 
     if is_final_chunk {
         req.state.status = RequestStatus::Decoding;
@@ -1171,61 +1260,70 @@ fn execute_batched_decode<M: ModelForward>(
         }
     };
 
-    // Check if all sequences use greedy sampling for fast-path
+    // Check if all sequences use greedy sampling and none need logprobs for fast-path
     let all_greedy = batch_ids.iter().all(|&id| {
         requests
             .get(&id)
             .map(|r| r.state.sampling_params.is_greedy())
             .unwrap_or(true)
     });
+    let any_need_logprobs = batch_ids.iter().any(|&id| {
+        requests
+            .get(&id)
+            .map(|r| r.state.num_top_logprobs.is_some())
+            .unwrap_or(false)
+    });
 
-    let sampled_tokens: Vec<u32> = if all_greedy {
-        // Fast path: single argmax kernel
-        let token_ids_tensor = match last_logits.argmax(1) {
-            Ok(t) => t,
-            Err(_) => {
-                failed.extend(&batch_ids);
-                return failed;
-            }
-        };
-        match token_ids_tensor.to_vec1() {
-            Ok(v) => v,
-            Err(_) => {
-                failed.extend(&batch_ids);
-                return failed;
-            }
+    // Transfer logits to CPU for sampling
+    let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
+        Ok(v) => v.into_iter().flatten().collect(),
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
         }
-    } else {
-        // Per-sequence sampling: transfer logits to CPU, sample individually
-        let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
-            Ok(v) => v.into_iter().flatten().collect(),
-            Err(_) => {
-                failed.extend(&batch_ids);
-                return failed;
-            }
-        };
-        let vocab_size = last_logits.dims()[1];
-        let mut tokens = Vec::with_capacity(batch_ids.len());
+    };
+    let vocab_size = last_logits.dims()[1];
+
+    // Step 5: Sample tokens and update state (with logprobs if requested)
+    if all_greedy && !any_need_logprobs {
+        // Fast path: greedy sampling without logprobs
         for (i, &req_id) in batch_ids.iter().enumerate() {
             let req = requests.get_mut(&req_id).unwrap();
             let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];
-            let token = sampling::sample(
+            let token_id = logit_slice
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            req.state.block_table.advance(1);
+            req.state.seqlen_offset += 1;
+            req.state.generated_token_ids.push(token_id);
+        }
+    } else {
+        // Per-sequence sampling with logprobs support
+        for (i, &req_id) in batch_ids.iter().enumerate() {
+            let req = requests.get_mut(&req_id).unwrap();
+            let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];
+            let result = sampling::sample(
                 logit_slice,
                 &req.state.sampling_params,
                 &req.state.generated_token_ids,
                 &mut req.state.sampler_state,
+                req.state.num_top_logprobs,
             );
-            tokens.push(token);
-        }
-        tokens
-    };
+            req.state.block_table.advance(1);
+            req.state.seqlen_offset += 1;
+            req.state.generated_token_ids.push(result.token_id);
 
-    // Step 5: Update state with sampled tokens
-    for (i, &req_id) in batch_ids.iter().enumerate() {
-        let req = requests.get_mut(&req_id).unwrap();
-        req.state.block_table.advance(1);
-        req.state.seqlen_offset += 1;
-        req.state.generated_token_ids.push(sampled_tokens[i]);
+            // Store logprobs if requested
+            if req.state.num_top_logprobs.is_some() {
+                req.state.token_logprobs.push(result.logprob);
+                if let Some(top) = result.top_logprobs {
+                    req.state.top_logprobs.push(top);
+                }
+            }
+        }
     }
 
     failed
@@ -1288,22 +1386,32 @@ fn check_finished(state: &SequenceState, tokenizer: &TokenizerWrapper) -> Option
 }
 
 /// Sample a single token from logits tensor using the sequence's sampling params.
+/// Returns the sampled token and stores logprobs in state if requested.
 fn sample_token(logits: &Tensor, state: &mut SequenceState) -> Result<u32, EngineError> {
-    if state.sampling_params.is_greedy() {
-        greedy_sample(logits).map_err(|e| EngineError::Model(e.to_string()))
-    } else {
-        let logits_vec: Vec<f32> = logits
-            .squeeze(0)
-            .and_then(|t| t.squeeze(0))
-            .and_then(|t| t.to_vec1())
-            .map_err(|e| EngineError::Model(e.to_string()))?;
-        Ok(sampling::sample(
-            &logits_vec,
-            &state.sampling_params,
-            &state.generated_token_ids,
-            &mut state.sampler_state,
-        ))
+    let logits_vec: Vec<f32> = logits
+        .squeeze(0)
+        .and_then(|t| t.squeeze(0))
+        .and_then(|t| t.to_dtype(candle_core::DType::F32))
+        .and_then(|t| t.to_vec1())
+        .map_err(|e| EngineError::Model(e.to_string()))?;
+
+    let result = sampling::sample(
+        &logits_vec,
+        &state.sampling_params,
+        &state.generated_token_ids,
+        &mut state.sampler_state,
+        state.num_top_logprobs,
+    );
+
+    // Store logprobs if requested
+    if state.num_top_logprobs.is_some() {
+        state.token_logprobs.push(result.logprob);
+        if let Some(top) = result.top_logprobs {
+            state.top_logprobs.push(top);
+        }
     }
+
+    Ok(result.token_id)
 }
 
 fn finish_request_with_error(
@@ -1717,6 +1825,10 @@ mod tests {
                             generated_text: String::new(),
                             generated_token_ids: req.state.generated_token_ids,
                             finish_reason: check.reason,
+                            token_logprobs: None,
+                            top_logprobs: None,
+                            prompt_token_ids: None,
+                            prompt_logprobs: None,
                         },
                     );
                 }

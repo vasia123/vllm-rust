@@ -48,6 +48,8 @@ pub async fn create_chat_completion(
         stop_strings: req.stop,
         stop_token_ids: req.stop_token_ids,
         include_stop_str_in_output: req.include_stop_str_in_output,
+        logprobs: None, // Chat completions don't support logprobs in this implementation
+        echo: false,
     };
 
     if req.stream {

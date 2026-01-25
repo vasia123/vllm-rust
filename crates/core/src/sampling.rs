@@ -1,6 +1,17 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+/// Result of a sampling operation, including logprob information.
+#[derive(Debug, Clone)]
+pub struct SamplingResult {
+    /// The sampled token ID.
+    pub token_id: u32,
+    /// Log probability of the sampled token.
+    pub logprob: f32,
+    /// Top-k tokens by log probability, if requested.
+    pub top_logprobs: Option<Vec<(u32, f32)>>,
+}
+
 /// Parameters controlling token sampling behavior.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -63,12 +74,17 @@ impl SamplerState {
 ///
 /// `logits` is a slice of f32 with length == vocab_size.
 /// `generated_tokens` is the list of previously generated token IDs (for repetition penalty).
+/// `num_top_logprobs` if Some(k), extracts top-k logprobs for the response.
+///
+/// Returns a `SamplingResult` containing the token ID, its log probability, and optionally
+/// the top-k log probabilities.
 pub fn sample(
     logits: &[f32],
     params: &SamplingParams,
     generated_tokens: &[u32],
     sampler_state: &mut SamplerState,
-) -> u32 {
+    num_top_logprobs: Option<usize>,
+) -> SamplingResult {
     let vocab_size = logits.len();
     let mut logits = logits.to_vec();
 
@@ -77,9 +93,33 @@ pub fn sample(
         apply_repetition_penalty(&mut logits, generated_tokens, params.repetition_penalty);
     }
 
+    // Compute log-softmax for logprob extraction (before temperature scaling for greedy)
+    // For non-greedy, we compute after temperature scaling
+    let log_probs_for_logprobs: Option<Vec<f32>> = if num_top_logprobs.is_some() {
+        if params.is_greedy() {
+            Some(log_softmax(&logits))
+        } else {
+            None // Will compute after temperature scaling
+        }
+    } else {
+        None
+    };
+
     // Step 2: Greedy fast-path
     if params.is_greedy() {
-        return argmax(&logits);
+        let token_id = argmax(&logits);
+        let (logprob, top_logprobs) = if let Some(ref log_probs) = log_probs_for_logprobs {
+            let lp = log_probs[token_id as usize];
+            let top = num_top_logprobs.map(|k| extract_top_k_logprobs(log_probs, k));
+            (lp, top)
+        } else {
+            (f32::NEG_INFINITY, None)
+        };
+        return SamplingResult {
+            token_id,
+            logprob,
+            top_logprobs,
+        };
     }
 
     // Step 3: Apply temperature
@@ -89,6 +129,13 @@ pub fn sample(
             *logit *= inv_temp;
         }
     }
+
+    // Compute log-softmax after temperature scaling for logprob extraction
+    let log_probs = if num_top_logprobs.is_some() {
+        Some(log_softmax(&logits))
+    } else {
+        None
+    };
 
     // Step 4: Convert to probabilities via softmax
     let mut probs = softmax(&logits);
@@ -118,7 +165,22 @@ pub fn sample(
     }
 
     // Step 9: Sample from distribution
-    sample_from_probs(&probs, &mut sampler_state.rng)
+    let token_id = sample_from_probs(&probs, &mut sampler_state.rng);
+
+    // Extract logprob for selected token and top-k
+    let (logprob, top_logprobs) = if let Some(ref lp) = log_probs {
+        let selected_logprob = lp[token_id as usize];
+        let top = num_top_logprobs.map(|k| extract_top_k_logprobs(lp, k));
+        (selected_logprob, top)
+    } else {
+        (f32::NEG_INFINITY, None)
+    };
+
+    SamplingResult {
+        token_id,
+        logprob,
+        top_logprobs,
+    }
 }
 
 fn apply_repetition_penalty(logits: &mut [f32], generated_tokens: &[u32], penalty: f32) {
@@ -190,6 +252,33 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     probs
 }
 
+/// Compute log-softmax in a numerically stable way.
+/// log_softmax(x_i) = x_i - max(x) - log(sum(exp(x_j - max(x))))
+pub fn log_softmax(logits: &[f32]) -> Vec<f32> {
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum_ln = logits
+        .iter()
+        .map(|&x| (x - max_logit).exp())
+        .sum::<f32>()
+        .ln();
+    logits.iter().map(|&x| x - max_logit - exp_sum_ln).collect()
+}
+
+/// Extract the top-k tokens by log probability.
+fn extract_top_k_logprobs(log_probs: &[f32], k: usize) -> Vec<(u32, f32)> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut indexed: Vec<(u32, f32)> = log_probs
+        .iter()
+        .enumerate()
+        .map(|(i, &lp)| (i as u32, lp))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.truncate(k);
+    indexed
+}
+
 fn argmax(values: &[f32]) -> u32 {
     values
         .iter()
@@ -221,8 +310,8 @@ mod tests {
         let logits = vec![1.0, 5.0, 3.0, 2.0];
         let params = SamplingParams::greedy();
         let mut state = SamplerState::new(Some(42));
-        let token = sample(&logits, &params, &[], &mut state);
-        assert_eq!(token, 1); // index of max value (5.0)
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(result.token_id, 1); // index of max value (5.0)
     }
 
     #[test]
@@ -233,8 +322,8 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let token = sample(&logits, &params, &[], &mut state);
-        assert_eq!(token, 2); // index of 10.0
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(result.token_id, 2); // index of 10.0
     }
 
     #[test]
@@ -248,9 +337,9 @@ mod tests {
         let mut state1 = SamplerState::new(Some(123));
         let mut state2 = SamplerState::new(Some(123));
 
-        let token1 = sample(&logits, &params, &[], &mut state1);
-        let token2 = sample(&logits, &params, &[], &mut state2);
-        assert_eq!(token1, token2);
+        let result1 = sample(&logits, &params, &[], &mut state1, None);
+        let result2 = sample(&logits, &params, &[], &mut state2, None);
+        assert_eq!(result1.token_id, result2.token_id);
     }
 
     #[test]
@@ -264,8 +353,8 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // Token 0 was already generated, should be penalized
-        let token = sample(&logits, &params, &[0], &mut state);
-        assert_ne!(token, 0); // penalized token should not be selected
+        let result = sample(&logits, &params, &[0], &mut state, None);
+        assert_ne!(result.token_id, 0); // penalized token should not be selected
     }
 
     #[test]
@@ -278,8 +367,8 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let token = sample(&logits, &params, &[], &mut state);
-        assert_eq!(token, 1); // only top-1 survives
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(result.token_id, 1); // only top-1 survives
     }
 
     #[test]
@@ -292,8 +381,8 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let token = sample(&logits, &params, &[], &mut state);
-        assert_eq!(token, 0); // 10.0 dominates
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(result.token_id, 0); // 10.0 dominates
     }
 
     #[test]
@@ -306,8 +395,8 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let token = sample(&logits, &params, &[], &mut state);
-        assert!(token <= 1); // only first two tokens should be candidates
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert!(result.token_id <= 1); // only first two tokens should be candidates
     }
 
     #[test]
@@ -345,8 +434,8 @@ mod tests {
         let mut counts = vec![0u32; 10];
         let mut state = SamplerState::new(Some(0));
         for _ in 0..1000 {
-            let token = sample(&logits, &params, &[], &mut state);
-            counts[token as usize] += 1;
+            let result = sample(&logits, &params, &[], &mut state, None);
+            counts[result.token_id as usize] += 1;
         }
 
         // With uniform logits, all tokens should be sampled at least once
@@ -365,9 +454,9 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // Token 2 (the only positive one) was generated, penalize it
-        let token = sample(&logits, &params, &[2], &mut state);
+        let result = sample(&logits, &params, &[2], &mut state, None);
         // 5.0 / 2.0 = 2.5, still higher than -1.0, so token 2 still wins
-        assert_eq!(token, 2);
+        assert_eq!(result.token_id, 2);
 
         // But with higher penalty...
         let params2 = SamplingParams {
@@ -375,8 +464,86 @@ mod tests {
             repetition_penalty: 10.0,
             ..Default::default()
         };
-        let token2 = sample(&logits, &params2, &[2], &mut state);
+        let result2 = sample(&logits, &params2, &[2], &mut state, None);
         // 5.0 / 10.0 = 0.5, -1.0 * 10.0 = -10.0 for the rest → token 2 still wins
-        assert_eq!(token2, 2);
+        assert_eq!(result2.token_id, 2);
+    }
+
+    #[test]
+    fn log_softmax_correctness() {
+        let logits = vec![1.0, 2.0, 3.0];
+        let log_probs = log_softmax(&logits);
+
+        // log_softmax should sum to 0 when exponentiated (i.e., exp sum = 1)
+        let exp_sum: f32 = log_probs.iter().map(|&lp| lp.exp()).sum();
+        assert!((exp_sum - 1.0).abs() < 1e-5);
+
+        // Higher logit → higher log probability
+        assert!(log_probs[2] > log_probs[1]);
+        assert!(log_probs[1] > log_probs[0]);
+
+        // All log probs should be <= 0
+        assert!(log_probs.iter().all(|&lp| lp <= 0.0));
+    }
+
+    #[test]
+    fn sample_returns_correct_logprob_for_greedy() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams::greedy();
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, Some(3));
+
+        // Token 1 has the highest logit (5.0)
+        assert_eq!(result.token_id, 1);
+
+        // Log probability should be negative and finite
+        assert!(result.logprob.is_finite());
+        assert!(result.logprob < 0.0);
+
+        // Should have top 3 logprobs
+        let top = result.top_logprobs.unwrap();
+        assert_eq!(top.len(), 3);
+        // First entry should be the highest (token 1)
+        assert_eq!(top[0].0, 1);
+        // Logprobs should be sorted descending
+        assert!(top[0].1 >= top[1].1);
+        assert!(top[1].1 >= top[2].1);
+    }
+
+    #[test]
+    fn sample_returns_logprob_for_sampled() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, Some(5));
+
+        // Logprob should be for the sampled token
+        assert!(result.logprob.is_finite());
+        assert!(result.logprob < 0.0);
+
+        // Top logprobs should include all 5 tokens
+        let top = result.top_logprobs.unwrap();
+        assert_eq!(top.len(), 5);
+
+        // The sampled token's logprob should match what's in top_logprobs
+        let sampled_in_top = top.iter().find(|(id, _)| *id == result.token_id);
+        assert!(sampled_in_top.is_some());
+        let (_, lp) = sampled_in_top.unwrap();
+        assert!((lp - result.logprob).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_logprobs_when_not_requested() {
+        let logits = vec![1.0, 5.0, 3.0];
+        let params = SamplingParams::greedy();
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+
+        assert!(result.top_logprobs.is_none());
+        // Logprob will be NEG_INFINITY when not computed
+        assert!(result.logprob == f32::NEG_INFINITY);
     }
 }
