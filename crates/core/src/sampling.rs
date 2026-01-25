@@ -431,7 +431,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut counts = vec![0u32; 10];
+        let mut counts = [0u32; 10];
         let mut state = SamplerState::new(Some(0));
         for _ in 0..1000 {
             let result = sample(&logits, &params, &[], &mut state, None);
@@ -665,7 +665,7 @@ mod tests {
 
         let nonzero_count = probs.iter().filter(|&&p| p > 0.0).count();
         // With these logits, cumsum reaches ~0.9 after first 2-3 tokens
-        assert!(nonzero_count >= 1 && nonzero_count <= 4);
+        assert!((1..=4).contains(&nonzero_count));
     }
 
     #[test]

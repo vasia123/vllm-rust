@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::request::{RequestId, RequestStatus, SequenceState};
 
+#[derive(Clone, Copy)]
 pub struct SchedulerConfig {
     pub max_running_requests: usize,
     pub max_tokens_per_step: usize,

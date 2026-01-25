@@ -287,6 +287,7 @@ async fn run_server(
             }),
             multi_step_count: 1,
             enable_prefix_caching: false,
+            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
 
         eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
@@ -309,6 +310,7 @@ async fn run_server(
             speculative_config: None,
             multi_step_count,
             enable_prefix_caching: false,
+            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
@@ -451,6 +453,7 @@ async fn run_generate(
             }),
             multi_step_count: 1,
             enable_prefix_caching: false,
+            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
 
         eprintln!(
@@ -478,6 +481,7 @@ async fn run_generate(
             speculative_config: None,
             multi_step_count,
             enable_prefix_caching: false,
+            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
 
         eprintln!(

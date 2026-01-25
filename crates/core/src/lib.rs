@@ -7,6 +7,7 @@ pub mod kv_cache;
 pub mod layers;
 pub mod loader;
 pub mod models;
+pub mod quantization;
 pub mod request;
 pub mod sampling;
 pub mod scheduler;

@@ -25,3 +25,4 @@ candle-flash-attn = { workspace = true, optional = true }
 half.workspace = true
 rand.workspace = true
 libloading.workspace = true
+tracing.workspace = true

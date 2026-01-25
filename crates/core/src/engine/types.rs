@@ -1,0 +1,148 @@
+//! Core types for the inference engine.
+
+use serde::Serialize;
+use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::kv_cache::MetricsSnapshot;
+use crate::request::{FinishReason, RequestId};
+use crate::sampling::SamplingParams;
+
+// ─── Streaming types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Token {
+        token_id: u32,
+        token_text: String,
+    },
+    Done {
+        finish_reason: FinishReason,
+        generated_text: String,
+    },
+    Error {
+        error: String,
+    },
+}
+
+// ─── Engine errors ────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("engine has shut down")]
+    Shutdown,
+    #[error("tokenization error: {0}")]
+    Tokenization(String),
+    #[error("model error: {0}")]
+    Model(String),
+    #[error("cache error: {0}")]
+    Cache(String),
+}
+
+// ─── Request/Response types ───────────────────────────────────────────────
+
+pub struct GenerationRequest {
+    pub prompt: String,
+    pub max_new_tokens: usize,
+    pub eos_token_id: u32,
+    pub sampling_params: SamplingParams,
+    pub stop_token_ids: Vec<u32>,
+    pub stop_strings: Vec<String>,
+    pub include_stop_str_in_output: bool,
+    pub logprobs: Option<u32>,
+    pub echo: bool,
+}
+
+impl Default for GenerationRequest {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            max_new_tokens: 128,
+            eos_token_id: 0,
+            sampling_params: SamplingParams::greedy(),
+            stop_token_ids: Vec::new(),
+            stop_strings: Vec::new(),
+            include_stop_str_in_output: false,
+            logprobs: None,
+            echo: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationResult {
+    pub request_id: RequestId,
+    pub generated_text: String,
+    pub generated_token_ids: Vec<u32>,
+    pub finish_reason: FinishReason,
+    pub token_logprobs: Option<Vec<f32>>,
+    pub top_logprobs: Option<Vec<Vec<(u32, f32)>>>,
+    pub prompt_token_ids: Option<Vec<u32>>,
+    pub prompt_logprobs: Option<Vec<Option<f32>>>,
+}
+
+// ─── Engine configuration ─────────────────────────────────────────────────
+
+pub struct SpeculativeConfig {
+    pub num_speculative_tokens: usize,
+}
+
+pub struct EngineConfig {
+    pub scheduler_config: crate::scheduler::SchedulerConfig,
+    pub block_size: usize,
+    pub speculative_config: Option<SpeculativeConfig>,
+    pub multi_step_count: usize,
+    pub enable_prefix_caching: bool,
+    pub cuda_graph_config: super::cuda_graph::CudaGraphConfig,
+}
+
+// ─── Engine Stats ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EngineStats {
+    pub num_running_requests: usize,
+    pub num_waiting_requests: usize,
+    pub num_free_blocks: usize,
+    pub num_total_blocks: usize,
+    pub block_size: usize,
+    pub kv_cache_metrics: MetricsSnapshot,
+    pub prefix_cache_stats: Option<(usize, usize)>,
+}
+
+// ─── Internal command types ───────────────────────────────────────────────
+
+pub(crate) enum ResponseChannel {
+    Complete(oneshot::Sender<Result<GenerationResult, EngineError>>),
+    Stream(mpsc::Sender<StreamEvent>),
+}
+
+pub(crate) enum EngineCommand {
+    Generate {
+        request: GenerationRequest,
+        response_tx: oneshot::Sender<Result<GenerationResult, EngineError>>,
+    },
+    GenerateStream {
+        request: GenerationRequest,
+        stream_tx: mpsc::Sender<StreamEvent>,
+    },
+    GetStats {
+        response_tx: oneshot::Sender<EngineStats>,
+    },
+    Shutdown,
+}
+
+// ─── Legacy types ─────────────────────────────────────────────────────────
+
+pub struct GenerationParams {
+    pub max_new_tokens: usize,
+    pub eos_token_id: u32,
+}
+
+impl Default for GenerationParams {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 128,
+            eos_token_id: 151645,
+        }
+    }
+}

@@ -141,6 +141,229 @@ impl From<NcclResult> for NcclResultCode {
     }
 }
 
+// ============================================================================
+// CUDA Runtime Library Wrapper
+// ============================================================================
+
+/// CUDA runtime result code (cudaError_t).
+pub type CudaError = c_int;
+
+/// CUDA success code.
+const CUDA_SUCCESS: CudaError = 0;
+
+/// Environment variable for custom CUDA runtime library path.
+/// Follows vLLM convention.
+const VLLM_CUDART_SO_PATH_ENV: &str = "VLLM_CUDART_SO_PATH";
+
+/// Type aliases for CUDA runtime function signatures.
+type CudaSetDeviceFn = unsafe extern "C" fn(c_int) -> CudaError;
+type CudaGetDeviceFn = unsafe extern "C" fn(*mut c_int) -> CudaError;
+type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> CudaError;
+type CudaMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> CudaError;
+type CudaFreeFn = unsafe extern "C" fn(*mut c_void) -> CudaError;
+type CudaGetErrorStringFn = unsafe extern "C" fn(CudaError) -> *const c_char;
+
+/// Dynamically loaded CUDA runtime library.
+///
+/// Provides access to essential CUDA runtime functions for device management.
+/// Following vLLM's pattern, this wrapper enables proper device context setup
+/// before NCCL initialization in multi-GPU environments.
+///
+/// # Loading Order
+///
+/// The library is loaded using the following fallback chain:
+/// 1. `VLLM_CUDART_SO_PATH` environment variable (if set)
+/// 2. `libcudart.so.12` (CUDA 12.x)
+/// 3. `libcudart.so.11` (CUDA 11.x)
+/// 4. `libcudart.so` (default symlink)
+pub struct CudaRuntimeLibrary {
+    #[allow(dead_code)]
+    library: Library,
+    set_device: CudaSetDeviceFn,
+    get_device: CudaGetDeviceFn,
+    device_synchronize: CudaDeviceSynchronizeFn,
+    malloc: CudaMallocFn,
+    free: CudaFreeFn,
+    get_error_string: CudaGetErrorStringFn,
+}
+
+impl CudaRuntimeLibrary {
+    /// Load CUDA runtime library.
+    ///
+    /// Tries multiple library names with fallback, following vLLM's pattern.
+    pub fn new() -> std::result::Result<Self, String> {
+        // Check environment variable first (vLLM compatibility)
+        if let Ok(path) = std::env::var(VLLM_CUDART_SO_PATH_ENV) {
+            if let Ok(lib) = Self::from_path(&path) {
+                tracing::debug!(path = %path, "Loaded CUDA runtime from VLLM_CUDART_SO_PATH");
+                return Ok(lib);
+            }
+            tracing::warn!(
+                path = %path,
+                "VLLM_CUDART_SO_PATH set but failed to load, trying default paths"
+            );
+        }
+
+        // Try common library names
+        let lib_names = [
+            "libcudart.so.12",
+            "libcudart.so.11",
+            "libcudart.so",
+        ];
+
+        for lib_name in &lib_names {
+            match Self::from_path(lib_name) {
+                Ok(lib) => {
+                    tracing::debug!(library = %lib_name, "Loaded CUDA runtime");
+                    return Ok(lib);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        Err("Failed to load CUDA runtime library. Tried: VLLM_CUDART_SO_PATH env var, \
+             libcudart.so.12, libcudart.so.11, libcudart.so".to_string())
+    }
+
+    /// Load CUDA runtime from a specific path.
+    fn from_path(path: &str) -> std::result::Result<Self, String> {
+        let library = unsafe { Library::new(path) }
+            .map_err(|e| format!("Failed to load {}: {}", path, e))?;
+
+        // Load all required function pointers
+        let (set_device, get_device, device_synchronize, malloc, free, get_error_string) = unsafe {
+            let set_device: libloading::Symbol<CudaSetDeviceFn> = library
+                .get(b"cudaSetDevice")
+                .map_err(|e| format!("cudaSetDevice: {}", e))?;
+
+            let get_device: libloading::Symbol<CudaGetDeviceFn> = library
+                .get(b"cudaGetDevice")
+                .map_err(|e| format!("cudaGetDevice: {}", e))?;
+
+            let device_synchronize: libloading::Symbol<CudaDeviceSynchronizeFn> = library
+                .get(b"cudaDeviceSynchronize")
+                .map_err(|e| format!("cudaDeviceSynchronize: {}", e))?;
+
+            let malloc: libloading::Symbol<CudaMallocFn> = library
+                .get(b"cudaMalloc")
+                .map_err(|e| format!("cudaMalloc: {}", e))?;
+
+            let free: libloading::Symbol<CudaFreeFn> = library
+                .get(b"cudaFree")
+                .map_err(|e| format!("cudaFree: {}", e))?;
+
+            let get_error_string: libloading::Symbol<CudaGetErrorStringFn> = library
+                .get(b"cudaGetErrorString")
+                .map_err(|e| format!("cudaGetErrorString: {}", e))?;
+
+            (*set_device, *get_device, *device_synchronize, *malloc, *free, *get_error_string)
+        };
+
+        Ok(Self {
+            library,
+            set_device,
+            get_device,
+            device_synchronize,
+            malloc,
+            free,
+            get_error_string,
+        })
+    }
+
+    /// Get error string for a CUDA error code.
+    pub fn error_string(&self, error: CudaError) -> String {
+        let ptr = unsafe { (self.get_error_string)(error) };
+        if ptr.is_null() {
+            return format!("Unknown CUDA error: {}", error);
+        }
+        unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    }
+
+    /// Check CUDA result and convert to error if needed.
+    fn check(&self, result: CudaError, operation: &str) -> std::result::Result<(), String> {
+        if result == CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{} failed: {} ({})", operation, self.error_string(result), result))
+        }
+    }
+
+    /// Set the current CUDA device.
+    ///
+    /// This binds subsequent CUDA operations to the specified device.
+    pub fn set_device(&self, device: usize) -> std::result::Result<(), String> {
+        let result = unsafe { (self.set_device)(device as c_int) };
+        self.check(result, &format!("cudaSetDevice({})", device))
+    }
+
+    /// Get the current CUDA device.
+    pub fn get_device(&self) -> std::result::Result<usize, String> {
+        let mut device: c_int = -1;
+        let result = unsafe { (self.get_device)(&mut device) };
+        self.check(result, "cudaGetDevice")?;
+        Ok(device as usize)
+    }
+
+    /// Synchronize the current device.
+    ///
+    /// Blocks until all previously issued commands complete.
+    pub fn device_synchronize(&self) -> std::result::Result<(), String> {
+        let result = unsafe { (self.device_synchronize)() };
+        self.check(result, "cudaDeviceSynchronize")
+    }
+
+    /// Allocate device memory.
+    ///
+    /// Returns a pointer to the allocated memory.
+    pub fn malloc(&self, size: usize) -> std::result::Result<*mut c_void, String> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let result = unsafe { (self.malloc)(&mut ptr, size) };
+        self.check(result, &format!("cudaMalloc({})", size))?;
+        Ok(ptr)
+    }
+
+    /// Free device memory.
+    ///
+    /// # Safety
+    /// The pointer must have been allocated by `malloc` and not already freed.
+    pub unsafe fn free(&self, ptr: *mut c_void) -> std::result::Result<(), String> {
+        let result = (self.free)(ptr);
+        self.check(result, "cudaFree")
+    }
+
+    /// Set device and force eager context initialization.
+    ///
+    /// Following vLLM's pattern, this allocates and frees a small buffer
+    /// to force CUDA to eagerly initialize the device context. This prevents
+    /// lazy initialization issues that can cause problems with NCCL.
+    ///
+    /// See: https://github.com/pytorch/pytorch/issues/155668
+    pub fn set_device_eager(&self, device: usize) -> std::result::Result<(), String> {
+        // Set the device
+        self.set_device(device)?;
+
+        // Force eager context initialization by allocating a small buffer
+        // This is the same trick vLLM uses: torch.zeros(1, device=device)
+        let ptr = self.malloc(64)?; // Allocate 64 bytes
+        unsafe { self.free(ptr)? };
+
+        // Synchronize to ensure context is fully initialized
+        self.device_synchronize()?;
+
+        tracing::trace!(device = device, "CUDA device context eagerly initialized");
+        Ok(())
+    }
+}
+
+// Safety: CudaRuntimeLibrary only contains function pointers and a Library handle,
+// which are safe to share across threads.
+unsafe impl Send for CudaRuntimeLibrary {}
+unsafe impl Sync for CudaRuntimeLibrary {}
+
+// ============================================================================
+// NCCL Library Wrapper
+// ============================================================================
+
 /// Type aliases for NCCL function signatures.
 type NcclGetVersionFn = unsafe extern "C" fn(*mut c_int) -> NcclResult;
 type NcclGetUniqueIdFn = unsafe extern "C" fn(*mut NcclUniqueId) -> NcclResult;
@@ -212,9 +435,12 @@ type NcclGroupEndFn = unsafe extern "C" fn() -> NcclResult;
 /// Dynamically loaded NCCL library.
 ///
 /// Loads libnccl.so at runtime and provides access to NCCL functions.
+/// Optionally loads CUDA runtime for proper device context management.
 pub struct NcclLibrary {
     #[allow(dead_code)]
     library: Library,
+    /// CUDA runtime for device management (optional but recommended for multi-GPU)
+    cuda_runtime: Option<CudaRuntimeLibrary>,
     version: i32,
 
     // Function pointers
@@ -341,8 +567,24 @@ impl NcclLibrary {
             ));
         }
 
+        // Load CUDA runtime for device management (optional but recommended)
+        let cuda_runtime = match CudaRuntimeLibrary::new() {
+            Ok(rt) => {
+                tracing::info!("CUDA runtime loaded for device management");
+                Some(rt)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CUDA runtime not loaded - multi-GPU setups may have issues"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             library,
+            cuda_runtime,
             version,
             get_unique_id: get_unique_id_fn,
             comm_init_rank: comm_init_rank_fn,
@@ -357,6 +599,41 @@ impl NcclLibrary {
             group_start: group_start_fn,
             group_end: group_end_fn,
         })
+    }
+
+    /// Get reference to CUDA runtime library (if available).
+    pub fn cuda_runtime(&self) -> Option<&CudaRuntimeLibrary> {
+        self.cuda_runtime.as_ref()
+    }
+
+    /// Set the CUDA device for the current thread with eager context initialization.
+    ///
+    /// This should be called before creating NCCL communicators in multi-GPU setups.
+    /// Following vLLM's pattern, this forces eager device context initialization
+    /// to prevent lazy initialization issues.
+    ///
+    /// # Arguments
+    /// * `device` - CUDA device ordinal (0-indexed)
+    ///
+    /// # Returns
+    /// * `Ok(())` - Device was set successfully (or CUDA runtime not available)
+    /// * `Err(...)` - Failed to set device
+    pub fn set_cuda_device(&self, device: usize) -> Result<()> {
+        if let Some(ref cuda_rt) = self.cuda_runtime {
+            cuda_rt.set_device_eager(device).map_err(|e| {
+                DistributedError::NcclError(format!("Failed to set CUDA device {}: {}", device, e))
+            })?;
+            tracing::debug!(device = device, "CUDA device set with eager initialization");
+            Ok(())
+        } else {
+            // CUDA runtime not available - this is acceptable for single-GPU setups
+            // but may cause issues with multi-GPU configurations
+            tracing::trace!(
+                device = device,
+                "CUDA runtime not available, skipping explicit device selection"
+            );
+            Ok(())
+        }
     }
 
     /// Get NCCL version as (major, minor, patch).
@@ -597,12 +874,30 @@ pub struct NcclCommunicator {
 impl NcclCommunicator {
     /// Create a new NCCL communicator.
     ///
+    /// This follows vLLM's initialization pattern:
+    /// 1. Set CUDA device with eager context initialization
+    /// 2. Create NCCL communicator
+    /// 3. Synchronize to ensure initialization is complete
+    ///
     /// # Arguments
     /// * `nccl` - Shared NCCL library instance
     /// * `unique_id` - Unique ID from rank 0 (must be broadcast first)
     /// * `world_size` - Total number of processes
     /// * `rank` - This process's rank
     /// * `device` - CUDA device ordinal for this rank
+    ///
+    /// # Warmup
+    ///
+    /// For production use, it's recommended to perform a warmup all_reduce
+    /// after creating the communicator to ensure all ranks are synchronized
+    /// and NCCL internal buffers are allocated. Example:
+    ///
+    /// ```ignore
+    /// let comm = NcclCommunicator::new(nccl, unique_id, world_size, rank, device)?;
+    /// // Perform warmup all_reduce with a small buffer
+    /// unsafe { comm.all_reduce_inplace(warmup_buffer, 1, dtype, ReduceOp::Sum, stream)?; }
+    /// stream.synchronize()?;
+    /// ```
     pub fn new(
         nccl: Arc<NcclLibrary>,
         unique_id: NcclUniqueId,
@@ -614,10 +909,40 @@ impl NcclCommunicator {
             return Err(DistributedError::InvalidRank { rank, world_size });
         }
 
-        // TODO: Set CUDA device before initializing communicator
-        // This requires CUDA runtime bindings
+        // Step 1: Set CUDA device with eager context initialization
+        // This ensures ncclCommInitRank uses the correct GPU context.
+        // Following vLLM's pattern, we force eager initialization to prevent
+        // lazy initialization issues.
+        nccl.set_cuda_device(device)?;
+
+        // Step 2: Create NCCL communicator
+        tracing::debug!(
+            rank = rank,
+            world_size = world_size,
+            device = device,
+            "Initializing NCCL communicator"
+        );
 
         let comm = nccl.comm_init_rank(world_size, unique_id, rank)?;
+
+        // Step 3: Synchronize device to ensure NCCL initialization is complete
+        // This is important for multi-GPU setups where NCCL may allocate
+        // internal buffers asynchronously
+        if let Some(ref cuda_rt) = nccl.cuda_runtime {
+            if let Err(e) = cuda_rt.device_synchronize() {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to synchronize after NCCL init (non-fatal)"
+                );
+            }
+        }
+
+        tracing::info!(
+            rank = rank,
+            world_size = world_size,
+            device = device,
+            "NCCL communicator initialized successfully"
+        );
 
         Ok(Self {
             nccl,
@@ -626,6 +951,20 @@ impl NcclCommunicator {
             world_size,
             device,
         })
+    }
+
+    /// Get the raw NCCL communicator handle.
+    ///
+    /// # Safety
+    /// The returned handle is only valid while this `NcclCommunicator` exists.
+    /// Do not store or use after the communicator is dropped.
+    pub fn raw_comm(&self) -> NcclComm {
+        self.comm
+    }
+
+    /// Get the device ordinal this communicator is bound to.
+    pub fn device(&self) -> usize {
+        self.device
     }
 
     /// Get the NCCL library reference.
@@ -740,5 +1079,97 @@ mod tests {
         // This should not panic regardless of NCCL availability
         let available = is_nccl_available();
         println!("NCCL available: {}", available);
+    }
+
+    // CUDA Runtime Library tests
+
+    #[test]
+    fn cuda_runtime_env_var_name() {
+        // Verify the env var name matches vLLM convention
+        assert_eq!(VLLM_CUDART_SO_PATH_ENV, "VLLM_CUDART_SO_PATH");
+    }
+
+    #[test]
+    fn cuda_runtime_load_check() {
+        // This should not panic regardless of CUDA availability
+        let result = CudaRuntimeLibrary::new();
+        match result {
+            Ok(_) => println!("CUDA runtime loaded successfully"),
+            Err(e) => println!("CUDA runtime not available: {}", e),
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires CUDA runtime to be installed"]
+    fn cuda_runtime_set_device() {
+        let cuda_rt = CudaRuntimeLibrary::new().expect("Failed to load CUDA runtime");
+
+        // Get current device
+        let device = cuda_rt.get_device().expect("Failed to get device");
+        println!("Current CUDA device: {}", device);
+
+        // Set device 0 (should always exist if CUDA is available)
+        cuda_rt.set_device(0).expect("Failed to set device 0");
+    }
+
+    #[test]
+    #[ignore = "Requires CUDA runtime to be installed"]
+    fn cuda_runtime_set_device_eager() {
+        let cuda_rt = CudaRuntimeLibrary::new().expect("Failed to load CUDA runtime");
+
+        // This tests the full eager initialization path
+        cuda_rt
+            .set_device_eager(0)
+            .expect("Failed to set device with eager init");
+
+        // Verify device is set
+        let device = cuda_rt.get_device().expect("Failed to get device");
+        assert_eq!(device, 0);
+    }
+
+    #[test]
+    #[ignore = "Requires CUDA runtime to be installed"]
+    fn cuda_runtime_malloc_free() {
+        let cuda_rt = CudaRuntimeLibrary::new().expect("Failed to load CUDA runtime");
+        cuda_rt.set_device(0).expect("Failed to set device");
+
+        // Allocate some memory
+        let ptr = cuda_rt.malloc(1024).expect("Failed to allocate memory");
+        assert!(!ptr.is_null());
+
+        // Free it
+        unsafe {
+            cuda_rt.free(ptr).expect("Failed to free memory");
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires CUDA runtime to be installed"]
+    fn cuda_runtime_error_string() {
+        let cuda_rt = CudaRuntimeLibrary::new().expect("Failed to load CUDA runtime");
+
+        // Error code 0 should be "success" or similar
+        let success_str = cuda_rt.error_string(0);
+        println!("CUDA success string: {}", success_str);
+
+        // Error code 1 is typically "invalid value"
+        let error_str = cuda_rt.error_string(1);
+        println!("CUDA error 1 string: {}", error_str);
+    }
+
+    #[test]
+    #[ignore = "Requires NCCL and CUDA to be installed"]
+    fn nccl_with_cuda_runtime() {
+        let nccl = NcclLibrary::new().expect("Failed to load NCCL");
+
+        // Check that CUDA runtime was loaded
+        assert!(
+            nccl.cuda_runtime().is_some(),
+            "CUDA runtime should be loaded with NCCL"
+        );
+
+        // Test set_cuda_device through NcclLibrary
+        nccl.set_cuda_device(0)
+            .expect("Failed to set CUDA device via NCCL");
     }
 }

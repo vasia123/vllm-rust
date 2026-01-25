@@ -115,7 +115,7 @@ mod tests {
         // Row 0: j=0..4 should be 0 (j <= 0 + 3 = 3), j=4 should be -inf
         for j in 0..total_len {
             let idx = j;
-            if j > 0 + seqlen_offset {
+            if j > seqlen_offset {
                 assert!(
                     mask_data[idx] == f32::NEG_INFINITY,
                     "Row 0, col {j} should be -inf"

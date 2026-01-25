@@ -151,6 +151,7 @@ mod tests {
             speculative_config: None,
             multi_step_count: 1,
             enable_prefix_caching: false,
+            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
         let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
         let (atomic_handle, _controller) = AtomicEngineHandle::new(handle);
