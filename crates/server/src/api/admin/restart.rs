@@ -70,7 +70,7 @@ impl EngineBuilder for ProductionEngineBuilder {
         use candle_core::{DType, Device};
         use vllm_core::{
             engine::{start_engine, start_engine_with_draft, EngineConfig, SpeculativeConfig},
-            kv_cache::{config::CacheConfig, KVCacheManager},
+            kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
             loader, models,
             scheduler::SchedulerConfig,
             tokenizer::TokenizerWrapper,
@@ -100,6 +100,7 @@ impl EngineBuilder for ProductionEngineBuilder {
             head_dim: files.config.head_dim,
             dtype,
             device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
         };
         eprintln!(
             "Allocating KV cache ({} blocks)...",
@@ -130,6 +131,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                 head_dim: draft_files.config.head_dim,
                 dtype,
                 device: device.clone(),
+                kv_cache_dtype: KVCacheDtype::Auto,
             };
             eprintln!(
                 "Allocating draft KV cache ({} blocks)...",

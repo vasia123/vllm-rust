@@ -6,9 +6,7 @@
 
 mod constraint;
 
-pub use constraint::{
-    ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, SamplingConstraint,
-};
+pub use constraint::{ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, SamplingConstraint};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

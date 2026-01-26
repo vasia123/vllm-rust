@@ -8,7 +8,7 @@ use vllm_core::{
     engine::{
         start_engine, start_engine_with_draft, EngineConfig, GenerationRequest, SpeculativeConfig,
     },
-    kv_cache::{config::CacheConfig, KVCacheManager},
+    kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
     loader, models,
     scheduler::SchedulerConfig,
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
@@ -237,6 +237,7 @@ async fn run_server(
         head_dim: files.config.head_dim,
         dtype,
         device: device.clone(),
+        kv_cache_dtype: KVCacheDtype::Auto,
     };
     eprintln!(
         "Allocating KV cache ({} blocks)...",
@@ -268,6 +269,7 @@ async fn run_server(
             head_dim: draft_files.config.head_dim,
             dtype,
             device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
         };
         eprintln!(
             "Allocating draft KV cache ({} blocks)...",
@@ -404,6 +406,7 @@ async fn run_generate(
         head_dim: files.config.head_dim,
         dtype,
         device: device.clone(),
+        kv_cache_dtype: KVCacheDtype::Auto,
     };
     eprintln!(
         "Allocating KV cache ({} blocks)...",
@@ -434,6 +437,7 @@ async fn run_generate(
             head_dim: draft_files.config.head_dim,
             dtype,
             device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
         };
         eprintln!(
             "Allocating draft KV cache ({} blocks)...",

@@ -34,9 +34,10 @@ pub fn fetch_model(model_id: &str) -> anyhow::Result<ModelFiles> {
     // If no quantization detected in config.json, try quantize_config.json
     if quantization.method == QuantizationMethod::None {
         if let Ok(quant_config_path) = repo.get("quantize_config.json") {
-            if let Ok(model_dir) = quant_config_path.parent().ok_or_else(|| {
-                anyhow::anyhow!("Failed to get parent directory")
-            }) {
+            if let Ok(model_dir) = quant_config_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get parent directory"))
+            {
                 quantization = detect_from_directory(model_dir);
             }
         }

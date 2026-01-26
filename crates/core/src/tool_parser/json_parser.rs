@@ -86,9 +86,7 @@ impl ToolCallParser for JsonToolParser {
             match &value {
                 serde_json::Value::Array(arr) => {
                     // Check if any element is a tool call
-                    let has_tool_calls = arr.iter().any(|item| {
-                        item.get("name").is_some()
-                    });
+                    let has_tool_calls = arr.iter().any(|item| item.get("name").is_some());
                     if has_tool_calls {
                         return None;
                     }

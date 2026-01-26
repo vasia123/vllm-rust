@@ -67,7 +67,7 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             .forward(
                 &input,
                 0,
-                &self.draft_kv_cache,
+                &mut self.draft_kv_cache,
                 &draft_block_table,
                 &slot_mapping,
             )
@@ -115,11 +115,9 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
 
         // --- Draft phase: generate K tokens ---
         let mut draft_tokens = Vec::with_capacity(k);
-        let last_target_token = *req
-            .state
-            .generated_token_ids
-            .last()
-            .ok_or_else(|| EngineError::Model("no generated tokens for speculative decode".to_string()))?;
+        let last_target_token = *req.state.generated_token_ids.last().ok_or_else(|| {
+            EngineError::Model("no generated tokens for speculative decode".to_string())
+        })?;
         let mut draft_input_token = last_target_token;
 
         for _ in 0..k {
@@ -137,7 +135,7 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
                 .forward(
                     &input,
                     draft_state.seqlen_offset,
-                    &self.draft_kv_cache,
+                    &mut self.draft_kv_cache,
                     &draft_state.block_table,
                     &slot_mapping,
                 )
@@ -224,10 +222,9 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
         }
         req.state.seqlen_offset = target_total;
 
-        let draft_state = req
-            .draft_state
-            .as_mut()
-            .ok_or_else(|| EngineError::Model("draft state not initialized for rollback".to_string()))?;
+        let draft_state = req.draft_state.as_mut().ok_or_else(|| {
+            EngineError::Model("draft state not initialized for rollback".to_string())
+        })?;
         let draft_freed = draft_state.block_table.trim_to(draft_total);
         if !draft_freed.is_empty() {
             self.draft_kv_cache

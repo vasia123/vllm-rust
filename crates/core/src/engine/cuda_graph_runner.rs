@@ -226,14 +226,13 @@ impl CudaGraphRunner {
 
             // Allocate output buffer matching warmup output shape
             let output_shape = warmup_output.dims().to_vec();
-            let output = Tensor::zeros(&output_shape[..], self.dtype, &self.device).map_err(
-                |e| {
+            let output =
+                Tensor::zeros(&output_shape[..], self.dtype, &self.device).map_err(|e| {
                     CudaGraphRunnerError::BufferAllocation(format!(
                         "Failed to allocate output buffer: {}",
                         e
                     ))
-                },
-            )?;
+                })?;
 
             // Synchronize before capture
             self.sync_device()?;
@@ -597,9 +596,7 @@ mod tests {
 
     #[test]
     fn test_builder_missing_device() {
-        let result = CudaGraphRunnerBuilder::new()
-            .vocab_size(32000)
-            .build();
+        let result = CudaGraphRunnerBuilder::new().vocab_size(32000).build();
         assert!(result.is_err());
     }
 
@@ -621,9 +618,7 @@ mod tests {
         let mut runner = CudaGraphRunner::new(config, Device::Cpu, 32000, DType::F32);
 
         // Warmup should succeed but capture 0 graphs on CPU
-        let result = runner.warmup(|_input| {
-            Tensor::zeros((1, 32000), DType::F32, &Device::Cpu)
-        });
+        let result = runner.warmup(|_input| Tensor::zeros((1, 32000), DType::F32, &Device::Cpu));
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);

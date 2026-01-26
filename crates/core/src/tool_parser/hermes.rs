@@ -25,14 +25,12 @@ pub struct HermesToolParser;
 
 // Regex to match tool_call tags and capture JSON content
 // Uses (?s) to make . match newlines, captures all content between tags
-static TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap()
-});
+static TOOL_CALL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap());
 
 // Regex to match any tool_call content (including malformed)
-static TOOL_CALL_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<tool_call>[\s\S]*?</tool_call>").unwrap()
-});
+static TOOL_CALL_TAG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<tool_call>[\s\S]*?</tool_call>").unwrap());
 
 /// Internal representation of parsed Hermes tool call.
 #[derive(Debug, serde::Deserialize)]
@@ -110,7 +108,8 @@ mod tests {
     #[test]
     fn test_parse_single_tool_call() {
         let parser = HermesToolParser::new();
-        let output = r#"<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
+        let output =
+            r#"<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -196,7 +195,9 @@ I'll get that information now."#;
     fn test_has_tool_calls() {
         let parser = HermesToolParser::new();
 
-        assert!(parser.has_tool_calls(r#"<tool_call>{"name": "test", "arguments": {}}</tool_call>"#));
+        assert!(
+            parser.has_tool_calls(r#"<tool_call>{"name": "test", "arguments": {}}</tool_call>"#)
+        );
         assert!(!parser.has_tool_calls("no tool calls here"));
         assert!(!parser.has_tool_calls("<tool_call>invalid json</tool_call>")); // Invalid JSON doesn't match
     }

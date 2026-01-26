@@ -55,7 +55,7 @@ impl LlamaAttention {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-        cache_engine: &CacheEngine,
+        cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
@@ -99,7 +99,7 @@ impl LlamaAttention {
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        cache_engine: &CacheEngine,
+        cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
@@ -248,7 +248,7 @@ impl LlamaDecoderLayer {
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
@@ -259,7 +259,7 @@ impl LlamaDecoderLayer {
             &xs,
             attention_mask,
             seqlen_offset,
-            kv_cache_mgr.engine(layer_idx),
+            kv_cache_mgr.engine_mut(layer_idx),
             block_table,
             slot_mapping,
         )?;
@@ -276,14 +276,16 @@ impl LlamaDecoderLayer {
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs =
-            self.self_attn
-                .forward_decode_batch(&xs, sequences, kv_cache_mgr.engine(layer_idx))?;
+        let xs = self.self_attn.forward_decode_batch(
+            &xs,
+            sequences,
+            kv_cache_mgr.engine_mut(layer_idx),
+        )?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = self
@@ -338,7 +340,7 @@ impl LlamaForCausalLM {
         &self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
@@ -381,7 +383,7 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
         &self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
@@ -398,7 +400,7 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
         &self,
         input_ids: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let mut xs = self.embed_tokens.forward(input_ids)?;
 
@@ -419,7 +421,7 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv_cache::config::CacheConfig;
+    use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
 
     fn test_config() -> crate::config::ModelConfig {
         crate::config::ModelConfig {
@@ -453,6 +455,7 @@ mod tests {
             head_dim: cfg.head_dim,
             dtype: DType::F32,
             device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
         }
     }
 
@@ -493,7 +496,13 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, seq_len);
 
         let logits = model
-            .forward(&input_ids, 0, &kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward");
 
         assert_eq!(
@@ -523,7 +532,13 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 1);
 
         let logits = model
-            .forward(&input_ids, 0, &kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward");
 
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
@@ -572,7 +587,13 @@ mod tests {
             .expect("allocate");
         let slot_mapping = block_table.slot_mapping(0, 3);
 
-        let result = model.forward(&input_ids, 0, &kv_cache_mgr, &block_table, &slot_mapping);
+        let result = model.forward(
+            &input_ids,
+            0,
+            &mut kv_cache_mgr,
+            &block_table,
+            &slot_mapping,
+        );
         assert!(
             result.is_ok(),
             "Llama forward should work without per-head norm"
@@ -609,7 +630,7 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 3);
 
         let logits = model
-            .forward(&prompt, 0, &kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(&prompt, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
             .expect("prefill");
         assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
         block_table.advance(3);
@@ -622,7 +643,13 @@ mod tests {
         let next_token = Tensor::zeros((1, 1), DType::U32, &device).expect("next token");
 
         let logits = model
-            .forward(&next_token, 3, &kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &next_token,
+                3,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("decode");
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }

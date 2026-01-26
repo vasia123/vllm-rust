@@ -223,12 +223,9 @@ impl Fp8Linear {
     /// Perform FP8 forward pass using CUDA kernels.
     #[cfg(feature = "cuda-kernels")]
     fn forward_fp8(&self, x: &Tensor) -> Result<Tensor> {
-        let weight_scale = self
-            .weight_scale
-            .as_ref()
-            .ok_or_else(|| candle_core::Error::Msg(
-                "FP8 forward requires weight scale".to_string()
-            ))?;
+        let weight_scale = self.weight_scale.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("FP8 forward requires weight scale".to_string())
+        })?;
 
         // Use FP8 GEMM: output = x @ (weight_fp8 * scale).T
         fp8_cuda::fp8_gemm(x, &self.weight, weight_scale, self.bias.as_ref())

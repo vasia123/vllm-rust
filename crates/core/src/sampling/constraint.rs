@@ -122,10 +122,7 @@ impl ChoiceConstraint {
                 if generated.len() > choice.len() {
                     return false;
                 }
-                choice
-                    .iter()
-                    .zip(generated.iter())
-                    .all(|(a, b)| a == b)
+                choice.iter().zip(generated.iter()).all(|(a, b)| a == b)
             })
             .collect()
     }
@@ -479,7 +476,9 @@ impl JsonSchemaConstraint {
             JsonParseState::ExpectingColon => vec![":"],
             JsonParseState::ExpectingValue { value_type } => match value_type {
                 JsonValueType::String => vec!["\""],
-                JsonValueType::Number => vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-"],
+                JsonValueType::Number => {
+                    vec!["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-"]
+                }
                 JsonValueType::Boolean => vec!["true", "false"],
                 JsonValueType::Null => vec!["null"],
                 JsonValueType::Object => vec!["{"],
@@ -534,7 +533,10 @@ impl SamplingConstraint for JsonSchemaConstraint {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
             // Optionally validate against schema here
             // For now, just check if it parses
-            return matches!(value, serde_json::Value::Object(_) | serde_json::Value::Array(_));
+            return matches!(
+                value,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            );
         }
         false
     }
@@ -568,11 +570,7 @@ mod tests {
 
     #[test]
     fn test_choice_constraint_from_token_ids() {
-        let choices = vec![
-            vec![1, 2, 3],
-            vec![1, 4, 5],
-            vec![6, 7],
-        ];
+        let choices = vec![vec![1, 2, 3], vec![1, 4, 5], vec![6, 7]];
         let constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
 
         assert_eq!(constraint.choices.len(), 3);
@@ -583,10 +581,7 @@ mod tests {
 
     #[test]
     fn test_choice_constraint_mask_logits() {
-        let choices = vec![
-            vec![1, 2],
-            vec![3, 4],
-        ];
+        let choices = vec![vec![1, 2], vec![3, 4]];
         let mut constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
 
         let mut logits = vec![0.0f32; 10];
@@ -601,10 +596,7 @@ mod tests {
 
     #[test]
     fn test_choice_constraint_is_complete() {
-        let choices = vec![
-            vec![1, 2],
-            vec![3, 4],
-        ];
+        let choices = vec![vec![1, 2], vec![3, 4]];
         let constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
 
         assert!(constraint.is_complete(&[1, 2], "test"));
@@ -615,11 +607,7 @@ mod tests {
 
     #[test]
     fn test_choice_constraint_remaining_choices() {
-        let choices = vec![
-            vec![1, 2, 3],
-            vec![1, 2, 4],
-            vec![5, 6],
-        ];
+        let choices = vec![vec![1, 2, 3], vec![1, 2, 4], vec![5, 6]];
         let constraint = ChoiceConstraint::from_token_ids(choices).unwrap();
 
         let remaining = constraint.remaining_choices(&[1, 2]);
@@ -726,11 +714,7 @@ mod tests {
         let tokenizer = Arc::new(mock_tokenizer());
 
         // Pattern that matches Cyrillic text
-        let constraint = RegexConstraint::new(
-            r"[а-яА-ЯёЁ]+",
-            tokenizer.clone(),
-            100,
-        ).unwrap();
+        let constraint = RegexConstraint::new(r"[а-яА-ЯёЁ]+", tokenizer.clone(), 100).unwrap();
 
         assert!(constraint.is_complete(&[], "Привет"));
         assert!(constraint.is_complete(&[], "Мир"));
@@ -743,11 +727,7 @@ mod tests {
 
         // Pattern that matches text with emoji
         // Note: \p{Emoji} requires the unicode-perl feature in regex
-        let constraint = RegexConstraint::new(
-            r".*[🎉🚀✨].*",
-            tokenizer.clone(),
-            100,
-        ).unwrap();
+        let constraint = RegexConstraint::new(r".*[🎉🚀✨].*", tokenizer.clone(), 100).unwrap();
 
         assert!(constraint.is_complete(&[], "Party 🎉!"));
         assert!(constraint.is_complete(&[], "🚀 Launch"));
@@ -764,7 +744,8 @@ mod tests {
             r".*",
             tokenizer.clone(),
             5, // 5 characters max
-        ).unwrap();
+        )
+        .unwrap();
 
         // "🎉🎉🎉🎉🎉" is 5 characters (20 bytes)
         assert!(constraint.is_valid_prefix("🎉🎉🎉🎉🎉"));
@@ -778,11 +759,7 @@ mod tests {
         let tokenizer = Arc::new(mock_tokenizer());
 
         // Pattern matching mixed Latin/Cyrillic/CJK
-        let constraint = RegexConstraint::new(
-            r"Hello.*世界",
-            tokenizer.clone(),
-            100,
-        ).unwrap();
+        let constraint = RegexConstraint::new(r"Hello.*世界", tokenizer.clone(), 100).unwrap();
 
         assert!(constraint.is_complete(&[], "Hello 世界"));
         assert!(constraint.is_complete(&[], "Hello мир 世界"));
@@ -821,11 +798,7 @@ mod tests {
     fn test_regex_constraint_is_valid_prefix_utf8() {
         let tokenizer = Arc::new(mock_tokenizer());
 
-        let constraint = RegexConstraint::new(
-            r"Привет.*мир",
-            tokenizer.clone(),
-            50,
-        ).unwrap();
+        let constraint = RegexConstraint::new(r"Привет.*мир", tokenizer.clone(), 50).unwrap();
 
         // Valid prefixes
         assert!(constraint.is_valid_prefix("П"));
@@ -841,7 +814,8 @@ mod tests {
         let constraint = JsonSchemaConstraint::new(schema, tokenizer);
 
         // Nested objects with UTF-8
-        let nested_json = r#"{"user": {"name": "Иван", "greeting": "Привет 🎉"}, "tags": ["тег1", "タグ2"]}"#;
+        let nested_json =
+            r#"{"user": {"name": "Иван", "greeting": "Привет 🎉"}, "tags": ["тег1", "タグ2"]}"#;
         assert!(constraint.is_complete(&[], nested_json));
     }
 }

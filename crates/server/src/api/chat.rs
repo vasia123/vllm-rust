@@ -91,13 +91,25 @@ pub async fn create_chat_completion(
                     let content = parser.extract_content(&result.generated_text);
                     (content, Some(calls), "tool_calls".to_string())
                 } else {
-                    (Some(result.generated_text), None, finish_reason_str(&result.finish_reason))
+                    (
+                        Some(result.generated_text),
+                        None,
+                        finish_reason_str(&result.finish_reason),
+                    )
                 }
             } else {
-                (Some(result.generated_text), None, finish_reason_str(&result.finish_reason))
+                (
+                    Some(result.generated_text),
+                    None,
+                    finish_reason_str(&result.finish_reason),
+                )
             }
         } else {
-            (Some(result.generated_text), None, finish_reason_str(&result.finish_reason))
+            (
+                Some(result.generated_text),
+                None,
+                finish_reason_str(&result.finish_reason),
+            )
         };
 
         let response = ChatCompletionResponse {

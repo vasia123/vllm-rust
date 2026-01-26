@@ -35,7 +35,7 @@ pub(crate) fn handle_command(
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
     prefix_cache: &mut Option<PrefixCache>,
-    kv_cache_mgr: &KVCacheManager,
+    kv_cache_mgr: &mut KVCacheManager,
 ) -> bool {
     match cmd {
         EngineCommand::Generate {
@@ -406,13 +406,14 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // Execute forward pass with CUDA graph context
     // The context indicates whether we can replay a cached graph
     // or should execute eagerly. Graph capture happens during warmup.
-    let logits = match model.forward_decode_batch_with_ctx(&input, &sequences, kv_cache_mgr, &forward_ctx) {
-        Ok(l) => l,
-        Err(_) => {
-            failed.extend(&batch_ids);
-            return failed;
-        }
-    };
+    let logits =
+        match model.forward_decode_batch_with_ctx(&input, &sequences, kv_cache_mgr, &forward_ctx) {
+            Ok(l) => l,
+            Err(_) => {
+                failed.extend(&batch_ids);
+                return failed;
+            }
+        };
 
     // Step 4: Extract logits and sample per-sequence
     let seq_dim = logits.dims()[1];

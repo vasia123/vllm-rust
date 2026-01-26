@@ -7,6 +7,7 @@ mod error;
 mod free_block_queue;
 pub mod metrics;
 pub mod prefix_cache;
+pub mod quantization;
 
 pub use block_metrics::{BlockEvictionEvent, BlockMetricsCollector, BlockMetricsState};
 pub use block_pool::BlockId;
@@ -16,6 +17,9 @@ pub use config::CacheConfig;
 pub use error::CacheError;
 pub use free_block_queue::FreeBlockQueue;
 pub use metrics::{KVCacheMetrics, MetricsSnapshot};
+pub use quantization::{
+    dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype, KVScales,
+};
 
 use block_pool::BlockPool;
 use prefix_cache::PrefixCache;
@@ -89,9 +93,16 @@ impl KVCacheManager {
         Ok(())
     }
 
-    /// Get the CacheEngine for a specific layer.
+    /// Get the CacheEngine for a specific layer (immutable).
     pub fn engine(&self, layer_idx: usize) -> &CacheEngine {
         &self.engines[layer_idx]
+    }
+
+    /// Get the CacheEngine for a specific layer (mutable).
+    ///
+    /// Required for quantized KV cache where write operations update scales.
+    pub fn engine_mut(&mut self, layer_idx: usize) -> &mut CacheEngine {
+        &mut self.engines[layer_idx]
     }
 
     pub fn block_size(&self) -> usize {
@@ -238,6 +249,7 @@ mod tests {
             head_dim: 8,
             dtype: DType::F32,
             device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
         }
     }
 
@@ -258,14 +270,14 @@ mod tests {
     #[test]
     fn write_read_through_manager() {
         let config = test_config();
-        let mgr = KVCacheManager::new(&config).unwrap();
+        let mut mgr = KVCacheManager::new(&config).unwrap();
 
         let k_data: Vec<f32> = (0..2 * 3 * 8).map(|i| i as f32).collect();
         let k = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
         let v = Tensor::from_vec(k_data, (2, 3, 8), &Device::Cpu).unwrap();
 
         // Write to layer 0, slots 0,1,2 (block 0)
-        mgr.engine(0).write(&k, &v, &[0, 1, 2]).unwrap();
+        mgr.engine_mut(0).write(&k, &v, &[0, 1, 2]).unwrap();
 
         // Read back
         let (k_out, _) = mgr.engine(0).read(&[0], 3).unwrap();

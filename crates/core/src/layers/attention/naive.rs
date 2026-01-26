@@ -41,7 +41,7 @@ impl AttentionBackend for NaiveAttentionBackend {
         k: &Tensor,
         v: &Tensor,
         attention_mask: Option<&Tensor>,
-        cache_engine: &CacheEngine,
+        cache_engine: &mut CacheEngine,
         metadata: &PagedAttentionMetadata,
         num_heads: usize,
         num_kv_heads: usize,
@@ -87,7 +87,7 @@ impl AttentionBackend for NaiveAttentionBackend {
         q: &Tensor,
         k_new: &Tensor,
         v_new: &Tensor,
-        cache_engine: &CacheEngine,
+        cache_engine: &mut CacheEngine,
         metadata: &BatchedDecodeMetadata,
         num_heads: usize,
         num_kv_heads: usize,
@@ -118,7 +118,7 @@ impl AttentionBackend for NaiveAttentionBackend {
 #[allow(clippy::too_many_arguments)]
 fn per_seq_decode(
     q: &Tensor,
-    cache_engine: &CacheEngine,
+    cache_engine: &mut CacheEngine,
     seq_block_ids: &[&[crate::kv_cache::BlockId]],
     kv_lengths: &[usize],
     batch_size: usize,

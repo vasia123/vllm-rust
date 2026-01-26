@@ -160,11 +160,8 @@ pub trait DummyInputGenerator: Send + Sync {
     /// Generate dummy input token IDs for the given batch size.
     ///
     /// Returns a tensor of shape `[batch_size, 1]` for decode warmup.
-    fn generate_input_ids(
-        &self,
-        batch_size: usize,
-        device: &Device,
-    ) -> candle_core::Result<Tensor>;
+    fn generate_input_ids(&self, batch_size: usize, device: &Device)
+        -> candle_core::Result<Tensor>;
 
     /// Get the vocabulary size for output buffer allocation.
     fn vocab_size(&self) -> usize;

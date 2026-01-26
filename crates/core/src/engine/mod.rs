@@ -35,16 +35,18 @@ pub use cuda_graph::{
     BatchDescriptor, CudaGraphConfig, CudaGraphDispatcher, CudaGraphError, CudaGraphStats,
     ForwardContext, RuntimeMode, WarmupManager, WarmupResult,
 };
-pub use cuda_graph_runner::{CudaGraphRunner, CudaGraphRunnerBuilder, CudaGraphRunnerError, CudaGraphRunnerStats};
-pub use warmup::{
-    DefaultDummyInputGenerator, DummyInputGenerator, DummySequence, RandomDummyInputGenerator,
-    WarmupConfig, WarmupError, WarmupStats,
+pub use cuda_graph_runner::{
+    CudaGraphRunner, CudaGraphRunnerBuilder, CudaGraphRunnerError, CudaGraphRunnerStats,
 };
 pub use handle::EngineHandle;
 pub use model_forward::{DecodeSequenceMetadata, ModelForward};
 pub use types::{
     EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest, GenerationResult,
     SpeculativeConfig, StreamEvent,
+};
+pub use warmup::{
+    DefaultDummyInputGenerator, DummyInputGenerator, DummySequence, RandomDummyInputGenerator,
+    WarmupConfig, WarmupError, WarmupStats,
 };
 
 // Re-export helpers for legacy API
@@ -370,7 +372,7 @@ mod tests {
             &self,
             input_ids: &candle_core::Tensor,
             _seqlen_offset: usize,
-            _kv_cache_mgr: &KVCacheManager,
+            _kv_cache_mgr: &mut KVCacheManager,
             _block_table: &BlockTable,
             _slot_mapping: &[usize],
         ) -> candle_core::Result<candle_core::Tensor> {
@@ -415,7 +417,7 @@ mod tests {
             &self,
             input_ids: &candle_core::Tensor,
             _seqlen_offset: usize,
-            _kv_cache_mgr: &KVCacheManager,
+            _kv_cache_mgr: &mut KVCacheManager,
             _block_table: &BlockTable,
             _slot_mapping: &[usize],
         ) -> candle_core::Result<candle_core::Tensor> {
@@ -441,6 +443,7 @@ mod tests {
     }
 
     fn test_cache_config() -> CacheConfig {
+        use crate::kv_cache::KVCacheDtype;
         CacheConfig {
             block_size: 16,
             num_blocks: 64,
@@ -449,6 +452,7 @@ mod tests {
             head_dim: 8,
             dtype: DType::F32,
             device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
         }
     }
 

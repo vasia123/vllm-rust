@@ -205,11 +205,7 @@ impl CudaRuntimeLibrary {
         }
 
         // Try common library names
-        let lib_names = [
-            "libcudart.so.12",
-            "libcudart.so.11",
-            "libcudart.so",
-        ];
+        let lib_names = ["libcudart.so.12", "libcudart.so.11", "libcudart.so"];
 
         for lib_name in &lib_names {
             match Self::from_path(lib_name) {
@@ -221,14 +217,17 @@ impl CudaRuntimeLibrary {
             }
         }
 
-        Err("Failed to load CUDA runtime library. Tried: VLLM_CUDART_SO_PATH env var, \
-             libcudart.so.12, libcudart.so.11, libcudart.so".to_string())
+        Err(
+            "Failed to load CUDA runtime library. Tried: VLLM_CUDART_SO_PATH env var, \
+             libcudart.so.12, libcudart.so.11, libcudart.so"
+                .to_string(),
+        )
     }
 
     /// Load CUDA runtime from a specific path.
     fn from_path(path: &str) -> std::result::Result<Self, String> {
-        let library = unsafe { Library::new(path) }
-            .map_err(|e| format!("Failed to load {}: {}", path, e))?;
+        let library =
+            unsafe { Library::new(path) }.map_err(|e| format!("Failed to load {}: {}", path, e))?;
 
         // Load all required function pointers
         let (set_device, get_device, device_synchronize, malloc, free, get_error_string) = unsafe {
@@ -256,7 +255,14 @@ impl CudaRuntimeLibrary {
                 .get(b"cudaGetErrorString")
                 .map_err(|e| format!("cudaGetErrorString: {}", e))?;
 
-            (*set_device, *get_device, *device_synchronize, *malloc, *free, *get_error_string)
+            (
+                *set_device,
+                *get_device,
+                *device_synchronize,
+                *malloc,
+                *free,
+                *get_error_string,
+            )
         };
 
         Ok(Self {
@@ -284,7 +290,12 @@ impl CudaRuntimeLibrary {
         if result == CUDA_SUCCESS {
             Ok(())
         } else {
-            Err(format!("{} failed: {} ({})", operation, self.error_string(result), result))
+            Err(format!(
+                "{} failed: {} ({})",
+                operation,
+                self.error_string(result),
+                result
+            ))
         }
     }
 

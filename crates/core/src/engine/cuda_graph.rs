@@ -469,10 +469,7 @@ pub struct CudaGraphWrapper {
 #[cfg(feature = "cuda-kernels")]
 impl CudaGraphWrapper {
     /// Create a new CUDA graph wrapper.
-    pub fn new(
-        dispatcher: Arc<std::sync::RwLock<CudaGraphDispatcher>>,
-        stream: CUstream,
-    ) -> Self {
+    pub fn new(dispatcher: Arc<std::sync::RwLock<CudaGraphDispatcher>>, stream: CUstream) -> Self {
         Self {
             dispatcher,
             stream,
@@ -789,8 +786,8 @@ mod tests {
 
         // Simulate warmup with failures for sizes > 8
         let result = manager.run_warmup(|size| size <= 8);
-        assert_eq!(result.graphs_captured, 3);  // 1, 4, 8
-        assert_eq!(result.graphs_failed, 1);    // 16
+        assert_eq!(result.graphs_captured, 3); // 1, 4, 8
+        assert_eq!(result.graphs_failed, 1); // 16
         assert_eq!(result.warmed_sizes, vec![1, 4, 8]);
     }
 

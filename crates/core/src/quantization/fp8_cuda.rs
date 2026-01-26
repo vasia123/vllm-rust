@@ -161,11 +161,8 @@ impl CustomOp1 for Fp8ComputeScalesOp {
         // Allocate scales output
         let scales_slice = dev.alloc_zeros::<f32>(num_tokens)?;
 
-        let func = dev.get_or_load_custom_func(
-            "fp8_compute_scales_bf16",
-            "fp8_quant",
-            FP8_QUANT_PTX,
-        )?;
+        let func =
+            dev.get_or_load_custom_func("fp8_compute_scales_bf16", "fp8_quant", FP8_QUANT_PTX)?;
 
         // Shared memory for block reduction
         let num_warps = BLOCK_SIZE / 32;
@@ -184,9 +181,8 @@ impl CustomOp1 for Fp8ComputeScalesOp {
         builder.arg(in_slice);
         builder.arg(&hidden_size_i32);
 
-        unsafe { builder.launch(cfg) }.map_err(|e| {
-            candle_core::Error::Msg(format!("fp8_compute_scales launch: {e}"))
-        })?;
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("fp8_compute_scales launch: {e}")))?;
 
         let output_storage = CudaStorage {
             slice: CudaStorageSlice::F32(scales_slice),
@@ -276,11 +272,8 @@ impl CustomOp1 for Fp8QuantWithScalesOp {
         let output_slice = dev.alloc_zeros::<u8>(elem_count)?;
 
         // Use the static quant kernel with per-token scale
-        let func = dev.get_or_load_custom_func(
-            "fp8_static_quant_bf16",
-            "fp8_quant",
-            FP8_QUANT_PTX,
-        )?;
+        let func =
+            dev.get_or_load_custom_func("fp8_static_quant_bf16", "fp8_quant", FP8_QUANT_PTX)?;
 
         let cfg = LaunchConfig {
             grid_dim: (num_tokens as u32, 1, 1),
@@ -298,9 +291,8 @@ impl CustomOp1 for Fp8QuantWithScalesOp {
         builder.arg(&hidden_size_i32);
         builder.arg(&per_token_i32);
 
-        unsafe { builder.launch(cfg) }.map_err(|e| {
-            candle_core::Error::Msg(format!("fp8_quant_with_scales launch: {e}"))
-        })?;
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("fp8_quant_with_scales launch: {e}")))?;
 
         drop(scale_guard);
 
@@ -631,9 +623,9 @@ impl CustomOp1 for Fp8GemmOp {
         builder.arg(scale_slice);
 
         if has_bias {
-            let bias_tensor = self.bias.as_ref().ok_or_else(||
+            let bias_tensor = self.bias.as_ref().ok_or_else(|| {
                 candle_core::Error::Msg("bias tensor missing despite has_bias=true".to_string())
-            )?;
+            })?;
             let (bias_guard, _) = bias_tensor.storage_and_layout();
             let bias_slice = match &*bias_guard {
                 Storage::Cuda(cs) => match &cs.slice {

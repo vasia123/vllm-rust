@@ -8,7 +8,9 @@ use crate::scheduler::SchedulerOutput;
 
 use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
-use super::helpers::{execute_batched_decode_with_graph, execute_prefill, finish_request_with_error};
+use super::helpers::{
+    execute_batched_decode_with_graph, execute_prefill, finish_request_with_error,
+};
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
 use super::types::EngineError;
@@ -278,7 +280,9 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
 
         for batch_size in sorted_sizes {
             if batch_size == 0 {
-                stats.errors.push("batch_size=0: skipped (invalid)".to_string());
+                stats
+                    .errors
+                    .push("batch_size=0: skipped (invalid)".to_string());
                 continue;
             }
 
@@ -293,7 +297,9 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                     }
                     Err(e) => {
                         warn!(batch_size, error = %e, "JIT warmup failed");
-                        stats.errors.push(format!("jit batch_size={batch_size}: {e}"));
+                        stats
+                            .errors
+                            .push(format!("jit batch_size={batch_size}: {e}"));
                         // Continue with other sizes
                     }
                 }
@@ -311,7 +317,9 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                     Err(e) => {
                         stats.graphs_failed += 1;
                         warn!(batch_size, error = %e, "CUDA graph capture failed");
-                        stats.errors.push(format!("graph batch_size={batch_size}: {e}"));
+                        stats
+                            .errors
+                            .push(format!("graph batch_size={batch_size}: {e}"));
                     }
                 }
             }

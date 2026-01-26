@@ -20,7 +20,7 @@ pub trait ModelForward: Send + 'static {
         &self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor>;
@@ -31,7 +31,7 @@ pub trait ModelForward: Send + 'static {
         &self,
         input_ids: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
     ) -> candle_core::Result<Tensor> {
         let batch_size = sequences.len();
         let mut outputs = Vec::with_capacity(batch_size);
@@ -62,7 +62,7 @@ pub trait ModelForward: Send + 'static {
         &self,
         input_ids: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         ctx: &ForwardContext,
     ) -> candle_core::Result<Tensor> {
         // Default: ignore context, use eager path
@@ -87,7 +87,7 @@ impl ModelForward for Box<dyn ModelForward> {
         &self,
         input_ids: &Tensor,
         seqlen_offset: usize,
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor> {
@@ -104,7 +104,7 @@ impl ModelForward for Box<dyn ModelForward> {
         &self,
         input_ids: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
     ) -> candle_core::Result<Tensor> {
         (**self).forward_decode_batch(input_ids, sequences, kv_cache_mgr)
     }
@@ -113,7 +113,7 @@ impl ModelForward for Box<dyn ModelForward> {
         &self,
         input_ids: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &KVCacheManager,
+        kv_cache_mgr: &mut KVCacheManager,
         ctx: &ForwardContext,
     ) -> candle_core::Result<Tensor> {
         (**self).forward_decode_batch_with_ctx(input_ids, sequences, kv_cache_mgr, ctx)

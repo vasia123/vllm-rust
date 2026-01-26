@@ -101,7 +101,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut state.requests,
                         config.block_size,
                         &mut state.prefix_cache,
-                        &kv_cache_mgr,
+                        &mut kv_cache_mgr,
                     ) {
                         return; // shutdown
                     }
@@ -123,7 +123,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut state.requests,
                         config.block_size,
                         &mut state.prefix_cache,
-                        &kv_cache_mgr,
+                        &mut kv_cache_mgr,
                     ) {
                         return;
                     }

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use vllm_core::tokenizer::ChatMessage;
 pub use vllm_core::tool_parser::{
-    FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolChoiceAuto,
-    ToolChoiceFunction, ToolChoiceSpecific, ToolDefinition,
+    FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolChoiceAuto, ToolChoiceFunction,
+    ToolChoiceSpecific, ToolDefinition,
 };
 
 // ─── Prompt (string, array of strings, token IDs, or array of token IDs) ─

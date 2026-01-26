@@ -91,7 +91,7 @@ mod tests {
     use tower::ServiceExt;
     use vllm_core::{
         engine::{start_engine, EngineConfig, ModelForward},
-        kv_cache::{config::CacheConfig, BlockTable, KVCacheManager},
+        kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager},
         scheduler::SchedulerConfig,
         tokenizer::{ChatTemplateEngine, TokenizerWrapper},
     };
@@ -107,7 +107,7 @@ mod tests {
             &self,
             input_ids: &Tensor,
             _seqlen_offset: usize,
-            _kv_cache_mgr: &KVCacheManager,
+            _kv_cache_mgr: &mut KVCacheManager,
             _block_table: &BlockTable,
             _slot_mapping: &[usize],
         ) -> candle_core::Result<Tensor> {
@@ -133,6 +133,7 @@ mod tests {
             head_dim: 8,
             dtype: candle_core::DType::F32,
             device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
         };
         let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
         let model = MockModel {

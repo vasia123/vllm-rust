@@ -513,11 +513,8 @@ pub fn create_weight_loader_with_params(
             Box::new(Fp8WeightLoader::new(vb, fp8_config))
         }
         QuantizationMethod::Awq => {
-            let awq_config = AwqConfig::from_detected(
-                detected.bits,
-                detected.group_size,
-                &detected.raw_config,
-            );
+            let awq_config =
+                AwqConfig::from_detected(detected.bits, detected.group_size, &detected.raw_config);
             Box::new(AwqWeightLoader::new(vb, awq_config))
         }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
