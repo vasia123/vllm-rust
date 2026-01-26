@@ -1,6 +1,6 @@
 use crate::kv_cache::BlockTable;
 use crate::lora::LoraRequest;
-use crate::sampling::{SamplerState, SamplingParams};
+use crate::sampling::{SamplerState, SamplingConstraint, SamplingParams};
 
 pub type RequestId = u64;
 
@@ -60,6 +60,8 @@ pub struct SequenceState {
     pub echo: bool,
     /// LoRA adapter to use for this request (None = no adapter).
     pub lora_request: Option<LoraRequest>,
+    /// Sampling constraint for structured output (JSON schema, regex, etc.).
+    pub constraint: Option<Box<dyn SamplingConstraint>>,
 }
 
 impl SequenceState {
@@ -93,6 +95,7 @@ impl SequenceState {
             prompt_logprobs: Vec::new(),
             echo: false,
             lora_request: None,
+            constraint: None,
         }
     }
 

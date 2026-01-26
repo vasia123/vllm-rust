@@ -538,6 +538,7 @@ mod tests {
                         &model,
                         &mut kv_cache_mgr,
                         &mut active,
+                        &tokenizer,
                     );
                 }
 

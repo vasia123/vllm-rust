@@ -6,6 +6,7 @@ use tracing::warn;
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::request::{RequestId, RequestStatus};
 use crate::scheduler::SchedulerOutput;
+use crate::tokenizer::TokenizerWrapper;
 
 use super::context::{ActiveRequest, DraftState, OwnedExecutionState};
 use super::helpers::{execute_decode, execute_prefill, finish_request_with_error, greedy_sample};
@@ -88,6 +89,7 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
         req_id: RequestId,
         target_kv_cache: &mut KVCacheManager,
         requests: &mut std::collections::HashMap<RequestId, ActiveRequest>,
+        tokenizer: &TokenizerWrapper,
     ) -> Result<(), EngineError> {
         let k = {
             let req = requests
@@ -102,7 +104,7 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
         };
 
         if k == 0 {
-            return execute_decode(req_id, &self.target_model, target_kv_cache, requests);
+            return execute_decode(req_id, &self.target_model, target_kv_cache, requests, tokenizer);
         }
 
         let req = requests
@@ -243,6 +245,7 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
         output: &SchedulerOutput,
         state: &mut OwnedExecutionState,
         kv_cache_mgr: &mut KVCacheManager,
+        tokenizer: &TokenizerWrapper,
     ) {
         for schedule in &output.prefill_requests {
             let req_id = schedule.request_id;
@@ -254,6 +257,7 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
                 &self.target_model,
                 kv_cache_mgr,
                 &mut state.requests,
+                tokenizer,
             ) {
                 finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
                 continue;
@@ -273,10 +277,11 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
         state: &mut OwnedExecutionState,
         kv_cache_mgr: &mut KVCacheManager,
         _multi_step_count: usize,
+        tokenizer: &TokenizerWrapper,
     ) {
         // Speculative decoding doesn't use multi-step in the same way
         for &req_id in &output.decode_requests {
-            let result = self.execute_speculative_decode(req_id, kv_cache_mgr, &mut state.requests);
+            let result = self.execute_speculative_decode(req_id, kv_cache_mgr, &mut state.requests, tokenizer);
             if let Err(e) = result {
                 finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
             }

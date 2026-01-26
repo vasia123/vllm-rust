@@ -1,12 +1,18 @@
 pub mod llama;
 pub mod llama_lora;
+pub mod llama_quantized;
 pub mod qwen3;
 pub mod qwen3_lora;
+pub mod qwen3_quantized;
 
 pub use llama::LlamaForCausalLM;
 pub use llama_lora::LlamaWithLora;
+pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use qwen3::Qwen3ForCausalLM;
 pub use qwen3_lora::Qwen3WithLora;
+pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
+
+use std::path::Path;
 
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -16,6 +22,10 @@ use crate::config::ModelConfig;
 use crate::engine::{DecodeSequenceMetadata, ModelForward};
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::lora::{LoraContext, LoraModel};
+use crate::quantization::{
+    create_weight_loader_with_params, detect_from_directory, DetectedQuantConfig,
+    QuantizationMethod,
+};
 
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -36,6 +46,76 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "LlamaForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
+}
+
+/// Construct a quantized model with automatic quantization detection.
+///
+/// This function detects the quantization method from the model directory
+/// (by reading config.json and quantize_config.json) and returns the appropriate
+/// quantized model variant.
+///
+/// If no quantization is detected, it falls back to the unquantized model.
+///
+/// # Arguments
+/// * `cfg` - Model configuration
+/// * `vb` - VarBuilder for loading weights
+/// * `model_dir` - Path to the model directory for quantization detection
+///
+/// # Returns
+/// A boxed model implementing ModelForward
+pub fn from_config_quantized(
+    cfg: &ModelConfig,
+    vb: VarBuilder<'static>,
+    model_dir: &Path,
+) -> Result<Box<dyn ModelForward>, ModelError> {
+    let detected = detect_from_directory(model_dir);
+    from_config_with_quant(cfg, vb, &detected)
+}
+
+/// Construct a model with explicit quantization configuration.
+///
+/// # Arguments
+/// * `cfg` - Model configuration
+/// * `vb` - VarBuilder for loading weights
+/// * `quant_config` - Detected quantization configuration
+pub fn from_config_with_quant(
+    cfg: &ModelConfig,
+    vb: VarBuilder<'static>,
+    quant_config: &DetectedQuantConfig,
+) -> Result<Box<dyn ModelForward>, ModelError> {
+    let arch = cfg
+        .architectures
+        .first()
+        .ok_or_else(|| ModelError::UnsupportedArchitecture("empty architectures list".into()))?;
+
+    // For non-quantized models, use the regular path
+    if quant_config.method == QuantizationMethod::None {
+        return from_config(cfg, vb);
+    }
+
+    // Create quantized weight loader
+    let weight_loader = create_weight_loader_with_params(vb.clone(), quant_config);
+
+    match arch.as_str() {
+        "Qwen3ForCausalLM" => Ok(Box::new(QuantizedQwen3ForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
+        "LlamaForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
+/// Get the detected quantization method for a model directory.
+///
+/// This is useful for checking quantization before loading.
+pub fn detect_quantization(model_dir: &Path) -> DetectedQuantConfig {
+    detect_from_directory(model_dir)
 }
 
 /// Construct a LoRA-enabled model from config.architectures[0].

@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::kv_cache::KVCacheManager;
 use crate::request::RequestId;
 use crate::scheduler::SchedulerOutput;
+use crate::tokenizer::TokenizerWrapper;
 
 use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
@@ -27,6 +28,7 @@ pub(crate) trait ExecutionStrategy: Send {
         output: &SchedulerOutput,
         state: &mut OwnedExecutionState,
         kv_cache_mgr: &mut KVCacheManager,
+        tokenizer: &TokenizerWrapper,
     );
 
     /// Execute decode for scheduled requests.
@@ -36,6 +38,7 @@ pub(crate) trait ExecutionStrategy: Send {
         state: &mut OwnedExecutionState,
         kv_cache_mgr: &mut KVCacheManager,
         multi_step_count: usize,
+        tokenizer: &TokenizerWrapper,
     );
 
     /// Handle preemption of requests.
@@ -147,7 +150,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
         strategy.handle_preemptions(&output, &mut state, &mut kv_cache_mgr);
 
         // Phase 5: Execute prefills
-        strategy.execute_prefills(&output, &mut state, &mut kv_cache_mgr);
+        strategy.execute_prefills(&output, &mut state, &mut kv_cache_mgr, &tokenizer);
 
         // Send stream tokens after prefill
         for schedule in &output.prefill_requests {
@@ -160,6 +163,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             &mut state,
             &mut kv_cache_mgr,
             config.multi_step_count,
+            &tokenizer,
         );
 
         // Send stream tokens after decode

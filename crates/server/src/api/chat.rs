@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
-use vllm_core::sampling::SamplingParams;
+use vllm_core::sampling::{JsonSchemaConstraint, SamplingConstraint, SamplingParams};
 use vllm_core::tokenizer::TokenizerWrapper;
 use vllm_core::tool_parser::{HermesToolParser, ToolCallParser};
 
@@ -13,7 +15,7 @@ use super::streaming::chat_completion_sse_stream;
 use super::types::{
     finish_reason_str, timestamp_now, ChatCompletionChoice, ChatCompletionRequest,
     ChatCompletionResponse, ChatLogProbToken, ChatLogProbs, ChatMessageResponse, ChatTopLogProb,
-    Usage,
+    ResponseFormat, Usage,
 };
 use super::AppState;
 
@@ -51,6 +53,9 @@ pub async fn create_chat_completion(
         None
     };
 
+    // Create constraint from response_format
+    let constraint = create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+
     let gen_req = GenerationRequest {
         prompt: prompt.clone(),
         max_new_tokens: req.max_tokens,
@@ -69,6 +74,7 @@ pub async fn create_chat_completion(
         logprobs: logprobs_count,
         echo: false,
         lora_request,
+        constraint,
     };
 
     if req.stream {
@@ -206,4 +212,25 @@ fn build_chat_logprobs(result: &GenerationResult, tokenizer: &TokenizerWrapper) 
     }
 
     ChatLogProbs { content }
+}
+
+/// Create a sampling constraint from response_format.
+fn create_constraint_from_response_format(
+    response_format: Option<&ResponseFormat>,
+    tokenizer: &Arc<TokenizerWrapper>,
+) -> Option<Box<dyn SamplingConstraint>> {
+    match response_format {
+        None | Some(ResponseFormat::Text) => None,
+        Some(ResponseFormat::JsonObject) => {
+            // Basic JSON object constraint
+            let schema = serde_json::json!({"type": "object"});
+            Some(Box::new(JsonSchemaConstraint::new(schema, tokenizer.clone())))
+        }
+        Some(ResponseFormat::JsonSchema { json_schema }) => {
+            Some(Box::new(JsonSchemaConstraint::new(
+                json_schema.schema.clone(),
+                tokenizer.clone(),
+            )))
+        }
+    }
 }

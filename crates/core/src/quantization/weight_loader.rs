@@ -119,7 +119,12 @@ struct LoadedUnquantizedLinear {
 
 impl QuantizedLinear for LoadedUnquantizedLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x.matmul(&self.weight.t()?)?;
+        // Handle 3D inputs by broadcasting weight to add batch dimension
+        let w = match x.dims().len() {
+            3 => self.weight.broadcast_left(x.dim(0)?)?,
+            _ => self.weight.clone(),
+        };
+        let y = x.matmul(&w.t()?)?;
         match &self.bias {
             Some(b) => y.broadcast_add(b),
             None => Ok(y),

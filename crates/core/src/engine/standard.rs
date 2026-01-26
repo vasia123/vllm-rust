@@ -1,13 +1,17 @@
 //! Standard (non-speculative) execution strategy.
 
+use std::sync::Arc;
+
 use tracing::{info, warn};
 
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::request::RequestStatus;
 use crate::scheduler::SchedulerOutput;
+use crate::tokenizer::TokenizerWrapper;
 
 use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
+use super::cuda_graph_runner::CudaGraphRunner;
 use super::helpers::{
     execute_batched_decode_with_graph, execute_prefill, finish_request_with_error,
 };
@@ -23,11 +27,17 @@ use super::warmup::{DummySequence, WarmupConfig, WarmupError, WarmupStats};
 /// decode for improved throughput.
 pub struct StandardExecution<M: ModelForward> {
     model: M,
+    /// CUDA graph runner for optimized decode execution.
+    /// Wrapped in Arc for shared access during decode operations.
+    graph_runner: Option<Arc<CudaGraphRunner>>,
 }
 
 impl<M: ModelForward> StandardExecution<M> {
     pub fn new(model: M) -> Self {
-        Self { model }
+        Self {
+            model,
+            graph_runner: None,
+        }
     }
 
     // ─── Warmup Methods ───────────────────────────────────────────────────
@@ -107,28 +117,88 @@ impl<M: ModelForward> StandardExecution<M> {
     /// Capture a CUDA graph for the given batch size.
     #[allow(unused_variables)] // dispatcher used when cuda-kernels enabled
     fn capture_decode_graph(
-        &self,
+        &mut self,
         batch_size: usize,
         kv_cache_mgr: &mut KVCacheManager,
         dispatcher: &mut CudaGraphDispatcher,
     ) -> Result<(), WarmupError> {
-        // CUDA graph capture requires the cuda-kernels feature
-        // For now, we just do JIT warmup without actual capture
-        // Full capture implementation will use CudaGraphWrapper
-
-        // The graph capture flow would be:
-        // 1. Create dummy sequences
-        // 2. Begin stream capture
-        // 3. Run forward pass (operations are recorded, not executed)
-        // 4. End capture and instantiate graph
-        // 5. Store in dispatcher cache
-
-        // For now, just run another forward to ensure everything is warm
-        self.run_dummy_decode(batch_size, kv_cache_mgr)?;
-
-        // Register the batch size as a valid key
+        // Register the batch size as valid for CUDA graph dispatch
         let descriptor = super::cuda_graph::BatchDescriptor::for_decode(batch_size);
         dispatcher.register_valid_key(descriptor);
+
+        // If graph runner exists, capture is already done via runner.warmup()
+        // If not, we just do JIT warmup
+        if self.graph_runner.is_none() {
+            self.run_dummy_decode(batch_size, kv_cache_mgr)?;
+        }
+
+        Ok(())
+    }
+
+    /// Initialize the CUDA graph runner for capture and replay.
+    fn initialize_graph_runner(
+        &mut self,
+        config: &WarmupConfig,
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<(), WarmupError> {
+        use candle_core::DType;
+        use super::cuda_graph::CudaGraphConfig;
+
+        // Get device from model
+        let device = self.model.device().clone();
+
+        // Skip if not CUDA device
+        if !device.is_cuda() {
+            return Ok(());
+        }
+
+        // Determine vocab size by running a single forward pass
+        let vocab_size = {
+            let mut dummy_seqs = self.create_dummy_sequences(1, kv_cache_mgr)?;
+
+            for seq in &mut dummy_seqs {
+                kv_cache_mgr
+                    .allocate_for_request(&mut seq.block_table, 1)
+                    .map_err(|e| WarmupError::CacheAllocation(e.to_string()))?;
+                seq.slot_mapping = seq.block_table.slot_mapping(seq.seqlen_offset, 1);
+            }
+
+            let input = candle_core::Tensor::zeros(
+                (1, 1),
+                DType::U32,
+                &device,
+            ).map_err(WarmupError::from)?;
+
+            let sequences: Vec<DecodeSequenceMetadata> = dummy_seqs
+                .iter()
+                .map(|seq| DecodeSequenceMetadata {
+                    seqlen_offset: seq.seqlen_offset,
+                    block_ids: seq.block_ids.clone(),
+                    slot_mapping: seq.slot_mapping.clone(),
+                })
+                .collect();
+
+            let logits = self
+                .model
+                .forward_decode_batch(&input, &sequences, kv_cache_mgr)
+                .map_err(|e| WarmupError::CacheAllocation(format!("forward failed: {e}")))?;
+
+            self.cleanup_dummy_sequences(dummy_seqs, kv_cache_mgr)?;
+
+            // Vocab size is the last dimension of logits
+            logits.dims().last().copied().unwrap_or(32000)
+        };
+
+        // Build CUDA graph config
+        let graph_config = CudaGraphConfig {
+            enabled: config.enable_graph_capture,
+            capture_sizes: config.decode_batch_sizes.clone(),
+            ..Default::default()
+        };
+
+        // Create runner
+        let runner = CudaGraphRunner::new(graph_config, device, vocab_size, DType::F32);
+        self.graph_runner = Some(Arc::new(runner));
 
         Ok(())
     }
@@ -158,6 +228,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
         output: &SchedulerOutput,
         state: &mut OwnedExecutionState,
         kv_cache_mgr: &mut KVCacheManager,
+        tokenizer: &TokenizerWrapper,
     ) {
         for schedule in &output.prefill_requests {
             let req_id = schedule.request_id;
@@ -167,6 +238,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 &self.model,
                 kv_cache_mgr,
                 &mut state.requests,
+                tokenizer,
             ) {
                 finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
             }
@@ -179,6 +251,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
         state: &mut OwnedExecutionState,
         kv_cache_mgr: &mut KVCacheManager,
         multi_step_count: usize,
+        _tokenizer: &TokenizerWrapper,
     ) {
         if output.decode_requests.is_empty() {
             return;
@@ -198,6 +271,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 kv_cache_mgr,
                 &mut state.requests,
                 Some(&state.cuda_graph_dispatcher),
+                self.graph_runner.as_ref(),
             );
 
             for req_id in failed {
@@ -274,6 +348,14 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             );
         }
 
+        // Initialize CUDA graph runner if graph capture is enabled
+        if config.enable_graph_capture && dispatcher.is_enabled() {
+            if let Err(e) = self.initialize_graph_runner(config, kv_cache_mgr) {
+                warn!(error = %e, "Failed to initialize graph runner");
+                stats.errors.push(format!("graph runner init: {e}"));
+            }
+        }
+
         // Process batch sizes in descending order (fail fast on OOM for large batches)
         let mut sorted_sizes = config.decode_batch_sizes.clone();
         sorted_sizes.sort_by(|a, b| b.cmp(a));
@@ -305,18 +387,18 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 }
             }
 
-            // Phase 2: CUDA graph capture
+            // Phase 2: CUDA graph registration
             if config.enable_graph_capture && dispatcher.is_enabled() {
                 match self.capture_decode_graph(batch_size, kv_cache_mgr, dispatcher) {
                     Ok(()) => {
                         stats.graphs_captured += 1;
                         if config.show_progress {
-                            info!(batch_size, "CUDA graph captured");
+                            info!(batch_size, "CUDA graph registered");
                         }
                     }
                     Err(e) => {
                         stats.graphs_failed += 1;
-                        warn!(batch_size, error = %e, "CUDA graph capture failed");
+                        warn!(batch_size, error = %e, "CUDA graph registration failed");
                         stats
                             .errors
                             .push(format!("graph batch_size={batch_size}: {e}"));
@@ -336,6 +418,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 graphs_captured = stats.graphs_captured,
                 graphs_failed = stats.graphs_failed,
                 time_ms = stats.total_time_ms,
+                runner_enabled = self.graph_runner.is_some(),
                 "Warmup complete"
             );
         }

@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::kv_cache::MetricsSnapshot;
 use crate::lora::LoraRequest;
 use crate::request::{FinishReason, RequestId};
-use crate::sampling::SamplingParams;
+use crate::sampling::{SamplingConstraint, SamplingParams};
 
 // ─── Streaming types ──────────────────────────────────────────────────────
 
@@ -54,6 +54,8 @@ pub struct GenerationRequest {
     pub echo: bool,
     /// LoRA adapter to use for this request (None = no adapter).
     pub lora_request: Option<LoraRequest>,
+    /// Sampling constraint for structured output (JSON schema, regex, etc.).
+    pub constraint: Option<Box<dyn SamplingConstraint>>,
 }
 
 impl Default for GenerationRequest {
@@ -69,6 +71,7 @@ impl Default for GenerationRequest {
             logprobs: None,
             echo: false,
             lora_request: None,
+            constraint: None,
         }
     }
 }

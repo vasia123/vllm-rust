@@ -13,6 +13,7 @@ use crate::tokenizer::TokenizerWrapper;
 
 use super::context::ActiveRequest;
 use super::cuda_graph::{BatchDescriptor, CudaGraphDispatcher, ForwardContext};
+use super::cuda_graph_runner::CudaGraphRunner;
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::types::{
     EngineCommand, EngineError, EngineStats, GenerationRequest, GenerationResult, ResponseChannel,
@@ -123,6 +124,7 @@ fn admit_request(
     state.num_top_logprobs = request.logprobs.map(|n| n as usize);
     state.echo = request.echo;
     state.lora_request = request.lora_request;
+    state.constraint = request.constraint;
 
     // Check prefix cache for reusable blocks
     if let Some(cache) = prefix_cache.as_mut() {
@@ -174,6 +176,7 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
+    tokenizer: &TokenizerWrapper,
 ) -> Result<(), EngineError> {
     let req = requests
         .get_mut(&req_id)
@@ -256,7 +259,7 @@ pub(crate) fn execute_prefill<M: ModelForward>(
         let logits = logits
             .narrow(1, seq_dim - 1, 1)
             .map_err(|e| EngineError::Model(e.to_string()))?;
-        let next_token = sample_token(&logits, &mut req.state)?;
+        let next_token = sample_token(&logits, &mut req.state, tokenizer)?;
         req.state.generated_token_ids.push(next_token);
     } else {
         req.state.status = RequestStatus::Prefilling;
@@ -270,6 +273,7 @@ pub(crate) fn execute_decode<M: ModelForward>(
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
+    tokenizer: &TokenizerWrapper,
 ) -> Result<(), EngineError> {
     let req = requests
         .get_mut(&req_id)
@@ -317,7 +321,7 @@ pub(crate) fn execute_decode<M: ModelForward>(
     let logits = logits
         .narrow(1, seq_dim - 1, 1)
         .map_err(|e| EngineError::Model(e.to_string()))?;
-    let next_token = sample_token(&logits, &mut req.state)?;
+    let next_token = sample_token(&logits, &mut req.state, tokenizer)?;
     req.state.generated_token_ids.push(next_token);
 
     Ok(())
@@ -335,17 +339,19 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
 ) -> Vec<RequestId> {
-    execute_batched_decode_with_graph(decode_request_ids, model, kv_cache_mgr, requests, None)
+    execute_batched_decode_with_graph(decode_request_ids, model, kv_cache_mgr, requests, None, None)
 }
 
 /// Execute batched decode with optional CUDA graph support.
 /// When a dispatcher is provided, dispatches to cached graphs when available.
+/// When a graph runner is provided, uses it for optimized execution.
 pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     decode_request_ids: &[RequestId],
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
     dispatcher: Option<&Arc<std::sync::RwLock<CudaGraphDispatcher>>>,
+    graph_runner: Option<&Arc<CudaGraphRunner>>,
 ) -> Vec<RequestId> {
     let mut failed = Vec::new();
     let mut batch_ids: Vec<RequestId> = Vec::with_capacity(decode_request_ids.len());
@@ -437,15 +443,33 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         }
     };
 
-    // Execute forward pass - use LoRA path if adapter is specified, otherwise use CUDA graph path
+    // Execute forward pass - prioritize: LoRA > CUDA Graph Runner > Model Context > Eager
     // Note: CUDA graphs and LoRA are currently mutually exclusive for simplicity
     let logits = if batch_lora_ctx.has_adapter() {
+        // LoRA path - no graph support
         match model.forward_decode_batch_with_lora(&input, &sequences, kv_cache_mgr, &batch_lora_ctx)
         {
             Ok(l) => l,
             Err(_) => {
                 failed.extend(&batch_ids);
                 return failed;
+            }
+        }
+    } else if let Some(runner) = graph_runner {
+        // Try CUDA graph runner path for optimized execution
+        match runner.execute(&input, |inp| {
+            model.forward_decode_batch(inp, &sequences, kv_cache_mgr)
+        }) {
+            Ok(l) => l,
+            Err(_) => {
+                // Fall back to eager execution on runner error
+                match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        failed.extend(&batch_ids);
+                        return failed;
+                    }
+                }
             }
         }
     } else {
@@ -585,6 +609,18 @@ pub(crate) fn check_finished(
         }
     }
 
+    // Check if constraint is satisfied (structured output complete)
+    if let Some(ref constraint) = state.constraint {
+        if let Ok(text) = tokenizer.decode(&state.generated_token_ids) {
+            if constraint.is_complete(&state.generated_token_ids, &text) {
+                return Some(FinishCheck {
+                    reason: FinishReason::Stop,
+                    trim_bytes: 0,
+                });
+            }
+        }
+    }
+
     if state.num_generated() >= state.max_new_tokens {
         return Some(FinishCheck {
             reason: FinishReason::Length,
@@ -595,13 +631,27 @@ pub(crate) fn check_finished(
     None
 }
 
-pub(crate) fn sample_token(logits: &Tensor, state: &mut SequenceState) -> Result<u32, EngineError> {
-    let logits_vec: Vec<f32> = logits
+pub(crate) fn sample_token(
+    logits: &Tensor,
+    state: &mut SequenceState,
+    tokenizer: &TokenizerWrapper,
+) -> Result<u32, EngineError> {
+    let mut logits_vec: Vec<f32> = logits
         .squeeze(0)
         .and_then(|t| t.squeeze(0))
         .and_then(|t| t.to_dtype(candle_core::DType::F32))
         .and_then(|t| t.to_vec1())
         .map_err(|e| EngineError::Model(e.to_string()))?;
+
+    // Apply constraint masking if present
+    if let Some(ref mut constraint) = state.constraint {
+        let generated_text = tokenizer
+            .decode(&state.generated_token_ids)
+            .unwrap_or_default();
+        constraint
+            .mask_logits(&mut logits_vec, &generated_text)
+            .map_err(|e| EngineError::Model(format!("constraint error: {}", e)))?;
+    }
 
     let result = sampling::sample(
         &logits_vec,

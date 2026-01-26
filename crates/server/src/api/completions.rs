@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -6,14 +7,14 @@ use axum::Json;
 
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
-use vllm_core::sampling::SamplingParams;
+use vllm_core::sampling::{JsonSchemaConstraint, SamplingConstraint, SamplingParams};
 use vllm_core::tokenizer::TokenizerWrapper;
 
 use super::error::ApiError;
 use super::streaming::completion_sse_stream;
 use super::types::{
     finish_reason_str, timestamp_now, CompletionChoice, CompletionLogProbs, CompletionRequest,
-    CompletionResponse, PromptInput, Usage,
+    CompletionResponse, PromptInput, ResponseFormat, Usage,
 };
 use super::AppState;
 
@@ -41,6 +42,9 @@ pub async fn create_completion(
         // Convert lora_name to LoraRequest (references a pre-loaded adapter by name)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
+        // Create constraint from response_format
+        let constraint = create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+
         let gen_req = GenerationRequest {
             prompt,
             max_new_tokens: req.max_tokens,
@@ -59,6 +63,7 @@ pub async fn create_completion(
             logprobs: None, // Streaming doesn't support logprobs yet
             echo: false,
             lora_request,
+            constraint,
         };
 
         let _ = prompt_tokens; // Used for non-streaming only
@@ -81,8 +86,18 @@ pub async fn create_completion(
         // Convert lora_name to LoraRequest (for batch requests, same adapter for all)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
+        // Create constraint from response_format (same for all prompts in batch)
+        let constraint = create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+
         for (index, input) in inputs.into_iter().enumerate() {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
+
+            // Clone constraint for each request in batch (constraints are stateful)
+            let request_constraint = if constraint.is_some() {
+                create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+            } else {
+                None
+            };
 
             let gen_req = GenerationRequest {
                 prompt,
@@ -102,6 +117,7 @@ pub async fn create_completion(
                 logprobs: req.logprobs,
                 echo: req.echo,
                 lora_request: lora_request.clone(),
+                constraint: request_constraint,
             };
 
             let result = state
@@ -163,6 +179,27 @@ fn resolve_prompt_input(state: &AppState, input: PromptInput) -> Result<(String,
                 .decode(&ids)
                 .map_err(|e| ApiError::EngineError(format!("Failed to decode token IDs: {}", e)))?;
             Ok((text, token_count))
+        }
+    }
+}
+
+/// Create a sampling constraint from response_format.
+fn create_constraint_from_response_format(
+    response_format: Option<&ResponseFormat>,
+    tokenizer: &Arc<TokenizerWrapper>,
+) -> Option<Box<dyn SamplingConstraint>> {
+    match response_format {
+        None | Some(ResponseFormat::Text) => None,
+        Some(ResponseFormat::JsonObject) => {
+            // Basic JSON object constraint
+            let schema = serde_json::json!({"type": "object"});
+            Some(Box::new(JsonSchemaConstraint::new(schema, tokenizer.clone())))
+        }
+        Some(ResponseFormat::JsonSchema { json_schema }) => {
+            Some(Box::new(JsonSchemaConstraint::new(
+                json_schema.schema.clone(),
+                tokenizer.clone(),
+            )))
         }
     }
 }
