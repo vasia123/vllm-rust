@@ -1,13 +1,21 @@
+pub mod gemma;
+pub mod gemma2;
 pub mod llama;
 pub mod llama_lora;
 pub mod llama_quantized;
+pub mod mistral;
+pub mod mixtral;
 pub mod qwen3;
 pub mod qwen3_lora;
 pub mod qwen3_quantized;
 
+pub use gemma::GemmaForCausalLM;
+pub use gemma2::Gemma2ForCausalLM;
 pub use llama::LlamaForCausalLM;
 pub use llama_lora::LlamaWithLora;
 pub use llama_quantized::QuantizedLlamaForCausalLM;
+pub use mistral::MistralForCausalLM;
+pub use mixtral::MixtralForCausalLM;
 pub use qwen3::Qwen3ForCausalLM;
 pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
@@ -42,8 +50,12 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         .first()
         .ok_or_else(|| ModelError::UnsupportedArchitecture("empty architectures list".into()))?;
     match arch.as_str() {
-        "Qwen3ForCausalLM" => Ok(Box::new(Qwen3ForCausalLM::new(cfg, vb)?)),
+        "GemmaForCausalLM" => Ok(Box::new(GemmaForCausalLM::new(cfg, vb)?)),
+        "Gemma2ForCausalLM" => Ok(Box::new(Gemma2ForCausalLM::new(cfg, vb)?)),
         "LlamaForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
+        "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new(cfg, vb)?)),
+        "MixtralForCausalLM" => Ok(Box::new(MixtralForCausalLM::new(cfg, vb)?)),
+        "Qwen3ForCausalLM" => Ok(Box::new(Qwen3ForCausalLM::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
@@ -107,6 +119,10 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
+        // Gemma, Mistral, Mixtral: fallback to non-quantized (quantized variant not yet implemented)
+        "GemmaForCausalLM" | "Gemma2ForCausalLM" | "MistralForCausalLM" | "MixtralForCausalLM" => {
+            from_config(cfg, vb)
+        }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

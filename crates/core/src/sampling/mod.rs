@@ -3,9 +3,12 @@
 //! This module provides:
 //! - Token sampling with temperature, top-k, top-p, and repetition penalty
 //! - Constrained generation with choice, regex, and JSON schema constraints
+//! - Beam search decoding for higher quality generation
 
+mod beam;
 mod constraint;
 
+pub use beam::{beam_search_top_k, BeamHypothesis, BeamSearchConfig, BeamSearchState};
 pub use constraint::{ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, SamplingConstraint};
 
 use rand::rngs::StdRng;
@@ -37,6 +40,8 @@ pub struct SamplingParams {
     pub min_p: f32,
     /// Optional seed for deterministic sampling.
     pub seed: Option<u64>,
+    /// Beam search configuration. None = disabled (use standard sampling).
+    pub beam_search: Option<BeamSearchConfig>,
 }
 
 impl Default for SamplingParams {
@@ -48,6 +53,7 @@ impl Default for SamplingParams {
             repetition_penalty: 1.0,
             min_p: 0.0,
             seed: None,
+            beam_search: None,
         }
     }
 }
@@ -62,6 +68,21 @@ impl SamplingParams {
 
     pub fn is_greedy(&self) -> bool {
         self.temperature < 1e-6
+    }
+
+    pub fn is_beam_search(&self) -> bool {
+        self.beam_search.is_some()
+    }
+
+    /// Create sampling params configured for beam search.
+    pub fn beam_search(beam_width: usize) -> Self {
+        Self {
+            beam_search: Some(BeamSearchConfig {
+                beam_width,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 }
 

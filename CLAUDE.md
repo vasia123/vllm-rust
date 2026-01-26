@@ -48,9 +48,9 @@ Production-grade. Every line, every commit, every decision — as if it ships to
 
 - Read before write. Always.
 - Verify assumptions with code, not guesses
-- One logical change per commit
 - If unsure — ask, don't assume
 - Run `cargo check` after every edit
 - Run `cargo test` before declaring done
 - No stubs. Either complete the implementation or document the gap with a detailed TODO.
+- Mark all workarounds with TODO explaining the proper solution.
 - Think before generating. Less code that works > more code that might.

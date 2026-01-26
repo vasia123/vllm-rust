@@ -8,6 +8,7 @@ pub mod layers;
 pub mod loader;
 pub mod lora;
 pub mod models;
+pub mod moe;
 pub mod quantization;
 pub mod request;
 pub mod sampling;

@@ -67,6 +67,7 @@ pub async fn create_chat_completion(
             repetition_penalty: req.repetition_penalty,
             min_p: req.min_p,
             seed: req.seed,
+            beam_search: None,
         },
         stop_strings: req.stop,
         stop_token_ids: req.stop_token_ids,
