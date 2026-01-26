@@ -9,7 +9,9 @@ use vllm_core::{
         start_engine, start_engine_with_draft, EngineConfig, GenerationRequest, SpeculativeConfig,
     },
     kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
-    loader, models,
+    loader,
+    lora::LoraLoader,
+    models,
     scheduler::SchedulerConfig,
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
 };
@@ -62,6 +64,11 @@ enum Command {
         /// Decode steps per scheduler invocation (amortizes scheduling overhead)
         #[arg(long, default_value_t = 4)]
         multi_step_count: usize,
+
+        /// LoRA adapters to load at startup (format: name=path, can be repeated)
+        /// Example: --lora-adapter sql=./sql-adapter --lora-adapter code=./code-adapter
+        #[arg(long = "lora-adapter")]
+        lora_adapters: Vec<String>,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -113,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             num_blocks,
             max_requests,
             multi_step_count,
+            lora_adapters,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = if model == "Qwen/Qwen3-0.6B" {
@@ -163,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 num_blocks,
                 max_requests,
                 multi_step_count,
+                lora_adapters,
             )
             .await
         }
@@ -202,6 +211,7 @@ async fn run_server(
     num_blocks: usize,
     max_requests: usize,
     multi_step_count: usize,
+    lora_adapters: Vec<String>,
 ) -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -214,11 +224,55 @@ async fn run_server(
     eprintln!("Loading weights to GPU (bf16)...");
     let vb = loader::load_weights(&files.weights, dtype, &device)?;
 
+    // Parse LoRA adapter specs first
+    let parsed_lora_specs: Vec<(&str, &str)> = lora_adapters
+        .iter()
+        .map(|spec| {
+            let parts: Vec<&str> = spec.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                anyhow::bail!(
+                    "Invalid LoRA adapter spec '{}': expected format 'name=path'",
+                    spec
+                );
+            }
+            Ok((parts[0], parts[1]))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // Build model - use LoRA-enabled variant if adapters specified
     eprintln!(
         "Building model ({} layers)...",
         files.config.num_hidden_layers
     );
-    let model = models::from_config(&files.config, vb)?;
+
+    let model: Box<dyn vllm_core::engine::ModelForward> = if !parsed_lora_specs.is_empty() {
+        // Create LoRA-enabled model and register adapters
+        let mut lora_model = models::from_config_with_lora(&files.config, vb)?;
+
+        eprintln!("Loading {} LoRA adapter(s)...", parsed_lora_specs.len());
+        let lora_loader = LoraLoader::new(device.clone(), dtype);
+
+        for (idx, (name, path)) in parsed_lora_specs.iter().enumerate() {
+            eprintln!("  Loading adapter '{}' from: {}", name, path);
+            let adapter = lora_loader.load(path, *name, (idx + 1) as u32)?;
+            eprintln!(
+                "    Loaded {} layer adapters (rank={}, alpha={})",
+                adapter.num_adapters(),
+                adapter.rank,
+                adapter.alpha
+            );
+            lora_model.register_lora(&adapter);
+        }
+
+        eprintln!(
+            "Registered adapters: {:?}",
+            lora_model.lora_adapters()
+        );
+        Box::new(lora_model)
+    } else {
+        // Create regular model without LoRA
+        models::from_config(&files.config, vb)?
+    };
 
     let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
     let tokenizer = Arc::new(tokenizer);

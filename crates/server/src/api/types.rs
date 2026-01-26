@@ -85,6 +85,10 @@ pub struct CompletionRequest {
     /// Response format for structured output (JSON schema, etc.)
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// Name of the LoRA adapter to use for this request.
+    /// Must match an adapter loaded at server startup.
+    #[serde(default)]
+    pub lora_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +177,17 @@ pub struct ChatCompletionRequest {
     /// Controls how the model uses tools
     #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
+    /// Name of the LoRA adapter to use for this request.
+    /// Must match an adapter loaded at server startup.
+    #[serde(default)]
+    pub lora_name: Option<String>,
+    /// Whether to return log probabilities of the output tokens.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of most likely tokens to return at each position (1-20).
+    /// Requires logprobs to be true.
+    #[serde(default)]
+    pub top_logprobs: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -190,6 +205,42 @@ pub struct ChatCompletionChoice {
     pub message: ChatMessageResponse,
     pub index: u32,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogProbs>,
+}
+
+/// Log probabilities for chat completion tokens, following OpenAI format.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogProbs {
+    /// A list of message content tokens with log probability information.
+    pub content: Vec<ChatLogProbToken>,
+}
+
+/// Log probability information for a single token in chat completions.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogProbToken {
+    /// The token string.
+    pub token: String,
+    /// The log probability of this token.
+    pub logprob: f32,
+    /// UTF-8 byte representation of the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    /// Top alternative tokens with their log probabilities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<Vec<ChatTopLogProb>>,
+}
+
+/// A top-k log probability entry for chat completions.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTopLogProb {
+    /// The token string.
+    pub token: String,
+    /// The log probability of this token.
+    pub logprob: f32,
+    /// UTF-8 byte representation of the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]

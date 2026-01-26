@@ -6,6 +6,7 @@ pub mod engine;
 pub mod kv_cache;
 pub mod layers;
 pub mod loader;
+pub mod lora;
 pub mod models;
 pub mod quantization;
 pub mod request;

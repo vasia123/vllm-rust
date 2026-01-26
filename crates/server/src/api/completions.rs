@@ -5,6 +5,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use vllm_core::engine::{GenerationRequest, GenerationResult};
+use vllm_core::lora::LoraRequest;
 use vllm_core::sampling::SamplingParams;
 use vllm_core::tokenizer::TokenizerWrapper;
 
@@ -37,6 +38,9 @@ pub async fn create_completion(
             .unwrap_or(PromptInput::Text(String::new()));
         let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
 
+        // Convert lora_name to LoraRequest (references a pre-loaded adapter by name)
+        let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
+
         let gen_req = GenerationRequest {
             prompt,
             max_new_tokens: req.max_tokens,
@@ -54,6 +58,7 @@ pub async fn create_completion(
             include_stop_str_in_output: req.include_stop_str_in_output,
             logprobs: None, // Streaming doesn't support logprobs yet
             echo: false,
+            lora_request,
         };
 
         let _ = prompt_tokens; // Used for non-streaming only
@@ -72,6 +77,9 @@ pub async fn create_completion(
         let mut choices = Vec::with_capacity(inputs.len());
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
+
+        // Convert lora_name to LoraRequest (for batch requests, same adapter for all)
+        let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
         for (index, input) in inputs.into_iter().enumerate() {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
@@ -93,6 +101,7 @@ pub async fn create_completion(
                 include_stop_str_in_output: req.include_stop_str_in_output,
                 logprobs: req.logprobs,
                 echo: req.echo,
+                lora_request: lora_request.clone(),
             };
 
             let result = state

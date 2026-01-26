@@ -18,6 +18,7 @@ use super::types::{
     EngineCommand, EngineError, EngineStats, GenerationRequest, GenerationResult, ResponseChannel,
     StreamEvent,
 };
+use crate::lora::LoraContext;
 
 /// Result of checking if generation should stop.
 pub(crate) struct FinishCheck {
@@ -121,6 +122,7 @@ fn admit_request(
     state.include_stop_str_in_output = request.include_stop_str_in_output;
     state.num_top_logprobs = request.logprobs.map(|n| n as usize);
     state.echo = request.echo;
+    state.lora_request = request.lora_request;
 
     // Check prefix cache for reusable blocks
     if let Some(cache) = prefix_cache.as_mut() {
@@ -191,13 +193,22 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     let input = Tensor::from_vec(chunk_tokens.to_vec(), (1, actual_chunk), model.device())
         .map_err(|e| EngineError::Model(e.to_string()))?;
 
+    // Build LoRA context from request's lora_request if present
+    let lora_ctx = req
+        .state
+        .lora_request
+        .as_ref()
+        .map(|lr| LoraContext::with_adapter(&lr.name))
+        .unwrap_or_else(LoraContext::none);
+
     let logits = model
-        .forward(
+        .forward_with_lora(
             &input,
             offset,
             kv_cache_mgr,
             &req.state.block_table,
             &slot_mapping,
+            &lora_ctx,
         )
         .map_err(|e| EngineError::Model(e.to_string()))?;
 
@@ -280,13 +291,22 @@ pub(crate) fn execute_decode<M: ModelForward>(
     let input = Tensor::new(&[[last_token]], model.device())
         .map_err(|e| EngineError::Model(e.to_string()))?;
 
+    // Build LoRA context from request's lora_request if present
+    let lora_ctx = req
+        .state
+        .lora_request
+        .as_ref()
+        .map(|lr| LoraContext::with_adapter(&lr.name))
+        .unwrap_or_else(LoraContext::none);
+
     let logits = model
-        .forward(
+        .forward_with_lora(
             &input,
             req.state.seqlen_offset,
             kv_cache_mgr,
             &req.state.block_table,
             &slot_mapping,
+            &lora_ctx,
         )
         .map_err(|e| EngineError::Model(e.to_string()))?;
 
@@ -350,9 +370,23 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         return failed;
     }
 
-    // Step 2: Collect input tokens and per-sequence metadata
+    // Step 2: Collect input tokens, per-sequence metadata, and LoRA context
     let mut token_ids: Vec<u32> = Vec::with_capacity(batch_ids.len());
     let mut sequences: Vec<DecodeSequenceMetadata> = Vec::with_capacity(batch_ids.len());
+
+    // Determine batch LoRA context from first request with a LoRA adapter
+    // Note: In production, you'd want to batch requests by LoRA adapter for efficiency
+    let batch_lora_ctx = batch_ids
+        .iter()
+        .find_map(|&req_id| {
+            requests.get(&req_id).and_then(|req| {
+                req.state
+                    .lora_request
+                    .as_ref()
+                    .map(|lr| LoraContext::with_adapter(&lr.name))
+            })
+        })
+        .unwrap_or_else(LoraContext::none);
 
     for &req_id in &batch_ids {
         let Some(req) = requests.get(&req_id) else {
@@ -403,17 +437,29 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         }
     };
 
-    // Execute forward pass with CUDA graph context
-    // The context indicates whether we can replay a cached graph
-    // or should execute eagerly. Graph capture happens during warmup.
-    let logits =
+    // Execute forward pass - use LoRA path if adapter is specified, otherwise use CUDA graph path
+    // Note: CUDA graphs and LoRA are currently mutually exclusive for simplicity
+    let logits = if batch_lora_ctx.has_adapter() {
+        match model.forward_decode_batch_with_lora(&input, &sequences, kv_cache_mgr, &batch_lora_ctx)
+        {
+            Ok(l) => l,
+            Err(_) => {
+                failed.extend(&batch_ids);
+                return failed;
+            }
+        }
+    } else {
+        // Execute forward pass with CUDA graph context
+        // The context indicates whether we can replay a cached graph
+        // or should execute eagerly. Graph capture happens during warmup.
         match model.forward_decode_batch_with_ctx(&input, &sequences, kv_cache_mgr, &forward_ctx) {
             Ok(l) => l,
             Err(_) => {
                 failed.extend(&batch_ids);
                 return failed;
             }
-        };
+        }
+    };
 
     // Step 4: Extract logits and sample per-sequence
     let seq_dim = logits.dims()[1];

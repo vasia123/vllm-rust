@@ -5,6 +5,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::kv_cache::MetricsSnapshot;
+use crate::lora::LoraRequest;
 use crate::request::{FinishReason, RequestId};
 use crate::sampling::SamplingParams;
 
@@ -51,6 +52,8 @@ pub struct GenerationRequest {
     pub include_stop_str_in_output: bool,
     pub logprobs: Option<u32>,
     pub echo: bool,
+    /// LoRA adapter to use for this request (None = no adapter).
+    pub lora_request: Option<LoraRequest>,
 }
 
 impl Default for GenerationRequest {
@@ -65,6 +68,7 @@ impl Default for GenerationRequest {
             include_stop_str_in_output: false,
             logprobs: None,
             echo: false,
+            lora_request: None,
         }
     }
 }

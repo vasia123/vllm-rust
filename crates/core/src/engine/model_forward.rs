@@ -3,6 +3,7 @@
 use candle_core::{Device, Tensor};
 
 use crate::kv_cache::{BlockId, BlockTable, KVCacheManager};
+use crate::lora::LoraContext;
 
 use super::cuda_graph::ForwardContext;
 
@@ -79,6 +80,51 @@ pub trait ModelForward: Send + 'static {
         false
     }
 
+    /// Whether this model supports LoRA adapters.
+    ///
+    /// Returns `true` if the model can use LoRA adapters for per-request
+    /// fine-tuning behavior. LoRA-enabled models should override this and
+    /// the `forward_with_lora` methods.
+    fn supports_lora(&self) -> bool {
+        false
+    }
+
+    /// Single-sequence forward pass with LoRA adapter support.
+    ///
+    /// For models that support LoRA, this method applies the specified adapter
+    /// during inference. For models that don't support LoRA, this delegates to
+    /// the standard forward pass and ignores the LoRA context.
+    fn forward_with_lora(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+        lora_ctx: &LoraContext,
+    ) -> candle_core::Result<Tensor> {
+        // Default: ignore LoRA context and use base forward
+        let _ = lora_ctx;
+        self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+    }
+
+    /// Batched decode with LoRA adapter support.
+    ///
+    /// For models that support LoRA, this method applies the specified adapter
+    /// during batched decode. For models that don't support LoRA, this delegates
+    /// to the standard batched decode and ignores the LoRA context.
+    fn forward_decode_batch_with_lora(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        lora_ctx: &LoraContext,
+    ) -> candle_core::Result<Tensor> {
+        // Default: ignore LoRA context and use base batched decode
+        let _ = lora_ctx;
+        self.forward_decode_batch(input_ids, sequences, kv_cache_mgr)
+    }
+
     fn device(&self) -> &Device;
 }
 
@@ -121,6 +167,39 @@ impl ModelForward for Box<dyn ModelForward> {
 
     fn supports_cuda_graphs(&self) -> bool {
         (**self).supports_cuda_graphs()
+    }
+
+    fn supports_lora(&self) -> bool {
+        (**self).supports_lora()
+    }
+
+    fn forward_with_lora(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+        lora_ctx: &LoraContext,
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_with_lora(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+            lora_ctx,
+        )
+    }
+
+    fn forward_decode_batch_with_lora(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        lora_ctx: &LoraContext,
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_decode_batch_with_lora(input_ids, sequences, kv_cache_mgr, lora_ctx)
     }
 
     fn device(&self) -> &Device {

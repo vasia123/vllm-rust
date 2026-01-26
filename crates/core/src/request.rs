@@ -1,4 +1,5 @@
 use crate::kv_cache::BlockTable;
+use crate::lora::LoraRequest;
 use crate::sampling::{SamplerState, SamplingParams};
 
 pub type RequestId = u64;
@@ -57,6 +58,8 @@ pub struct SequenceState {
     pub prompt_logprobs: Vec<Option<f32>>,
     /// Whether to include prompt tokens and their logprobs in output.
     pub echo: bool,
+    /// LoRA adapter to use for this request (None = no adapter).
+    pub lora_request: Option<LoraRequest>,
 }
 
 impl SequenceState {
@@ -89,6 +92,7 @@ impl SequenceState {
             top_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
             echo: false,
+            lora_request: None,
         }
     }
 
