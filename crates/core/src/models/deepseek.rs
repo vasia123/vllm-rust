@@ -233,11 +233,11 @@ impl DeepSeekDecoderLayer {
                 .get("num_experts_per_tok")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(2) as usize;
-            let moe_intermediate = cfg
-                .extra
-                .get("moe_intermediate_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(cfg.intermediate_size as u64) as usize;
+            let moe_intermediate =
+                cfg.extra
+                    .get("moe_intermediate_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(cfg.intermediate_size as u64) as usize;
 
             let layer_cfg = MoELayerConfig {
                 hidden_size: cfg.hidden_size,
@@ -636,7 +636,13 @@ mod tests {
             .unwrap();
         let slot_mapping: Vec<usize> = (0..4).collect();
 
-        let output = model.forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping);
+        let output = model.forward(
+            &input_ids,
+            0,
+            &mut kv_cache_mgr,
+            &block_table,
+            &slot_mapping,
+        );
         assert!(output.is_ok());
         let output = output.unwrap();
         assert_eq!(output.dims(), &[1, 4, cfg.vocab_size]);
@@ -659,8 +665,13 @@ mod tests {
             .unwrap();
         let slot_mapping: Vec<usize> = (0..3).collect();
 
-        let prefill_out =
-            model.forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping);
+        let prefill_out = model.forward(
+            &input_ids,
+            0,
+            &mut kv_cache_mgr,
+            &block_table,
+            &slot_mapping,
+        );
         assert!(prefill_out.is_ok());
 
         // Decode 1 token using forward_decode_batch

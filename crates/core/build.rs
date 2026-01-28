@@ -5,6 +5,8 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/fp8_quant.cu");
     println!("cargo:rerun-if-changed=kernels/fp8_gemm.cu");
     println!("cargo:rerun-if-changed=kernels/gptq_dequant.cu");
+    println!("cargo:rerun-if-changed=kernels/fused_moe_align.cu");
+    println!("cargo:rerun-if-changed=kernels/fused_moe_gemm.cu");
 
     // Only compile CUDA kernels when the feature is enabled
     if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_err() {
@@ -35,6 +37,16 @@ fn main() {
             "kernels/gptq_dequant.cu",
             "kernels/gptq_dequant.ptx",
             vec![], // GPTQ dequantization kernel
+        ),
+        (
+            "kernels/fused_moe_align.cu",
+            "kernels/fused_moe_align.ptx",
+            vec![], // Fused MoE token alignment kernel
+        ),
+        (
+            "kernels/fused_moe_gemm.cu",
+            "kernels/fused_moe_gemm.ptx",
+            vec![], // Fused MoE GEMM kernel
         ),
     ];
 

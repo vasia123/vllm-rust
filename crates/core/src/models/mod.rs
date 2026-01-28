@@ -31,7 +31,7 @@ use thiserror::Error;
 use crate::config::ModelConfig;
 use crate::engine::{DecodeSequenceMetadata, ModelForward};
 use crate::kv_cache::{
-    BlockTable, CacheConfig, CacheError, KVCacheManager, KVCacheDtype, MLACacheConfig,
+    BlockTable, CacheConfig, CacheError, KVCacheDtype, KVCacheManager, MLACacheConfig,
 };
 use crate::lora::{LoraContext, LoraModel};
 use crate::quantization::{
