@@ -29,6 +29,7 @@
 
 mod backend;
 pub mod flash;
+pub mod flashinfer;
 pub mod naive;
 mod ops;
 
@@ -40,6 +41,7 @@ pub use ops::{apply_per_head_norm, repeat_kv};
 
 // Re-export backend implementations
 pub use flash::FlashAttentionBackend;
+pub use flashinfer::FlashInferBackend;
 pub use naive::NaiveAttentionBackend;
 
 use candle_core::{Result, Tensor};

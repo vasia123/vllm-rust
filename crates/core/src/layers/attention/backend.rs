@@ -114,13 +114,23 @@ pub trait AttentionBackend: Send + Sync {
 }
 
 /// Select the best available attention backend.
+///
+/// Priority order:
+/// 1. FlashInfer (best for paged attention decode)
+/// 2. FlashAttention (good for prefill)
+/// 3. Naive (fallback)
 pub fn select_backend() -> Box<dyn AttentionBackend> {
-    #[cfg(feature = "flash-attn")]
+    #[cfg(feature = "flashinfer")]
+    {
+        Box::new(super::flashinfer::FlashInferBackend::new())
+    }
+
+    #[cfg(all(feature = "flash-attn", not(feature = "flashinfer")))]
     {
         Box::new(super::flash::FlashAttentionBackend::new())
     }
 
-    #[cfg(not(feature = "flash-attn"))]
+    #[cfg(not(any(feature = "flash-attn", feature = "flashinfer")))]
     {
         Box::new(super::naive::NaiveAttentionBackend::new())
     }

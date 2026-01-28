@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 test-utils = []
 flash-attn = ["dep:candle-flash-attn"]
+flashinfer = ["dep:flashinfer-rs"]
 cuda-kernels = []
 
 [dependencies]
@@ -22,6 +23,7 @@ minijinja.workspace = true
 minijinja-contrib.workspace = true
 ahash.workspace = true
 candle-flash-attn = { workspace = true, optional = true }
+flashinfer-rs = { git = "https://github.com/vasia123/flashinfer-rs", optional = true }
 half.workspace = true
 rand.workspace = true
 libloading.workspace = true
