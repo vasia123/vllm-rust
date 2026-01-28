@@ -25,12 +25,16 @@ pub struct HermesToolParser;
 
 // Regex to match tool_call tags and capture JSON content
 // Uses (?s) to make . match newlines, captures all content between tags
-static TOOL_CALL_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap());
+static TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>")
+        .expect("TOOL_CALL_REGEX pattern is invalid - this is a build-time error")
+});
 
 // Regex to match any tool_call content (including malformed)
-static TOOL_CALL_TAG_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<tool_call>[\s\S]*?</tool_call>").unwrap());
+static TOOL_CALL_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<tool_call>[\s\S]*?</tool_call>")
+        .expect("TOOL_CALL_TAG_REGEX pattern is invalid - this is a build-time error")
+});
 
 /// Internal representation of parsed Hermes tool call.
 #[derive(Debug, serde::Deserialize)]

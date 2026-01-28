@@ -209,6 +209,17 @@ impl GptqLinear {
         group_size: i64,
         device: &Device,
     ) -> Result<Self> {
+        // Validate inputs
+        if in_features == 0 {
+            candle_core::bail!("in_features must be non-zero");
+        }
+        if out_features == 0 {
+            candle_core::bail!("out_features must be non-zero");
+        }
+        if bits != 4 && bits != 8 {
+            candle_core::bail!("GPTQ only supports 4-bit or 8-bit quantization, got {bits}");
+        }
+
         // Calculate packed dimensions
         let pack_factor = 32 / bits as usize;
         let packed_in = in_features.div_ceil(pack_factor);
@@ -431,6 +442,27 @@ mod tests {
         assert_eq!(linear.in_features(), 4096);
         assert_eq!(linear.out_features(), 4096);
         assert!(!linear.has_bias());
+    }
+
+    #[test]
+    fn test_gptq_linear_validation_zero_in_features() {
+        let result = GptqLinear::new(0, 128, false, 4, 128, &Device::Cpu);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("in_features"));
+    }
+
+    #[test]
+    fn test_gptq_linear_validation_zero_out_features() {
+        let result = GptqLinear::new(64, 0, false, 4, 128, &Device::Cpu);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out_features"));
+    }
+
+    #[test]
+    fn test_gptq_linear_validation_invalid_bits() {
+        let result = GptqLinear::new(64, 128, false, 2, 128, &Device::Cpu);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("4-bit or 8-bit"));
     }
 
     #[test]

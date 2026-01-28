@@ -42,6 +42,8 @@ pub enum CacheVariant {
 
 impl CacheVariant {
     /// Get as standard cache engine, panics if MLA.
+    ///
+    /// For a non-panicking alternative, use [`try_as_standard`](Self::try_as_standard).
     pub fn as_standard(&self) -> &CacheEngine {
         match self {
             CacheVariant::Standard(e) => e,
@@ -50,6 +52,8 @@ impl CacheVariant {
     }
 
     /// Get as standard cache engine (mutable), panics if MLA.
+    ///
+    /// For a non-panicking alternative, use [`try_as_standard_mut`](Self::try_as_standard_mut).
     pub fn as_standard_mut(&mut self) -> &mut CacheEngine {
         match self {
             CacheVariant::Standard(e) => e,
@@ -58,6 +62,8 @@ impl CacheVariant {
     }
 
     /// Get as MLA cache engine, panics if Standard.
+    ///
+    /// For a non-panicking alternative, use [`try_as_mla`](Self::try_as_mla).
     pub fn as_mla(&self) -> &MLACacheEngine {
         match self {
             CacheVariant::MLA(e) => e,
@@ -66,10 +72,56 @@ impl CacheVariant {
     }
 
     /// Get as MLA cache engine (mutable), panics if Standard.
+    ///
+    /// For a non-panicking alternative, use [`try_as_mla_mut`](Self::try_as_mla_mut).
     pub fn as_mla_mut(&mut self) -> &mut MLACacheEngine {
         match self {
             CacheVariant::MLA(e) => e,
             CacheVariant::Standard(_) => panic!("Expected MLA cache, got Standard"),
+        }
+    }
+
+    /// Try to get as standard cache engine, returns error if MLA.
+    pub fn try_as_standard(&self) -> Result<&CacheEngine, CacheError> {
+        match self {
+            CacheVariant::Standard(e) => Ok(e),
+            CacheVariant::MLA(_) => Err(CacheError::CacheTypeMismatch {
+                expected: "Standard",
+                found: "MLA",
+            }),
+        }
+    }
+
+    /// Try to get as standard cache engine (mutable), returns error if MLA.
+    pub fn try_as_standard_mut(&mut self) -> Result<&mut CacheEngine, CacheError> {
+        match self {
+            CacheVariant::Standard(e) => Ok(e),
+            CacheVariant::MLA(_) => Err(CacheError::CacheTypeMismatch {
+                expected: "Standard",
+                found: "MLA",
+            }),
+        }
+    }
+
+    /// Try to get as MLA cache engine, returns error if Standard.
+    pub fn try_as_mla(&self) -> Result<&MLACacheEngine, CacheError> {
+        match self {
+            CacheVariant::MLA(e) => Ok(e),
+            CacheVariant::Standard(_) => Err(CacheError::CacheTypeMismatch {
+                expected: "MLA",
+                found: "Standard",
+            }),
+        }
+    }
+
+    /// Try to get as MLA cache engine (mutable), returns error if Standard.
+    pub fn try_as_mla_mut(&mut self) -> Result<&mut MLACacheEngine, CacheError> {
+        match self {
+            CacheVariant::MLA(e) => Ok(e),
+            CacheVariant::Standard(_) => Err(CacheError::CacheTypeMismatch {
+                expected: "MLA",
+                found: "Standard",
+            }),
         }
     }
 
@@ -212,10 +264,7 @@ impl KVCacheManager {
 
     /// Check if this manager uses MLA compressed cache.
     pub fn is_mla(&self) -> bool {
-        self.engines
-            .first()
-            .map(|e| e.is_mla())
-            .unwrap_or(false)
+        self.engines.first().map(|e| e.is_mla()).unwrap_or(false)
     }
 
     pub fn block_size(&self) -> usize {
@@ -822,14 +871,14 @@ mod tests {
 
     fn test_mla_config() -> MLACacheConfig {
         MLACacheConfig::new(
-            32,  // kv_lora_rank
-            8,   // qk_rope_head_dim
-            16,  // qk_nope_head_dim
-            16,  // v_head_dim
-            4,   // num_heads
-            4,   // block_size
-            16,  // num_blocks
-            2,   // num_layers
+            32, // kv_lora_rank
+            8,  // qk_rope_head_dim
+            16, // qk_nope_head_dim
+            16, // v_head_dim
+            4,  // num_heads
+            4,  // block_size
+            16, // num_blocks
+            2,  // num_layers
             DType::F32,
             Device::Cpu,
         )
@@ -870,6 +919,60 @@ mod tests {
     fn cache_variant_as_mla_panics_on_standard() {
         let variant = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
         let _ = variant.as_mla();
+    }
+
+    #[test]
+    fn cache_variant_try_as_standard_ok() {
+        let variant = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
+        assert!(variant.try_as_standard().is_ok());
+    }
+
+    #[test]
+    fn cache_variant_try_as_standard_err() {
+        let variant = CacheVariant::MLA(MLACacheEngine::new(&test_mla_config()).unwrap());
+        let result = variant.try_as_standard();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(
+            err,
+            CacheError::CacheTypeMismatch {
+                expected: "Standard",
+                found: "MLA"
+            }
+        ));
+    }
+
+    #[test]
+    fn cache_variant_try_as_mla_ok() {
+        let variant = CacheVariant::MLA(MLACacheEngine::new(&test_mla_config()).unwrap());
+        assert!(variant.try_as_mla().is_ok());
+    }
+
+    #[test]
+    fn cache_variant_try_as_mla_err() {
+        let variant = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
+        let result = variant.try_as_mla();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(matches!(
+            err,
+            CacheError::CacheTypeMismatch {
+                expected: "MLA",
+                found: "Standard"
+            }
+        ));
+    }
+
+    #[test]
+    fn cache_variant_try_as_standard_mut_ok() {
+        let mut variant = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
+        assert!(variant.try_as_standard_mut().is_ok());
+    }
+
+    #[test]
+    fn cache_variant_try_as_mla_mut_ok() {
+        let mut variant = CacheVariant::MLA(MLACacheEngine::new(&test_mla_config()).unwrap());
+        assert!(variant.try_as_mla_mut().is_ok());
     }
 
     #[test]
@@ -945,9 +1048,7 @@ mod tests {
         let k_pe = Tensor::randn(0f32, 1f32, (2, 8), &Device::Cpu).unwrap();
 
         // Write to MLA cache
-        mgr.mla_engine_mut(0)
-            .write(&kv_c, &k_pe, &[0, 1])
-            .unwrap();
+        mgr.mla_engine_mut(0).write(&kv_c, &k_pe, &[0, 1]).unwrap();
 
         // Read back raw
         let (kv_c_out, k_pe_out) = mgr.mla_engine(0).read_raw(&[0], 2).unwrap();

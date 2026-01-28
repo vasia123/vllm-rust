@@ -193,6 +193,14 @@ impl Fp8Linear {
         activation_scheme: ActivationScheme,
         device: &Device,
     ) -> Result<Self> {
+        // Validate inputs
+        if in_features == 0 {
+            candle_core::bail!("in_features must be non-zero");
+        }
+        if out_features == 0 {
+            candle_core::bail!("out_features must be non-zero");
+        }
+
         // Initialize with BF16 zeros (actual FP8 weights loaded later)
         let weight = Tensor::zeros((out_features, in_features), DType::BF16, device)?;
         let bias = if has_bias {
@@ -373,6 +381,20 @@ mod tests {
         assert_eq!(linear.in_features(), 64);
         assert_eq!(linear.out_features(), 128);
         assert!(linear.has_bias());
+    }
+
+    #[test]
+    fn test_fp8_linear_validation_zero_in_features() {
+        let result = Fp8Linear::new(0, 128, false, ActivationScheme::Dynamic, &Device::Cpu);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("in_features"));
+    }
+
+    #[test]
+    fn test_fp8_linear_validation_zero_out_features() {
+        let result = Fp8Linear::new(64, 0, false, ActivationScheme::Dynamic, &Device::Cpu);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out_features"));
     }
 
     #[test]

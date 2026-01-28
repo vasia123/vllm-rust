@@ -8,6 +8,12 @@ pub enum CacheError {
     #[error("block {block_id} is not allocated")]
     BlockNotAllocated { block_id: usize },
 
+    #[error("cache type mismatch: expected {expected}, found {found}")]
+    CacheTypeMismatch {
+        expected: &'static str,
+        found: &'static str,
+    },
+
     #[error("candle error: {0}")]
     Candle(#[from] candle_core::Error),
 }
@@ -29,5 +35,17 @@ mod tests {
     fn error_display_block_not_allocated() {
         let e = CacheError::BlockNotAllocated { block_id: 42 };
         assert_eq!(e.to_string(), "block 42 is not allocated");
+    }
+
+    #[test]
+    fn error_display_cache_type_mismatch() {
+        let e = CacheError::CacheTypeMismatch {
+            expected: "Standard",
+            found: "MLA",
+        };
+        assert_eq!(
+            e.to_string(),
+            "cache type mismatch: expected Standard, found MLA"
+        );
     }
 }

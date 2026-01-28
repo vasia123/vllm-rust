@@ -109,7 +109,11 @@ impl ColumnParallelLinear {
     pub fn forward(&self, input: &Tensor, comm: &dyn DeviceCommunicator) -> Result<Tensor> {
         // Handle N-dimensional input by flattening to 2D for matmul
         let input_dims = input.dims();
-        let in_features = *input_dims.last().unwrap();
+        let in_features = *input_dims.last().ok_or_else(|| {
+            super::error::DistributedError::TensorError(candle_core::Error::Msg(
+                "Tensor must have at least 1 dimension".to_string(),
+            ))
+        })?;
         let batch_size: usize = input_dims.iter().rev().skip(1).product();
 
         // Flatten: [..., in_features] -> [batch, in_features]
@@ -240,7 +244,11 @@ impl RowParallelLinear {
 
         // Handle N-dimensional input by flattening to 2D for matmul
         let input_dims = input.dims();
-        let in_features = *input_dims.last().unwrap();
+        let in_features = *input_dims.last().ok_or_else(|| {
+            super::error::DistributedError::TensorError(candle_core::Error::Msg(
+                "Tensor must have at least 1 dimension".to_string(),
+            ))
+        })?;
         let batch_size: usize = input_dims.iter().rev().skip(1).product();
 
         // Flatten: [..., in_features] -> [batch, in_features]
