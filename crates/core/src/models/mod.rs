@@ -1,3 +1,4 @@
+pub mod deepseek;
 pub mod gemma;
 pub mod gemma2;
 pub mod llama;
@@ -9,6 +10,7 @@ pub mod qwen3;
 pub mod qwen3_lora;
 pub mod qwen3_quantized;
 
+pub use deepseek::DeepSeekForCausalLM;
 pub use gemma::GemmaForCausalLM;
 pub use gemma2::Gemma2ForCausalLM;
 pub use llama::LlamaForCausalLM;
@@ -50,6 +52,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         .first()
         .ok_or_else(|| ModelError::UnsupportedArchitecture("empty architectures list".into()))?;
     match arch.as_str() {
+        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
+            Ok(Box::new(DeepSeekForCausalLM::new(cfg, vb)?))
+        }
         "GemmaForCausalLM" => Ok(Box::new(GemmaForCausalLM::new(cfg, vb)?)),
         "Gemma2ForCausalLM" => Ok(Box::new(Gemma2ForCausalLM::new(cfg, vb)?)),
         "LlamaForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
@@ -119,8 +124,9 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        // Gemma, Mistral, Mixtral: fallback to non-quantized (quantized variant not yet implemented)
-        "GemmaForCausalLM" | "Gemma2ForCausalLM" | "MistralForCausalLM" | "MixtralForCausalLM" => {
+        // Gemma, Mistral, Mixtral, DeepSeek: fallback to non-quantized (quantized variant not yet implemented)
+        "GemmaForCausalLM" | "Gemma2ForCausalLM" | "MistralForCausalLM" | "MixtralForCausalLM"
+        | "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
             from_config(cfg, vb)
         }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
