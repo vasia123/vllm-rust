@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+use crate::multimodal::ContentPart;
+
 pub struct TokenizerWrapper {
     inner: Tokenizer,
 }
@@ -49,10 +51,111 @@ impl TokenizerWrapper {
 
 // ─── Chat Template ────────────────────────────────────────────────────────
 
+/// Message content that can be either text or multimodal (text + images).
+///
+/// This type supports the OpenAI API format where content can be:
+/// - A simple string: `"content": "Hello"`
+/// - An array of content parts: `"content": [{"type": "text", "text": "Hello"}, {"type": "image_url", ...}]`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// Simple text content (most common case).
+    Text(String),
+    /// Array of content parts for multimodal messages.
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Get the text content, joining all text parts if multimodal.
+    pub fn as_text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        }
+    }
+
+    /// Check if this content has any images.
+    pub fn has_images(&self) -> bool {
+        match self {
+            MessageContent::Text(_) => false,
+            MessageContent::Parts(parts) => parts.iter().any(|p| matches!(p, ContentPart::Image { .. })),
+        }
+    }
+
+    /// Get all image URLs from this content.
+    pub fn image_urls(&self) -> Vec<&str> {
+        match self {
+            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Image { image_url } => Some(image_url.url.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Convert to content parts (wraps string in a Text part).
+    pub fn into_parts(self) -> Vec<ContentPart> {
+        match self {
+            MessageContent::Text(s) => vec![ContentPart::text(s)],
+            MessageContent::Parts(parts) => parts,
+        }
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        MessageContent::Text(s)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        MessageContent::Text(s.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
+}
+
+impl ChatMessage {
+    /// Create a new text-only chat message.
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: MessageContent::Text(content.into()),
+        }
+    }
+
+    /// Create a new multimodal chat message.
+    pub fn multimodal(role: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: role.into(),
+            content: MessageContent::Parts(parts),
+        }
+    }
+
+    /// Get the text content of this message.
+    pub fn text(&self) -> String {
+        self.content.as_text()
+    }
+
+    /// Check if this message has images.
+    pub fn has_images(&self) -> bool {
+        self.content.has_images()
+    }
 }
 
 pub struct ChatTemplateEngine {
@@ -204,10 +307,7 @@ mod tests {
             "<|begin|>".to_string(),
             "<|end|>".to_string(),
         );
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "Hello")];
         let result = engine.apply(&messages, true).unwrap();
         assert!(result.contains("<|im_start|>user\nHello<|im_end|>"));
         assert!(result.contains("<|im_start|>assistant\n"));
@@ -218,18 +318,9 @@ mod tests {
         let engine =
             ChatTemplateEngine::new(CHATML_TEMPLATE.to_string(), "".to_string(), "".to_string());
         let messages = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "What is 2+2?".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "4".to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "And 3+3?".to_string(),
-            },
+            ChatMessage::new("user", "What is 2+2?"),
+            ChatMessage::new("assistant", "4"),
+            ChatMessage::new("user", "And 3+3?"),
         ];
         let result = engine.apply(&messages, true).unwrap();
         assert!(result.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>"));
@@ -242,10 +333,7 @@ mod tests {
     fn chat_template_no_generation_prompt() {
         let engine =
             ChatTemplateEngine::new(CHATML_TEMPLATE.to_string(), "".to_string(), "".to_string());
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hi".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "Hi")];
         let result = engine.apply(&messages, false).unwrap();
         assert!(!result.contains("<|im_start|>assistant"));
     }
@@ -256,10 +344,7 @@ mod tests {
 {% endfor %}{{ eos_token }}"#;
         let engine =
             ChatTemplateEngine::new(template.to_string(), "<s>".to_string(), "</s>".to_string());
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Test".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "Test")];
         let result = engine.apply(&messages, false).unwrap();
         assert!(result.starts_with("<s>"));
         assert!(result.ends_with("</s>"));
@@ -278,10 +363,7 @@ mod tests {
         std::fs::write(&path, config_json).unwrap();
 
         let engine = ChatTemplateEngine::from_tokenizer_config(&path).unwrap();
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "Hello")];
         let result = engine.apply(&messages, false).unwrap();
         assert!(result.contains("user: Hello"));
 
@@ -301,10 +383,7 @@ mod tests {
         std::fs::write(&path, config_json).unwrap();
 
         let engine = ChatTemplateEngine::from_tokenizer_config(&path).unwrap();
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hi".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "Hi")];
         let result = engine.apply(&messages, false).unwrap();
         assert!(result.starts_with("<bos>"));
 
@@ -321,12 +400,59 @@ mod tests {
         let engine =
             ChatTemplateEngine::from_tokenizer_config(&config_path).expect("load template");
 
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello!".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "Hello!")];
         let result = engine.apply(&messages, true).unwrap();
         assert!(!result.is_empty());
         assert!(result.contains("Hello!"));
+    }
+
+    #[test]
+    fn test_message_content_text() {
+        let content = MessageContent::Text("Hello".to_string());
+        assert_eq!(content.as_text(), "Hello");
+        assert!(!content.has_images());
+    }
+
+    #[test]
+    fn test_message_content_multimodal() {
+        let content = MessageContent::Parts(vec![
+            ContentPart::text("What is in this image?"),
+            ContentPart::image_url("https://example.com/img.jpg"),
+        ]);
+        assert_eq!(content.as_text(), "What is in this image?");
+        assert!(content.has_images());
+        assert_eq!(content.image_urls(), vec!["https://example.com/img.jpg"]);
+    }
+
+    #[test]
+    fn test_chat_message_new() {
+        let msg = ChatMessage::new("user", "Hello");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.text(), "Hello");
+        assert!(!msg.has_images());
+    }
+
+    #[test]
+    fn test_chat_message_multimodal() {
+        let msg = ChatMessage::multimodal("user", vec![
+            ContentPart::text("Describe this:"),
+            ContentPart::image_url("https://example.com/img.jpg"),
+        ]);
+        assert_eq!(msg.role, "user");
+        assert!(msg.has_images());
+    }
+
+    #[test]
+    fn test_message_content_deserialization() {
+        // Text-only (string)
+        let json = r#"{"role": "user", "content": "Hello"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.text(), "Hello");
+
+        // Multimodal (array)
+        let json = r#"{"role": "user", "content": [{"type": "text", "text": "Hi"}, {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}]}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.text(), "Hi");
+        assert!(msg.has_images());
     }
 }

@@ -52,5 +52,6 @@ Production-grade. Every line, every commit, every decision — as if it ships to
 - Run `cargo check` after every edit
 - Run `cargo test` before declaring done
 - No stubs. Either complete the implementation or document the gap with a detailed TODO.
-- Mark all workarounds with TODO explaining the proper solution.
+- Workarounds require TODO with explanation of the proper fix.
+- Use NOTE for non-obvious decisions or important context that isn't actionable.
 - Think before generating. Less code that works > more code that might.
