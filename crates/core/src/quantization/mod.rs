@@ -3,7 +3,8 @@
 //! This module provides support for various quantization methods:
 //! - **FP8**: 8-bit floating point (Hopper GPUs)
 //! - **GPTQ**: INT4/INT8 with grouping (Marlin kernels)
-//! - **AWQ**: Activation-aware weight quantization (future)
+//! - **AWQ**: Activation-aware weight quantization
+//! - **GGUF**: GGML universal format (llama.cpp compatible)
 //!
 //! # Architecture
 //!
@@ -29,9 +30,13 @@ mod detection;
 pub mod fp8;
 #[cfg(feature = "cuda-kernels")]
 pub mod fp8_cuda;
+pub mod gguf;
 pub mod gptq;
 #[cfg(feature = "cuda-kernels")]
 pub mod gptq_cuda;
+pub mod marlin;
+#[cfg(feature = "marlin")]
+pub mod marlin_cuda;
 pub mod weight_loader;
 
 // Re-export public types
@@ -44,9 +49,21 @@ pub use detection::{detect_from_directory, detect_from_json, DetectedQuantConfig
 pub use fp8::Fp8Config;
 #[cfg(feature = "cuda-kernels")]
 pub use fp8_cuda::{fp8_dequantize, fp8_gemm, fp8_quantize_dynamic_per_token, fp8_quantize_static};
+pub use gguf::{
+    dequantize as gguf_dequantize, GgmlType, GgufConfig, GgufFile, GgufLinear, GgufMetadata,
+    GgufTensorInfo, GgufValue, GgufWeightLoader,
+};
 pub use gptq::GptqConfig;
 #[cfg(feature = "cuda-kernels")]
 pub use gptq_cuda::{gptq_dequantize, gptq_gemm};
+pub use marlin::{
+    check_marlin_supported, check_marlin_supports_shape, marlin_make_workspace,
+    marlin_permute_scales, repack_gptq_to_marlin, MarlinConfig, MarlinLinear, MarlinScalarType,
+    GPTQ_MARLIN_MIN_THREAD_K, GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_TILE,
+    MARLIN_SUPPORTED_GROUP_SIZES,
+};
+#[cfg(feature = "marlin")]
+pub use marlin_cuda::marlin_gemm;
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
     AwqWeightLoader, Fp8WeightLoader, GptqWeightLoader, QuantizedWeightLoader,
@@ -80,6 +97,21 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             detected.group_size,
             &detected.raw_config,
         )),
+        QuantizationMethod::Gguf => Box::new(GgufConfig::default()),
+        QuantizationMethod::Marlin => {
+            let is_sym = detected
+                .raw_config
+                .get("sym")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            Box::new(MarlinConfig::from_detected(
+                detected.bits,
+                detected.group_size,
+                detected.desc_act,
+                Some(is_sym),
+                &detected.raw_config,
+            ))
+        }
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -186,5 +218,29 @@ mod tests {
 
         assert_eq!(linear.in_features(), 64);
         assert_eq!(linear.out_features(), 128);
+    }
+
+    #[test]
+    fn test_create_config_gguf() {
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::Gguf,
+            bits: None,
+            group_size: None,
+            desc_act: None,
+            activation_scheme: None,
+            raw_config: Default::default(),
+        };
+
+        let config = create_config(&detected);
+        assert_eq!(config.method(), QuantizationMethod::Gguf);
+        assert_eq!(config.min_capability(), 0); // CPU supported
+    }
+
+    #[test]
+    fn test_is_supported_gguf() {
+        // GGUF works on any device including CPU
+        assert!(is_supported(0, QuantizationMethod::Gguf));
+        assert!(is_supported(70, QuantizationMethod::Gguf));
+        assert!(is_supported(90, QuantizationMethod::Gguf));
     }
 }

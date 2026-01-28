@@ -1,9 +1,18 @@
 //! MoE Router implementation.
 //!
 //! Routes tokens to experts using top-k selection with softmax normalization.
+//!
+//! ## CUDA Acceleration
+//!
+//! When the `cuda-moe` feature is enabled, the router uses a fused CUDA kernel
+//! that combines softmax and top-k selection in a single pass for improved
+//! performance. See [`crate::moe::topk_softmax`] for details.
 
 use candle_core::{Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
+
+#[cfg(feature = "cuda-moe")]
+use super::topk_softmax::{topk_softmax, TopKSoftmaxConfig};
 
 /// Configuration for the MoE router.
 #[derive(Debug, Clone)]
@@ -63,21 +72,33 @@ impl MoERouter for TopKRouter {
         // Compute router logits: [num_tokens, num_experts]
         let router_logits = self.gate.forward(hidden_states)?;
 
-        // Apply softmax to get routing probabilities
-        let routing_probs = candle_nn::ops::softmax(&router_logits, candle_core::D::Minus1)?;
+        // Use fused CUDA kernel when available
+        #[cfg(feature = "cuda-moe")]
+        {
+            let config = TopKSoftmaxConfig::new(self.config.top_k, self.config.renormalize);
+            return topk_softmax(&router_logits, &config);
+        }
 
-        // Get top-k experts and their weights
-        let (top_k_weights, top_k_indices) = top_k_with_indices(&routing_probs, self.config.top_k)?;
+        // CPU fallback path
+        #[cfg(not(feature = "cuda-moe"))]
+        {
+            // Apply softmax to get routing probabilities
+            let routing_probs = candle_nn::ops::softmax(&router_logits, candle_core::D::Minus1)?;
 
-        // Optionally renormalize weights so they sum to 1
-        let final_weights = if self.config.renormalize {
-            let sum = top_k_weights.sum_keepdim(candle_core::D::Minus1)?;
-            top_k_weights.broadcast_div(&sum)?
-        } else {
-            top_k_weights
-        };
+            // Get top-k experts and their weights
+            let (top_k_weights, top_k_indices) =
+                top_k_with_indices(&routing_probs, self.config.top_k)?;
 
-        Ok((final_weights, top_k_indices))
+            // Optionally renormalize weights so they sum to 1
+            let final_weights = if self.config.renormalize {
+                let sum = top_k_weights.sum_keepdim(candle_core::D::Minus1)?;
+                top_k_weights.broadcast_div(&sum)?
+            } else {
+                top_k_weights
+            };
+
+            Ok((final_weights, top_k_indices))
+        }
     }
 
     fn num_experts(&self) -> usize {

@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod mla_cache_config;
 pub mod mla_cache_engine;
 pub mod prefix_cache;
+pub mod prefix_cache_stats;
 pub mod quantization;
 
 pub use block_metrics::{BlockEvictionEvent, BlockMetricsCollector, BlockMetricsState};
@@ -21,6 +22,11 @@ pub use free_block_queue::FreeBlockQueue;
 pub use metrics::{KVCacheMetrics, MetricsSnapshot};
 pub use mla_cache_config::{MLACacheConfig, MLADims};
 pub use mla_cache_engine::MLACacheEngine;
+pub use prefix_cache_stats::{
+    export_prometheus_metrics, format_prometheus_output, PrefixCacheStats,
+    PrefixCacheStatsSnapshot, PrometheusMetric, PrometheusMetricType, SlidingWindowMetrics,
+    SlidingWindowSnapshot,
+};
 pub use quantization::{
     dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype, KVScales,
 };

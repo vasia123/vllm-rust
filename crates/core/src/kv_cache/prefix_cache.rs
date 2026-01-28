@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use super::block_pool::BlockId;
 use super::metrics::KVCacheMetrics;
+use super::prefix_cache_stats::{
+    PrefixCacheStats, PrefixCacheStatsSnapshot, SlidingWindowMetrics, SlidingWindowSnapshot,
+};
 
 /// Hash-based prefix cache for KV cache block reuse.
 ///
@@ -17,8 +20,14 @@ pub struct PrefixCache {
     cache: HashMap<u64, CachedBlock>,
     /// Monotonic access counter for LRU eviction
     access_counter: u64,
-    /// Optional metrics tracking
+    /// Optional metrics tracking (legacy KVCacheMetrics)
     metrics: Option<Arc<KVCacheMetrics>>,
+    /// Detailed prefix cache statistics
+    stats: Arc<PrefixCacheStats>,
+    /// Sliding window metrics for recent hit rate
+    sliding_window: SlidingWindowMetrics,
+    /// Whether cache was reset (for sliding window signaling)
+    was_reset: bool,
 }
 
 struct CachedBlock {
@@ -28,23 +37,68 @@ struct CachedBlock {
 }
 
 impl PrefixCache {
+    /// Default sliding window size for recent metrics (number of requests).
+    pub const DEFAULT_WINDOW_SIZE: u64 = 1000;
+
     pub fn new(block_size: usize) -> Self {
         Self {
             block_size,
             cache: HashMap::new(),
             access_counter: 0,
             metrics: None,
+            stats: Arc::new(PrefixCacheStats::new()),
+            sliding_window: SlidingWindowMetrics::new(Self::DEFAULT_WINDOW_SIZE),
+            was_reset: false,
         }
     }
 
-    /// Create a PrefixCache with metrics tracking enabled.
+    /// Create a PrefixCache with legacy KVCacheMetrics tracking enabled.
     pub fn with_metrics(block_size: usize, metrics: Arc<KVCacheMetrics>) -> Self {
         Self {
             block_size,
             cache: HashMap::new(),
             access_counter: 0,
             metrics: Some(metrics),
+            stats: Arc::new(PrefixCacheStats::new()),
+            sliding_window: SlidingWindowMetrics::new(Self::DEFAULT_WINDOW_SIZE),
+            was_reset: false,
         }
+    }
+
+    /// Create a PrefixCache with custom sliding window size.
+    pub fn with_window_size(block_size: usize, window_size: u64) -> Self {
+        Self {
+            block_size,
+            cache: HashMap::new(),
+            access_counter: 0,
+            metrics: None,
+            stats: Arc::new(PrefixCacheStats::new()),
+            sliding_window: SlidingWindowMetrics::new(window_size),
+            was_reset: false,
+        }
+    }
+
+    /// Create a PrefixCache with all options.
+    pub fn with_all_options(
+        block_size: usize,
+        metrics: Option<Arc<KVCacheMetrics>>,
+        stats: Arc<PrefixCacheStats>,
+        window_size: u64,
+    ) -> Self {
+        Self {
+            block_size,
+            cache: HashMap::new(),
+            access_counter: 0,
+            metrics,
+            stats,
+            sliding_window: SlidingWindowMetrics::new(window_size),
+            was_reset: false,
+        }
+    }
+
+    /// Get the underlying stats instance (for sharing across components).
+    pub fn stats(&self) -> &Arc<PrefixCacheStats> {
+        &self.stats
     }
 
     /// Match prefix blocks for a given prompt.
@@ -69,15 +123,34 @@ impl PrefixCache {
         }
 
         // Record metrics: hits = matched blocks, misses = total needed - matched
+        let total_full_blocks = hashes.len();
+        let block_hits = matched_blocks.len();
+        let block_misses = total_full_blocks.saturating_sub(block_hits);
+        let num_cached = block_hits * self.block_size;
+        let tokens_queried = prompt_tokens.len();
+
+        // Record to legacy KVCacheMetrics
         if let Some(ref m) = self.metrics {
-            let total_full_blocks = hashes.len();
-            let hits = matched_blocks.len();
-            let misses = total_full_blocks.saturating_sub(hits);
-            m.record_cache_query(hits, misses);
+            m.record_cache_query(block_hits, block_misses);
         }
 
-        let num_cached = matched_blocks.len() * self.block_size;
+        // Record to detailed PrefixCacheStats
+        self.stats
+            .record_query(block_hits, block_misses, tokens_queried, num_cached);
+
         (matched_blocks, num_cached)
+    }
+
+    /// Record a request observation for sliding window metrics.
+    ///
+    /// This should be called once per request after match_prefix, providing
+    /// the number of tokens queried and hit for that request. This enables
+    /// the sliding window to track per-request hit rates.
+    pub fn record_request(&mut self, tokens_queried: usize, tokens_hit: usize) {
+        let reset = self.was_reset;
+        self.was_reset = false;
+        self.sliding_window
+            .observe(1, tokens_queried as u64, tokens_hit as u64, reset);
     }
 
     /// Register blocks from a completed prefill into the cache.
@@ -159,8 +232,10 @@ impl PrefixCache {
             evicted.push(block_id);
         }
 
-        // Note: eviction metrics are recorded by the caller (KVCacheManager)
-        // to avoid double-counting when the manager coordinates eviction.
+        // Record eviction in internal stats
+        // Note: legacy KVCacheMetrics eviction is still recorded by the caller
+        // (KVCacheManager) to avoid double-counting when manager coordinates.
+        self.stats.record_eviction(evicted.len());
 
         evicted
     }
@@ -173,6 +248,76 @@ impl PrefixCache {
     /// Number of blocks with no active references (evictable).
     pub fn num_evictable_blocks(&self) -> usize {
         self.cache.values().filter(|e| e.ref_count == 0).count()
+    }
+
+    /// Get a snapshot of the detailed prefix cache statistics.
+    pub fn get_stats(&self) -> PrefixCacheStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    /// Get a snapshot of the sliding window (recent) metrics.
+    pub fn get_sliding_window_stats(&self) -> SlidingWindowSnapshot {
+        self.sliding_window.snapshot()
+    }
+
+    /// Get the current hit rate from lifetime statistics.
+    ///
+    /// Returns `None` if no queries have been made.
+    pub fn hit_rate(&self) -> Option<f64> {
+        self.stats.block_hit_rate()
+    }
+
+    /// Get the token hit rate from lifetime statistics.
+    ///
+    /// Returns `None` if no tokens have been queried.
+    pub fn token_hit_rate(&self) -> Option<f64> {
+        self.stats.token_hit_rate()
+    }
+
+    /// Get the recent hit rate from the sliding window.
+    ///
+    /// This provides a more responsive view of recent cache performance.
+    pub fn recent_hit_rate(&self) -> f64 {
+        self.sliding_window.hit_rate()
+    }
+
+    /// Reset all statistics (both lifetime and sliding window).
+    ///
+    /// This does NOT clear the cache itself, only the counters.
+    pub fn reset_stats(&mut self) {
+        self.stats.reset();
+        self.sliding_window.reset();
+        self.was_reset = true;
+    }
+
+    /// Clear the cache and reset all statistics.
+    ///
+    /// Returns the block IDs that were evicted (all cached blocks).
+    pub fn clear(&mut self) -> Vec<BlockId> {
+        let evicted: Vec<BlockId> = self.cache.values().map(|e| e.block_id).collect();
+        let num_evicted = evicted.len();
+
+        self.cache.clear();
+        self.access_counter = 0;
+
+        // Record eviction in stats
+        self.stats.record_eviction(num_evicted);
+        self.reset_stats();
+
+        evicted
+    }
+
+    /// Get the block size used by this cache.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// Estimate memory used by cached blocks in bytes.
+    ///
+    /// Note: This is an estimate based on block count and size. The actual
+    /// memory consumption depends on the KV cache tensor dimensions and dtype.
+    pub fn estimated_cached_bytes(&self, bytes_per_block: usize) -> usize {
+        self.cache.len() * bytes_per_block
     }
 }
 
@@ -488,5 +633,221 @@ mod tests {
         assert_eq!(blocks, vec![10]);
         let evicted = cache.evict(1);
         assert_eq!(evicted.len(), 0); // still referenced
+    }
+
+    // ─── PrefixCacheStats integration tests ────────────────────────────────────
+
+    #[test]
+    fn stats_track_queries() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register prefix
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+
+        // Query: 2 block hits, 8 tokens queried, 8 tokens hit
+        let (_, num_cached) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(num_cached, 8);
+
+        let stats = cache.get_stats();
+        assert_eq!(stats.num_hits, 2);
+        assert_eq!(stats.num_misses, 0);
+        assert_eq!(stats.tokens_queried, 8);
+        assert_eq!(stats.tokens_hit, 8);
+        assert_eq!(stats.block_hit_rate, Some(1.0));
+        assert_eq!(stats.token_hit_rate, Some(1.0));
+    }
+
+    #[test]
+    fn stats_track_partial_hit() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register only first block
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+
+        // Query 2 blocks (8 tokens): 1 hit, 1 miss, 4 tokens cached
+        cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let stats = cache.get_stats();
+        assert_eq!(stats.num_hits, 1);
+        assert_eq!(stats.num_misses, 1);
+        assert_eq!(stats.tokens_queried, 8);
+        assert_eq!(stats.tokens_hit, 4);
+
+        let block_rate = stats.block_hit_rate.unwrap();
+        assert!((block_rate - 0.5).abs() < 0.001);
+
+        let token_rate = stats.token_hit_rate.unwrap();
+        assert!((token_rate - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn stats_track_evictions() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register and release
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+
+        assert_eq!(cache.get_stats().num_evictions, 0);
+
+        // Evict
+        let evicted = cache.evict(1);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(cache.get_stats().num_evictions, 1);
+    }
+
+    #[test]
+    fn stats_hit_rate_methods() {
+        let mut cache = PrefixCache::new(4);
+
+        // No data yet
+        assert_eq!(cache.hit_rate(), None);
+        assert_eq!(cache.token_hit_rate(), None);
+
+        // Register and query
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+        cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        assert_eq!(cache.hit_rate(), Some(1.0));
+        assert_eq!(cache.token_hit_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn stats_reset() {
+        let mut cache = PrefixCache::new(4);
+
+        // Generate some stats
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        cache.match_prefix(&[1, 2, 3, 4]);
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+        cache.evict(1);
+
+        let stats = cache.get_stats();
+        assert!(stats.num_hits > 0 || stats.num_evictions > 0);
+
+        // Reset stats
+        cache.reset_stats();
+
+        let stats = cache.get_stats();
+        assert_eq!(stats.num_hits, 0);
+        assert_eq!(stats.num_misses, 0);
+        assert_eq!(stats.num_evictions, 0);
+        assert_eq!(stats.num_queries, 0);
+    }
+
+    #[test]
+    fn stats_clear_cache() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register blocks
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+        assert_eq!(cache.num_cached_blocks(), 2);
+
+        // Clear returns all block IDs
+        let evicted = cache.clear();
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(cache.num_cached_blocks(), 0);
+    }
+
+    // ─── Sliding window tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn sliding_window_tracks_requests() {
+        let mut cache = PrefixCache::with_window_size(4, 10);
+
+        // Register and match
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+        let (_, num_cached) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        cache.record_request(8, num_cached);
+
+        let sw = cache.get_sliding_window_stats();
+        assert_eq!(sw.num_requests, 1);
+        assert_eq!(sw.tokens_queried, 8);
+        assert_eq!(sw.tokens_hit, 8);
+        assert!((sw.hit_rate - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn sliding_window_recent_hit_rate() {
+        let mut cache = PrefixCache::with_window_size(4, 10);
+
+        // Register prefix
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+
+        // Request 1: full hit (4 tokens)
+        let (_, c1) = cache.match_prefix(&[1, 2, 3, 4]);
+        cache.record_request(4, c1);
+
+        // Request 2: partial hit (8 tokens, 4 hit)
+        let (_, c2) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        cache.record_request(8, c2);
+
+        // Recent hit rate: (4 + 4) / (4 + 8) = 8 / 12 = 0.666...
+        let rate = cache.recent_hit_rate();
+        assert!((rate - 0.6666).abs() < 0.01);
+    }
+
+    #[test]
+    fn sliding_window_reset_on_cache_reset() {
+        let mut cache = PrefixCache::with_window_size(4, 10);
+
+        // Generate some data
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        let (_, c) = cache.match_prefix(&[1, 2, 3, 4]);
+        cache.record_request(4, c);
+
+        let sw = cache.get_sliding_window_stats();
+        assert_eq!(sw.num_requests, 1);
+
+        // Reset stats (simulates cache reset)
+        cache.reset_stats();
+
+        // Record new request - should signal reset to sliding window
+        let (_, c) = cache.match_prefix(&[1, 2, 3, 4]);
+        cache.record_request(4, c);
+
+        let sw = cache.get_sliding_window_stats();
+        // Window should have been reset before new observation
+        assert_eq!(sw.num_requests, 1);
+    }
+
+    #[test]
+    fn block_size_accessor() {
+        let cache = PrefixCache::new(16);
+        assert_eq!(cache.block_size(), 16);
+    }
+
+    #[test]
+    fn estimated_cached_bytes() {
+        let mut cache = PrefixCache::new(4);
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+
+        // 2 blocks, 1024 bytes each
+        let bytes = cache.estimated_cached_bytes(1024);
+        assert_eq!(bytes, 2048);
+    }
+
+    #[test]
+    fn with_all_options() {
+        // PrefixCacheStats already imported at top of file via super::prefix_cache_stats
+        let shared_stats = Arc::new(PrefixCacheStats::new());
+        let metrics = Arc::new(KVCacheMetrics::new());
+
+        let mut cache = PrefixCache::with_all_options(
+            4,
+            Some(Arc::clone(&metrics)),
+            Arc::clone(&shared_stats),
+            500,
+        );
+
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        cache.match_prefix(&[1, 2, 3, 4]);
+
+        // Both metrics systems should track the query
+        assert_eq!(metrics.cache_hits(), 1);
+        assert_eq!(shared_stats.num_hits(), 1);
+
+        // Shared stats can be accessed externally
+        assert_eq!(cache.stats().num_hits(), 1);
     }
 }

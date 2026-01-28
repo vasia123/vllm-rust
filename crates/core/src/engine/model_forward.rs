@@ -4,6 +4,7 @@ use candle_core::{Device, Tensor};
 
 use crate::kv_cache::{BlockId, BlockTable, KVCacheManager};
 use crate::lora::LoraContext;
+use crate::multimodal::MultimodalInputs;
 
 use super::cuda_graph::ForwardContext;
 
@@ -132,6 +133,51 @@ pub trait ModelForward: Send + 'static {
     }
 
     fn device(&self) -> &Device;
+
+    /// Whether this model supports multimodal (image/video) inputs.
+    ///
+    /// Returns `true` if the model can process images along with text.
+    /// Multimodal-enabled models should override this and the
+    /// `forward_multimodal` method.
+    fn supports_multimodal(&self) -> bool {
+        false
+    }
+
+    /// Forward pass with multimodal inputs (images/video).
+    ///
+    /// For models that support multimodal inputs (like LLaVA), this method
+    /// processes image embeddings and merges them with text embeddings at
+    /// the appropriate positions.
+    ///
+    /// For models that don't support multimodal, this delegates to the
+    /// standard forward pass and ignores the multimodal inputs.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Text token IDs [batch, seq_len]
+    /// * `multimodal_inputs` - Optional multimodal data (images, positions)
+    /// * `seqlen_offset` - Position offset for RoPE
+    /// * `kv_cache_mgr` - KV cache manager
+    /// * `block_table` - Block table for paged attention
+    /// * `slot_mapping` - Slot mapping for cache
+    #[allow(unused_variables)]
+    fn forward_multimodal(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        // Default: ignore multimodal inputs and use base forward
+        self.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
 }
 
 impl ModelForward for Box<dyn ModelForward> {
@@ -210,5 +256,28 @@ impl ModelForward for Box<dyn ModelForward> {
 
     fn device(&self) -> &Device {
         (**self).device()
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        (**self).supports_multimodal()
+    }
+
+    fn forward_multimodal(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_multimodal(
+            input_ids,
+            multimodal_inputs,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 }

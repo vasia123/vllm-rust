@@ -7,6 +7,8 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/gptq_dequant.cu");
     println!("cargo:rerun-if-changed=kernels/fused_moe_align.cu");
     println!("cargo:rerun-if-changed=kernels/fused_moe_gemm.cu");
+    println!("cargo:rerun-if-changed=kernels/swiglu.cu");
+    println!("cargo:rerun-if-changed=kernels/topk_softmax.cu");
 
     // Only compile CUDA kernels when the feature is enabled
     if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_err() {
@@ -47,6 +49,16 @@ fn main() {
             "kernels/fused_moe_gemm.cu",
             "kernels/fused_moe_gemm.ptx",
             vec![], // Fused MoE GEMM kernel
+        ),
+        (
+            "kernels/swiglu.cu",
+            "kernels/swiglu.ptx",
+            vec![], // Fused SwiGLU activation kernel
+        ),
+        (
+            "kernels/topk_softmax.cu",
+            "kernels/topk_softmax.ptx",
+            vec![], // Fused top-k softmax for MoE routing
         ),
     ];
 

@@ -70,6 +70,15 @@ pub(crate) fn handle_command(
             false
         }
         EngineCommand::GetStats { response_tx } => {
+            // Get detailed prefix cache stats if available
+            let (prefix_cache_detailed_stats, prefix_cache_recent_stats) = match prefix_cache {
+                Some(cache) => (
+                    Some(cache.get_stats()),
+                    Some(cache.get_sliding_window_stats()),
+                ),
+                None => (None, None),
+            };
+
             let stats = EngineStats {
                 num_running_requests: scheduler.num_running(),
                 num_waiting_requests: scheduler.num_waiting(),
@@ -78,6 +87,8 @@ pub(crate) fn handle_command(
                 block_size,
                 kv_cache_metrics: kv_cache_mgr.metrics().snapshot(),
                 prefix_cache_stats: kv_cache_mgr.prefix_cache_stats(),
+                prefix_cache_detailed_stats,
+                prefix_cache_recent_stats,
             };
             let _ = response_tx.send(stats);
             false

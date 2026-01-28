@@ -1,15 +1,15 @@
 //! Multimodal support for vision-language models.
 //!
 //! This module provides infrastructure for handling multimodal inputs
-//! (text + images/video) in LLMs like LLaVA, Qwen-VL, etc.
+//! (text + images/video/audio) in LLMs like LLaVA, Qwen-VL, Whisper, etc.
 //!
 //! # Architecture
 //!
 //! Multimodal processing follows these steps:
-//! 1. Parse content parts (text, images) from the request
-//! 2. Encode images using a vision encoder (CLIP/SigLIP)
-//! 3. Tokenize text with special placeholder tokens for images
-//! 4. Inject image embeddings at placeholder positions during forward pass
+//! 1. Parse content parts (text, images, audio) from the request
+//! 2. Encode media using appropriate encoders (CLIP/SigLIP for images, Whisper for audio)
+//! 3. Tokenize text with special placeholder tokens for media
+//! 4. Inject media embeddings at placeholder positions during forward pass
 //!
 //! # Example
 //!
@@ -25,10 +25,13 @@
 //! let inputs = processor.process(&content)?;
 //! ```
 
+pub mod audio;
 mod inputs;
 mod processor;
+mod projector;
 mod vision;
 
 pub use inputs::{ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage};
 pub use processor::{MultimodalProcessor, ProcessorConfig};
+pub use projector::{MultimodalProjector, ProjectorConfig, ProjectorType};
 pub use vision::{VisionEncoder, VisionEncoderConfig, VisionEncoderType};

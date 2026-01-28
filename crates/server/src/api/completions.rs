@@ -43,7 +43,8 @@ pub async fn create_completion(
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
         // Create constraint from response_format
-        let constraint = create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+        let constraint =
+            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
 
         let gen_req = GenerationRequest {
             prompt,
@@ -88,14 +89,18 @@ pub async fn create_completion(
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
         // Create constraint from response_format (same for all prompts in batch)
-        let constraint = create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+        let constraint =
+            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
 
         for (index, input) in inputs.into_iter().enumerate() {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
 
             // Clone constraint for each request in batch (constraints are stateful)
             let request_constraint = if constraint.is_some() {
-                create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+                create_constraint_from_response_format(
+                    req.response_format.as_ref(),
+                    &state.tokenizer,
+                )
             } else {
                 None
             };
@@ -195,14 +200,14 @@ fn create_constraint_from_response_format(
         Some(ResponseFormat::JsonObject) => {
             // Basic JSON object constraint
             let schema = serde_json::json!({"type": "object"});
-            Some(Box::new(JsonSchemaConstraint::new(schema, tokenizer.clone())))
-        }
-        Some(ResponseFormat::JsonSchema { json_schema }) => {
             Some(Box::new(JsonSchemaConstraint::new(
-                json_schema.schema.clone(),
+                schema,
                 tokenizer.clone(),
             )))
         }
+        Some(ResponseFormat::JsonSchema { json_schema }) => Some(Box::new(
+            JsonSchemaConstraint::new(json_schema.schema.clone(), tokenizer.clone()),
+        )),
     }
 }
 

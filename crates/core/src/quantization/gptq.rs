@@ -8,12 +8,17 @@
 //! - Group-wise quantization with configurable group size
 //! - Desc_act (descending activation order) optimization
 //! - Fused INT4 GEMM kernel acceleration
+//! - Automatic Marlin kernel selection when conditions are met
 
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
+use super::marlin::{
+    check_marlin_supports_shape, MarlinConfig, MarlinLinear, MarlinScalarType,
+    MARLIN_SUPPORTED_GROUP_SIZES,
+};
 
 #[cfg(feature = "cuda-kernels")]
 use super::gptq_cuda;
@@ -117,6 +122,63 @@ impl GptqConfig {
             in_features.div_ceil(self.group_size as usize)
         }
     }
+
+    /// Check if Marlin kernel can be used for this config.
+    ///
+    /// Marlin supports:
+    /// - 4-bit quantization (uint4b8)
+    /// - 8-bit quantization (uint8b128)
+    /// - Group sizes: -1, 32, 64, 128
+    /// - GPU compute capability >= 8.0 (Ampere)
+    pub fn can_use_marlin(&self) -> bool {
+        // Check bits
+        if self.bits != 4 && self.bits != 8 {
+            return false;
+        }
+
+        // Check group size
+        if !MARLIN_SUPPORTED_GROUP_SIZES.contains(&(self.group_size as i32)) {
+            return false;
+        }
+
+        // Only symmetric quantization supported by Marlin GPTQ path
+        if !self.sym {
+            return false;
+        }
+
+        true
+    }
+
+    /// Check if Marlin supports a specific layer shape.
+    pub fn can_use_marlin_for_shape(&self, in_features: usize, out_features: usize) -> bool {
+        if !self.can_use_marlin() {
+            return false;
+        }
+
+        check_marlin_supports_shape(out_features, in_features, self.group_size as i32).is_ok()
+    }
+
+    /// Convert to MarlinConfig if Marlin is supported.
+    pub fn to_marlin_config(&self) -> Option<MarlinConfig> {
+        if !self.can_use_marlin() {
+            return None;
+        }
+
+        let scalar_type = match (self.bits, self.sym) {
+            (4, true) => MarlinScalarType::Uint4b8,
+            (8, true) => MarlinScalarType::Uint8b128,
+            _ => return None,
+        };
+
+        Some(MarlinConfig {
+            bits: self.bits,
+            group_size: self.group_size as i32,
+            desc_act: self.desc_act,
+            is_sym: self.sym,
+            scalar_type,
+            use_fp32_reduce: true,
+        })
+    }
 }
 
 impl Default for GptqConfig {
@@ -153,6 +215,20 @@ impl QuantizationConfig for GptqConfig {
         bias: bool,
         device: &Device,
     ) -> Result<Box<dyn QuantizedLinear>> {
+        // Try to use Marlin if conditions are met
+        if self.use_marlin && self.can_use_marlin_for_shape(in_features, out_features) {
+            if let Some(marlin_config) = self.to_marlin_config() {
+                return Ok(Box::new(MarlinLinear::new(
+                    in_features,
+                    out_features,
+                    bias,
+                    marlin_config,
+                    device,
+                )?));
+            }
+        }
+
+        // Fallback to standard GPTQ
         Ok(Box::new(GptqLinear::new(
             in_features,
             out_features,
@@ -494,6 +570,85 @@ mod tests {
         assert!(config.desc_act);
         assert!(!config.sym);
         assert!((config.damp_percent - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_gptq_can_use_marlin() {
+        // INT4 with supported group sizes should work
+        let config = GptqConfig::int4(128);
+        assert!(config.can_use_marlin());
+
+        let config = GptqConfig::int4(64);
+        assert!(config.can_use_marlin());
+
+        let config = GptqConfig::int4(32);
+        assert!(config.can_use_marlin());
+
+        let config = GptqConfig::int4(-1); // per-channel
+        assert!(config.can_use_marlin());
+
+        // Unsupported group size
+        let mut config = GptqConfig::int4(100);
+        config.group_size = 100;
+        assert!(!config.can_use_marlin());
+
+        // Asymmetric quantization not supported
+        let mut config = GptqConfig::int4(128);
+        config.sym = false;
+        assert!(!config.can_use_marlin());
+    }
+
+    #[test]
+    fn test_gptq_can_use_marlin_for_shape() {
+        let config = GptqConfig::int4(128);
+
+        // Valid Marlin shapes (divisible by MIN_THREAD_N=64 and MIN_THREAD_K=128)
+        assert!(config.can_use_marlin_for_shape(4096, 4096));
+        assert!(config.can_use_marlin_for_shape(8192, 1024));
+
+        // Invalid shapes
+        assert!(!config.can_use_marlin_for_shape(100, 4096)); // K not divisible by 128
+        assert!(!config.can_use_marlin_for_shape(4096, 100)); // N not divisible by 64
+    }
+
+    #[test]
+    fn test_gptq_to_marlin_config() {
+        let config = GptqConfig::int4(128);
+        let marlin_config = config.to_marlin_config();
+
+        assert!(marlin_config.is_some());
+        let mc = marlin_config.unwrap();
+        assert_eq!(mc.bits, 4);
+        assert_eq!(mc.group_size, 128);
+        assert_eq!(mc.scalar_type, MarlinScalarType::Uint4b8);
+
+        // Asymmetric returns None
+        let mut config = GptqConfig::int4(128);
+        config.sym = false;
+        assert!(config.to_marlin_config().is_none());
+    }
+
+    #[test]
+    fn test_gptq_creates_marlin_for_valid_shape() {
+        // With Marlin enabled and valid shape, should create MarlinLinear
+        let config = GptqConfig::int4(128);
+        let linear = config
+            .create_linear(4096, 4096, false, &Device::Cpu)
+            .unwrap();
+
+        // Verify shape requirements are checked
+        assert_eq!(linear.in_features(), 4096);
+        assert_eq!(linear.out_features(), 4096);
+    }
+
+    #[test]
+    fn test_gptq_falls_back_to_gptq_linear() {
+        // When Marlin is disabled, should create GptqLinear
+        let config = GptqConfig::int4(128).with_marlin(false);
+        let linear = config.create_linear(64, 128, false, &Device::Cpu).unwrap();
+
+        assert_eq!(linear.in_features(), 64);
+        assert_eq!(linear.out_features(), 128);
     }
 
     #[cfg(feature = "cuda-kernels")]

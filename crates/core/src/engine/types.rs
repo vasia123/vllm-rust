@@ -4,7 +4,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::kv_cache::MetricsSnapshot;
+use crate::kv_cache::{MetricsSnapshot, PrefixCacheStatsSnapshot, SlidingWindowSnapshot};
 use crate::lora::LoraRequest;
 use crate::request::{FinishReason, RequestId};
 use crate::sampling::{SamplingConstraint, SamplingParams};
@@ -113,7 +113,14 @@ pub struct EngineStats {
     pub num_total_blocks: usize,
     pub block_size: usize,
     pub kv_cache_metrics: MetricsSnapshot,
+    /// Legacy prefix cache stats: (num_cached_blocks, num_evictable_blocks)
     pub prefix_cache_stats: Option<(usize, usize)>,
+    /// Detailed prefix cache statistics (lifetime counters).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_detailed_stats: Option<PrefixCacheStatsSnapshot>,
+    /// Sliding window prefix cache statistics (recent hit rate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_recent_stats: Option<SlidingWindowSnapshot>,
 }
 
 // ─── Internal command types ───────────────────────────────────────────────

@@ -462,6 +462,7 @@ mod tests {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: None,

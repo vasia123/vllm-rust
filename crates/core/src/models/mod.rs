@@ -6,6 +6,7 @@ pub mod llama_lora;
 pub mod llama_quantized;
 pub mod mistral;
 pub mod mixtral;
+pub mod qwen2;
 pub mod qwen3;
 pub mod qwen3_lora;
 pub mod qwen3_quantized;
@@ -18,6 +19,7 @@ pub use llama_lora::LlamaWithLora;
 pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use mistral::MistralForCausalLM;
 pub use mixtral::MixtralForCausalLM;
+pub use qwen2::Qwen2ForCausalLM;
 pub use qwen3::Qwen3ForCausalLM;
 pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
@@ -62,6 +64,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "LlamaForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
         "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new(cfg, vb)?)),
         "MixtralForCausalLM" => Ok(Box::new(MixtralForCausalLM::new(cfg, vb)?)),
+        "Qwen2ForCausalLM" => Ok(Box::new(Qwen2ForCausalLM::new(cfg, vb)?)),
         "Qwen3ForCausalLM" => Ok(Box::new(Qwen3ForCausalLM::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
@@ -126,11 +129,12 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        // Gemma, Mistral, Mixtral, DeepSeek: fallback to non-quantized (quantized variant not yet implemented)
+        // Gemma, Mistral, Mixtral, DeepSeek, Qwen2: fallback to non-quantized (quantized variant not yet implemented)
         "GemmaForCausalLM"
         | "Gemma2ForCausalLM"
         | "MistralForCausalLM"
         | "MixtralForCausalLM"
+        | "Qwen2ForCausalLM"
         | "DeepseekV2ForCausalLM"
         | "DeepseekV3ForCausalLM" => from_config(cfg, vb),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),

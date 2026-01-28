@@ -264,10 +264,7 @@ async fn run_server(
             lora_model.register_lora(&adapter);
         }
 
-        eprintln!(
-            "Registered adapters: {:?}",
-            lora_model.lora_adapters()
-        );
+        eprintln!("Registered adapters: {:?}", lora_model.lora_adapters());
         Box::new(lora_model)
     } else {
         // Create regular model without LoRA

@@ -54,7 +54,8 @@ pub async fn create_chat_completion(
     };
 
     // Create constraint from response_format
-    let constraint = create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+    let constraint =
+        create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
 
     let gen_req = GenerationRequest {
         prompt: prompt.clone(),
@@ -225,13 +226,13 @@ fn create_constraint_from_response_format(
         Some(ResponseFormat::JsonObject) => {
             // Basic JSON object constraint
             let schema = serde_json::json!({"type": "object"});
-            Some(Box::new(JsonSchemaConstraint::new(schema, tokenizer.clone())))
-        }
-        Some(ResponseFormat::JsonSchema { json_schema }) => {
             Some(Box::new(JsonSchemaConstraint::new(
-                json_schema.schema.clone(),
+                schema,
                 tokenizer.clone(),
             )))
         }
+        Some(ResponseFormat::JsonSchema { json_schema }) => Some(Box::new(
+            JsonSchemaConstraint::new(json_schema.schema.clone(), tokenizer.clone()),
+        )),
     }
 }

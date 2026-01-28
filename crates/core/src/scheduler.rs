@@ -1,6 +1,329 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::request::{RequestId, RequestStatus, SequenceState};
+
+/// Scheduling policy for request ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedulingPolicy {
+    /// First-come-first-served: requests are processed in arrival order.
+    #[default]
+    Fcfs,
+    /// Priority-based: requests with lower priority values are processed first.
+    /// Ties are broken by arrival time (earlier arrivals first).
+    Priority,
+}
+
+/// Priority level for a request. Lower values indicate higher priority.
+pub type RequestPriority = i32;
+
+/// Default priority for requests when none is specified.
+pub const DEFAULT_PRIORITY: RequestPriority = 0;
+
+/// Entry in the priority queue containing request metadata for ordering.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PriorityEntry {
+    /// Priority value (lower = higher priority).
+    priority: RequestPriority,
+    /// Arrival time as monotonic counter (lower = earlier).
+    arrival_time: u64,
+    /// The request identifier.
+    request_id: RequestId,
+}
+
+impl Ord for PriorityEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // For BinaryHeap (max-heap), we reverse the ordering to get min-heap behavior.
+        // Lower priority value = higher priority = should come first.
+        // For equal priorities, earlier arrival = should come first.
+        match self.priority.cmp(&other.priority) {
+            Ordering::Equal => {
+                // Earlier arrival time should have higher priority (come first).
+                // Reverse comparison for max-heap: smaller arrival_time -> Greater ordering.
+                other.arrival_time.cmp(&self.arrival_time)
+            }
+            Ordering::Less => {
+                // self has lower priority value = higher priority = should come first.
+                // For max-heap: self should be "greater".
+                Ordering::Greater
+            }
+            Ordering::Greater => {
+                // self has higher priority value = lower priority = should come later.
+                // For max-heap: self should be "less".
+                Ordering::Less
+            }
+        }
+    }
+}
+
+impl PartialOrd for PriorityEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Unified request queue that supports both FCFS and Priority scheduling.
+/// Uses an enum internally to avoid trait object overhead.
+pub enum RequestQueue {
+    Fcfs(FcfsRequestQueue),
+    Priority(PriorityRequestQueue),
+}
+
+impl RequestQueue {
+    /// Create a new request queue based on the scheduling policy.
+    pub fn new(policy: SchedulingPolicy) -> Self {
+        match policy {
+            SchedulingPolicy::Fcfs => Self::Fcfs(FcfsRequestQueue::new()),
+            SchedulingPolicy::Priority => Self::Priority(PriorityRequestQueue::new()),
+        }
+    }
+
+    /// Add a request to the queue with the given priority.
+    pub fn add(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
+        match self {
+            Self::Fcfs(q) => q.add(request_id, priority, arrival_time),
+            Self::Priority(q) => q.add(request_id, priority, arrival_time),
+        }
+    }
+
+    /// Remove and return the highest-priority request, or None if empty.
+    pub fn pop(&mut self) -> Option<RequestId> {
+        match self {
+            Self::Fcfs(q) => q.pop(),
+            Self::Priority(q) => q.pop(),
+        }
+    }
+
+    /// Peek at the highest-priority request without removing it.
+    pub fn peek(&self) -> Option<RequestId> {
+        match self {
+            Self::Fcfs(q) => q.peek(),
+            Self::Priority(q) => q.peek(),
+        }
+    }
+
+    /// Remove a specific request from the queue.
+    /// Returns true if the request was found and removed.
+    pub fn remove(&mut self, request_id: RequestId) -> bool {
+        match self {
+            Self::Fcfs(q) => q.remove(request_id),
+            Self::Priority(q) => q.remove(request_id),
+        }
+    }
+
+    /// Prepend a request to the front of the queue (for preempted requests).
+    /// For FCFS, this goes to the front. For priority queues, this re-adds with
+    /// the same priority (priority queues don't have a "front" concept).
+    pub fn prepend(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
+        match self {
+            Self::Fcfs(q) => q.prepend(request_id, priority, arrival_time),
+            Self::Priority(q) => q.prepend(request_id, priority, arrival_time),
+        }
+    }
+
+    /// Check if the queue is empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Fcfs(q) => q.is_empty(),
+            Self::Priority(q) => q.is_empty(),
+        }
+    }
+
+    /// Get the number of requests in the queue.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Fcfs(q) => q.len(),
+            Self::Priority(q) => q.len(),
+        }
+    }
+
+    /// Get request IDs in scheduling order as a vector.
+    pub fn iter_in_order(&self) -> Vec<RequestId> {
+        match self {
+            Self::Fcfs(q) => q.iter_in_order(),
+            Self::Priority(q) => q.iter_in_order(),
+        }
+    }
+}
+
+/// First-come-first-served request queue.
+/// Requests are processed in the order they arrive.
+pub struct FcfsRequestQueue {
+    queue: VecDeque<(RequestId, RequestPriority, u64)>,
+}
+
+impl FcfsRequestQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+impl Default for FcfsRequestQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FcfsRequestQueue {
+    pub fn add(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
+        self.queue.push_back((request_id, priority, arrival_time));
+    }
+
+    pub fn pop(&mut self) -> Option<RequestId> {
+        self.queue.pop_front().map(|(id, _, _)| id)
+    }
+
+    pub fn peek(&self) -> Option<RequestId> {
+        self.queue.front().map(|(id, _, _)| *id)
+    }
+
+    pub fn remove(&mut self, request_id: RequestId) -> bool {
+        if let Some(pos) = self.queue.iter().position(|(id, _, _)| *id == request_id) {
+            self.queue.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn prepend(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
+        self.queue.push_front((request_id, priority, arrival_time));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn iter_in_order(&self) -> Vec<RequestId> {
+        self.queue.iter().map(|(id, _, _)| *id).collect()
+    }
+}
+
+/// Priority-based request queue.
+/// Requests with lower priority values are processed first.
+/// Ties are broken by arrival time (earlier arrivals first).
+pub struct PriorityRequestQueue {
+    heap: BinaryHeap<PriorityEntry>,
+    /// Track removed request IDs for lazy deletion.
+    removed: HashSet<RequestId>,
+}
+
+impl PriorityRequestQueue {
+    pub fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            removed: HashSet::new(),
+        }
+    }
+
+    /// Clean up any removed entries from the top of the heap.
+    fn cleanup_top(&mut self) {
+        loop {
+            let should_pop = self
+                .heap
+                .peek()
+                .is_some_and(|entry| self.removed.contains(&entry.request_id));
+            if should_pop {
+                if let Some(entry) = self.heap.pop() {
+                    self.removed.remove(&entry.request_id);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Count non-removed entries.
+    fn active_count(&self) -> usize {
+        self.heap
+            .iter()
+            .filter(|e| !self.removed.contains(&e.request_id))
+            .count()
+    }
+
+    pub fn add(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
+        // If this request was previously marked as removed, unmark it.
+        self.removed.remove(&request_id);
+        self.heap.push(PriorityEntry {
+            priority,
+            arrival_time,
+            request_id,
+        });
+    }
+
+    pub fn pop(&mut self) -> Option<RequestId> {
+        self.cleanup_top();
+        self.heap.pop().map(|entry| entry.request_id)
+    }
+
+    pub fn peek(&self) -> Option<RequestId> {
+        // Skip removed entries manually since we can't mutate.
+        // BinaryHeap iteration is not guaranteed to be in heap order,
+        // so we need to find the minimum manually.
+        self.heap
+            .iter()
+            .filter(|e| !self.removed.contains(&e.request_id))
+            .max() // max because our Ord is reversed
+            .map(|e| e.request_id)
+    }
+
+    pub fn remove(&mut self, request_id: RequestId) -> bool {
+        // Use lazy deletion: mark as removed, clean up during pop.
+        let exists = self
+            .heap
+            .iter()
+            .any(|e| e.request_id == request_id && !self.removed.contains(&request_id));
+        if exists {
+            self.removed.insert(request_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn prepend(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
+        // For priority queue, prepend is the same as add.
+        // The priority determines position, not insertion order.
+        self.add(request_id, priority, arrival_time);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active_count() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.active_count()
+    }
+
+    pub fn iter_in_order(&self) -> Vec<RequestId> {
+        // Create a sorted copy for iteration.
+        let mut entries: Vec<_> = self
+            .heap
+            .iter()
+            .filter(|e| !self.removed.contains(&e.request_id))
+            .copied()
+            .collect();
+        entries.sort_by(|a, b| b.cmp(a)); // Reverse because our Ord is reversed.
+        entries.into_iter().map(|e| e.request_id).collect()
+    }
+}
+
+impl Default for PriorityRequestQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Create a request queue based on the scheduling policy.
+pub fn create_request_queue(policy: SchedulingPolicy) -> RequestQueue {
+    RequestQueue::new(policy)
+}
 
 #[derive(Clone, Copy)]
 pub struct SchedulerConfig {
@@ -8,6 +331,19 @@ pub struct SchedulerConfig {
     pub max_tokens_per_step: usize,
     /// Enable chunked prefill: long prompts are processed in chunks across steps.
     pub enable_chunked_prefill: bool,
+    /// Scheduling policy for request ordering.
+    pub scheduling_policy: SchedulingPolicy,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_running_requests: 256,
+            max_tokens_per_step: 8192,
+            enable_chunked_prefill: false,
+            scheduling_policy: SchedulingPolicy::Fcfs,
+        }
+    }
 }
 
 /// A scheduled prefill request with the number of tokens to process this step.
@@ -25,40 +361,80 @@ pub struct SchedulerOutput {
     pub preempted_requests: Vec<RequestId>,
 }
 
+/// Metadata for requests tracked by the scheduler.
+#[derive(Debug, Clone, Copy)]
+struct RequestMetadata {
+    priority: RequestPriority,
+    arrival_time: u64,
+}
+
 pub struct Scheduler {
     config: SchedulerConfig,
-    waiting_queue: VecDeque<RequestId>,
+    waiting_queue: RequestQueue,
     running_set: HashSet<RequestId>,
+    /// Metadata for all tracked requests (waiting + running).
+    request_metadata: HashMap<RequestId, RequestMetadata>,
+    /// Monotonic counter for arrival time ordering.
+    arrival_counter: u64,
 }
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
+            waiting_queue: create_request_queue(config.scheduling_policy),
             config,
-            waiting_queue: VecDeque::new(),
             running_set: HashSet::new(),
+            request_metadata: HashMap::new(),
+            arrival_counter: 0,
         }
     }
 
+    /// Add a request to the waiting queue with default priority.
     pub fn add_request(&mut self, id: RequestId) {
-        self.waiting_queue.push_back(id);
+        self.add_request_with_priority(id, DEFAULT_PRIORITY);
     }
 
+    /// Add a request to the waiting queue with a specified priority.
+    /// Lower priority values indicate higher priority (processed first).
+    pub fn add_request_with_priority(&mut self, id: RequestId, priority: RequestPriority) {
+        let arrival_time = self.arrival_counter;
+        self.arrival_counter += 1;
+
+        self.request_metadata.insert(
+            id,
+            RequestMetadata {
+                priority,
+                arrival_time,
+            },
+        );
+        self.waiting_queue.add(id, priority, arrival_time);
+    }
+
+    /// Remove a request from both waiting queue and running set.
     pub fn remove_request(&mut self, id: RequestId) {
         self.running_set.remove(&id);
-        self.waiting_queue.retain(|&x| x != id);
+        self.waiting_queue.remove(id);
+        self.request_metadata.remove(&id);
     }
 
+    /// Check if the scheduler has no pending or running requests.
     pub fn is_idle(&self) -> bool {
         self.waiting_queue.is_empty() && self.running_set.is_empty()
     }
 
+    /// Get the number of currently running requests.
     pub fn num_running(&self) -> usize {
         self.running_set.len()
     }
 
+    /// Get the number of waiting requests.
     pub fn num_waiting(&self) -> usize {
         self.waiting_queue.len()
+    }
+
+    /// Get the scheduling policy in use.
+    pub fn scheduling_policy(&self) -> SchedulingPolicy {
+        self.config.scheduling_policy
     }
 
     /// Core scheduling logic. Called once per engine iteration.
@@ -117,39 +493,81 @@ impl Scheduler {
             }
         }
 
-        // Step 2: Preempt (newest-first to minimize wasted compute)
+        // Step 2: Preempt according to policy
+        // - FCFS: newest-first (minimizes wasted compute on older requests)
+        // - Priority: lowest-priority-first (protects high-priority requests)
         to_preempt.sort_by(|a, b| {
-            let order_a = states[a].arrival_order;
-            let order_b = states[b].arrival_order;
-            order_b.cmp(&order_a)
+            match self.config.scheduling_policy {
+                SchedulingPolicy::Fcfs => {
+                    // Newest first: higher arrival_order = newer = preempt first
+                    let order_a = states[a].arrival_order;
+                    let order_b = states[b].arrival_order;
+                    order_b.cmp(&order_a)
+                }
+                SchedulingPolicy::Priority => {
+                    // Lowest priority first: higher priority value = lower priority = preempt first
+                    // Ties broken by arrival order (newer first)
+                    let meta_a = self.request_metadata.get(a);
+                    let meta_b = self.request_metadata.get(b);
+                    match (meta_a, meta_b) {
+                        (Some(ma), Some(mb)) => {
+                            // Higher priority value = lower priority = should be preempted first
+                            match mb.priority.cmp(&ma.priority) {
+                                Ordering::Equal => {
+                                    // Tie-breaker: newer requests preempted first
+                                    mb.arrival_time.cmp(&ma.arrival_time)
+                                }
+                                other => other,
+                            }
+                        }
+                        // Fallback to arrival order if metadata missing
+                        _ => {
+                            let order_a = states[a].arrival_order;
+                            let order_b = states[b].arrival_order;
+                            order_b.cmp(&order_a)
+                        }
+                    }
+                }
+            }
         });
         for req_id in to_preempt {
             let state = &states[&req_id];
             free_blocks += state.num_blocks();
             self.running_set.remove(&req_id);
-            self.waiting_queue.push_front(req_id);
+            // Re-add to waiting queue with original metadata.
+            if let Some(metadata) = self.request_metadata.get(&req_id) {
+                self.waiting_queue
+                    .prepend(req_id, metadata.priority, metadata.arrival_time);
+            }
             output.preempted_requests.push(req_id);
         }
 
-        // Step 3: Admit waiting requests (FCFS)
+        // Step 3: Admit waiting requests according to scheduling policy
         let preempted_set: HashSet<RequestId> = output.preempted_requests.iter().copied().collect();
         let mut newly_admitted = Vec::new();
-        while !self.waiting_queue.is_empty()
-            && self.running_set.len() + newly_admitted.len() < self.config.max_running_requests
-        {
-            let &req_id = self.waiting_queue.front().unwrap();
-            if preempted_set.contains(&req_id) {
+
+        // Collect candidates in scheduling order.
+        let candidates: Vec<RequestId> = self.waiting_queue.iter_in_order();
+
+        for req_id in candidates {
+            if self.running_set.len() + newly_admitted.len() >= self.config.max_running_requests {
                 break;
             }
-            let state = &states[&req_id];
+            if preempted_set.contains(&req_id) {
+                // Don't re-admit preempted requests in the same step.
+                break;
+            }
+            let Some(state) = states.get(&req_id) else {
+                continue;
+            };
             let remaining = state.prompt_token_ids.len() - state.num_computed_tokens;
 
             if remaining == 0 {
-                // Full prefix cached — admit directly for decode
+                // Full prefix cached — admit directly for decode.
                 if budget > 0 {
                     let blocks_needed = state.blocks_needed_for_step();
                     if blocks_needed <= free_blocks {
-                        self.waiting_queue.pop_front();
+                        self.waiting_queue.remove(req_id);
                         newly_admitted.push(req_id);
                         free_blocks -= blocks_needed;
                         budget -= 1;
@@ -175,7 +593,7 @@ impl Scheduler {
 
             let blocks_needed = state.block_table.blocks_needed(chunk_size);
             if blocks_needed <= free_blocks && chunk_size <= budget {
-                self.waiting_queue.pop_front();
+                self.waiting_queue.remove(req_id);
                 newly_admitted.push(req_id);
                 free_blocks -= blocks_needed;
                 budget -= chunk_size;
@@ -193,6 +611,29 @@ impl Scheduler {
         }
 
         output
+    }
+
+    /// Provides direct access to the running set for tests.
+    #[cfg(test)]
+    pub(crate) fn running_set_mut(&mut self) -> &mut HashSet<RequestId> {
+        &mut self.running_set
+    }
+
+    /// Provides direct access to request metadata for tests.
+    #[cfg(test)]
+    pub(crate) fn insert_metadata(
+        &mut self,
+        id: RequestId,
+        priority: RequestPriority,
+        arrival_time: u64,
+    ) {
+        self.request_metadata.insert(
+            id,
+            RequestMetadata {
+                priority,
+                arrival_time,
+            },
+        );
     }
 }
 
@@ -246,13 +687,193 @@ mod tests {
         state
     }
 
+    fn fcfs_config(max_running: usize, max_tokens: usize, chunked: bool) -> SchedulerConfig {
+        SchedulerConfig {
+            max_running_requests: max_running,
+            max_tokens_per_step: max_tokens,
+            enable_chunked_prefill: chunked,
+            scheduling_policy: SchedulingPolicy::Fcfs,
+        }
+    }
+
+    fn priority_config(max_running: usize, max_tokens: usize, chunked: bool) -> SchedulerConfig {
+        SchedulerConfig {
+            max_running_requests: max_running,
+            max_tokens_per_step: max_tokens,
+            enable_chunked_prefill: chunked,
+            scheduling_policy: SchedulingPolicy::Priority,
+        }
+    }
+
+    // ==================== FCFS Request Queue Tests ====================
+
+    #[test]
+    fn fcfs_queue_basic_operations() {
+        let mut queue = FcfsRequestQueue::new();
+
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.peek(), None);
+        assert_eq!(queue.pop(), None);
+
+        queue.add(1, 0, 0);
+        queue.add(2, 0, 1);
+        queue.add(3, 0, 2);
+
+        assert!(!queue.is_empty());
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.peek(), Some(1));
+
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.pop(), Some(3));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn fcfs_queue_prepend() {
+        let mut queue = FcfsRequestQueue::new();
+
+        queue.add(1, 0, 0);
+        queue.add(2, 0, 1);
+        queue.prepend(3, 0, 2); // Should go to front
+
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(2));
+    }
+
+    #[test]
+    fn fcfs_queue_remove() {
+        let mut queue = FcfsRequestQueue::new();
+
+        queue.add(1, 0, 0);
+        queue.add(2, 0, 1);
+        queue.add(3, 0, 2);
+
+        assert!(queue.remove(2));
+        assert!(!queue.remove(2)); // Already removed
+        assert!(!queue.remove(99)); // Never existed
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(3));
+    }
+
+    #[test]
+    fn fcfs_queue_iter_in_order() {
+        let mut queue = FcfsRequestQueue::new();
+
+        queue.add(1, 0, 0);
+        queue.add(2, 0, 1);
+        queue.add(3, 0, 2);
+
+        let order: Vec<_> = queue.iter_in_order();
+        assert_eq!(order, vec![1, 2, 3]);
+    }
+
+    // ==================== Priority Request Queue Tests ====================
+
+    #[test]
+    fn priority_queue_basic_operations() {
+        let mut queue = PriorityRequestQueue::new();
+
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.peek(), None);
+        assert_eq!(queue.pop(), None);
+
+        // Add with different priorities (lower = higher priority)
+        queue.add(1, 10, 0); // Low priority
+        queue.add(2, 5, 1); // Medium priority
+        queue.add(3, 1, 2); // High priority
+
+        assert!(!queue.is_empty());
+        assert_eq!(queue.len(), 3);
+
+        // Should pop in priority order (lowest value first)
+        assert_eq!(queue.pop(), Some(3)); // priority 1
+        assert_eq!(queue.pop(), Some(2)); // priority 5
+        assert_eq!(queue.pop(), Some(1)); // priority 10
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn priority_queue_same_priority_uses_arrival_time() {
+        let mut queue = PriorityRequestQueue::new();
+
+        // Same priority, different arrival times
+        queue.add(1, 5, 2); // Later arrival
+        queue.add(2, 5, 0); // Earlier arrival
+        queue.add(3, 5, 1); // Middle arrival
+
+        // Should pop in arrival order when priorities are equal
+        assert_eq!(queue.pop(), Some(2)); // arrival 0
+        assert_eq!(queue.pop(), Some(3)); // arrival 1
+        assert_eq!(queue.pop(), Some(1)); // arrival 2
+    }
+
+    #[test]
+    fn priority_queue_remove() {
+        let mut queue = PriorityRequestQueue::new();
+
+        queue.add(1, 1, 0);
+        queue.add(2, 2, 1);
+        queue.add(3, 3, 2);
+
+        assert!(queue.remove(2));
+        assert!(!queue.remove(2)); // Already removed
+        assert!(!queue.remove(99)); // Never existed
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(3));
+    }
+
+    #[test]
+    fn priority_queue_prepend_acts_as_add() {
+        let mut queue = PriorityRequestQueue::new();
+
+        queue.add(1, 5, 0);
+        queue.prepend(2, 1, 1); // Should still respect priority
+
+        // Even though 2 was "prepended", its lower priority value wins
+        assert_eq!(queue.pop(), Some(2)); // priority 1
+        assert_eq!(queue.pop(), Some(1)); // priority 5
+    }
+
+    #[test]
+    fn priority_queue_iter_in_order() {
+        let mut queue = PriorityRequestQueue::new();
+
+        queue.add(1, 10, 0);
+        queue.add(2, 5, 1);
+        queue.add(3, 1, 2);
+        queue.add(4, 5, 3); // Same priority as 2, later arrival
+
+        let order: Vec<_> = queue.iter_in_order();
+        assert_eq!(order, vec![3, 2, 4, 1]); // By priority, then arrival
+    }
+
+    #[test]
+    fn priority_queue_negative_priorities() {
+        let mut queue = PriorityRequestQueue::new();
+
+        queue.add(1, 0, 0);
+        queue.add(2, -10, 1); // Negative = even higher priority
+        queue.add(3, 10, 2);
+
+        assert_eq!(queue.pop(), Some(2)); // -10 (highest priority)
+        assert_eq!(queue.pop(), Some(1)); // 0
+        assert_eq!(queue.pop(), Some(3)); // 10 (lowest priority)
+    }
+
+    // ==================== Scheduler FCFS Tests ====================
+
     #[test]
     fn single_request_admitted() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         let state = make_state(0, 5, RequestStatus::Waiting, 16, 0);
@@ -272,11 +893,7 @@ mod tests {
 
     #[test]
     fn running_request_scheduled_for_decode() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         let state = make_decoding_state(0, 5, 3, 16, 0);
@@ -296,11 +913,7 @@ mod tests {
 
     #[test]
     fn max_running_requests_enforced() {
-        let config = SchedulerConfig {
-            max_running_requests: 2,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(2, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         let mut states = HashMap::new();
@@ -318,11 +931,7 @@ mod tests {
 
     #[test]
     fn token_budget_enforced() {
-        let config = SchedulerConfig {
-            max_running_requests: 10,
-            max_tokens_per_step: 10, // tight budget
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(10, 10, false);
         let mut scheduler = Scheduler::new(config);
 
         let mut states = HashMap::new();
@@ -339,11 +948,7 @@ mod tests {
 
     #[test]
     fn block_budget_enforced() {
-        let config = SchedulerConfig {
-            max_running_requests: 10,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(10, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         let mut states = HashMap::new();
@@ -358,18 +963,15 @@ mod tests {
 
     #[test]
     fn preemption_frees_blocks() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         // Running request owns 1 block, but 0 free blocks and decode needs a new block
         let mut states = HashMap::new();
         let state = make_decoding_state(0, 16, 0, 16, 0);
         states.insert(0, state);
-        scheduler.running_set.insert(0);
+        scheduler.running_set_mut().insert(0);
+        scheduler.insert_metadata(0, DEFAULT_PRIORITY, 0);
 
         // 0 free blocks means decode needs 1 block but can't get it
         let output = scheduler.schedule(&refs(&states), 0);
@@ -381,19 +983,17 @@ mod tests {
 
     #[test]
     fn preemption_newest_first() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         let mut states = HashMap::new();
         // Two running requests, both need 1 new block, only 1 available
         states.insert(0, make_decoding_state(0, 16, 0, 16, 0)); // older
         states.insert(1, make_decoding_state(1, 16, 0, 16, 1)); // newer
-        scheduler.running_set.insert(0);
-        scheduler.running_set.insert(1);
+        scheduler.running_set_mut().insert(0);
+        scheduler.running_set_mut().insert(1);
+        scheduler.insert_metadata(0, DEFAULT_PRIORITY, 0);
+        scheduler.insert_metadata(1, DEFAULT_PRIORITY, 1);
 
         let output = scheduler.schedule(&refs(&states), 1);
         // Only 1 block available, one decode succeeds, newer gets preempted
@@ -403,16 +1003,13 @@ mod tests {
 
     #[test]
     fn preempted_request_readmitted() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         let mut states = HashMap::new();
         states.insert(0, make_decoding_state(0, 5, 3, 16, 0));
-        scheduler.running_set.insert(0);
+        scheduler.running_set_mut().insert(0);
+        scheduler.insert_metadata(0, DEFAULT_PRIORITY, 0);
 
         // Preempt (0 blocks available, needs new block at boundary)
         states.get_mut(&0).unwrap().block_table.advance(11); // fill to 16+3=19, needs 2nd block
@@ -434,13 +1031,9 @@ mod tests {
 
     #[test]
     fn remove_request_from_running() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
-        scheduler.running_set.insert(0);
+        scheduler.running_set_mut().insert(0);
 
         scheduler.remove_request(0);
         assert!(scheduler.is_idle());
@@ -448,11 +1041,7 @@ mod tests {
 
     #[test]
     fn remove_request_from_waiting() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
         scheduler.add_request(0);
 
@@ -462,17 +1051,13 @@ mod tests {
 
     #[test]
     fn decode_no_new_block_needed() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         // 5 tokens in block of 16, next decode fits without new block
         let mut states = HashMap::new();
         states.insert(0, make_decoding_state(0, 5, 0, 16, 0));
-        scheduler.running_set.insert(0);
+        scheduler.running_set_mut().insert(0);
 
         let output = scheduler.schedule(&refs(&states), 0); // 0 free blocks but not needed
         assert_eq!(output.decode_requests, vec![0]);
@@ -481,11 +1066,7 @@ mod tests {
 
     #[test]
     fn chunked_prefill_splits_long_prompt() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 10, // tight budget
-            enable_chunked_prefill: true,
-        };
+        let config = fcfs_config(4, 10, true);
         let mut scheduler = Scheduler::new(config);
 
         // 25-token prompt, budget 10 → first chunk = 10 tokens
@@ -501,11 +1082,7 @@ mod tests {
 
     #[test]
     fn chunked_prefill_continued_chunk() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 10,
-            enable_chunked_prefill: true,
-        };
+        let config = fcfs_config(4, 10, true);
         let mut scheduler = Scheduler::new(config);
 
         // Simulate a request that already computed 10 tokens, has 15 remaining
@@ -519,7 +1096,7 @@ mod tests {
 
         let mut states = HashMap::new();
         states.insert(0, state);
-        scheduler.running_set.insert(0);
+        scheduler.running_set_mut().insert(0);
 
         let output = scheduler.schedule(&refs(&states), 64);
         assert_eq!(output.prefill_requests.len(), 1);
@@ -530,18 +1107,14 @@ mod tests {
 
     #[test]
     fn chunked_prefill_mixed_with_decode() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 20,
-            enable_chunked_prefill: true,
-        };
+        let config = fcfs_config(4, 20, true);
         let mut scheduler = Scheduler::new(config);
 
         // One decoding request + one new prefill
         let mut states = HashMap::new();
         states.insert(0, make_decoding_state(0, 5, 3, 16, 0));
         states.insert(1, make_state(1, 30, RequestStatus::Waiting, 16, 1));
-        scheduler.running_set.insert(0);
+        scheduler.running_set_mut().insert(0);
         scheduler.add_request(1);
 
         let output = scheduler.schedule(&refs(&states), 64);
@@ -554,11 +1127,7 @@ mod tests {
 
     #[test]
     fn no_chunking_when_disabled() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 10,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 10, false);
         let mut scheduler = Scheduler::new(config);
 
         // 25-token prompt with budget 10: without chunking, doesn't fit
@@ -574,11 +1143,7 @@ mod tests {
 
     #[test]
     fn full_prefix_cached_admits_for_decode() {
-        let config = SchedulerConfig {
-            max_running_requests: 4,
-            max_tokens_per_step: 512,
-            enable_chunked_prefill: false,
-        };
+        let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
         // Simulate a request where prefix cache covered entire prompt
@@ -601,5 +1166,256 @@ mod tests {
         assert_eq!(output.decode_requests, vec![0]);
         assert_eq!(scheduler.num_running(), 1);
         assert_eq!(scheduler.num_waiting(), 0);
+    }
+
+    // ==================== Scheduler Priority Tests ====================
+
+    #[test]
+    fn priority_scheduling_respects_priority() {
+        let config = priority_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        // Add requests with different priorities
+        states.insert(0, make_state(0, 5, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 5, RequestStatus::Waiting, 16, 1));
+        states.insert(2, make_state(2, 5, RequestStatus::Waiting, 16, 2));
+
+        // Request 1 has highest priority (lowest value), 0 has lowest
+        scheduler.add_request_with_priority(0, 10); // Low priority
+        scheduler.add_request_with_priority(1, 1); // High priority
+        scheduler.add_request_with_priority(2, 5); // Medium priority
+
+        // Only allow 1 request to be admitted
+        let config = priority_config(1, 512, false);
+        let mut scheduler = Scheduler::new(config);
+        states.insert(0, make_state(0, 5, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 5, RequestStatus::Waiting, 16, 1));
+        states.insert(2, make_state(2, 5, RequestStatus::Waiting, 16, 2));
+
+        scheduler.add_request_with_priority(0, 10);
+        scheduler.add_request_with_priority(1, 1);
+        scheduler.add_request_with_priority(2, 5);
+
+        let output = scheduler.schedule(&refs(&states), 64);
+
+        // Request 1 should be admitted first (priority 1)
+        assert_eq!(prefill_ids(&output), vec![1]);
+        assert_eq!(scheduler.num_running(), 1);
+        assert_eq!(scheduler.num_waiting(), 2);
+
+        // Schedule again to get next request
+        // Only include requests 0 and 2 in states (request 1 was already processed)
+        states.remove(&1);
+        let config = priority_config(1, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        scheduler.add_request_with_priority(0, 10);
+        scheduler.add_request_with_priority(2, 5);
+
+        let output = scheduler.schedule(&refs(&states), 64);
+
+        // Request 2 should be next (priority 5 < 10)
+        assert_eq!(prefill_ids(&output), vec![2]);
+    }
+
+    #[test]
+    fn priority_scheduling_same_priority_uses_arrival_order() {
+        let config = priority_config(1, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_state(0, 5, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 5, RequestStatus::Waiting, 16, 1));
+        states.insert(2, make_state(2, 5, RequestStatus::Waiting, 16, 2));
+
+        // All have same priority, should use arrival order
+        scheduler.add_request_with_priority(0, 5);
+        scheduler.add_request_with_priority(1, 5);
+        scheduler.add_request_with_priority(2, 5);
+
+        let output = scheduler.schedule(&refs(&states), 64);
+        assert_eq!(prefill_ids(&output), vec![0]); // First arrival
+    }
+
+    #[test]
+    fn priority_scheduling_with_multiple_admits() {
+        let config = priority_config(3, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        for i in 0..5 {
+            states.insert(i, make_state(i, 5, RequestStatus::Waiting, 16, i));
+        }
+
+        // Add with various priorities
+        scheduler.add_request_with_priority(0, 3);
+        scheduler.add_request_with_priority(1, 1); // Highest
+        scheduler.add_request_with_priority(2, 2);
+        scheduler.add_request_with_priority(3, 5);
+        scheduler.add_request_with_priority(4, 4);
+
+        let output = scheduler.schedule(&refs(&states), 64);
+
+        // Should admit 3 requests in priority order: 1, 2, 0
+        assert_eq!(prefill_ids(&output), vec![1, 2, 0]);
+        assert_eq!(scheduler.num_running(), 3);
+        assert_eq!(scheduler.num_waiting(), 2);
+    }
+
+    #[test]
+    fn priority_scheduling_preempted_request_readded() {
+        let config = priority_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0));
+        scheduler.running_set_mut().insert(0);
+        scheduler.insert_metadata(0, 5, 0);
+
+        // Preempt due to no blocks
+        let output = scheduler.schedule(&refs(&states), 0);
+        assert_eq!(output.preempted_requests, vec![0]);
+
+        // Request should be back in waiting queue with same metadata
+        assert_eq!(scheduler.num_waiting(), 1);
+
+        // Reset state
+        let state = states.get_mut(&0).unwrap();
+        state.status = RequestStatus::Preempted;
+        state.block_table = crate::kv_cache::BlockTable::new(16);
+
+        // Reschedule with blocks available
+        let output = scheduler.schedule(&refs(&states), 64);
+        assert_eq!(prefill_ids(&output), vec![0]);
+    }
+
+    #[test]
+    fn default_scheduling_policy_is_fcfs() {
+        let config = SchedulerConfig::default();
+        assert_eq!(config.scheduling_policy, SchedulingPolicy::Fcfs);
+    }
+
+    #[test]
+    fn scheduler_reports_policy() {
+        let fcfs = Scheduler::new(fcfs_config(4, 512, false));
+        assert_eq!(fcfs.scheduling_policy(), SchedulingPolicy::Fcfs);
+
+        let priority = Scheduler::new(priority_config(4, 512, false));
+        assert_eq!(priority.scheduling_policy(), SchedulingPolicy::Priority);
+    }
+
+    #[test]
+    fn create_request_queue_returns_correct_type() {
+        let fcfs = create_request_queue(SchedulingPolicy::Fcfs);
+        let priority = create_request_queue(SchedulingPolicy::Priority);
+
+        // Basic sanity check that they work
+        let mut fcfs = fcfs;
+        let mut priority = priority;
+
+        fcfs.add(1, 0, 0);
+        priority.add(1, 0, 0);
+
+        assert!(!fcfs.is_empty());
+        assert!(!priority.is_empty());
+    }
+
+    #[test]
+    fn priority_preemption_evicts_lowest_priority_first() {
+        // With priority scheduling, preemption should prefer to evict
+        // lowest-priority requests (highest priority value) to protect
+        // high-priority requests.
+        let config = priority_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        // Three running requests with different priorities:
+        // Request 0: priority 1 (high priority) - should be protected
+        // Request 1: priority 10 (low priority) - should be preempted first
+        // Request 2: priority 5 (medium priority) - should be preempted second if needed
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0));
+        states.insert(1, make_decoding_state(1, 16, 0, 16, 1));
+        states.insert(2, make_decoding_state(2, 16, 0, 16, 2));
+
+        scheduler.running_set_mut().insert(0);
+        scheduler.running_set_mut().insert(1);
+        scheduler.running_set_mut().insert(2);
+        scheduler.insert_metadata(0, 1, 0); // High priority
+        scheduler.insert_metadata(1, 10, 1); // Low priority
+        scheduler.insert_metadata(2, 5, 2); // Medium priority
+
+        // Only 1 block available, each request needs 1 block for decode
+        // Two must be preempted, should preempt lowest priority first
+        let output = scheduler.schedule(&refs(&states), 1);
+
+        // Only 1 decode can succeed
+        assert_eq!(output.decode_requests.len(), 1);
+
+        // Two requests preempted: should be request 1 (priority 10) first,
+        // then request 2 (priority 5). Request 0 (priority 1) should survive.
+        assert_eq!(output.preempted_requests.len(), 2);
+        assert_eq!(output.preempted_requests[0], 1); // Lowest priority (10)
+        assert_eq!(output.preempted_requests[1], 2); // Next lowest (5)
+        assert_eq!(output.decode_requests[0], 0); // Highest priority (1) survives
+    }
+
+    #[test]
+    fn fcfs_preemption_evicts_newest_first() {
+        // With FCFS scheduling, preemption should evict newest requests first
+        // to minimize wasted compute on older requests.
+        let config = fcfs_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        // Three running requests with different arrival times
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0)); // Oldest
+        states.insert(1, make_decoding_state(1, 16, 0, 16, 1)); // Middle
+        states.insert(2, make_decoding_state(2, 16, 0, 16, 2)); // Newest
+
+        scheduler.running_set_mut().insert(0);
+        scheduler.running_set_mut().insert(1);
+        scheduler.running_set_mut().insert(2);
+        scheduler.insert_metadata(0, DEFAULT_PRIORITY, 0);
+        scheduler.insert_metadata(1, DEFAULT_PRIORITY, 1);
+        scheduler.insert_metadata(2, DEFAULT_PRIORITY, 2);
+
+        // Only 1 block available, each request needs 1 block for decode
+        let output = scheduler.schedule(&refs(&states), 1);
+
+        assert_eq!(output.decode_requests.len(), 1);
+        assert_eq!(output.preempted_requests.len(), 2);
+
+        // Preempted in newest-first order
+        assert_eq!(output.preempted_requests[0], 2); // Newest (arrival 2)
+        assert_eq!(output.preempted_requests[1], 1); // Next newest (arrival 1)
+        assert_eq!(output.decode_requests[0], 0); // Oldest survives
+    }
+
+    #[test]
+    fn priority_preemption_tiebreaker_is_arrival_time() {
+        // When priorities are equal, preemption should prefer newer arrivals
+        let config = priority_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        // Two requests with same priority, different arrival times
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0)); // Older
+        states.insert(1, make_decoding_state(1, 16, 0, 16, 1)); // Newer
+
+        scheduler.running_set_mut().insert(0);
+        scheduler.running_set_mut().insert(1);
+        scheduler.insert_metadata(0, 5, 0); // Same priority, older
+        scheduler.insert_metadata(1, 5, 1); // Same priority, newer
+
+        // Only 1 block available
+        let output = scheduler.schedule(&refs(&states), 1);
+
+        assert_eq!(output.decode_requests.len(), 1);
+        assert_eq!(output.preempted_requests.len(), 1);
+
+        // Newer request should be preempted when priorities are equal
+        assert_eq!(output.preempted_requests[0], 1); // Newer
+        assert_eq!(output.decode_requests[0], 0); // Older survives
     }
 }
