@@ -215,9 +215,11 @@ impl VisionAttention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // Reshape back: [batch, seq_len, hidden_size]
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
 
         self.out_proj.forward(&attn_output)
     }

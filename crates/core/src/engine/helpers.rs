@@ -339,7 +339,14 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
 ) -> Vec<RequestId> {
-    execute_batched_decode_with_graph(decode_request_ids, model, kv_cache_mgr, requests, None, None)
+    execute_batched_decode_with_graph(
+        decode_request_ids,
+        model,
+        kv_cache_mgr,
+        requests,
+        None,
+        None,
+    )
 }
 
 /// Execute batched decode with optional CUDA graph support.
@@ -447,8 +454,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // Note: CUDA graphs and LoRA are currently mutually exclusive for simplicity
     let logits = if batch_lora_ctx.has_adapter() {
         // LoRA path - no graph support
-        match model.forward_decode_batch_with_lora(&input, &sequences, kv_cache_mgr, &batch_lora_ctx)
-        {
+        match model.forward_decode_batch_with_lora(
+            &input,
+            &sequences,
+            kv_cache_mgr,
+            &batch_lora_ctx,
+        ) {
             Ok(l) => l,
             Err(_) => {
                 failed.extend(&batch_ids);

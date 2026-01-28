@@ -52,9 +52,78 @@ impl Default for ModelConfig {
     }
 }
 
+impl ModelConfig {
+    /// Check if this model uses MLA (Multi-head Latent Attention).
+    ///
+    /// MLA is used by DeepSeek V2/V3 models and identified by the presence
+    /// of `kv_lora_rank` in the config.
+    pub fn is_mla_model(&self) -> bool {
+        self.extra.contains_key("kv_lora_rank")
+    }
+
+    /// Extract MLA dimensions from config.
+    ///
+    /// Returns `None` if this is not an MLA model.
+    pub fn mla_dims(&self) -> Option<crate::kv_cache::MLADims> {
+        crate::kv_cache::MLADims::from_config_extra(&self.extra)
+    }
+
+    /// Check if this is a DeepSeek model.
+    pub fn is_deepseek(&self) -> bool {
+        self.architectures.iter().any(|a| a.contains("DeepSeek"))
+    }
+
+    /// Check if this is a MoE (Mixture of Experts) model.
+    pub fn is_moe(&self) -> bool {
+        self.extra.contains_key("n_routed_experts")
+    }
+
+    /// Get the number of routed experts (for MoE models).
+    pub fn num_routed_experts(&self) -> Option<usize> {
+        self.extra
+            .get("n_routed_experts")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get the top-k experts per token (for MoE models).
+    pub fn num_experts_per_tok(&self) -> Option<usize> {
+        self.extra
+            .get("num_experts_per_tok")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEEPSEEK_V3_CONFIG: &str = r#"{
+        "architectures": ["DeepSeekForCausalLM"],
+        "hidden_size": 7168,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "num_hidden_layers": 60,
+        "intermediate_size": 18432,
+        "vocab_size": 129280,
+        "max_position_embeddings": 163840,
+        "head_dim": 192,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 10000,
+        "tie_word_embeddings": false,
+        "bos_token_id": 0,
+        "eos_token_id": 1,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "q_lora_rank": 1536,
+        "n_routed_experts": 256,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 8
+    }"#;
 
     const QWEN3_06B_CONFIG: &str = r#"{
         "architectures": ["Qwen3ForCausalLM"],
@@ -114,5 +183,47 @@ mod tests {
 
         let gqa_groups = config.num_attention_heads / config.num_key_value_heads;
         assert_eq!(gqa_groups, 2);
+    }
+
+    #[test]
+    fn parse_deepseek_v3_config() {
+        let config: ModelConfig =
+            serde_json::from_str(DEEPSEEK_V3_CONFIG).expect("failed to parse config");
+
+        assert!(config.is_deepseek());
+        assert!(config.is_mla_model());
+        assert!(config.is_moe());
+    }
+
+    #[test]
+    fn mla_dims_extraction() {
+        let config: ModelConfig =
+            serde_json::from_str(DEEPSEEK_V3_CONFIG).expect("failed to parse config");
+
+        let dims = config.mla_dims().expect("should have MLA dims");
+        assert_eq!(dims.kv_lora_rank, 512);
+        assert_eq!(dims.qk_rope_head_dim, 64);
+        assert_eq!(dims.qk_nope_head_dim, 128);
+        assert_eq!(dims.v_head_dim, 128);
+    }
+
+    #[test]
+    fn moe_config_extraction() {
+        let config: ModelConfig =
+            serde_json::from_str(DEEPSEEK_V3_CONFIG).expect("failed to parse config");
+
+        assert_eq!(config.num_routed_experts(), Some(256));
+        assert_eq!(config.num_experts_per_tok(), Some(8));
+    }
+
+    #[test]
+    fn non_mla_model() {
+        let config: ModelConfig =
+            serde_json::from_str(QWEN3_06B_CONFIG).expect("failed to parse config");
+
+        assert!(!config.is_mla_model());
+        assert!(config.mla_dims().is_none());
+        assert!(!config.is_deepseek());
+        assert!(!config.is_moe());
     }
 }

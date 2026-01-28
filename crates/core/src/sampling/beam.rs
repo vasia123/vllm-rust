@@ -3,8 +3,8 @@
 //! Beam search maintains multiple hypotheses (beams) at each step and selects
 //! the top-k candidates based on cumulative log probability scores.
 
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// Configuration for beam search decoding.
 #[derive(Debug, Clone)]
@@ -82,8 +82,8 @@ impl Default for BeamHypothesis {
 #[derive(Debug, Clone)]
 struct BeamCandidate {
     token_id: u32,
-    score: f32,  // Cumulative score if this token is selected
-    beam_idx: usize,  // Which beam this extends
+    score: f32,      // Cumulative score if this token is selected
+    beam_idx: usize, // Which beam this extends
 }
 
 impl PartialEq for BeamCandidate {
@@ -103,7 +103,10 @@ impl PartialOrd for BeamCandidate {
 impl Ord for BeamCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse order for min-heap (we want to keep highest scores)
-        other.score.partial_cmp(&self.score).unwrap_or(Ordering::Equal)
+        other
+            .score
+            .partial_cmp(&self.score)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -229,7 +232,8 @@ impl BeamSearchState {
             let parent_beam = &self.beams[candidate.beam_idx];
             let mut new_hyp = BeamHypothesis {
                 token_ids: parent_beam.token_ids.clone(),
-                score: parent_beam.score + log_probs[candidate.beam_idx][candidate.token_id as usize],
+                score: parent_beam.score
+                    + log_probs[candidate.beam_idx][candidate.token_id as usize],
                 is_finished: candidate.token_id == self.eos_token_id,
                 parent_beam_idx: candidate.beam_idx,
             };
@@ -259,11 +263,8 @@ impl BeamSearchState {
 
     /// Get the best completed hypotheses.
     pub fn get_best_hypotheses(&self) -> Vec<&BeamHypothesis> {
-        let mut all: Vec<&BeamHypothesis> = self
-            .completed
-            .iter()
-            .chain(self.beams.iter())
-            .collect();
+        let mut all: Vec<&BeamHypothesis> =
+            self.completed.iter().chain(self.beams.iter()).collect();
 
         all.sort_by(|a, b| {
             let score_a = a.normalized_score(self.config.length_penalty);
@@ -297,10 +298,7 @@ pub fn beam_search_top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
         .sum::<f32>()
         .ln();
 
-    let log_probs: Vec<f32> = logits
-        .iter()
-        .map(|&x| x - max_logit - exp_sum_ln)
-        .collect();
+    let log_probs: Vec<f32> = logits.iter().map(|&x| x - max_logit - exp_sum_ln).collect();
 
     // Get top-k
     let mut indexed: Vec<(u32, f32)> = log_probs
@@ -364,8 +362,8 @@ mod tests {
         // Simulate log probabilities for 2 beams, vocab size 4
         // Token 2 is EOS
         let log_probs = vec![
-            vec![-1.0, -2.0, -0.5, -3.0],  // Beam 0: token 2 (EOS) has highest prob
-            vec![-2.0, -1.0, -4.0, -3.0],  // Beam 1: token 1 has highest prob
+            vec![-1.0, -2.0, -0.5, -3.0], // Beam 0: token 2 (EOS) has highest prob
+            vec![-2.0, -1.0, -4.0, -3.0], // Beam 1: token 1 has highest prob
         ];
 
         let transitions = state.step(&log_probs);
@@ -387,20 +385,23 @@ mod tests {
         // Run a few steps where EOS is eventually selected
         // First step: some tokens, no EOS
         let log_probs1 = vec![
-            vec![-1.0, -2.0, -10.0, -3.0],  // Token 0 best (not EOS)
-            vec![-2.0, -1.0, -10.0, -3.0],  // Token 1 best (not EOS)
+            vec![-1.0, -2.0, -10.0, -3.0], // Token 0 best (not EOS)
+            vec![-2.0, -1.0, -10.0, -3.0], // Token 1 best (not EOS)
         ];
         state.step(&log_probs1);
 
         // Second step: EOS is best
         let log_probs2 = vec![
-            vec![-10.0, -10.0, -0.1, -10.0],  // Token 2 (EOS) best
-            vec![-10.0, -10.0, -0.2, -10.0],  // Token 2 (EOS) best
+            vec![-10.0, -10.0, -0.1, -10.0], // Token 2 (EOS) best
+            vec![-10.0, -10.0, -0.2, -10.0], // Token 2 (EOS) best
         ];
         state.step(&log_probs2);
 
         // At least one beam should have completed with EOS
-        assert!(!state.completed.is_empty(), "Should have completed hypotheses after EOS selection");
+        assert!(
+            !state.completed.is_empty(),
+            "Should have completed hypotheses after EOS selection"
+        );
     }
 
     #[test]

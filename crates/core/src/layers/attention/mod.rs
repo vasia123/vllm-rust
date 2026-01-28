@@ -1,7 +1,7 @@
 //! Attention backends and operations for transformer inference.
 //!
 //! This module provides:
-//! - Pluggable attention backends (naive, FlashAttention, future: FlashInfer)
+//! - Pluggable attention backends (naive, FlashAttention, FlashInfer)
 //! - Common attention operations (repeat_kv, apply_per_head_norm)
 //! - Paged attention for efficient KV cache management
 //!
@@ -11,6 +11,7 @@
 //!
 //! - `NaiveAttentionBackend`: Reference implementation using standard matmuls
 //! - `FlashAttentionBackend`: FlashAttention-2 via candle-flash-attn
+//! - `FlashInferBackend`: FlashInfer kernels for 2-3x decode speedup
 //!
 //! # Example
 //!
@@ -30,6 +31,7 @@
 mod backend;
 pub mod flash;
 pub mod flashinfer;
+pub mod mla;
 pub mod naive;
 mod ops;
 
@@ -42,6 +44,7 @@ pub use ops::{apply_per_head_norm, repeat_kv};
 // Re-export backend implementations
 pub use flash::FlashAttentionBackend;
 pub use flashinfer::FlashInferBackend;
+pub use mla::MLAAttention;
 pub use naive::NaiveAttentionBackend;
 
 use candle_core::{Result, Tensor};

@@ -325,7 +325,10 @@ impl GemmaDecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self.post_attention_layernorm.forward(&xs)?.apply(&self.mlp)?;
+        let xs = self
+            .post_attention_layernorm
+            .forward(&xs)?
+            .apply(&self.mlp)?;
         residual + xs
     }
 
@@ -345,7 +348,10 @@ impl GemmaDecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self.post_attention_layernorm.forward(&xs)?.apply(&self.mlp)?;
+        let xs = self
+            .post_attention_layernorm
+            .forward(&xs)?
+            .apply(&self.mlp)?;
         residual + xs
     }
 }
@@ -444,7 +450,13 @@ impl crate::engine::ModelForward for GemmaForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        self.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     fn forward_decode_batch(
@@ -519,7 +531,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
         let model = GemmaForCausalLM::new(&cfg, vb);
-        assert!(model.is_ok(), "GemmaForCausalLM should construct with zero weights");
+        assert!(
+            model.is_ok(),
+            "GemmaForCausalLM should construct with zero weights"
+        );
 
         let model = model.unwrap();
         assert_eq!(model.layers.len(), cfg.num_hidden_layers);
@@ -546,7 +561,13 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, seq_len);
 
         let logits = model
-            .forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward");
 
         assert_eq!(
@@ -575,7 +596,13 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 1);
 
         let logits = model
-            .forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward");
 
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
@@ -627,7 +654,10 @@ mod tests {
         assert!(result_vec[2].abs() < 0.01, "GELU(0) should be ≈0");
 
         // GELU is smooth and monotonically increasing for positive values
-        assert!(result_vec[4] > result_vec[3], "GELU should be increasing for positive x");
+        assert!(
+            result_vec[4] > result_vec[3],
+            "GELU should be increasing for positive x"
+        );
     }
 
     #[test]
@@ -662,7 +692,13 @@ mod tests {
         let next_token = Tensor::zeros((1, 1), DType::U32, &device).expect("next token");
 
         let logits = model
-            .forward(&next_token, 3, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &next_token,
+                3,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("decode");
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }

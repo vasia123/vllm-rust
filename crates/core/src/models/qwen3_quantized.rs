@@ -28,12 +28,24 @@ impl QuantizedSwiGluMlp {
         loader: &dyn QuantizedWeightLoader,
         prefix: &str,
     ) -> Result<Self> {
-        let gate_proj =
-            loader.load_linear(&format!("{prefix}.gate_proj"), hidden_size, intermediate_size, false)?;
-        let up_proj =
-            loader.load_linear(&format!("{prefix}.up_proj"), hidden_size, intermediate_size, false)?;
-        let down_proj =
-            loader.load_linear(&format!("{prefix}.down_proj"), intermediate_size, hidden_size, false)?;
+        let gate_proj = loader.load_linear(
+            &format!("{prefix}.gate_proj"),
+            hidden_size,
+            intermediate_size,
+            false,
+        )?;
+        let up_proj = loader.load_linear(
+            &format!("{prefix}.up_proj"),
+            hidden_size,
+            intermediate_size,
+            false,
+        )?;
+        let down_proj = loader.load_linear(
+            &format!("{prefix}.down_proj"),
+            intermediate_size,
+            hidden_size,
+            false,
+        )?;
 
         Ok(Self {
             gate_proj,
@@ -322,8 +334,11 @@ impl QuantizedQwen3DecoderLayer {
             &format!("{prefix}.mlp"),
         )?;
 
-        let input_layernorm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_layer.pp("input_layernorm"))?;
+        let input_layernorm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb_layer.pp("input_layernorm"),
+        )?;
         let post_attention_layernorm = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -361,7 +376,9 @@ impl QuantizedQwen3DecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self.mlp.forward(&self.post_attention_layernorm.forward(&xs)?)?;
+        let xs = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&xs)?)?;
         residual + xs
     }
 
@@ -381,7 +398,9 @@ impl QuantizedQwen3DecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self.mlp.forward(&self.post_attention_layernorm.forward(&xs)?)?;
+        let xs = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&xs)?)?;
         residual + xs
     }
 }
@@ -415,7 +434,12 @@ impl QuantizedQwen3ForCausalLM {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(QuantizedQwen3DecoderLayer::new(cfg, weight_loader, vb.clone(), i)?);
+            layers.push(QuantizedQwen3DecoderLayer::new(
+                cfg,
+                weight_loader,
+                vb.clone(),
+                i,
+            )?);
         }
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
@@ -558,7 +582,7 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
 mod tests {
     use super::*;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
-    use crate::quantization::{DetectedQuantConfig, create_weight_loader_with_params};
+    use crate::quantization::{create_weight_loader_with_params, DetectedQuantConfig};
 
     fn test_config() -> crate::config::ModelConfig {
         crate::config::ModelConfig {

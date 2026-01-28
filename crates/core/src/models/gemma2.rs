@@ -1,10 +1,11 @@
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::repeat_kv;
+use crate::layers::RotaryEmbedding;
 
 // ─── Gemma2 RMSNorm ──────────────────────────────────────────────────────────
 //
@@ -52,6 +53,45 @@ fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
     scaled.tanh()? * cap
 }
 
+/// Create a sliding window causal mask.
+///
+/// This mask allows attention only to positions within `window_size` tokens
+/// before the current position, while maintaining causality.
+///
+/// # Arguments
+/// * `q_len` - Number of query positions
+/// * `kv_len` - Number of key/value positions
+/// * `seqlen_offset` - Offset in the sequence (for decode phase)
+/// * `window_size` - Maximum number of tokens to attend to
+/// * `dtype` - Output dtype
+/// * `device` - Target device
+fn sliding_window_mask(
+    q_len: usize,
+    kv_len: usize,
+    seqlen_offset: usize,
+    window_size: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut mask = vec![f32::NEG_INFINITY; q_len * kv_len];
+
+    for i in 0..q_len {
+        let query_pos = seqlen_offset + i;
+        for j in 0..kv_len {
+            // Causal: can only attend to positions <= query_pos
+            // Sliding window: can only attend to positions >= query_pos - window_size + 1
+            let is_causal = j <= query_pos;
+            let is_in_window = query_pos < window_size || j > query_pos - window_size;
+
+            if is_causal && is_in_window {
+                mask[i * kv_len + j] = 0.0;
+            }
+        }
+    }
+
+    Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
+}
+
 // ─── Gemma2 MLP ──────────────────────────────────────────────────────────────
 
 struct Gemma2Mlp {
@@ -93,20 +133,14 @@ struct Gemma2Attention {
     num_kv_heads: usize,
     head_dim: usize,
     scaling: f64,
-    // TODO: implement soft capping in attention kernel
-    #[allow(dead_code)]
+    /// Soft capping for attention logits (applied before softmax)
     attn_logit_softcap: Option<f64>,
-    // TODO: implement sliding window masking
-    #[allow(dead_code)]
+    /// Sliding window size (None = global attention)
     sliding_window: Option<usize>,
 }
 
 impl Gemma2Attention {
-    fn new(
-        cfg: &ModelConfig,
-        layer_idx: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -164,13 +198,15 @@ impl Gemma2Attention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        _attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
+        let device = xs.device();
+        let dtype = xs.dtype();
 
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
@@ -188,28 +224,60 @@ impl Gemma2Attention {
 
         let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
+        // Write new K, V to cache
+        // k is [b_sz, num_kv_heads, q_len, head_dim] = [1, 2, 5, 16]
+        // CacheEngine.write expects [num_kv_heads, num_tokens, head_dim] and transposes internally
+        let k_for_cache = k.squeeze(0)?.contiguous()?; // [num_kv_heads, q_len, head_dim]
+        let v_for_cache = v.squeeze(0)?.contiguous()?;
+        cache_engine
+            .write(&k_for_cache, &v_for_cache, slot_mapping)
+            .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+
+        // Read full K, V history from cache
+        // cache_engine.read returns [1, num_kv_heads, kv_len, head_dim]
+        let num_tokens = seqlen_offset + q_len;
+        let (k_full, v_full) = cache_engine
+            .read(block_table.block_ids(), num_tokens)
+            .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
+
+        let kv_len = k_full.dim(2)?; // kv_len is at dim 2 in [1, kv_heads, kv_len, head_dim]
+
+        // GQA: repeat KV heads to match num_heads
+        let num_kv_groups = self.num_heads / self.num_kv_heads;
+        let k_full = repeat_kv(k_full, num_kv_groups)?; // [1, num_heads, kv_len, head_dim]
+        let v_full = repeat_kv(v_full, num_kv_groups)?;
+
         // Apply custom scaling
         let q = (q * self.scaling)?;
 
-        // For sliding window layers, we need to apply windowed attention
-        // For now, use standard paged attention (full context)
-        // TODO: implement sliding window masking
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            seqlen_offset,
-            cache_engine,
-            block_table.block_ids(),
-            slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
+        // Compute attention scores: [b, num_heads, q_len, kv_len]
+        let mut attn_weights = q.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
 
-        // Apply attention logit soft capping is handled inside attention computation
-        // For now, we skip it as it requires modifying the attention kernel
+        // Apply soft capping to attention logits (before softmax)
+        if let Some(cap) = self.attn_logit_softcap {
+            attn_weights = soft_cap(&attn_weights, cap)?;
+        }
+
+        // Create attention mask (causal or sliding window)
+        // Both return shape [1, 1, q_len, kv_len] for broadcasting
+        let mask = if let Some(window_size) = self.sliding_window {
+            sliding_window_mask(q_len, kv_len, seqlen_offset, window_size, dtype, device)?
+        } else {
+            // Standard causal mask already returns [1, 1, q_len, kv_len]
+            crate::layers::causal_mask(q_len, seqlen_offset, dtype, device)?
+        };
+
+        attn_weights = attn_weights.broadcast_add(&mask)?;
+
+        // Softmax and output
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&v_full)?;
+
+        // Reshape to [b, q_len, num_heads * head_dim]
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
 
         attn_output.apply(&self.o_proj)
     }
@@ -221,6 +289,8 @@ impl Gemma2Attention {
         cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
+        let device = xs.device();
+        let dtype = xs.dtype();
 
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
@@ -236,98 +306,70 @@ impl Gemma2Attention {
             .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        #[cfg(feature = "cuda-kernels")]
-        {
-            let q = q.squeeze(2)?;
-            let k = k.squeeze(2)?;
-            let v = v.squeeze(2)?;
+        // Process each sequence individually to apply soft capping and sliding window
+        let mut outputs = Vec::with_capacity(batch_size);
+        let num_kv_groups = self.num_heads / self.num_kv_heads;
 
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
+        for (i, seq) in sequences.iter().enumerate() {
+            let q_i = q.i(i)?.unsqueeze(0)?;
+            let k_i = k.i(i)?.unsqueeze(0)?;
+            let v_i = v.i(i)?.unsqueeze(0)?;
 
-            // Apply custom scaling
-            let q = (q * self.scaling)?;
+            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
 
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
+            // Write to cache
+            // k_i is [1, num_kv_heads, 1, head_dim], CacheEngine.write expects [num_kv_heads, 1, head_dim]
+            let k_for_cache = k_i.squeeze(0)?.contiguous()?; // [num_kv_heads, 1, head_dim]
+            let v_for_cache = v_i.squeeze(0)?.contiguous()?;
             cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
+                .write(&k_for_cache, &v_for_cache, &seq.slot_mapping)
                 .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
 
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-                }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
+            // Read full KV history
+            // cache_engine.read returns [1, num_kv_heads, kv_len, head_dim]
+            let kv_len = seq.seqlen_offset + 1;
+            let (k_full, v_full) = cache_engine
+                .read(&seq.block_ids, kv_len)
+                .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
 
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+            // GQA: repeat KV heads
+            let k_full = repeat_kv(k_full, num_kv_groups)?; // [1, num_heads, kv_len, head_dim]
+            let v_full = repeat_kv(v_full, num_kv_groups)?;
 
-            // Scale already applied to q
-            let scale = 1.0f32;
+            // Apply scaling
+            let q_i = (q_i * self.scaling)?;
 
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-            )?;
+            // Compute attention scores
+            let mut attn_weights = q_i.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
 
-            attn_output.apply(&self.o_proj)?.unsqueeze(1)
-        }
-
-        #[cfg(not(feature = "cuda-kernels"))]
-        {
-            let mut outputs = Vec::with_capacity(batch_size);
-            for (i, seq) in sequences.iter().enumerate() {
-                let q_i = q.narrow(0, i, 1)?;
-                let k_i = k.narrow(0, i, 1)?;
-                let v_i = v.narrow(0, i, 1)?;
-
-                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-                // Apply custom scaling
-                let q_i = (q_i * self.scaling)?;
-
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None,
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-                outputs.push(attn_out);
+            // Apply soft capping
+            if let Some(cap) = self.attn_logit_softcap {
+                attn_weights = soft_cap(&attn_weights, cap)?;
             }
 
-            let attn_output = Tensor::cat(&outputs, 0)?;
-            attn_output.apply(&self.o_proj)
+            // Apply sliding window mask if needed
+            if let Some(window_size) = self.sliding_window {
+                let mask =
+                    sliding_window_mask(1, kv_len, seq.seqlen_offset, window_size, dtype, device)?;
+                attn_weights = attn_weights.broadcast_add(&mask)?;
+            }
+            // No causal mask needed for decode (single query token)
+
+            // Softmax and output
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v_full)?;
+
+            // Reshape: [1, num_heads, 1, head_dim] -> [1, 1, num_heads * head_dim]
+            let attn_output =
+                attn_output
+                    .transpose(1, 2)?
+                    .reshape((1, 1, self.num_heads * self.head_dim))?;
+
+            outputs.push(attn_output);
         }
+
+        let attn_output = Tensor::cat(&outputs, 0)?;
+        attn_output.apply(&self.o_proj)
     }
 }
 
@@ -556,7 +598,13 @@ impl crate::engine::ModelForward for Gemma2ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        self.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     fn forward_decode_batch(
@@ -677,7 +725,13 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, seq_len);
 
         let logits = model
-            .forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward");
 
         assert_eq!(
@@ -757,7 +811,13 @@ mod tests {
         let next_token = Tensor::zeros((1, 1), DType::U32, &device).expect("next token");
 
         let logits = model
-            .forward(&next_token, 3, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &next_token,
+                3,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("decode");
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }
@@ -783,7 +843,15 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 1);
 
         let x = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).expect("input");
-        let result = layer.forward(&x, None, 0, &mut kv_cache_mgr, 0, &block_table, &slot_mapping);
+        let result = layer.forward(
+            &x,
+            None,
+            0,
+            &mut kv_cache_mgr,
+            0,
+            &block_table,
+            &slot_mapping,
+        );
         assert!(result.is_ok());
     }
 

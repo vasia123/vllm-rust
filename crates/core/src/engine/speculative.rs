@@ -104,7 +104,13 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
         };
 
         if k == 0 {
-            return execute_decode(req_id, &self.target_model, target_kv_cache, requests, tokenizer);
+            return execute_decode(
+                req_id,
+                &self.target_model,
+                target_kv_cache,
+                requests,
+                tokenizer,
+            );
         }
 
         let req = requests
@@ -281,7 +287,12 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
     ) {
         // Speculative decoding doesn't use multi-step in the same way
         for &req_id in &output.decode_requests {
-            let result = self.execute_speculative_decode(req_id, kv_cache_mgr, &mut state.requests, tokenizer);
+            let result = self.execute_speculative_decode(
+                req_id,
+                kv_cache_mgr,
+                &mut state.requests,
+                tokenizer,
+            );
             if let Err(e) = result {
                 finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
             }

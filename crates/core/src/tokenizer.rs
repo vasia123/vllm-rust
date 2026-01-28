@@ -77,7 +77,7 @@ impl MessageContent {
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join("")
+                .join(""),
         }
     }
 
@@ -85,7 +85,9 @@ impl MessageContent {
     pub fn has_images(&self) -> bool {
         match self {
             MessageContent::Text(_) => false,
-            MessageContent::Parts(parts) => parts.iter().any(|p| matches!(p, ContentPart::Image { .. })),
+            MessageContent::Parts(parts) => {
+                parts.iter().any(|p| matches!(p, ContentPart::Image { .. }))
+            }
         }
     }
 
@@ -434,10 +436,13 @@ mod tests {
 
     #[test]
     fn test_chat_message_multimodal() {
-        let msg = ChatMessage::multimodal("user", vec![
-            ContentPart::text("Describe this:"),
-            ContentPart::image_url("https://example.com/img.jpg"),
-        ]);
+        let msg = ChatMessage::multimodal(
+            "user",
+            vec![
+                ContentPart::text("Describe this:"),
+                ContentPart::image_url("https://example.com/img.jpg"),
+            ],
+        );
         assert_eq!(msg.role, "user");
         assert!(msg.has_images());
     }

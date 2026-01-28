@@ -141,8 +141,8 @@ impl<M: ModelForward> StandardExecution<M> {
         config: &WarmupConfig,
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<(), WarmupError> {
-        use candle_core::DType;
         use super::cuda_graph::CudaGraphConfig;
+        use candle_core::DType;
 
         // Get device from model
         let device = self.model.device().clone();
@@ -163,11 +163,8 @@ impl<M: ModelForward> StandardExecution<M> {
                 seq.slot_mapping = seq.block_table.slot_mapping(seq.seqlen_offset, 1);
             }
 
-            let input = candle_core::Tensor::zeros(
-                (1, 1),
-                DType::U32,
-                &device,
-            ).map_err(WarmupError::from)?;
+            let input = candle_core::Tensor::zeros((1, 1), DType::U32, &device)
+                .map_err(WarmupError::from)?;
 
             let sequences: Vec<DecodeSequenceMetadata> = dummy_seqs
                 .iter()

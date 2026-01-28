@@ -6,6 +6,8 @@ pub mod config;
 mod error;
 mod free_block_queue;
 pub mod metrics;
+pub mod mla_cache_config;
+pub mod mla_cache_engine;
 pub mod prefix_cache;
 pub mod quantization;
 
@@ -17,6 +19,8 @@ pub use config::CacheConfig;
 pub use error::CacheError;
 pub use free_block_queue::FreeBlockQueue;
 pub use metrics::{KVCacheMetrics, MetricsSnapshot};
+pub use mla_cache_config::{MLACacheConfig, MLADims};
+pub use mla_cache_engine::MLACacheEngine;
 pub use quantization::{
     dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype, KVScales,
 };
@@ -25,10 +29,62 @@ use block_pool::BlockPool;
 use prefix_cache::PrefixCache;
 use std::sync::Arc;
 
+/// Cache variant for supporting different KV storage formats.
+///
+/// Standard models (Llama, Qwen, Mistral) use `Standard` with full K/V tensors.
+/// DeepSeek V2/V3 uses `MLA` with compressed latent representations (42x memory savings).
+pub enum CacheVariant {
+    /// Standard paged KV cache: [num_blocks, block_size, num_kv_heads, head_dim]
+    Standard(CacheEngine),
+    /// MLA compressed cache: kv_c [kv_lora_rank] + k_pe [qk_rope_head_dim]
+    MLA(MLACacheEngine),
+}
+
+impl CacheVariant {
+    /// Get as standard cache engine, panics if MLA.
+    pub fn as_standard(&self) -> &CacheEngine {
+        match self {
+            CacheVariant::Standard(e) => e,
+            CacheVariant::MLA(_) => panic!("Expected Standard cache, got MLA"),
+        }
+    }
+
+    /// Get as standard cache engine (mutable), panics if MLA.
+    pub fn as_standard_mut(&mut self) -> &mut CacheEngine {
+        match self {
+            CacheVariant::Standard(e) => e,
+            CacheVariant::MLA(_) => panic!("Expected Standard cache, got MLA"),
+        }
+    }
+
+    /// Get as MLA cache engine, panics if Standard.
+    pub fn as_mla(&self) -> &MLACacheEngine {
+        match self {
+            CacheVariant::MLA(e) => e,
+            CacheVariant::Standard(_) => panic!("Expected MLA cache, got Standard"),
+        }
+    }
+
+    /// Get as MLA cache engine (mutable), panics if Standard.
+    pub fn as_mla_mut(&mut self) -> &mut MLACacheEngine {
+        match self {
+            CacheVariant::MLA(e) => e,
+            CacheVariant::Standard(_) => panic!("Expected MLA cache, got Standard"),
+        }
+    }
+
+    /// Check if this is an MLA cache variant.
+    pub fn is_mla(&self) -> bool {
+        matches!(self, CacheVariant::MLA(_))
+    }
+}
+
 /// Top-level coordinator: BlockPool + per-layer CacheEngines.
+///
+/// Supports both standard KV cache and MLA compressed cache through `CacheVariant`.
 pub struct KVCacheManager {
     block_pool: BlockPool,
-    engines: Vec<CacheEngine>,
+    engines: Vec<CacheVariant>,
     block_size: usize,
     metrics: Arc<KVCacheMetrics>,
     /// Optional prefix cache for block reuse and eviction coordination
@@ -36,6 +92,7 @@ pub struct KVCacheManager {
 }
 
 impl KVCacheManager {
+    /// Create a KVCacheManager with standard KV cache (for Llama, Qwen, Mistral, etc.)
     pub fn new(config: &CacheConfig) -> Result<Self, CacheError> {
         Self::with_metrics(config, Arc::new(KVCacheMetrics::new()))
     }
@@ -47,7 +104,7 @@ impl KVCacheManager {
     ) -> Result<Self, CacheError> {
         let mut engines = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            engines.push(CacheEngine::new(config)?);
+            engines.push(CacheVariant::Standard(CacheEngine::new(config)?));
         }
         Ok(Self {
             block_pool: BlockPool::new(config.num_blocks),
@@ -66,6 +123,32 @@ impl KVCacheManager {
         let mut mgr = Self::with_metrics(config, Arc::clone(&metrics))?;
         mgr.prefix_cache = Some(PrefixCache::with_metrics(config.block_size, metrics));
         Ok(mgr)
+    }
+
+    /// Create a KVCacheManager with MLA compressed cache (for DeepSeek V2/V3).
+    ///
+    /// MLA cache stores compressed latent representations instead of full K/V tensors,
+    /// achieving ~42x memory reduction for DeepSeek models.
+    pub fn new_mla(config: &MLACacheConfig) -> Result<Self, CacheError> {
+        Self::new_mla_with_metrics(config, Arc::new(KVCacheMetrics::new()))
+    }
+
+    /// Create a KVCacheManager with MLA cache and custom metrics.
+    pub fn new_mla_with_metrics(
+        config: &MLACacheConfig,
+        metrics: Arc<KVCacheMetrics>,
+    ) -> Result<Self, CacheError> {
+        let mut engines = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            engines.push(CacheVariant::MLA(MLACacheEngine::new(config)?));
+        }
+        Ok(Self {
+            block_pool: BlockPool::new(config.num_blocks),
+            engines,
+            block_size: config.block_size,
+            metrics,
+            prefix_cache: None,
+        })
     }
 
     /// Allocate blocks needed for `new_tokens` additional tokens.
@@ -94,15 +177,45 @@ impl KVCacheManager {
     }
 
     /// Get the CacheEngine for a specific layer (immutable).
+    ///
+    /// # Panics
+    /// Panics if this is an MLA cache manager. Use `mla_engine()` instead.
     pub fn engine(&self, layer_idx: usize) -> &CacheEngine {
-        &self.engines[layer_idx]
+        self.engines[layer_idx].as_standard()
     }
 
     /// Get the CacheEngine for a specific layer (mutable).
     ///
     /// Required for quantized KV cache where write operations update scales.
+    ///
+    /// # Panics
+    /// Panics if this is an MLA cache manager. Use `mla_engine_mut()` instead.
     pub fn engine_mut(&mut self, layer_idx: usize) -> &mut CacheEngine {
-        &mut self.engines[layer_idx]
+        self.engines[layer_idx].as_standard_mut()
+    }
+
+    /// Get the MLACacheEngine for a specific layer (immutable).
+    ///
+    /// # Panics
+    /// Panics if this is a standard cache manager. Use `engine()` instead.
+    pub fn mla_engine(&self, layer_idx: usize) -> &MLACacheEngine {
+        self.engines[layer_idx].as_mla()
+    }
+
+    /// Get the MLACacheEngine for a specific layer (mutable).
+    ///
+    /// # Panics
+    /// Panics if this is a standard cache manager. Use `engine_mut()` instead.
+    pub fn mla_engine_mut(&mut self, layer_idx: usize) -> &mut MLACacheEngine {
+        self.engines[layer_idx].as_mla_mut()
+    }
+
+    /// Check if this manager uses MLA compressed cache.
+    pub fn is_mla(&self) -> bool {
+        self.engines
+            .first()
+            .map(|e| e.is_mla())
+            .unwrap_or(false)
     }
 
     pub fn block_size(&self) -> usize {
@@ -703,5 +816,142 @@ mod tests {
         assert_eq!(table_b.block_ids().len(), 2);
         // Second block should be different from A's
         assert_ne!(table_b.block_ids()[1], table_a.block_ids()[1]);
+    }
+
+    // ─── CacheVariant and MLA cache tests ────────────────────────────────────────
+
+    fn test_mla_config() -> MLACacheConfig {
+        MLACacheConfig::new(
+            32,  // kv_lora_rank
+            8,   // qk_rope_head_dim
+            16,  // qk_nope_head_dim
+            16,  // v_head_dim
+            4,   // num_heads
+            4,   // block_size
+            16,  // num_blocks
+            2,   // num_layers
+            DType::F32,
+            Device::Cpu,
+        )
+    }
+
+    #[test]
+    fn cache_variant_is_mla() {
+        let standard = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
+        assert!(!standard.is_mla());
+
+        let mla = CacheVariant::MLA(MLACacheEngine::new(&test_mla_config()).unwrap());
+        assert!(mla.is_mla());
+    }
+
+    #[test]
+    fn cache_variant_as_standard() {
+        let mut variant = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
+        let _ = variant.as_standard();
+        let _ = variant.as_standard_mut();
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected Standard cache, got MLA")]
+    fn cache_variant_as_standard_panics_on_mla() {
+        let variant = CacheVariant::MLA(MLACacheEngine::new(&test_mla_config()).unwrap());
+        let _ = variant.as_standard();
+    }
+
+    #[test]
+    fn cache_variant_as_mla() {
+        let mut variant = CacheVariant::MLA(MLACacheEngine::new(&test_mla_config()).unwrap());
+        let _ = variant.as_mla();
+        let _ = variant.as_mla_mut();
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected MLA cache, got Standard")]
+    fn cache_variant_as_mla_panics_on_standard() {
+        let variant = CacheVariant::Standard(CacheEngine::new(&test_config()).unwrap());
+        let _ = variant.as_mla();
+    }
+
+    #[test]
+    fn kv_cache_manager_new_mla() {
+        let config = test_mla_config();
+        let mgr = KVCacheManager::new_mla(&config).unwrap();
+
+        assert!(mgr.is_mla());
+        assert_eq!(mgr.num_free_blocks(), 16);
+        assert_eq!(mgr.block_size(), 4);
+    }
+
+    #[test]
+    fn kv_cache_manager_standard_is_not_mla() {
+        let config = test_config();
+        let mgr = KVCacheManager::new(&config).unwrap();
+
+        assert!(!mgr.is_mla());
+    }
+
+    #[test]
+    fn kv_cache_manager_mla_engine_mut() {
+        let config = test_mla_config();
+        let mut mgr = KVCacheManager::new_mla(&config).unwrap();
+
+        // Should work for MLA manager
+        let _ = mgr.mla_engine_mut(0);
+        let _ = mgr.mla_engine_mut(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected Standard cache, got MLA")]
+    fn kv_cache_manager_engine_mut_panics_on_mla() {
+        let config = test_mla_config();
+        let mut mgr = KVCacheManager::new_mla(&config).unwrap();
+
+        // Should panic because this is an MLA manager
+        let _ = mgr.engine_mut(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Expected MLA cache, got Standard")]
+    fn kv_cache_manager_mla_engine_mut_panics_on_standard() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        // Should panic because this is a standard manager
+        let _ = mgr.mla_engine_mut(0);
+    }
+
+    #[test]
+    fn kv_cache_manager_mla_allocate_and_free() {
+        let config = test_mla_config();
+        let mut mgr = KVCacheManager::new_mla(&config).unwrap();
+
+        assert_eq!(mgr.num_free_blocks(), 16);
+
+        let mut table = BlockTable::new(config.block_size);
+        mgr.allocate_for_request(&mut table, 10).unwrap(); // needs 3 blocks
+        assert_eq!(mgr.num_free_blocks(), 13);
+
+        mgr.free_request(&mut table).unwrap();
+        assert_eq!(mgr.num_free_blocks(), 16);
+    }
+
+    #[test]
+    fn kv_cache_manager_mla_write_read() {
+        let config = test_mla_config();
+        let mut mgr = KVCacheManager::new_mla(&config).unwrap();
+
+        // Create test data
+        let kv_c = Tensor::randn(0f32, 1f32, (2, 32), &Device::Cpu).unwrap();
+        let k_pe = Tensor::randn(0f32, 1f32, (2, 8), &Device::Cpu).unwrap();
+
+        // Write to MLA cache
+        mgr.mla_engine_mut(0)
+            .write(&kv_c, &k_pe, &[0, 1])
+            .unwrap();
+
+        // Read back raw
+        let (kv_c_out, k_pe_out) = mgr.mla_engine(0).read_raw(&[0], 2).unwrap();
+        assert_eq!(kv_c_out.dims(), &[2, 32]);
+        assert_eq!(k_pe_out.dims(), &[2, 8]);
     }
 }

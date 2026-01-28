@@ -30,7 +30,9 @@ use thiserror::Error;
 
 use crate::config::ModelConfig;
 use crate::engine::{DecodeSequenceMetadata, ModelForward};
-use crate::kv_cache::{BlockTable, KVCacheManager};
+use crate::kv_cache::{
+    BlockTable, CacheConfig, CacheError, KVCacheManager, KVCacheDtype, MLACacheConfig,
+};
 use crate::lora::{LoraContext, LoraModel};
 use crate::quantization::{
     create_weight_loader_with_params, detect_from_directory, DetectedQuantConfig,
@@ -125,10 +127,12 @@ pub fn from_config_with_quant(
             weight_loader.as_ref(),
         )?)),
         // Gemma, Mistral, Mixtral, DeepSeek: fallback to non-quantized (quantized variant not yet implemented)
-        "GemmaForCausalLM" | "Gemma2ForCausalLM" | "MistralForCausalLM" | "MixtralForCausalLM"
-        | "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
-            from_config(cfg, vb)
-        }
+        "GemmaForCausalLM"
+        | "Gemma2ForCausalLM"
+        | "MistralForCausalLM"
+        | "MixtralForCausalLM"
+        | "DeepseekV2ForCausalLM"
+        | "DeepseekV3ForCausalLM" => from_config(cfg, vb),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
@@ -138,6 +142,60 @@ pub fn from_config_with_quant(
 /// This is useful for checking quantization before loading.
 pub fn detect_quantization(model_dir: &Path) -> DetectedQuantConfig {
     detect_from_directory(model_dir)
+}
+
+/// Create a KVCacheManager appropriate for the given model configuration.
+///
+/// For MLA models (DeepSeek V2/V3), this creates a compressed MLA cache.
+/// For standard models (Llama, Qwen, etc.), this creates a standard paged KV cache.
+///
+/// # Arguments
+/// * `cfg` - Model configuration (determines cache type based on architecture)
+/// * `block_size` - Tokens per block
+/// * `num_blocks` - Total number of cache blocks
+/// * `dtype` - Data type for cache storage
+/// * `device` - Target device
+///
+/// # Returns
+/// A KVCacheManager configured for the model type
+pub fn create_cache_manager(
+    cfg: &ModelConfig,
+    block_size: usize,
+    num_blocks: usize,
+    dtype: candle_core::DType,
+    device: &Device,
+) -> Result<KVCacheManager, CacheError> {
+    if cfg.is_mla_model() {
+        let mla_dims = cfg
+            .mla_dims()
+            .expect("MLA model must have mla_dims in config");
+        let mla_config = MLACacheConfig {
+            kv_lora_rank: mla_dims.kv_lora_rank,
+            qk_rope_head_dim: mla_dims.qk_rope_head_dim,
+            qk_nope_head_dim: mla_dims.qk_nope_head_dim,
+            v_head_dim: mla_dims.v_head_dim,
+            num_heads: cfg.num_attention_heads,
+            block_size,
+            num_blocks,
+            num_layers: cfg.num_hidden_layers,
+            dtype,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+        };
+        KVCacheManager::new_mla(&mla_config)
+    } else {
+        let cache_config = CacheConfig {
+            block_size,
+            num_blocks,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            dtype,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+        };
+        KVCacheManager::new(&cache_config)
+    }
 }
 
 /// Construct a LoRA-enabled model from config.architectures[0].
@@ -198,12 +256,22 @@ impl ModelForward for LoraEnabledModel {
         slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor> {
         match self {
-            LoraEnabledModel::Llama(m) => {
-                ModelForward::forward(m, input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
-            }
-            LoraEnabledModel::Qwen3(m) => {
-                ModelForward::forward(m, input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
-            }
+            LoraEnabledModel::Llama(m) => ModelForward::forward(
+                m,
+                input_ids,
+                seqlen_offset,
+                kv_cache_mgr,
+                block_table,
+                slot_mapping,
+            ),
+            LoraEnabledModel::Qwen3(m) => ModelForward::forward(
+                m,
+                input_ids,
+                seqlen_offset,
+                kv_cache_mgr,
+                block_table,
+                slot_mapping,
+            ),
         }
     }
 
@@ -231,12 +299,20 @@ impl ModelForward for LoraEnabledModel {
         ctx: &crate::engine::ForwardContext,
     ) -> candle_core::Result<Tensor> {
         match self {
-            LoraEnabledModel::Llama(m) => {
-                ModelForward::forward_decode_batch_with_ctx(m, input_ids, sequences, kv_cache_mgr, ctx)
-            }
-            LoraEnabledModel::Qwen3(m) => {
-                ModelForward::forward_decode_batch_with_ctx(m, input_ids, sequences, kv_cache_mgr, ctx)
-            }
+            LoraEnabledModel::Llama(m) => ModelForward::forward_decode_batch_with_ctx(
+                m,
+                input_ids,
+                sequences,
+                kv_cache_mgr,
+                ctx,
+            ),
+            LoraEnabledModel::Qwen3(m) => ModelForward::forward_decode_batch_with_ctx(
+                m,
+                input_ids,
+                sequences,
+                kv_cache_mgr,
+                ctx,
+            ),
         }
     }
 
@@ -290,12 +366,20 @@ impl ModelForward for LoraEnabledModel {
         lora_ctx: &LoraContext,
     ) -> candle_core::Result<Tensor> {
         match self {
-            LoraEnabledModel::Llama(m) => {
-                ModelForward::forward_decode_batch_with_lora(m, input_ids, sequences, kv_cache_mgr, lora_ctx)
-            }
-            LoraEnabledModel::Qwen3(m) => {
-                ModelForward::forward_decode_batch_with_lora(m, input_ids, sequences, kv_cache_mgr, lora_ctx)
-            }
+            LoraEnabledModel::Llama(m) => ModelForward::forward_decode_batch_with_lora(
+                m,
+                input_ids,
+                sequences,
+                kv_cache_mgr,
+                lora_ctx,
+            ),
+            LoraEnabledModel::Qwen3(m) => ModelForward::forward_decode_batch_with_lora(
+                m,
+                input_ids,
+                sequences,
+                kv_cache_mgr,
+                lora_ctx,
+            ),
         }
     }
 

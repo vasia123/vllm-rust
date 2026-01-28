@@ -105,7 +105,13 @@ pub trait ModelForward: Send + 'static {
     ) -> candle_core::Result<Tensor> {
         // Default: ignore LoRA context and use base forward
         let _ = lora_ctx;
-        self.forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        self.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     /// Batched decode with LoRA adapter support.

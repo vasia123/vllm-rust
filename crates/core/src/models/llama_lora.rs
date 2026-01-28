@@ -60,29 +60,25 @@ impl LlamaAttentionWithLora {
         // Q projection
         let q_key = format!("{}.q_proj", layer_prefix);
         if let Some(adapter) = layer_lora.get_adapter(&q_key) {
-            self.q_proj
-                .register_adapter(adapter_name, adapter.clone());
+            self.q_proj.register_adapter(adapter_name, adapter.clone());
         }
 
         // K projection
         let k_key = format!("{}.k_proj", layer_prefix);
         if let Some(adapter) = layer_lora.get_adapter(&k_key) {
-            self.k_proj
-                .register_adapter(adapter_name, adapter.clone());
+            self.k_proj.register_adapter(adapter_name, adapter.clone());
         }
 
         // V projection
         let v_key = format!("{}.v_proj", layer_prefix);
         if let Some(adapter) = layer_lora.get_adapter(&v_key) {
-            self.v_proj
-                .register_adapter(adapter_name, adapter.clone());
+            self.v_proj.register_adapter(adapter_name, adapter.clone());
         }
 
         // O projection
         let o_key = format!("{}.o_proj", layer_prefix);
         if let Some(adapter) = layer_lora.get_adapter(&o_key) {
-            self.o_proj
-                .register_adapter(adapter_name, adapter.clone());
+            self.o_proj.register_adapter(adapter_name, adapter.clone());
         }
     }
 
@@ -276,8 +272,7 @@ impl SwiGluMlpWithLora {
 
         let up_key = format!("{}.up_proj", layer_prefix);
         if let Some(adapter) = layer_lora.get_adapter(&up_key) {
-            self.up_proj
-                .register_adapter(adapter_name, adapter.clone());
+            self.up_proj.register_adapter(adapter_name, adapter.clone());
         }
 
         let down_key = format!("{}.down_proj", layer_prefix);

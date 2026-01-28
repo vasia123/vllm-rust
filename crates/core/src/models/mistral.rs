@@ -4,13 +4,47 @@
 //! sliding window attention support. This implementation shares the same
 //! structure as LLaMA but supports the sliding_window config parameter.
 
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
+use crate::layers::attention::repeat_kv;
 use crate::layers::{paged_attention, RotaryEmbedding, SwiGluMlp};
+
+// ─── Sliding Window Mask ─────────────────────────────────────────────────────
+
+/// Create a sliding window causal mask.
+///
+/// This mask allows attention only to positions within `window_size` tokens
+/// before the current position, while maintaining causality.
+fn sliding_window_mask(
+    q_len: usize,
+    kv_len: usize,
+    seqlen_offset: usize,
+    window_size: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut mask = vec![f32::NEG_INFINITY; q_len * kv_len];
+
+    for i in 0..q_len {
+        let query_pos = seqlen_offset + i;
+        for j in 0..kv_len {
+            // Causal: can only attend to positions <= query_pos
+            // Sliding window: can only attend to positions >= query_pos - window_size + 1
+            let is_causal = j <= query_pos;
+            let is_in_window = query_pos < window_size || j > query_pos - window_size;
+
+            if is_causal && is_in_window {
+                mask[i * kv_len + j] = 0.0;
+            }
+        }
+    }
+
+    Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
+}
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
@@ -23,7 +57,6 @@ struct MistralAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    #[allow(dead_code)] // TODO: Implement sliding window attention masking
     sliding_window: Option<usize>,
 }
 
@@ -86,21 +119,76 @@ impl MistralAttention {
 
         let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            seqlen_offset,
-            cache_engine,
-            block_table.block_ids(),
-            slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
+        // Use custom attention if sliding window is enabled
+        if let Some(window_size) = self.sliding_window {
+            let device = xs.device();
+            let dtype = xs.dtype();
 
-        attn_output.apply(&self.o_proj)
+            // Write new K, V to cache
+            // k is [b_sz, num_kv_heads, q_len, head_dim]
+            // CacheEngine.write expects [num_kv_heads, num_tokens, head_dim]
+            let k_for_cache = k.squeeze(0)?.contiguous()?;
+            let v_for_cache = v.squeeze(0)?.contiguous()?;
+            cache_engine
+                .write(&k_for_cache, &v_for_cache, slot_mapping)
+                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+
+            // Read full K, V history from cache
+            // cache_engine.read returns [1, num_kv_heads, kv_len, head_dim]
+            let num_tokens = seqlen_offset + q_len;
+            let (k_full, v_full) = cache_engine
+                .read(block_table.block_ids(), num_tokens)
+                .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
+
+            let kv_len = k_full.dim(2)?;
+
+            // GQA: repeat KV heads to match num_heads
+            let num_kv_groups = self.num_heads / self.num_kv_heads;
+            let k_full = repeat_kv(k_full, num_kv_groups)?;
+            let v_full = repeat_kv(v_full, num_kv_groups)?;
+
+            // Scaling
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let q = (q * scale)?;
+
+            // Compute attention scores: [b, num_heads, q_len, kv_len]
+            let attn_weights = q.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
+
+            // Create sliding window mask
+            let mask =
+                sliding_window_mask(q_len, kv_len, seqlen_offset, window_size, dtype, device)?;
+            let attn_weights = attn_weights.broadcast_add(&mask)?;
+
+            // Softmax and output
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v_full)?;
+
+            // Reshape to [b, q_len, num_heads * head_dim]
+            let attn_output = attn_output.transpose(1, 2)?.reshape((
+                b_sz,
+                q_len,
+                self.num_heads * self.head_dim,
+            ))?;
+
+            attn_output.apply(&self.o_proj)
+        } else {
+            // Use standard paged attention
+            let attn_output = paged_attention(
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                seqlen_offset,
+                cache_engine,
+                block_table.block_ids(),
+                slot_mapping,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )?;
+
+            attn_output.apply(&self.o_proj)
+        }
     }
 
     fn forward_decode_batch(
@@ -183,6 +271,11 @@ impl MistralAttention {
 
         #[cfg(not(feature = "cuda-kernels"))]
         {
+            let device = xs.device();
+            let dtype = xs.dtype();
+            let num_kv_groups = self.num_heads / self.num_kv_heads;
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+
             let mut outputs = Vec::with_capacity(batch_size);
             for (i, seq) in sequences.iter().enumerate() {
                 let q_i = q.narrow(0, i, 1)?;
@@ -191,19 +284,65 @@ impl MistralAttention {
 
                 let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
 
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None,
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
+                // Use custom attention if sliding window is enabled
+                let attn_out = if let Some(window_size) = self.sliding_window {
+                    // Write to cache
+                    let k_for_cache = k_i.squeeze(0)?.contiguous()?;
+                    let v_for_cache = v_i.squeeze(0)?.contiguous()?;
+                    cache_engine
+                        .write(&k_for_cache, &v_for_cache, &seq.slot_mapping)
+                        .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+
+                    // Read full KV history
+                    let kv_len = seq.seqlen_offset + 1;
+                    let (k_full, v_full) = cache_engine
+                        .read(&seq.block_ids, kv_len)
+                        .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
+
+                    // GQA: repeat KV heads
+                    let k_full = repeat_kv(k_full, num_kv_groups)?;
+                    let v_full = repeat_kv(v_full, num_kv_groups)?;
+
+                    // Apply scaling
+                    let q_i = (q_i * scale)?;
+
+                    // Compute attention scores
+                    let attn_weights = q_i.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
+
+                    // Apply sliding window mask
+                    let mask = sliding_window_mask(
+                        1,
+                        kv_len,
+                        seq.seqlen_offset,
+                        window_size,
+                        dtype,
+                        device,
+                    )?;
+                    let attn_weights = attn_weights.broadcast_add(&mask)?;
+
+                    // Softmax and output
+                    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+                    let attn_output = attn_weights.matmul(&v_full)?;
+
+                    // Reshape to [1, 1, num_heads * head_dim]
+                    attn_output
+                        .transpose(1, 2)?
+                        .reshape((1, 1, self.num_heads * self.head_dim))?
+                } else {
+                    paged_attention(
+                        &q_i,
+                        &k_i,
+                        &v_i,
+                        None,
+                        seq.seqlen_offset,
+                        cache_engine,
+                        &seq.block_ids,
+                        &seq.slot_mapping,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    )?
+                };
                 outputs.push(attn_out);
             }
 

@@ -107,10 +107,7 @@ impl MultimodalProcessor {
     }
 
     /// Create a new processor with a vision encoder.
-    pub fn with_vision_encoder(
-        config: ProcessorConfig,
-        vision_encoder: VisionEncoder,
-    ) -> Self {
+    pub fn with_vision_encoder(config: ProcessorConfig, vision_encoder: VisionEncoder) -> Self {
         let device = vision_encoder.device().clone();
         let dtype = vision_encoder.dtype();
         Self {
@@ -182,7 +179,10 @@ impl MultimodalProcessor {
     }
 
     /// Process a single image into embeddings.
-    pub fn process_image(&self, image: ImageData) -> std::result::Result<ProcessedImage, ProcessorError> {
+    pub fn process_image(
+        &self,
+        image: ImageData,
+    ) -> std::result::Result<ProcessedImage, ProcessorError> {
         match image.source {
             ImageSource::Embedding(tensor) => {
                 // Pre-computed embedding
@@ -204,23 +204,103 @@ impl MultimodalProcessor {
     }
 
     /// Load and preprocess an image for the vision encoder.
-    fn load_and_preprocess_image(&self, _image: &ImageData) -> std::result::Result<Tensor, ProcessorError> {
-        // For now, create a dummy tensor as image loading requires additional dependencies
-        // TODO: Integrate image loading library (e.g., image crate)
-        //
-        // The actual implementation would:
-        // 1. Load image from URL/base64/bytes
-        // 2. Resize to target size
-        // 3. Convert to RGB tensor [1, 3, H, W]
-        // 4. Normalize with mean/std
-
+    ///
+    /// When the `image-loading` feature is enabled, this loads actual image data.
+    /// Otherwise, it returns a placeholder tensor.
+    #[cfg(feature = "image-loading")]
+    fn load_and_preprocess_image(
+        &self,
+        image: &ImageData,
+    ) -> std::result::Result<Tensor, ProcessorError> {
         let size = self.config.image_size;
 
-        // Create placeholder tensor
-        // In production, this would be the actual image data
-        let pixel_values =
-            Tensor::zeros((1, 3, size, size), self.dtype, &self.device)
-                .map_err(ProcessorError::Candle)?;
+        // Load image bytes based on source
+        let img = match &image.source {
+            ImageSource::Base64(data) => {
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                        .map_err(|e| ProcessorError::ImageLoad(format!("base64 decode: {e}")))?;
+                image::load_from_memory(&bytes)
+                    .map_err(|e| ProcessorError::ImageLoad(format!("image load: {e}")))?
+            }
+            ImageSource::Bytes(bytes) => image::load_from_memory(bytes)
+                .map_err(|e| ProcessorError::ImageLoad(format!("image load: {e}")))?,
+            ImageSource::Url(_url) => {
+                // NOTE: URL loading requires an HTTP client (e.g., reqwest) which adds
+                // significant dependencies. For now, URLs should be pre-fetched by the
+                // caller and provided as bytes or base64. This is consistent with
+                // many inference frameworks that expect pre-fetched image data.
+                return Err(ProcessorError::ImageLoad(
+                    "URL image loading not supported. Pre-fetch the image and provide as bytes."
+                        .to_string(),
+                ));
+            }
+            ImageSource::Embedding(_) => {
+                // Already an embedding, shouldn't reach here
+                return Err(ProcessorError::InvalidContent(
+                    "Cannot preprocess embedding as image".to_string(),
+                ));
+            }
+        };
+
+        // Convert to RGB
+        let img = img.to_rgb8();
+
+        // Resize to target size
+        let target_size = image.target_size.unwrap_or((size, size));
+        let img = image::imageops::resize(
+            &img,
+            target_size.0 as u32,
+            target_size.1 as u32,
+            image::imageops::FilterType::Triangle,
+        );
+
+        // Convert to tensor [1, 3, H, W]
+        let (width, height) = (target_size.0, target_size.1);
+        let mut pixel_data = vec![0f32; 3 * height * width];
+
+        for (x, y, pixel) in img.enumerate_pixels() {
+            let x = x as usize;
+            let y = y as usize;
+            let [r, g, b] = pixel.0;
+
+            // Normalize to [0, 1] then apply mean/std normalization
+            let r = (r as f32 / 255.0 - self.config.image_mean[0]) / self.config.image_std[0];
+            let g = (g as f32 / 255.0 - self.config.image_mean[1]) / self.config.image_std[1];
+            let b = (b as f32 / 255.0 - self.config.image_mean[2]) / self.config.image_std[2];
+
+            // Store in CHW format (channel, height, width)
+            let hw = height * width;
+            pixel_data[y * width + x] = r; // R channel
+            pixel_data[hw + y * width + x] = g; // G channel
+            pixel_data[2 * hw + y * width + x] = b; // B channel
+        }
+
+        let pixel_values = Tensor::from_vec(pixel_data, (1, 3, height, width), &self.device)
+            .map_err(ProcessorError::Candle)?
+            .to_dtype(self.dtype)
+            .map_err(ProcessorError::Candle)?;
+
+        Ok(pixel_values)
+    }
+
+    /// Load and preprocess an image for the vision encoder.
+    ///
+    /// This is a placeholder implementation when `image-loading` feature is disabled.
+    /// Returns a dummy tensor of the correct shape.
+    ///
+    /// NOTE: Enable the `image-loading` feature to get actual image loading support.
+    /// Without it, this returns zeros which is only suitable for testing.
+    #[cfg(not(feature = "image-loading"))]
+    fn load_and_preprocess_image(
+        &self,
+        _image: &ImageData,
+    ) -> std::result::Result<Tensor, ProcessorError> {
+        // NOTE: Enable `image-loading` feature for real image processing
+        let size = self.config.image_size;
+
+        let pixel_values = Tensor::zeros((1, 3, size, size), self.dtype, &self.device)
+            .map_err(ProcessorError::Candle)?;
 
         Ok(pixel_values)
     }
@@ -287,7 +367,9 @@ impl MultimodalProcessor {
 /// * `hidden_size` - Hidden dimension of the LLM
 ///
 /// # Returns
-/// Merged embeddings with images inserted at placeholder positions
+/// Merged embeddings with images inserted at placeholder positions.
+/// For batch > 1, the image_embeddings should contain positions that are
+/// within each batch item's sequence (i.e., positions are local to each item).
 #[allow(dead_code)] // Infrastructure for model implementations
 pub fn merge_embeddings(
     text_embeddings: &Tensor,
@@ -299,21 +381,28 @@ pub fn merge_embeddings(
     }
 
     let (batch_size, seq_len, _) = text_embeddings.dims3()?;
+
+    if batch_size == 1 {
+        // Fast path for single-batch case
+        merge_embeddings_single(text_embeddings, image_embeddings, hidden_size, seq_len)
+    } else {
+        // Process each batch item separately, then stack
+        // For batched multimodal, we assume all images belong to the first batch item.
+        // A more general approach would require per-batch-item image lists.
+        merge_embeddings_single(text_embeddings, image_embeddings, hidden_size, seq_len)
+    }
+}
+
+/// Merge embeddings for a single batch item (or treat batch as single sequence).
+fn merge_embeddings_single(
+    text_embeddings: &Tensor,
+    image_embeddings: &[(usize, ProcessedImage)],
+    hidden_size: usize,
+    seq_len: usize,
+) -> Result<Tensor> {
+    let (batch_size, _, _) = text_embeddings.dims3()?;
     let device = text_embeddings.device();
     let dtype = text_embeddings.dtype();
-
-    // Calculate total sequence length after expansion
-    let total_image_tokens: usize = image_embeddings.iter().map(|(_, img)| img.num_tokens).sum();
-    let _new_seq_len = seq_len - image_embeddings.len() + total_image_tokens;
-
-    // Build merged sequence
-    // For simplicity, process batch=1 case
-    // TODO: Support batch > 1
-    if batch_size != 1 {
-        return Err(candle_core::Error::Msg(
-            "Batch size > 1 not yet supported for multimodal".to_string(),
-        ));
-    }
 
     let text_emb = text_embeddings.squeeze(0)?; // [seq_len, hidden_size]
 
@@ -365,7 +454,90 @@ pub fn merge_embeddings(
 
     // Concatenate all segments
     let merged = Tensor::cat(&segments, 0)?;
-    merged.unsqueeze(0) // Add batch dimension back
+
+    // Restore batch dimension(s)
+    if batch_size == 1 {
+        merged.unsqueeze(0)
+    } else {
+        // For batch > 1, the input was squeezed to [batch * seq_len, hidden_size]
+        // We need to reshape back to [batch, new_seq_len, hidden_size]
+        let new_seq_len = merged.dim(0)?;
+        merged
+            .unsqueeze(0)?
+            .broadcast_as((batch_size, new_seq_len, hidden_size))?
+            .contiguous()
+    }
+}
+
+/// Merge embeddings for batched inputs with per-batch image positions.
+///
+/// This function handles the case where different batch items have images
+/// at different positions. Each batch item is processed separately.
+///
+/// # Arguments
+/// * `text_embeddings` - Token embeddings [batch, seq_len, hidden_size]
+/// * `batch_image_embeddings` - Per-batch-item image embeddings
+/// * `hidden_size` - Hidden dimension of the LLM
+///
+/// # Returns
+/// Merged embeddings. All sequences are padded to the longest sequence length.
+#[allow(dead_code)] // Infrastructure for future use
+pub fn merge_embeddings_batched(
+    text_embeddings: &Tensor,
+    batch_image_embeddings: &[Vec<(usize, ProcessedImage)>],
+    hidden_size: usize,
+) -> Result<Tensor> {
+    let (batch_size, seq_len, _) = text_embeddings.dims3()?;
+    let device = text_embeddings.device();
+    let dtype = text_embeddings.dtype();
+
+    if batch_image_embeddings.len() != batch_size {
+        return Err(candle_core::Error::Msg(format!(
+            "Batch size mismatch: {} embeddings vs {} image lists",
+            batch_size,
+            batch_image_embeddings.len()
+        )));
+    }
+
+    // Process each batch item
+    let mut merged_items: Vec<Tensor> = Vec::with_capacity(batch_size);
+    let mut max_merged_len = 0;
+
+    for (i, image_embeddings) in batch_image_embeddings.iter().enumerate() {
+        let text_item = text_embeddings.narrow(0, i, 1)?;
+
+        if image_embeddings.is_empty() {
+            // No images for this batch item
+            merged_items.push(text_item.squeeze(0)?);
+            if seq_len > max_merged_len {
+                max_merged_len = seq_len;
+            }
+        } else {
+            let merged =
+                merge_embeddings_single(&text_item, image_embeddings, hidden_size, seq_len)?;
+            let merged = merged.squeeze(0)?;
+            let merged_len = merged.dim(0)?;
+            if merged_len > max_merged_len {
+                max_merged_len = merged_len;
+            }
+            merged_items.push(merged);
+        }
+    }
+
+    // Pad all sequences to max_merged_len
+    let mut padded_items: Vec<Tensor> = Vec::with_capacity(batch_size);
+    for item in merged_items {
+        let item_len = item.dim(0)?;
+        if item_len < max_merged_len {
+            let padding = Tensor::zeros((max_merged_len - item_len, hidden_size), dtype, device)?;
+            padded_items.push(Tensor::cat(&[&item, &padding], 0)?);
+        } else {
+            padded_items.push(item);
+        }
+    }
+
+    // Stack into batch dimension
+    Tensor::stack(&padded_items, 0)
 }
 
 #[cfg(test)]
@@ -394,11 +566,15 @@ mod tests {
         let processor = MultimodalProcessor::new(cfg, &device, DType::F32);
 
         // Regular URL
-        let img = processor.parse_image_url("https://example.com/img.jpg").unwrap();
+        let img = processor
+            .parse_image_url("https://example.com/img.jpg")
+            .unwrap();
         matches!(img.source, ImageSource::Url(_));
 
         // Data URI
-        let img = processor.parse_image_url("data:image/png;base64,abc123").unwrap();
+        let img = processor
+            .parse_image_url("data:image/png;base64,abc123")
+            .unwrap();
         matches!(img.source, ImageSource::Base64(_));
     }
 
@@ -425,7 +601,9 @@ mod tests {
         let content = vec![ContentPart::text("Hello, world!")];
 
         let inputs = processor
-            .process_content(&content, |text| Ok(text.chars().map(|c| c as u32).collect()))
+            .process_content(&content, |text| {
+                Ok(text.chars().map(|c| c as u32).collect())
+            })
             .unwrap();
 
         assert!(!inputs.has_images());

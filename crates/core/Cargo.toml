@@ -8,6 +8,7 @@ test-utils = []
 flash-attn = ["dep:candle-flash-attn"]
 flashinfer = ["dep:flashinfer-rs"]
 cuda-kernels = []
+image-loading = ["dep:image", "dep:base64"]
 
 [dependencies]
 tokio.workspace = true
@@ -24,6 +25,8 @@ minijinja-contrib.workspace = true
 ahash.workspace = true
 candle-flash-attn = { workspace = true, optional = true }
 flashinfer-rs = { git = "https://github.com/vasia123/flashinfer-rs", optional = true }
+image = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 half.workspace = true
 rand.workspace = true
 libloading.workspace = true
