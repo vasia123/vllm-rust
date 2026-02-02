@@ -333,6 +333,7 @@ async fn run_server(
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
@@ -358,6 +359,7 @@ async fn run_server(
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: None,
@@ -501,6 +503,7 @@ async fn run_generate(
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
@@ -531,6 +534,7 @@ async fn run_generate(
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: None,

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod chat;
 pub mod completions;
+pub mod embeddings;
 pub mod error;
 pub mod middleware;
 pub mod models;
@@ -60,6 +61,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .route("/v1/embeddings", post(embeddings::create_embedding))
         .layer(axum::middleware::from_fn_with_state(
             accepting,
             middleware::reject_during_restart,
@@ -74,6 +76,7 @@ pub fn create_full_router(app_state: AppState, admin_state: AdminState) -> Route
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .route("/v1/embeddings", post(embeddings::create_embedding))
         .layer(axum::middleware::from_fn_with_state(
             accepting,
             middleware::reject_during_restart,
@@ -147,6 +150,7 @@ mod tests {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
+                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: None,

@@ -144,6 +144,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                     max_running_requests: config.max_requests,
                     max_tokens_per_step: config.max_tokens_per_step,
                     enable_chunked_prefill: config.enable_chunked_prefill,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                 },
                 block_size: config.block_size,
                 speculative_config: Some(SpeculativeConfig {
@@ -172,6 +173,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                     max_running_requests: config.max_requests,
                     max_tokens_per_step: config.max_tokens_per_step,
                     enable_chunked_prefill: config.enable_chunked_prefill,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                 },
                 block_size: config.block_size,
                 speculative_config: None,
@@ -447,6 +449,8 @@ mod tests {
                             block_size: 16,
                             kv_cache_metrics: Default::default(),
                             prefix_cache_stats: None,
+                            prefix_cache_detailed_stats: None,
+                            prefix_cache_recent_stats: None,
                         };
                         let _ = response_tx.send(stats);
                     }
