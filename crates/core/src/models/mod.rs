@@ -6,6 +6,7 @@ pub mod bloom;
 pub mod cohere;
 pub mod dbrx;
 pub mod deepseek;
+pub mod deepseek_quantized;
 pub mod exaone;
 pub mod falcon;
 pub mod gemma;
@@ -62,6 +63,7 @@ pub use bloom::BloomForCausalLM;
 pub use cohere::CohereForCausalLM;
 pub use dbrx::DbrxForCausalLM;
 pub use deepseek::DeepSeekForCausalLM;
+pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use exaone::ExaoneForCausalLM;
 pub use falcon::FalconForCausalLM;
 pub use gemma::GemmaForCausalLM;
@@ -282,8 +284,9 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        // TODO: Add quantized variants for remaining architectures
-        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => from_config(cfg, vb),
+        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => Ok(Box::new(
+            QuantizedDeepSeekForCausalLM::new(cfg, vb, weight_loader.as_ref())?,
+        )),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

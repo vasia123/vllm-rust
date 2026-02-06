@@ -31,6 +31,158 @@ use super::cuda_graph::CudaGraphConfig;
 #[cfg(test)]
 use super::cuda_graph::RuntimeMode;
 
+// ─── In-place tensor copy ─────────────────────────────────────────────────
+
+/// Copies tensor data from `src` into `dst` in-place using device-to-device memcpy.
+///
+/// Both tensors must:
+/// - Have the same dtype
+/// - Have the same number of elements
+/// - Reside on the same device
+///
+/// For CUDA tensors, this performs an async device-to-device memcpy on the device's
+/// stream. For CPU tensors, this copies via the standard byte slice path.
+///
+/// This is essential for CUDA graph capture and replay, where the graph's input
+/// buffers must be updated in-place before replaying the recorded operations.
+pub fn cuda_memcpy_inplace(dst: &Tensor, src: &Tensor) -> Result<(), CudaGraphRunnerError> {
+    if dst.dtype() != src.dtype() {
+        return Err(CudaGraphRunnerError::InplaceCopyFailed(format!(
+            "dtype mismatch: dst={:?}, src={:?}",
+            dst.dtype(),
+            src.dtype()
+        )));
+    }
+    if dst.elem_count() != src.elem_count() {
+        return Err(CudaGraphRunnerError::InplaceCopyFailed(format!(
+            "element count mismatch: dst={}, src={}",
+            dst.elem_count(),
+            src.elem_count()
+        )));
+    }
+    if dst.device().location() != src.device().location() {
+        return Err(CudaGraphRunnerError::InplaceCopyFailed(format!(
+            "device mismatch: dst={:?}, src={:?}",
+            dst.device().location(),
+            src.device().location()
+        )));
+    }
+
+    dst.inplace_op2(src, &InplaceCopyOp)
+        .map_err(|e| CudaGraphRunnerError::InplaceCopyFailed(e.to_string()))
+}
+
+/// Candle InplaceOp2 that copies data from one tensor's storage into another.
+struct InplaceCopyOp;
+
+impl candle_core::InplaceOp2 for InplaceCopyOp {
+    fn name(&self) -> &'static str {
+        "inplace_copy_dtod"
+    }
+
+    fn cpu_fwd(
+        &self,
+        dst_storage: &mut candle_core::CpuStorage,
+        dst_layout: &candle_core::Layout,
+        src_storage: &candle_core::CpuStorage,
+        src_layout: &candle_core::Layout,
+    ) -> candle_core::Result<()> {
+        use candle_core::CpuStorage;
+
+        let dst_offset = dst_layout.start_offset();
+        let src_offset = src_layout.start_offset();
+        let elem_count = dst_layout.shape().elem_count();
+
+        match (dst_storage, src_storage) {
+            (CpuStorage::U8(d), CpuStorage::U8(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            (CpuStorage::U32(d), CpuStorage::U32(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            (CpuStorage::I64(d), CpuStorage::I64(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            (CpuStorage::BF16(d), CpuStorage::BF16(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            (CpuStorage::F16(d), CpuStorage::F16(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            (CpuStorage::F32(d), CpuStorage::F32(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            (CpuStorage::F64(d), CpuStorage::F64(s)) => {
+                d[dst_offset..dst_offset + elem_count]
+                    .copy_from_slice(&s[src_offset..src_offset + elem_count]);
+            }
+            _ => candle_core::bail!("inplace_copy: unsupported or mismatched dtypes"),
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        dst_storage: &mut candle_core::CudaStorage,
+        dst_layout: &candle_core::Layout,
+        src_storage: &candle_core::CudaStorage,
+        src_layout: &candle_core::Layout,
+    ) -> candle_core::Result<()> {
+        use candle_core::cuda::CudaStorageSlice;
+
+        let elem_count = dst_layout.shape().elem_count();
+        let dst_offset = dst_layout.start_offset();
+        let src_offset = src_layout.start_offset();
+
+        match (&mut dst_storage.slice, &src_storage.slice) {
+            (CudaStorageSlice::U8(d), CudaStorageSlice::U8(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            (CudaStorageSlice::U32(d), CudaStorageSlice::U32(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            (CudaStorageSlice::I64(d), CudaStorageSlice::I64(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            (CudaStorageSlice::BF16(d), CudaStorageSlice::BF16(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            (CudaStorageSlice::F16(d), CudaStorageSlice::F16(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            (CudaStorageSlice::F32(d), CudaStorageSlice::F32(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            (CudaStorageSlice::F64(d), CudaStorageSlice::F64(s)) => {
+                let sv = s.slice(src_offset..src_offset + elem_count);
+                let mut dv = d.slice_mut(dst_offset..dst_offset + elem_count);
+                dst_storage.device.memcpy_dtod(&sv, &mut dv)?;
+            }
+            _ => candle_core::bail!("inplace_copy: unsupported or mismatched CUDA dtypes"),
+        }
+        Ok(())
+    }
+}
+
 /// Pre-allocated buffers for a specific batch size.
 #[cfg(feature = "cuda-kernels")]
 struct CaptureBuffers {
@@ -259,10 +411,15 @@ impl CudaGraphRunner {
                 }
             };
 
-            // TODO: Need in-place copy for CUDA graph capture.
-            // Candle doesn't support copy_from directly.
-            // For now, we store the output shape/dtype for validation.
-            let _ = &capture_output;
+            // Copy the captured forward output into the pre-allocated output buffer.
+            // This records the memcpy as part of the CUDA graph so that on replay,
+            // the graph writes its results into the same output buffer.
+            cuda_memcpy_inplace(&output, &capture_output).map_err(|e| {
+                CudaGraphRunnerError::WarmupFailed(format!(
+                    "Failed to record output copy in graph: {}",
+                    e
+                ))
+            })?;
 
             // End capture
             let mut graph: CUgraph = std::ptr::null_mut();
@@ -351,12 +508,15 @@ impl CudaGraphRunner {
                         .map_err(|e| CudaGraphRunnerError::ExecutionFailed(e.to_string()))?
                 };
 
-                // TODO: Need in-place copy for CUDA graph replay.
-                // Candle doesn't support copy_from. This limits CUDA graph functionality.
-                // For now, we need to re-capture the graph or use raw CUDA memcpy.
-                // Workaround: Store padded_input reference to avoid unused warning.
-                let _ = &padded_input;
-                let _ = &captured.buffers.input_ids;
+                // Copy new input data into the captured graph's input buffer.
+                // The graph was recorded reading from this buffer, so updating
+                // it in-place before replay feeds the new tokens to the model.
+                cuda_memcpy_inplace(&captured.buffers.input_ids, &padded_input).map_err(|e| {
+                    CudaGraphRunnerError::ExecutionFailed(format!(
+                        "Failed to copy input for graph replay: {}",
+                        e
+                    ))
+                })?;
 
                 // Get stream and replay graph
                 let stream = self.get_cuda_stream()?;
@@ -425,7 +585,7 @@ impl CudaGraphRunner {
 
         let (storage, _) = dummy.storage_and_layout();
         match &*storage {
-            candle_core::Storage::Cuda(cuda_storage) => {
+            candle_core::Storage::Cuda(_cuda_storage) => {
                 // Get the stream from the device
                 // cudarc CudaDevice uses stream 0 by default
                 Ok(std::ptr::null_mut()) // Default stream (stream 0)
@@ -478,6 +638,8 @@ pub enum CudaGraphRunnerError {
     ReplayFailed(i32),
     #[error("execution failed: {0}")]
     ExecutionFailed(String),
+    #[error("in-place copy failed: {0}")]
+    InplaceCopyFailed(String),
 }
 
 /// Builder for creating CUDA graph runner with proper configuration.
@@ -640,5 +802,104 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.dims(), &[4, 32000]);
+    }
+
+    // ─── In-place copy tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_inplace_copy_f32() {
+        let device = Device::Cpu;
+        let src = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device).unwrap();
+        let dst = Tensor::zeros((2, 2), DType::F32, &device).unwrap();
+
+        cuda_memcpy_inplace(&dst, &src).unwrap();
+
+        let dst_data: Vec<f32> = dst.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dst_data, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_inplace_copy_u32() {
+        let device = Device::Cpu;
+        let src = Tensor::from_vec(vec![10u32, 20, 30, 40], (4, 1), &device).unwrap();
+        let dst = Tensor::zeros((4, 1), DType::U32, &device).unwrap();
+
+        cuda_memcpy_inplace(&dst, &src).unwrap();
+
+        let dst_data: Vec<u32> = dst.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dst_data, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_inplace_copy_bf16() {
+        let device = Device::Cpu;
+        let src = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let dst = Tensor::zeros((2, 2), DType::BF16, &device).unwrap();
+
+        cuda_memcpy_inplace(&dst, &src).unwrap();
+
+        let dst_f32 = dst.to_dtype(DType::F32).unwrap();
+        let dst_data: Vec<f32> = dst_f32.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dst_data, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_inplace_copy_overwrites_existing_data() {
+        let device = Device::Cpu;
+        let dst = Tensor::from_vec(vec![100.0f32, 200.0, 300.0], (3,), &device).unwrap();
+        let src = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (3,), &device).unwrap();
+
+        cuda_memcpy_inplace(&dst, &src).unwrap();
+
+        let dst_data: Vec<f32> = dst.to_vec1().unwrap();
+        assert_eq!(dst_data, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_inplace_copy_dtype_mismatch_rejected() {
+        let device = Device::Cpu;
+        let src = Tensor::zeros((2, 2), DType::F32, &device).unwrap();
+        let dst = Tensor::zeros((2, 2), DType::U32, &device).unwrap();
+
+        let result = cuda_memcpy_inplace(&dst, &src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("dtype mismatch"),
+            "Expected dtype mismatch error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_inplace_copy_shape_mismatch_rejected() {
+        let device = Device::Cpu;
+        let src = Tensor::zeros((2, 3), DType::F32, &device).unwrap();
+        let dst = Tensor::zeros((3, 3), DType::F32, &device).unwrap();
+
+        let result = cuda_memcpy_inplace(&dst, &src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("element count mismatch"),
+            "Expected element count mismatch error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_inplace_copy_same_element_count_different_shape() {
+        // Shapes differ but element counts match -- should succeed
+        let device = Device::Cpu;
+        let src = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device).unwrap();
+        let dst = Tensor::zeros((3, 2), DType::F32, &device).unwrap();
+
+        cuda_memcpy_inplace(&dst, &src).unwrap();
+
+        let dst_data: Vec<f32> = dst.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(dst_data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 }

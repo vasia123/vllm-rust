@@ -273,9 +273,7 @@ impl MptAttention {
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-            // TODO: ALiBi bias is not applied in the CUDA kernel path.
-            // The paged_attention_cuda kernel does not accept attention bias.
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
+            let attn_output = crate::cuda_kernels::paged_attention_cuda_alibi(
                 &q,
                 cache_engine.k_cache(),
                 cache_engine.v_cache(),
@@ -286,6 +284,7 @@ impl MptAttention {
                 self.num_heads,
                 max_blocks_per_seq,
                 max_seq_len,
+                self.alibi.slopes(),
             )?;
 
             self.out_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)
@@ -892,5 +891,110 @@ mod tests {
 
         let model = model.unwrap();
         assert_eq!(model.blocks.len(), cfg.num_hidden_layers);
+    }
+
+    // ---- ALiBi Slope Tests ----
+
+    #[test]
+    fn test_mpt_alibi_slopes_8_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(8);
+        assert_eq!(slopes.len(), 8);
+
+        let expected = [
+            0.5_f32, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625,
+        ];
+        for (i, (&actual, &exp)) in slopes.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() < 1e-6,
+                "Head {i}: expected {exp}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mpt_alibi_slopes_16_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(16);
+        assert_eq!(slopes.len(), 16);
+
+        let base: f32 = 2.0_f32.powf(-0.5);
+        for (i, &slope) in slopes.iter().enumerate() {
+            let expected = base.powi((i + 1) as i32);
+            assert!(
+                (slope - expected).abs() < 1e-5,
+                "Head {i}: expected {expected}, got {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mpt_alibi_slopes_32_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(32);
+        assert_eq!(slopes.len(), 32);
+
+        let base: f32 = 2.0_f32.powf(-0.25);
+        for (i, &slope) in slopes.iter().enumerate() {
+            let expected = base.powi((i + 1) as i32);
+            assert!(
+                (slope - expected).abs() < 1e-5,
+                "Head {i}: expected {expected}, got {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mpt_alibi_slopes_64_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(64);
+        assert_eq!(slopes.len(), 64);
+
+        let base: f32 = 2.0_f32.powf(-0.125);
+        for (i, &slope) in slopes.iter().enumerate() {
+            let expected = base.powi((i + 1) as i32);
+            assert!(
+                (slope - expected).abs() < 1e-4,
+                "Head {i}: expected {expected}, got {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mpt_alibi_bias_changes_attention_output() {
+        let device = Device::Cpu;
+
+        let alibi = AlibiAttentionBias::new(4, DType::F32, &device).expect("create alibi");
+
+        // Bias for q_len=1, kv_len=10 (decode with 10 tokens in cache)
+        let bias = alibi.build_bias_matrix(1, 10).expect("build bias");
+        let bias_data: Vec<f32> = bias
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("to_vec1");
+
+        // Verify non-zero biases exist (ALiBi is active)
+        let has_nonzero = bias_data.iter().any(|&v| v.abs() > 1e-6);
+        assert!(
+            has_nonzero,
+            "ALiBi bias should have non-zero values for past tokens"
+        );
+
+        // Current position (position 9) should have zero bias
+        let slopes = crate::layers::compute_alibi_slopes(4);
+        for h in 0..4 {
+            let current_idx = h * 10 + 9;
+            assert!(
+                bias_data[current_idx].abs() < 1e-6,
+                "Head {h}: current position bias should be 0, got {}",
+                bias_data[current_idx]
+            );
+
+            // First position (distance = -9) should have negative bias
+            let first_idx = h * 10;
+            let expected = slopes[h] * (-9.0_f32);
+            assert!(
+                (bias_data[first_idx] - expected).abs() < 1e-5,
+                "Head {h}: expected bias {expected}, got {}",
+                bias_data[first_idx]
+            );
+        }
     }
 }

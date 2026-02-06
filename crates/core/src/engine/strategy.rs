@@ -86,7 +86,8 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
     mut cmd_rx: mpsc::Receiver<EngineCommand>,
 ) {
     use super::helpers::{
-        build_generation_result, check_finished, handle_command, send_stream_token,
+        build_generation_result, check_beam_finished, check_finished, finalize_beam_request,
+        handle_command, is_beam_request, send_stream_token,
     };
     use super::types::ResponseChannel;
     use crate::request::FinishReason;
@@ -188,7 +189,12 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             .collect();
         for &req_id in &scheduled_ids {
             if let Some(req) = state.requests.get(&req_id) {
-                if let Some(check) = check_finished(&req.state, &tokenizer) {
+                let check = if is_beam_request(req) {
+                    check_beam_finished(req)
+                } else {
+                    check_finished(&req.state, &tokenizer)
+                };
+                if let Some(check) = check {
                     finished.push((req_id, check));
                 }
             }
@@ -204,12 +210,18 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             };
             state.scheduler.remove_request(req_id);
 
+            // Beam search finalization: select best hypothesis and free beam block tables
+            let (mut text, finish_reason) = if req.beam_state.is_some() {
+                finalize_beam_request(&mut req, &mut kv_cache_mgr, &tokenizer)
+            } else {
+                let text = tokenizer
+                    .decode(&req.state.generated_token_ids)
+                    .unwrap_or_default();
+                (text, check.reason)
+            };
+
             let block_ids = req.state.block_table.release();
             if kv_cache_mgr.has_prefix_cache() {
-                // Register completed prefix blocks and release the owner reference.
-                // register_prefix adds blocks to the cache (ref_count = 1).
-                // release_prefix decrements ref_count; blocks with ref_count > 0 stay cached.
-                // Only uncached blocks (partial last block, decode blocks) are returned for freeing.
                 kv_cache_mgr.register_prefix(&req.state.prompt_token_ids, &block_ids);
                 let to_free = kv_cache_mgr.release_prefix(&req.state.prompt_token_ids, &block_ids);
                 if !to_free.is_empty() {
@@ -218,7 +230,6 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                     }
                 }
 
-                // Record sliding window metrics for this request
                 if let Some(cache) = kv_cache_mgr.prefix_cache_mut() {
                     cache.record_request(
                         req.state.prompt_token_ids.len(),
@@ -233,15 +244,12 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                 }
             }
 
-            let mut text = tokenizer
-                .decode(&req.state.generated_token_ids)
-                .unwrap_or_default();
             if check.trim_bytes > 0 {
                 let new_len = text.len().saturating_sub(check.trim_bytes);
                 text.truncate(new_len);
             }
 
-            if check.reason == FinishReason::Stop && !req.state.stop_token_ids.is_empty() {
+            if finish_reason == FinishReason::Stop && !req.state.stop_token_ids.is_empty() {
                 if let Some(&last) = req.state.generated_token_ids.last() {
                     if req.state.stop_token_ids.contains(&last) {
                         req.state.generated_token_ids.pop();
@@ -252,12 +260,12 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             match req.response {
                 ResponseChannel::Complete(tx) => {
                     let result =
-                        build_generation_result(req_id, text, &mut req.state, check.reason);
+                        build_generation_result(req_id, text, &mut req.state, finish_reason);
                     let _ = tx.send(Ok(result));
                 }
                 ResponseChannel::Stream(tx) => {
                     let _ = tx.try_send(super::types::StreamEvent::Done {
-                        finish_reason: check.reason,
+                        finish_reason,
                         generated_text: text,
                     });
                 }

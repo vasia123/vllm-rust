@@ -70,6 +70,86 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Create a su-scaled (LongRoPE) rotary embedding used by Phi-3 long-context models.
+    ///
+    /// Per-dimension scaling factors are applied to the inverse frequencies. The model
+    /// config provides `short_factor` and `long_factor` arrays of length `rotary_dim / 2`.
+    /// At construction time, we choose long factors when `max_seq_len > original_max_position_embeddings`,
+    /// matching vLLM's approach of deciding once based on the serving context length.
+    ///
+    /// The mscale (magnitude scaling) compensates for the frequency rescaling:
+    ///   `mscale = sqrt(1 + log(scale) / log(original_max_pos))`
+    /// where `scale = max_seq_len / original_max_position_embeddings`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_su_scaled(
+        head_dim: usize,
+        max_seq_len: usize,
+        original_max_position_embeddings: usize,
+        rope_theta: f64,
+        short_factor: &[f64],
+        long_factor: &[f64],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let rotary_dim = head_dim;
+        let half_dim = rotary_dim / 2;
+
+        if short_factor.len() != half_dim {
+            return Err(candle_core::Error::Msg(format!(
+                "short_factor length ({}) must equal rotary_dim/2 ({})",
+                short_factor.len(),
+                half_dim
+            )));
+        }
+        if long_factor.len() != half_dim {
+            return Err(candle_core::Error::Msg(format!(
+                "long_factor length ({}) must equal rotary_dim/2 ({})",
+                long_factor.len(),
+                half_dim
+            )));
+        }
+
+        let use_long = max_seq_len > original_max_position_embeddings;
+        let (factors, cache_len) = if use_long {
+            (long_factor, max_seq_len)
+        } else {
+            (short_factor, original_max_position_embeddings)
+        };
+
+        // mscale = sqrt(1 + log(scale) / log(original_max_pos))
+        let scale = max_seq_len as f64 / original_max_position_embeddings as f64;
+        let mscale = if scale <= 1.0 {
+            1.0_f64
+        } else {
+            (1.0 + scale.ln() / (original_max_position_embeddings as f64).ln()).sqrt()
+        };
+
+        // Scaled inverse frequencies: inv_freq[i] = 1.0 / (factors[i] * base^(2i / rotary_dim))
+        let inv_freq: Vec<f32> = (0..rotary_dim)
+            .step_by(2)
+            .enumerate()
+            .map(|(idx, i)| {
+                1.0 / (factors[idx] as f32 * (rope_theta as f32).powf(i as f32 / rotary_dim as f32))
+            })
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq =
+            Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
+
+        let t = Tensor::arange(0u32, cache_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((cache_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+
+        Ok(Self {
+            sin: freqs.sin()?.affine(mscale, 0.0)?.to_dtype(dtype)?,
+            cos: freqs.cos()?.affine(mscale, 0.0)?.to_dtype(dtype)?,
+            rotary_dim,
+            head_dim,
+            is_neox_style: true,
+        })
+    }
+
     /// Get the rotary dimension.
     pub fn rotary_dim(&self) -> usize {
         self.rotary_dim
@@ -235,7 +315,7 @@ impl RotaryEmbedding {
         let sin = self.sin.index_select(&pos_tensor, 0)?;
 
         // rope expects 4D input [b, h, t, d]
-        // [total_tokens, heads, head_dim] → [1, heads, total_tokens, head_dim]
+        // [total_tokens, heads, head_dim] -> [1, heads, total_tokens, head_dim]
         let q = q.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
         let k = k.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
 
@@ -272,8 +352,6 @@ mod tests {
         let rope = RotaryEmbedding::new(head_dim, max_seq_len, rope_theta, DType::F32, &device)
             .expect("Failed to create RotaryEmbedding");
 
-        // sin and cos should have shape [max_seq_len, rotary_dim/2]
-        // For full rotation, rotary_dim == head_dim
         let sin_shape = rope.sin.dims();
         let cos_shape = rope.cos.dims();
 
@@ -289,14 +367,14 @@ mod tests {
         let head_dim = 64;
         let max_seq_len = 128;
         let rope_theta = 10000.0;
-        let partial_factor = 0.5; // GLM uses 0.5
+        let partial_factor = 0.5;
 
         let rope = RotaryEmbedding::new_partial(
             head_dim,
             max_seq_len,
             rope_theta,
             partial_factor,
-            false, // is_neox_style = false for GLM
+            false,
             DType::F32,
             &device,
         )
@@ -306,7 +384,6 @@ mod tests {
         assert_eq!(rope.rotary_dim(), rotary_dim);
         assert!(rope.is_partial());
 
-        // sin and cos should have shape [max_seq_len, rotary_dim/2]
         let sin_shape = rope.sin.dims();
         let cos_shape = rope.cos.dims();
 
@@ -334,7 +411,6 @@ mod tests {
         )
         .expect("Failed to create partial RotaryEmbedding");
 
-        // Create q and k with shape [batch, heads, seq, head_dim]
         let q = Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device)
             .expect("Failed to create q");
         let k = Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device)
@@ -342,7 +418,6 @@ mod tests {
 
         let (q_rot, k_rot) = rope.apply(&q, &k, 0).expect("Failed to apply partial RoPE");
 
-        // Output shape should match input shape
         assert_eq!(q_rot.dims(), &[batch, num_heads, seq_len, head_dim]);
         assert_eq!(k_rot.dims(), &[batch, num_heads, seq_len, head_dim]);
     }
@@ -367,7 +442,6 @@ mod tests {
         )
         .expect("Failed to create partial RotaryEmbedding");
 
-        // Create q and k with known values
         let q = Tensor::ones((batch, num_heads, seq_len, head_dim), DType::F32, &device)
             .expect("Failed to create q");
         let k = Tensor::ones((batch, num_heads, seq_len, head_dim), DType::F32, &device)
@@ -375,8 +449,6 @@ mod tests {
 
         let (q_rot, k_rot) = rope.apply(&q, &k, 0).expect("Failed to apply partial RoPE");
 
-        // At position 0, cos=1, sin=0, so first half should be unchanged
-        // The second half (passthrough) should be unchanged regardless of position
         let rotary_dim = rope.rotary_dim();
         let q_pass: Vec<f32> = q_rot
             .narrow(3, rotary_dim, head_dim - rotary_dim)
@@ -393,7 +465,6 @@ mod tests {
             .to_vec1()
             .unwrap();
 
-        // Passthrough dimensions should be unchanged (all 1s)
         for &v in &q_pass {
             assert!(
                 (v - 1.0).abs() < 1e-5,
@@ -455,7 +526,6 @@ mod tests {
         let cos_data: Vec<f32> = rope.cos.flatten_all().unwrap().to_vec1().unwrap();
         let sin_data: Vec<f32> = rope.sin.flatten_all().unwrap().to_vec1().unwrap();
 
-        // cos and sin should be in [-1, 1]
         for val in &cos_data {
             assert!(*val >= -1.0 && *val <= 1.0, "cos value {val} out of bounds");
         }
@@ -466,14 +536,12 @@ mod tests {
 
     #[test]
     fn test_rotary_inv_freq_formula() {
-        // Verify inv_freq computation: inv_freq[i] = 1 / (theta ^ (2i / head_dim))
         let device = Device::Cpu;
         let head_dim = 64;
         let rope_theta = 10000.0;
         let rope = RotaryEmbedding::new(head_dim, 16, rope_theta, DType::F32, &device)
             .expect("Failed to create RotaryEmbedding");
 
-        // At position 0, freqs = 0 * inv_freq = 0, so cos=1, sin=0
         let cos_row0: Vec<f32> = rope
             .cos
             .narrow(0, 0, 1)
@@ -513,7 +581,6 @@ mod tests {
         let rope = RotaryEmbedding::new(head_dim, 128, 10000.0, DType::F32, &device)
             .expect("Failed to create RotaryEmbedding");
 
-        // Create q and k with shape [batch, heads, seq, head_dim]
         let q = Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device)
             .expect("Failed to create q");
         let k = Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device)
@@ -541,7 +608,6 @@ mod tests {
         let k = Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device)
             .expect("Failed to create k");
 
-        // Apply with seqlen_offset = 10 (as if continuing from position 10)
         let (q_rot, k_rot) = rope
             .apply(&q, &k, 10)
             .expect("Failed to apply RoPE with offset");
@@ -561,14 +627,11 @@ mod tests {
         let rope = RotaryEmbedding::new(head_dim, 128, 10000.0, DType::F32, &device)
             .expect("Failed to create RotaryEmbedding");
 
-        // q: [total_tokens, num_heads, head_dim]
-        // k: [total_tokens, num_kv_heads, head_dim]
         let q = Tensor::randn(0.0f32, 1.0, (total_tokens, num_heads, head_dim), &device)
             .expect("Failed to create q");
         let k = Tensor::randn(0.0f32, 1.0, (total_tokens, num_kv_heads, head_dim), &device)
             .expect("Failed to create k");
 
-        // Variable positions for each token
         let positions: Vec<usize> = (0..total_tokens).collect();
 
         let (q_rot, k_rot) = rope
@@ -594,7 +657,6 @@ mod tests {
         let k = Tensor::randn(0.0f32, 1.0, (total_tokens, num_heads, head_dim), &device)
             .expect("Failed to create k");
 
-        // Non-contiguous positions (simulating batched sequences)
         let positions = vec![0, 1, 5, 10, 100];
 
         let (q_rot, k_rot) = rope
@@ -621,23 +683,18 @@ mod tests {
         let head_dim = 64;
         let max_seq_len = 32;
 
-        // Default theta (Llama)
         let rope1 = RotaryEmbedding::new(head_dim, max_seq_len, 10000.0, DType::F32, &device)
             .expect("Failed to create RoPE with theta=10000");
 
-        // Larger theta (used by some models for longer context)
         let rope2 = RotaryEmbedding::new(head_dim, max_seq_len, 1000000.0, DType::F32, &device)
             .expect("Failed to create RoPE with theta=1000000");
 
-        // Both should have valid shape
         assert_eq!(rope1.cos.dims(), &[max_seq_len, head_dim / 2]);
         assert_eq!(rope2.cos.dims(), &[max_seq_len, head_dim / 2]);
 
-        // But different values (larger theta → slower frequency decay)
         let cos1_data: Vec<f32> = rope1.cos.flatten_all().unwrap().to_vec1().unwrap();
         let cos2_data: Vec<f32> = rope2.cos.flatten_all().unwrap().to_vec1().unwrap();
 
-        // Values should differ for non-zero positions
         assert!(
             cos1_data[head_dim / 2..]
                 .iter()
@@ -649,7 +706,6 @@ mod tests {
 
     #[test]
     fn test_rotary_cos_sin_pythagorean_identity() {
-        // cos²(x) + sin²(x) = 1
         let device = Device::Cpu;
         let rope = RotaryEmbedding::new(64, 32, 10000.0, DType::F32, &device)
             .expect("Failed to create RotaryEmbedding");
@@ -661,7 +717,280 @@ mod tests {
             let sum = c * c + s * s;
             assert!(
                 (sum - 1.0).abs() < 1e-5,
-                "Pythagorean identity violated: cos²+sin² = {sum}"
+                "Pythagorean identity violated: cos^2+sin^2 = {sum}"
+            );
+        }
+    }
+
+    // ── Su-Scaled (LongRoPE) Tests ──────────────────────────────────────────
+
+    fn uniform_factors(half_dim: usize, value: f64) -> Vec<f64> {
+        vec![value; half_dim]
+    }
+
+    #[test]
+    fn test_su_scaled_rope_construction_short() {
+        let device = Device::Cpu;
+        let head_dim = 16;
+        let half_dim = head_dim / 2;
+        let original_max_pos = 4096;
+        let max_seq_len = 2048;
+        let short_factor = uniform_factors(half_dim, 1.0);
+        let long_factor = uniform_factors(half_dim, 4.0);
+        let rope = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len,
+            original_max_pos,
+            10000.0,
+            &short_factor,
+            &long_factor,
+            DType::F32,
+            &device,
+        )
+        .expect("Failed to create su-scaled RoPE");
+        assert_eq!(rope.cos.dims(), &[original_max_pos, half_dim]);
+        assert_eq!(rope.sin.dims(), &[original_max_pos, half_dim]);
+        assert_eq!(rope.rotary_dim(), head_dim);
+        assert!(!rope.is_partial());
+    }
+
+    #[test]
+    fn test_su_scaled_rope_construction_long() {
+        let device = Device::Cpu;
+        let head_dim = 16;
+        let half_dim = head_dim / 2;
+        let original_max_pos = 4096;
+        let max_seq_len = 131072;
+        let short_factor = uniform_factors(half_dim, 1.0);
+        let long_factor = uniform_factors(half_dim, 4.0);
+        let rope = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len,
+            original_max_pos,
+            10000.0,
+            &short_factor,
+            &long_factor,
+            DType::F32,
+            &device,
+        )
+        .expect("Failed to create su-scaled RoPE (long)");
+        assert_eq!(rope.cos.dims(), &[max_seq_len, half_dim]);
+        assert_eq!(rope.sin.dims(), &[max_seq_len, half_dim]);
+    }
+
+    #[test]
+    fn test_su_scaled_rope_frequency_computation() {
+        let device = Device::Cpu;
+        let head_dim = 16;
+        let half_dim = head_dim / 2;
+        let max_seq_len = 64;
+        let rope_theta = 10000.0;
+        let standard = RotaryEmbedding::new(head_dim, max_seq_len, rope_theta, DType::F32, &device)
+            .expect("standard rope");
+        let su_factors = uniform_factors(half_dim, 1.0);
+        let su_scaled = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+            rope_theta,
+            &su_factors,
+            &su_factors,
+            DType::F32,
+            &device,
+        )
+        .expect("su-scaled rope with factor=1.0");
+        let std_cos: Vec<f32> = standard.cos.flatten_all().unwrap().to_vec1().unwrap();
+        let su_cos: Vec<f32> = su_scaled.cos.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (a, b)) in std_cos.iter().zip(su_cos.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "Position {i}: standard cos={a}, su-scaled cos={b} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn test_su_scaled_rope_factors_change_frequencies() {
+        let device = Device::Cpu;
+        let head_dim = 16;
+        let half_dim = head_dim / 2;
+        let max_seq_len = 64;
+        let short_factor = uniform_factors(half_dim, 1.0);
+        let long_factor = uniform_factors(half_dim, 4.0);
+        let rope_short = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+            10000.0,
+            &short_factor,
+            &long_factor,
+            DType::F32,
+            &device,
+        )
+        .expect("short rope");
+        let rope_long = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len * 2,
+            max_seq_len,
+            10000.0,
+            &short_factor,
+            &long_factor,
+            DType::F32,
+            &device,
+        )
+        .expect("long rope");
+        let short_cos: Vec<f32> = rope_short
+            .cos
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let long_cos: Vec<f32> = rope_long
+            .cos
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            short_cos
+                .iter()
+                .zip(long_cos.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "Short and long factors should produce different frequencies"
+        );
+    }
+
+    #[test]
+    fn test_su_scaled_rope_mscale_applied() {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let half_dim = head_dim / 2;
+        let original_max_pos = 4096;
+        let max_seq_len = original_max_pos * 32;
+        let factors = uniform_factors(half_dim, 1.0);
+        let rope = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len,
+            original_max_pos,
+            10000.0,
+            &factors,
+            &factors,
+            DType::F32,
+            &device,
+        )
+        .expect("su-scaled with mscale");
+        let expected_mscale =
+            (1.0 + (32.0_f64).ln() / (original_max_pos as f64).ln()).sqrt() as f32;
+        let cos_row0: Vec<f32> = rope
+            .cos
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (i, &c) in cos_row0.iter().enumerate() {
+            assert!(
+                (c - expected_mscale).abs() < 1e-4,
+                "cos[0,{i}] = {c}, expected mscale = {expected_mscale}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_su_scaled_rope_invalid_factor_length() {
+        let device = Device::Cpu;
+        let head_dim = 16;
+        let too_short = vec![1.0; 4];
+        let correct = vec![1.0; 8];
+        let result = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            4096,
+            4096,
+            10000.0,
+            &too_short,
+            &correct,
+            DType::F32,
+            &device,
+        );
+        assert!(
+            result.is_err(),
+            "Should fail with wrong short_factor length"
+        );
+        let result = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            4096,
+            4096,
+            10000.0,
+            &correct,
+            &too_short,
+            DType::F32,
+            &device,
+        );
+        assert!(result.is_err(), "Should fail with wrong long_factor length");
+    }
+
+    #[test]
+    fn test_su_scaled_rope_apply_shape() {
+        let device = Device::Cpu;
+        let batch = 1;
+        let num_heads = 4;
+        let seq_len = 8;
+        let head_dim = 16;
+        let half_dim = head_dim / 2;
+        let factors = uniform_factors(half_dim, 1.5);
+        let rope = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            128,
+            128,
+            10000.0,
+            &factors,
+            &factors,
+            DType::F32,
+            &device,
+        )
+        .expect("su-scaled rope");
+        let q =
+            Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device).expect("q");
+        let k =
+            Tensor::randn(0.0f32, 1.0, (batch, num_heads, seq_len, head_dim), &device).expect("k");
+        let (q_rot, k_rot) = rope.apply(&q, &k, 0).expect("apply su-scaled");
+        assert_eq!(q_rot.dims(), &[batch, num_heads, seq_len, head_dim]);
+        assert_eq!(k_rot.dims(), &[batch, num_heads, seq_len, head_dim]);
+    }
+
+    #[test]
+    fn test_su_scaled_rope_pythagorean_with_mscale() {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let half_dim = head_dim / 2;
+        let original_max_pos = 4096;
+        let max_seq_len = original_max_pos * 4;
+        let factors = uniform_factors(half_dim, 1.0);
+        let rope = RotaryEmbedding::new_su_scaled(
+            head_dim,
+            max_seq_len,
+            original_max_pos,
+            10000.0,
+            &factors,
+            &factors,
+            DType::F32,
+            &device,
+        )
+        .expect("su-scaled with mscale");
+        let scale = max_seq_len as f64 / original_max_pos as f64;
+        let expected_mscale_sq = (1.0 + scale.ln() / (original_max_pos as f64).ln()) as f32;
+        let cos_data: Vec<f32> = rope.cos.flatten_all().unwrap().to_vec1().unwrap();
+        let sin_data: Vec<f32> = rope.sin.flatten_all().unwrap().to_vec1().unwrap();
+        for (c, s) in cos_data.iter().zip(sin_data.iter()) {
+            let sum = c * c + s * s;
+            assert!(
+                (sum - expected_mscale_sq).abs() < 1e-4,
+                "cos^2+sin^2 = {sum}, expected mscale^2 = {expected_mscale_sq}"
             );
         }
     }

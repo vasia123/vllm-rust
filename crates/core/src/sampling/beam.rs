@@ -102,10 +102,9 @@ impl PartialOrd for BeamCandidate {
 
 impl Ord for BeamCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse order for min-heap (we want to keep highest scores)
-        other
-            .score
-            .partial_cmp(&self.score)
+        // Max-heap: highest score pops first
+        self.score
+            .partial_cmp(&other.score)
             .unwrap_or(Ordering::Equal)
     }
 }

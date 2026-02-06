@@ -228,7 +228,7 @@ impl BloomAttention {
             .reshape((batch_size, 1, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // For decode: per-sequence ALiBi bias applied inside the loop
+        // For decode: ALiBi bias applied inside the CUDA kernel
         #[cfg(feature = "cuda-kernels")]
         {
             let q = q.squeeze(2)?;
@@ -266,10 +266,7 @@ impl BloomAttention {
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-            // TODO: ALiBi bias is not applied in the CUDA kernel path.
-            // The paged_attention_cuda kernel does not accept attention bias.
-            // For production use, this requires a custom ALiBi-aware kernel.
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
+            let attn_output = crate::cuda_kernels::paged_attention_cuda_alibi(
                 &q,
                 cache_engine.k_cache(),
                 cache_engine.v_cache(),
@@ -280,6 +277,7 @@ impl BloomAttention {
                 self.num_heads,
                 max_blocks_per_seq,
                 max_seq_len,
+                self.alibi.slopes(),
             )?;
 
             self.dense.forward(&attn_output, tp_ctx)?.unsqueeze(1)
@@ -893,5 +891,114 @@ mod tests {
         let model = BloomForCausalLM::new(&cfg, vb).expect("build model");
 
         assert_eq!(model.h.len(), cfg.num_hidden_layers);
+    }
+
+    // ---- ALiBi Slope Tests ----
+
+    #[test]
+    fn test_bloom_alibi_slopes_8_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(8);
+        assert_eq!(slopes.len(), 8);
+
+        // For 8 heads: base = 2^(-1) = 0.5, slopes = [0.5^1 .. 0.5^8]
+        let expected = [
+            0.5_f32, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625,
+        ];
+        for (i, (&actual, &exp)) in slopes.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() < 1e-6,
+                "Head {i}: expected {exp}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bloom_alibi_slopes_16_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(16);
+        assert_eq!(slopes.len(), 16);
+
+        let base: f32 = 2.0_f32.powf(-0.5);
+        for (i, &slope) in slopes.iter().enumerate() {
+            let expected = base.powi((i + 1) as i32);
+            assert!(
+                (slope - expected).abs() < 1e-5,
+                "Head {i}: expected {expected}, got {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bloom_alibi_slopes_32_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(32);
+        assert_eq!(slopes.len(), 32);
+
+        let base: f32 = 2.0_f32.powf(-0.25);
+        for (i, &slope) in slopes.iter().enumerate() {
+            let expected = base.powi((i + 1) as i32);
+            assert!(
+                (slope - expected).abs() < 1e-5,
+                "Head {i}: expected {expected}, got {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bloom_alibi_slopes_64_heads() {
+        let slopes = crate::layers::compute_alibi_slopes(64);
+        assert_eq!(slopes.len(), 64);
+
+        let base: f32 = 2.0_f32.powf(-0.125);
+        for (i, &slope) in slopes.iter().enumerate() {
+            let expected = base.powi((i + 1) as i32);
+            assert!(
+                (slope - expected).abs() < 1e-4,
+                "Head {i}: expected {expected}, got {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bloom_alibi_bias_changes_attention_output() {
+        // Verify that ALiBi bias produces different results than no bias.
+        let device = Device::Cpu;
+
+        let alibi = AlibiAttentionBias::new(4, DType::F32, &device).expect("create alibi");
+
+        // Bias for q_len=1, kv_len=5 (decode with 5 tokens in cache)
+        let bias_with_alibi = alibi.build_bias_matrix(1, 5).expect("build bias");
+        let bias_data: Vec<f32> = bias_with_alibi
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("to_vec1");
+
+        // Without ALiBi, all bias values would be zero. With ALiBi, only the
+        // last column (self-position) should be zero.
+        let has_nonzero = bias_data.iter().any(|&v| v.abs() > 1e-6);
+        assert!(
+            has_nonzero,
+            "ALiBi bias should have non-zero values for past tokens"
+        );
+
+        // The last element of each head (position 4, the current token) should
+        // be zero because distance = 0.
+        let slopes = crate::layers::compute_alibi_slopes(4);
+        for h in 0..4 {
+            let last_idx = h * 5 + 4;
+            assert!(
+                bias_data[last_idx].abs() < 1e-6,
+                "Head {h}: current position bias should be 0, got {}",
+                bias_data[last_idx]
+            );
+
+            // First key position (distance = -4) should have negative bias
+            let first_idx = h * 5;
+            let expected = slopes[h] * (-4.0_f32);
+            assert!(
+                (bias_data[first_idx] - expected).abs() < 1e-5,
+                "Head {h}: expected bias {expected}, got {}",
+                bias_data[first_idx]
+            );
+        }
     }
 }

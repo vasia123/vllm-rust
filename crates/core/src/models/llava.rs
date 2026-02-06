@@ -60,7 +60,108 @@ impl Default for VisionSelectFeature {
     }
 }
 
+impl VisionSelectFeature {
+    /// Parse from HuggingFace config strategy string.
+    pub fn from_strategy_str(s: &str) -> Self {
+        match s {
+            "patch" => Self::PatchOnly,
+            "cls" => Self::ClsOnly,
+            "default" | "full" => Self::Default,
+            _ => Self::Default,
+        }
+    }
+}
+
 impl LLaVAConfig {
+    /// Parse LLaVA config from a ModelConfig, extracting vision_config from extra fields.
+    ///
+    /// Falls back to LLaVA 1.5 defaults for any missing fields.
+    pub fn from_model_config(cfg: &ModelConfig) -> Self {
+        let defaults = VisionEncoderConfig::clip_vit_l_14_336();
+
+        let (vision_config, select_feature, image_token_id) = if let Some(vc) =
+            cfg.extra.get("vision_config")
+        {
+            let hidden_size = vc
+                .get("hidden_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(defaults.hidden_size as u64) as usize;
+            let intermediate_size =
+                vc.get("intermediate_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.intermediate_size as u64) as usize;
+            let num_attention_heads =
+                vc.get("num_attention_heads")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.num_attention_heads as u64) as usize;
+            let num_hidden_layers =
+                vc.get("num_hidden_layers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.num_hidden_layers as u64) as usize;
+            let image_size = vc
+                .get("image_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(defaults.image_size as u64) as usize;
+            let patch_size = vc
+                .get("patch_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(defaults.patch_size as u64) as usize;
+            let num_channels = vc
+                .get("num_channels")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(defaults.num_channels as u64) as usize;
+            let layer_norm_eps = vc
+                .get("layer_norm_eps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(defaults.layer_norm_eps);
+
+            let encoder_type = if vc.get("model_type").and_then(|v| v.as_str()) == Some("siglip") {
+                crate::multimodal::VisionEncoderType::SigLip
+            } else {
+                crate::multimodal::VisionEncoderType::Clip
+            };
+
+            let vision_config = VisionEncoderConfig {
+                hidden_size,
+                intermediate_size,
+                num_attention_heads,
+                num_hidden_layers,
+                image_size,
+                patch_size,
+                num_channels,
+                layer_norm_eps,
+                encoder_type,
+            };
+
+            let select_feature = cfg
+                .extra
+                .get("vision_feature_select_strategy")
+                .and_then(|v| v.as_str())
+                .map(VisionSelectFeature::from_strategy_str)
+                .unwrap_or_default();
+
+            let image_token_id = cfg
+                .extra
+                .get("image_token_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(32000) as u32;
+
+            (vision_config, select_feature, image_token_id)
+        } else {
+            (defaults, VisionSelectFeature::Default, 32000)
+        };
+
+        let projector_config = ProjectorConfig::mlp(vision_config.hidden_size, cfg.hidden_size);
+
+        Self {
+            model_config: cfg.clone(),
+            vision_config,
+            projector_config,
+            image_token_id,
+            mm_vision_select_feature: select_feature,
+        }
+    }
+
     /// Create LLaVA 1.5 configuration (CLIP ViT-L/14 @ 336px + Llama).
     pub fn llava_1_5(model_config: ModelConfig) -> Self {
         let vision_config = VisionEncoderConfig::clip_vit_l_14_336();
@@ -188,15 +289,7 @@ impl LLaVAForConditionalGeneration {
     /// Extracts vision and projector configuration from the ModelConfig's extra
     /// fields, falling back to LLaVA 1.5 defaults when not specified.
     pub fn from_model_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        // Determine LLaVA variant from extra config fields
-        let llava_cfg = if cfg.extra.contains_key("vision_config") {
-            // TODO: Parse full vision config from extra fields when available.
-            // For now, use LLaVA 1.5 defaults as a reasonable fallback.
-            LLaVAConfig::llava_1_5(cfg.clone())
-        } else {
-            LLaVAConfig::llava_1_5(cfg.clone())
-        };
-
+        let llava_cfg = LLaVAConfig::from_model_config(cfg);
         Self::new(&llava_cfg, vb)
     }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::kv_cache::BlockTable;
 use crate::request::{RequestId, SequenceState};
+use crate::sampling::BeamSearchState;
 use crate::scheduler::Scheduler;
 
 use super::cuda_graph::CudaGraphDispatcher;
@@ -16,6 +17,20 @@ pub(crate) struct DraftState {
     pub seqlen_offset: usize,
 }
 
+/// Per-request state for beam search decoding.
+///
+/// Each beam request internally manages `beam_width` beams. The `search` field
+/// tracks hypotheses and performs beam expansion. Each beam has its own block
+/// table and sequence length offset for independent KV cache management.
+pub(crate) struct BeamState {
+    /// Beam search algorithm state (hypotheses, expansion, completion).
+    pub search: BeamSearchState,
+    /// Per-beam block tables for KV cache management.
+    pub beam_block_tables: Vec<BlockTable>,
+    /// Per-beam sequence length offsets (prompt_len + generated tokens for that beam).
+    pub beam_seqlen_offsets: Vec<usize>,
+}
+
 /// Active request being processed by the engine.
 pub(crate) struct ActiveRequest {
     pub state: SequenceState,
@@ -23,6 +38,9 @@ pub(crate) struct ActiveRequest {
     pub num_streamed_tokens: usize,
     pub streamed_text_len: usize,
     pub draft_state: Option<DraftState>,
+    /// Beam search state. When `Some`, this request uses beam search decoding
+    /// instead of standard autoregressive sampling.
+    pub beam_state: Option<BeamState>,
 }
 
 /// Owned execution state for strategies.

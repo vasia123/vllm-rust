@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/fused_moe_gemm.cu");
     println!("cargo:rerun-if-changed=kernels/swiglu.cu");
     println!("cargo:rerun-if-changed=kernels/topk_softmax.cu");
+    println!("cargo:rerun-if-changed=kernels/bnb_fused_matmul.cu");
 
     // Only compile CUDA kernels when the feature is enabled
     if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_err() {
@@ -59,6 +60,11 @@ fn main() {
             "kernels/topk_softmax.cu",
             "kernels/topk_softmax.ptx",
             vec![], // Fused top-k softmax for MoE routing
+        ),
+        (
+            "kernels/bnb_fused_matmul.cu",
+            "kernels/bnb_fused_matmul.ptx",
+            vec![], // BitsAndBytes fused dequantize + GEMM
         ),
     ];
 

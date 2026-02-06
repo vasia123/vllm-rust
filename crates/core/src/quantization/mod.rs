@@ -26,6 +26,8 @@
 
 pub mod awq;
 pub mod bitsandbytes;
+#[cfg(feature = "cuda-kernels")]
+pub mod bnb_cuda;
 mod config;
 mod detection;
 pub mod fp8;
@@ -45,6 +47,8 @@ pub use awq::{AwqConfig, AwqLinear, AwqVersion};
 pub use bitsandbytes::{
     quantize_int8, quantize_nf4, unpack_nf4, BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType,
 };
+#[cfg(feature = "cuda-kernels")]
+pub use bnb_cuda::{bnb_int8_gemm, bnb_nf4_gemm};
 pub use config::{
     ActivationScheme, NoQuantizationConfig, QuantizationConfig, QuantizationMethod,
     QuantizedLinear, UnquantizedLinear,

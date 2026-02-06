@@ -158,6 +158,16 @@ fn admit_request(
     }
 
     scheduler.add_request(id);
+    // Initialize beam state if beam search is configured
+    let beam_state = state.sampling_params.beam_search.as_ref().map(|config| {
+        use crate::sampling::BeamSearchState;
+        super::context::BeamState {
+            search: BeamSearchState::new(config.clone(), state.eos_token_id),
+            beam_block_tables: Vec::new(),
+            beam_seqlen_offsets: Vec::new(),
+        }
+    });
+
     requests.insert(
         id,
         ActiveRequest {
@@ -166,6 +176,7 @@ fn admit_request(
             num_streamed_tokens: 0,
             streamed_text_len: 0,
             draft_state: None,
+            beam_state,
         },
     );
 }
@@ -280,8 +291,49 @@ pub(crate) fn execute_prefill<M: ModelForward>(
         let logits = logits
             .narrow(1, seq_dim - 1, 1)
             .map_err(|e| EngineError::Model(e.to_string()))?;
-        let next_token = sample_token(&logits, &mut req.state, tokenizer)?;
-        req.state.generated_token_ids.push(next_token);
+
+        if req.beam_state.is_some() {
+            // Beam search: compute log_softmax over full vocab and run initial beam step
+            let logits_vec: Vec<f32> = logits
+                .squeeze(0)
+                .and_then(|t| t.squeeze(0))
+                .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| EngineError::Model(e.to_string()))?;
+
+            let log_probs = sampling::log_softmax(&logits_vec);
+
+            let beam_state = req.beam_state.as_mut().expect("checked above");
+            let beam_width = beam_state.search.config.beam_width;
+
+            // Initial step: all beams see the same log_probs (from the single prompt)
+            let initial_log_probs: Vec<Vec<f32>> = vec![log_probs; beam_width];
+            let transitions = beam_state.search.step(&initial_log_probs);
+
+            // Clone the request's block table into per-beam block tables
+            let prompt_len = req.state.seqlen_offset;
+            let block_ids = req.state.block_table.block_ids().to_vec();
+            let block_size = kv_cache_mgr.block_size();
+
+            beam_state.beam_block_tables.clear();
+            beam_state.beam_seqlen_offsets.clear();
+
+            for _ in 0..beam_width {
+                let mut bt = crate::kv_cache::BlockTable::new(block_size);
+                bt.append_blocks(&block_ids);
+                bt.advance(prompt_len);
+                beam_state.beam_block_tables.push(bt);
+                beam_state.beam_seqlen_offsets.push(prompt_len);
+            }
+
+            // Set generated_token_ids to the best beam's first token for streaming
+            if let Some(&(_, token_id)) = transitions.first() {
+                req.state.generated_token_ids.push(token_id);
+            }
+        } else {
+            let next_token = sample_token(&logits, &mut req.state, tokenizer)?;
+            req.state.generated_token_ids.push(next_token);
+        }
     } else {
         req.state.status = RequestStatus::Prefilling;
     }
@@ -813,4 +865,239 @@ pub fn greedy_sample(logits: &Tensor) -> anyhow::Result<u32> {
     let logits = logits.squeeze(0)?.squeeze(0)?;
     let token_id = logits.argmax(0)?.to_scalar::<u32>()?;
     Ok(token_id)
+}
+
+// ─── Beam Search Helpers ───────────────────────────────────────────────────
+
+/// Execute a single beam search decode step for a request.
+///
+/// For each active beam: allocate 1 slot, run forward pass, compute log_softmax,
+/// then call `BeamSearchState::step()` to select the best candidates. After
+/// expansion, reassign block tables so each new beam inherits from its parent.
+pub(crate) fn execute_beam_decode<M: ModelForward>(
+    req_id: RequestId,
+    model: &M,
+    kv_cache_mgr: &mut KVCacheManager,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+    tokenizer: &TokenizerWrapper,
+) -> Result<(), EngineError> {
+    let req = requests
+        .get_mut(&req_id)
+        .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
+
+    let beam_state = req
+        .beam_state
+        .as_mut()
+        .ok_or_else(|| EngineError::Model("beam_state is None for beam decode".to_string()))?;
+
+    let num_active = beam_state.search.num_active_beams();
+    if num_active == 0 {
+        return Ok(());
+    }
+
+    let beam_width = beam_state.search.config.beam_width;
+
+    // 1. Allocate slots and build per-beam metadata for batched forward
+    let mut beam_input_tokens: Vec<u32> = Vec::with_capacity(beam_width);
+    let mut sequences: Vec<DecodeSequenceMetadata> = Vec::with_capacity(beam_width);
+
+    for beam_idx in 0..beam_width {
+        if beam_state.search.beams[beam_idx].is_finished {
+            continue;
+        }
+
+        // Allocate a slot for this beam
+        kv_cache_mgr
+            .allocate_for_request(&mut beam_state.beam_block_tables[beam_idx], 1)
+            .map_err(|e| EngineError::Cache(e.to_string()))?;
+
+        let seqlen_offset = beam_state.beam_seqlen_offsets[beam_idx];
+        let slot_mapping = beam_state.beam_block_tables[beam_idx].slot_mapping(seqlen_offset, 1);
+        let block_ids = beam_state.beam_block_tables[beam_idx].block_ids().to_vec();
+
+        // The last token for this beam
+        let last_token = beam_state.search.beams[beam_idx]
+            .token_ids
+            .last()
+            .copied()
+            .unwrap_or_else(|| {
+                // If no tokens yet (first decode step), use the last generated token
+                req.state.generated_token_ids.last().copied().unwrap_or(0)
+            });
+
+        beam_input_tokens.push(last_token);
+        sequences.push(DecodeSequenceMetadata {
+            request_id: req_id,
+            seqlen_offset,
+            block_ids,
+            slot_mapping,
+        });
+    }
+
+    if sequences.is_empty() {
+        return Ok(());
+    }
+
+    // 2. Batched forward pass for all active beams
+    let input = Tensor::new(
+        beam_input_tokens
+            .iter()
+            .map(|&t| vec![t])
+            .collect::<Vec<_>>(),
+        model.device(),
+    )
+    .map_err(|e| EngineError::Model(e.to_string()))?;
+
+    let logits = model
+        .forward_decode_batch(&input, &sequences, kv_cache_mgr)
+        .map_err(|e| EngineError::Model(e.to_string()))?;
+
+    // 3. Advance block tables and seqlen offsets for active beams
+    let mut active_beam_indices: Vec<usize> = Vec::new();
+    for beam_idx in 0..beam_width {
+        if !beam_state.search.beams[beam_idx].is_finished {
+            beam_state.beam_block_tables[beam_idx].advance(1);
+            beam_state.beam_seqlen_offsets[beam_idx] += 1;
+            active_beam_indices.push(beam_idx);
+        }
+    }
+
+    // 4. Extract per-beam logits and compute log_softmax
+    let mut per_beam_log_probs: Vec<Vec<f32>> = Vec::with_capacity(beam_width);
+    let mut active_idx = 0;
+
+    for beam_idx in 0..beam_width {
+        if beam_state.search.beams[beam_idx].is_finished {
+            // Dead beams get -inf log probs so they won't be selected
+            let vocab_size = logits.dims().last().copied().unwrap_or(0);
+            per_beam_log_probs.push(vec![f32::NEG_INFINITY; vocab_size]);
+        } else {
+            let beam_logits: Vec<f32> = logits
+                .narrow(0, active_idx, 1)
+                .and_then(|t| t.squeeze(0))
+                .and_then(|t| {
+                    // Handle both [1, vocab] and [vocab] shapes
+                    if t.dims().len() > 1 {
+                        t.squeeze(0)
+                    } else {
+                        Ok(t)
+                    }
+                })
+                .and_then(|t| t.to_dtype(candle_core::DType::F32))
+                .and_then(|t| t.to_vec1())
+                .map_err(|e| EngineError::Model(e.to_string()))?;
+
+            per_beam_log_probs.push(sampling::log_softmax(&beam_logits));
+            active_idx += 1;
+        }
+    }
+
+    // 5. Beam expansion step
+    let transitions = beam_state.search.step(&per_beam_log_probs);
+
+    // 6. Reassign block tables: new beam i gets a copy of parent beam's block table
+    let old_block_tables = beam_state.beam_block_tables.clone();
+    let old_offsets = beam_state.beam_seqlen_offsets.clone();
+
+    for (new_beam_idx, &(old_beam_idx, _token_id)) in transitions.iter().enumerate() {
+        beam_state.beam_block_tables[new_beam_idx] = old_block_tables[old_beam_idx].clone();
+        beam_state.beam_seqlen_offsets[new_beam_idx] = old_offsets[old_beam_idx];
+    }
+
+    // 7. Update generated_token_ids to best beam's sequence for streaming
+    let best = beam_state.search.get_best_hypotheses();
+    if let Some(best_hyp) = best.first() {
+        req.state.generated_token_ids.clear();
+        req.state.generated_token_ids.extend(&best_hyp.token_ids);
+    }
+
+    // For non-streaming requests, also update generated text eagerly
+    let _ = tokenizer; // Satisfies the signature; text is built at completion
+
+    Ok(())
+}
+
+/// Check if a beam search request has finished.
+///
+/// Returns `Some(FinishCheck)` when either:
+/// - All beams have completed (hit EOS or been pruned)
+/// - The max_new_tokens limit has been reached
+/// - Early stopping criteria are met
+pub(crate) fn check_beam_finished(req: &ActiveRequest) -> Option<FinishCheck> {
+    let beam_state = req.beam_state.as_ref()?;
+
+    if beam_state.search.is_done() {
+        return Some(FinishCheck {
+            reason: FinishReason::Eos,
+            trim_bytes: 0,
+        });
+    }
+
+    // Check max_new_tokens against the longest active beam
+    let max_beam_len = beam_state
+        .search
+        .beams
+        .iter()
+        .map(|b| b.token_ids.len())
+        .max()
+        .unwrap_or(0);
+
+    if max_beam_len >= req.state.max_new_tokens {
+        return Some(FinishCheck {
+            reason: FinishReason::Length,
+            trim_bytes: 0,
+        });
+    }
+
+    None
+}
+
+/// Finalize a beam search request: select the best hypothesis, update the
+/// sequence state, and free all per-beam block tables.
+pub(crate) fn finalize_beam_request(
+    req: &mut ActiveRequest,
+    kv_cache_mgr: &mut KVCacheManager,
+    tokenizer: &TokenizerWrapper,
+) -> (String, FinishReason) {
+    let beam_state = req
+        .beam_state
+        .as_mut()
+        .expect("finalize_beam_request called without beam_state");
+
+    let best = beam_state.search.get_best_hypotheses();
+    let (token_ids, finish_reason) = if let Some(best_hyp) = best.first() {
+        let reason = if best_hyp.is_finished {
+            FinishReason::Eos
+        } else {
+            FinishReason::Length
+        };
+        (best_hyp.token_ids.clone(), reason)
+    } else {
+        (Vec::new(), FinishReason::Length)
+    };
+
+    // Update sequence state with the best hypothesis
+    req.state.generated_token_ids = token_ids;
+
+    // Free all per-beam block tables
+    for bt in &mut beam_state.beam_block_tables {
+        let freed_ids = bt.release();
+        if !freed_ids.is_empty() {
+            let _ = kv_cache_mgr.free_blocks(&freed_ids);
+        }
+    }
+
+    // Clear beam state
+    req.beam_state = None;
+
+    let generated_text = tokenizer
+        .decode(&req.state.generated_token_ids)
+        .unwrap_or_default();
+
+    (generated_text, finish_reason)
+}
+
+/// Returns `true` if the given request is a beam search request.
+pub(crate) fn is_beam_request(req: &ActiveRequest) -> bool {
+    req.beam_state.is_some()
 }

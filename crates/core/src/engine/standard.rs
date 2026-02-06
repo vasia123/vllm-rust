@@ -13,7 +13,8 @@ use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
 use super::cuda_graph_runner::CudaGraphRunner;
 use super::helpers::{
-    execute_batched_decode_with_graph, execute_prefill, finish_request_with_error,
+    execute_batched_decode_with_graph, execute_beam_decode, execute_prefill,
+    finish_request_with_error, is_beam_request,
 };
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
@@ -258,52 +259,80 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             return;
         }
 
-        let num_steps = multi_step_count.max(1);
-        let mut active_decode_ids = output.decode_requests.clone();
+        // Partition into regular and beam search requests.
+        // Beam requests decode individually (each internally batches its own beams).
+        let mut regular_ids = Vec::new();
+        let mut beam_ids = Vec::new();
 
-        for _step in 0..num_steps {
-            if active_decode_ids.is_empty() {
-                break;
+        for &req_id in &output.decode_requests {
+            if let Some(req) = state.requests.get(&req_id) {
+                if is_beam_request(req) {
+                    beam_ids.push(req_id);
+                } else {
+                    regular_ids.push(req_id);
+                }
             }
+        }
 
-            let failed = execute_batched_decode_with_graph(
-                &active_decode_ids,
+        // Execute beam search decode for each beam request
+        for req_id in beam_ids {
+            if let Err(e) = execute_beam_decode(
+                req_id,
                 &self.model,
                 kv_cache_mgr,
                 &mut state.requests,
-                Some(&state.cuda_graph_dispatcher),
-                self.graph_runner.as_ref(),
-            );
-
-            for req_id in failed {
-                active_decode_ids.retain(|&id| id != req_id);
-                finish_request_with_error(
-                    req_id,
-                    EngineError::Model("batched decode failed".to_string()),
-                    &mut state.scheduler,
-                    &mut state.requests,
-                );
+                _tokenizer,
+            ) {
+                finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
             }
+        }
 
-            // Remove sequences that finished mid-step
-            // Note: We need a tokenizer to check stop strings, but for efficiency
-            // we only check non-string stop conditions here. Full check happens in main loop.
-            active_decode_ids.retain(|&id| {
-                state
-                    .requests
-                    .get(&id)
-                    .map(|r| {
-                        let s = &r.state;
-                        let last = s.generated_token_ids.last().copied();
-                        // Quick checks without tokenizer
-                        let eos = last.map(|t| t == s.eos_token_id).unwrap_or(false);
-                        let stop_token =
-                            last.map(|t| s.stop_token_ids.contains(&t)).unwrap_or(false);
-                        let max_len = s.num_generated() >= s.max_new_tokens;
-                        !eos && !stop_token && !max_len
-                    })
-                    .unwrap_or(false)
-            });
+        // Execute regular batched decode
+        if !regular_ids.is_empty() {
+            let num_steps = multi_step_count.max(1);
+            let mut active_decode_ids = regular_ids;
+
+            for _step in 0..num_steps {
+                if active_decode_ids.is_empty() {
+                    break;
+                }
+
+                let failed = execute_batched_decode_with_graph(
+                    &active_decode_ids,
+                    &self.model,
+                    kv_cache_mgr,
+                    &mut state.requests,
+                    Some(&state.cuda_graph_dispatcher),
+                    self.graph_runner.as_ref(),
+                );
+
+                for req_id in failed {
+                    active_decode_ids.retain(|&id| id != req_id);
+                    finish_request_with_error(
+                        req_id,
+                        EngineError::Model("batched decode failed".to_string()),
+                        &mut state.scheduler,
+                        &mut state.requests,
+                    );
+                }
+
+                // Remove sequences that finished mid-step
+                active_decode_ids.retain(|&id| {
+                    state
+                        .requests
+                        .get(&id)
+                        .map(|r| {
+                            let s = &r.state;
+                            let last = s.generated_token_ids.last().copied();
+                            let eos = last.map(|t| t == s.eos_token_id).unwrap_or(false);
+                            let stop_token =
+                                last.map(|t| s.stop_token_ids.contains(&t)).unwrap_or(false);
+                            let max_len = s.num_generated() >= s.max_new_tokens;
+                            !eos && !stop_token && !max_len
+                        })
+                        .unwrap_or(false)
+                });
+            }
         }
     }
 

@@ -8,7 +8,9 @@ use axum::Json;
 
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
-use vllm_core::sampling::{JsonSchemaConstraint, SamplingConstraint, SamplingParams};
+use vllm_core::sampling::{
+    BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
+};
 use vllm_core::tokenizer::TokenizerWrapper;
 
 use super::admin::prometheus;
@@ -69,6 +71,8 @@ pub async fn create_completion(
         let constraint =
             create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
 
+        let beam_search = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
+
         let gen_req = GenerationRequest {
             prompt,
             max_new_tokens: req.max_tokens,
@@ -82,8 +86,7 @@ pub async fn create_completion(
                 presence_penalty: req.presence_penalty,
                 min_p: req.min_p,
                 seed: req.seed,
-                // TODO: Wire beam_search from API when engine supports it in streaming mode
-                beam_search: None,
+                beam_search,
                 logit_bias: logit_bias.clone(),
             },
             stop_strings: req.stop,
@@ -164,6 +167,9 @@ pub async fn create_completion(
                     None
                 };
 
+                let iter_beam =
+                    build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
+
                 let gen_req = GenerationRequest {
                     prompt: prompt.clone(),
                     max_new_tokens: req.max_tokens,
@@ -177,7 +183,7 @@ pub async fn create_completion(
                         presence_penalty: req.presence_penalty,
                         min_p: req.min_p,
                         seed: req.seed,
-                        beam_search: None,
+                        beam_search: iter_beam,
                         logit_bias: logit_bias.clone(),
                     },
                     stop_strings: req.stop.clone(),
@@ -294,6 +300,20 @@ fn resolve_prompt_input(state: &AppState, input: PromptInput) -> Result<(String,
             Ok((text, token_count))
         }
     }
+}
+
+/// Build a `BeamSearchConfig` from optional API parameters.
+fn build_beam_config(
+    beam_width: Option<usize>,
+    length_penalty: Option<f32>,
+    early_stopping: Option<bool>,
+) -> Option<BeamSearchConfig> {
+    beam_width.map(|bw| BeamSearchConfig {
+        beam_width: bw,
+        length_penalty: length_penalty.unwrap_or(1.0),
+        early_stopping: early_stopping.unwrap_or(false),
+        ..Default::default()
+    })
 }
 
 /// Score a generation result by the sum of its token logprobs.

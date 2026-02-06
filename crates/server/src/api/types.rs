@@ -109,6 +109,15 @@ pub struct CompletionRequest {
     /// Must be >= n if n is set. Default is 1.
     #[serde(default = "default_best_of")]
     pub best_of: usize,
+    /// Beam search width. When set (> 1), uses beam search decoding instead of sampling.
+    #[serde(default)]
+    pub beam_width: Option<usize>,
+    /// Length penalty for beam search (0 = no normalization, 1 = full normalization).
+    #[serde(default)]
+    pub length_penalty: Option<f32>,
+    /// Whether to stop early when all beams have finished in beam search.
+    #[serde(default)]
+    pub early_stopping: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +253,15 @@ pub struct ChatCompletionRequest {
     /// Number of chat completion choices to generate. Default 1.
     #[serde(default = "default_n")]
     pub n: usize,
+    /// Beam search width. When set (> 1), uses beam search decoding instead of sampling.
+    #[serde(default)]
+    pub beam_width: Option<usize>,
+    /// Length penalty for beam search (0 = no normalization, 1 = full normalization).
+    #[serde(default)]
+    pub length_penalty: Option<f32>,
+    /// Whether to stop early when all beams have finished in beam search.
+    #[serde(default)]
+    pub early_stopping: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1449,5 +1467,58 @@ mod tests {
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
         assert!((req.frequency_penalty - 0.8).abs() < 1e-6);
         assert!((req.presence_penalty - 0.6).abs() < 1e-6);
+    }
+
+    // ─── beam_width deserialization ─────────────────────────────────
+
+    #[test]
+    fn completion_request_beam_width_explicit() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "hello",
+            "beam_width": 4,
+            "length_penalty": 0.8,
+            "early_stopping": true
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.beam_width, Some(4));
+        assert!((req.length_penalty.unwrap() - 0.8).abs() < 1e-6);
+        assert_eq!(req.early_stopping, Some(true));
+    }
+
+    #[test]
+    fn completion_request_beam_width_defaults_to_none() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "hello"
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.beam_width.is_none());
+        assert!(req.length_penalty.is_none());
+        assert!(req.early_stopping.is_none());
+    }
+
+    #[test]
+    fn chat_request_beam_width_explicit() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "beam_width": 2,
+            "length_penalty": 1.5
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.beam_width, Some(2));
+        assert!((req.length_penalty.unwrap() - 1.5).abs() < 1e-6);
+        assert!(req.early_stopping.is_none());
+    }
+
+    #[test]
+    fn chat_request_beam_width_defaults_to_none() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.beam_width.is_none());
     }
 }

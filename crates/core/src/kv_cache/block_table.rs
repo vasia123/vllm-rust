@@ -1,6 +1,7 @@
 use super::block_pool::BlockId;
 
 /// Per-request mapping: logical block index → physical BlockId.
+#[derive(Clone)]
 pub struct BlockTable {
     blocks: Vec<BlockId>,
     num_tokens_stored: usize,

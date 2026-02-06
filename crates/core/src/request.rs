@@ -108,11 +108,20 @@ impl SequenceState {
     }
 
     /// Blocks needed for the next step (prefill or single decode token).
+    ///
+    /// For beam search requests in decode phase, each beam may independently
+    /// need a new block, so the estimate is multiplied by `beam_width`.
     pub fn blocks_needed_for_step(&self) -> usize {
         if self.status == RequestStatus::Waiting || self.status == RequestStatus::Preempted {
             self.block_table.blocks_needed(self.prompt_token_ids.len())
         } else {
-            self.block_table.blocks_needed(1)
+            let beam_width = self
+                .sampling_params
+                .beam_search
+                .as_ref()
+                .map(|b| b.beam_width)
+                .unwrap_or(1);
+            self.block_table.blocks_needed(1) * beam_width
         }
     }
 }

@@ -1,5 +1,5 @@
 use super::error::ApiError;
-use super::types::{ChatCompletionRequest, CompletionRequest};
+use super::types::{ChatCompletionRequest, CompletionRequest, ResponseFormat};
 
 pub fn validate_completion_request(req: &CompletionRequest) -> Result<(), ApiError> {
     validate_temperature(req.temperature)?;
@@ -8,6 +8,7 @@ pub fn validate_completion_request(req: &CompletionRequest) -> Result<(), ApiErr
     validate_presence_penalty(req.presence_penalty)?;
     validate_max_tokens(req.max_tokens)?;
     validate_best_of(req.best_of)?;
+    validate_beam_search(req.beam_width, req.response_format.as_ref(), req.stream)?;
 
     if let Some(logprobs) = req.logprobs {
         if logprobs > 5 {
@@ -27,6 +28,7 @@ pub fn validate_chat_completion_request(req: &ChatCompletionRequest) -> Result<(
     validate_presence_penalty(req.presence_penalty)?;
     validate_max_tokens(req.max_tokens)?;
     validate_n(req.n)?;
+    validate_beam_search(req.beam_width, req.response_format.as_ref(), req.stream)?;
 
     if let Some(top_logprobs) = req.top_logprobs {
         if !req.logprobs.unwrap_or(false) {
@@ -102,6 +104,37 @@ fn validate_n(n: usize) -> Result<(), ApiError> {
     if n < 1 {
         return Err(ApiError::InvalidRequest("n must be at least 1".to_string()));
     }
+    Ok(())
+}
+
+fn validate_beam_search(
+    beam_width: Option<usize>,
+    response_format: Option<&ResponseFormat>,
+    _stream: bool,
+) -> Result<(), ApiError> {
+    let Some(bw) = beam_width else {
+        return Ok(());
+    };
+
+    if !(1..=16).contains(&bw) {
+        return Err(ApiError::InvalidRequest(format!(
+            "beam_width must be between 1 and 16, got {bw}"
+        )));
+    }
+
+    // Beam search is incompatible with structured output constraints
+    if let Some(fmt) = response_format {
+        match fmt {
+            ResponseFormat::Text => {}
+            ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. } => {
+                return Err(ApiError::InvalidRequest(
+                    "beam_search is not compatible with response_format json constraints"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -406,5 +439,80 @@ mod tests {
         let mut req = minimal_chat_request();
         req.top_logprobs = None;
         assert!(validate_chat_completion_request(&req).is_ok());
+    }
+
+    // ─── beam_width (completion) ────────────────────────────────────
+
+    #[test]
+    fn beam_width_zero_fails_completion() {
+        let mut req = minimal_completion_request();
+        req.beam_width = Some(0);
+        let err = validate_completion_request(&req).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("beam_width")));
+    }
+
+    #[test]
+    fn beam_width_above_sixteen_fails_completion() {
+        let mut req = minimal_completion_request();
+        req.beam_width = Some(17);
+        let err = validate_completion_request(&req).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("beam_width")));
+    }
+
+    #[test]
+    fn beam_width_one_passes_completion() {
+        let mut req = minimal_completion_request();
+        req.beam_width = Some(1);
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn beam_width_sixteen_passes_completion() {
+        let mut req = minimal_completion_request();
+        req.beam_width = Some(16);
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn beam_width_none_passes_completion() {
+        let mut req = minimal_completion_request();
+        req.beam_width = None;
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    // ─── beam_width (chat) ──────────────────────────────────────────
+
+    #[test]
+    fn beam_width_zero_fails_chat() {
+        let mut req = minimal_chat_request();
+        req.beam_width = Some(0);
+        let err = validate_chat_completion_request(&req).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("beam_width")));
+    }
+
+    #[test]
+    fn beam_width_valid_passes_chat() {
+        let mut req = minimal_chat_request();
+        req.beam_width = Some(4);
+        assert!(validate_chat_completion_request(&req).is_ok());
+    }
+
+    // ─── beam_width + response_format ───────────────────────────────
+
+    #[test]
+    fn beam_width_with_json_object_fails() {
+        let mut req = minimal_completion_request();
+        req.beam_width = Some(2);
+        req.response_format = Some(ResponseFormat::JsonObject);
+        let err = validate_completion_request(&req).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("not compatible")));
+    }
+
+    #[test]
+    fn beam_width_with_text_format_passes() {
+        let mut req = minimal_completion_request();
+        req.beam_width = Some(2);
+        req.response_format = Some(ResponseFormat::Text);
+        assert!(validate_completion_request(&req).is_ok());
     }
 }

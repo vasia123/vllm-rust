@@ -204,8 +204,9 @@ impl QuantizationConfig for BitsAndBytesConfig {
 /// BitsAndBytes quantized linear layer.
 ///
 /// Supports NF4 and INT8 modes. NF4 packs two 4-bit values per byte.
-/// Dequantization is performed on CPU via lookup table (NF4) or
-/// scale multiplication (INT8). A CUDA kernel path can be added later.
+/// On CUDA with the `cuda-kernels` feature, uses fused dequantize+GEMM
+/// kernels that avoid materializing full-precision weight tensors.
+/// Falls back to CPU dequantize-then-matmul when fused path is unavailable.
 #[derive(Debug)]
 pub struct BitsAndBytesLinear {
     /// NF4: packed u8 tensor (2 values per byte), shape [out_features * in_features / 2]
@@ -352,24 +353,92 @@ impl BitsAndBytesLinear {
             BnbQuantType::INT8 => self.dequantize_int8(),
         }
     }
+
+    /// Attempt fused dequantize+GEMM on CUDA via custom kernels.
+    ///
+    /// Returns the output tensor if the fused kernel launched successfully,
+    /// or an error if the kernel is unavailable (caller should fall back to
+    /// the dequantize-then-matmul path).
+    #[cfg(feature = "cuda-kernels")]
+    fn forward_fused(&self, x: &Tensor) -> Result<Tensor> {
+        use super::bnb_cuda;
+
+        match self.quant_type {
+            BnbQuantType::NF4 => bnb_cuda::bnb_nf4_gemm(
+                x,
+                &self.quantized_weight,
+                &self.absmax,
+                self.bias.as_ref(),
+                self.out_features,
+                self.block_size as i32,
+            ),
+            BnbQuantType::INT8 => {
+                let weight_2d = self
+                    .quantized_weight
+                    .reshape((self.out_features, self.in_features))?;
+                bnb_cuda::bnb_int8_gemm(
+                    x,
+                    &weight_2d,
+                    &self.absmax,
+                    self.bias.as_ref(),
+                    self.block_size as i32,
+                )
+            }
+        }
+    }
 }
 
 impl QuantizedLinear for BitsAndBytesLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Dequantize-then-matmul approach (works on CPU and any GPU)
-        // TODO: Add fused CUDA kernel for better GPU performance
-        let weight = self.dequantize()?;
-
         let x_f32 = if x.dtype() != DType::F32 {
             x.to_dtype(DType::F32)?
         } else {
             x.clone()
         };
 
-        let y = x_f32.matmul(&weight.t()?)?;
-        match &self.bias {
-            Some(b) => y.broadcast_add(b),
-            None => Ok(y),
+        // Reshape >2D inputs to 2D for matmul, then restore shape
+        let original_shape = x_f32.dims().to_vec();
+        let x_2d = if original_shape.len() > 2 {
+            let batch: usize = original_shape[..original_shape.len() - 1].iter().product();
+            let k = *original_shape.last().unwrap_or(&0);
+            x_f32.reshape((batch, k))?
+        } else {
+            x_f32.clone()
+        };
+
+        // On CUDA, try the fused dequantize+GEMM kernel first
+        #[cfg(feature = "cuda-kernels")]
+        if x_2d.device().is_cuda() {
+            match self.forward_fused(&x_2d) {
+                Ok(output) => {
+                    if original_shape.len() > 2 {
+                        let mut out_shape = original_shape[..original_shape.len() - 1].to_vec();
+                        out_shape.push(self.out_features);
+                        return output.reshape(out_shape);
+                    }
+                    return Ok(output);
+                }
+                Err(_) => {
+                    // Fused kernel failed (e.g. PTX not loaded); fall through
+                    // to the dequantize-then-matmul path below.
+                }
+            }
+        }
+
+        // Fallback: dequantize to full precision, then matmul
+        let weight = self.dequantize()?;
+        let y = x_2d.matmul(&weight.t()?)?;
+        let y = match &self.bias {
+            Some(b) => y.broadcast_add(b)?,
+            None => y,
+        };
+
+        if original_shape.len() > 2 {
+            let mut out_shape = original_shape[..original_shape.len() - 1].to_vec();
+            out_shape.push(self.out_features);
+            y.reshape(out_shape)
+        } else {
+            Ok(y)
         }
     }
 
@@ -1047,5 +1116,226 @@ mod tests {
         let cloned = config.clone_box();
         assert_eq!(cloned.method(), QuantizationMethod::BitsAndBytes);
         assert_eq!(cloned.min_capability(), 70);
+    }
+
+    // ─── GPU Tests ──────────────────────────────────────────────────────
+
+    mod gpu_tests {
+        use super::*;
+
+        fn get_cuda_device() -> Option<Device> {
+            Device::cuda_if_available(0).ok().filter(|d| d.is_cuda())
+        }
+
+        /// Create a NF4 linear layer on the given device with known weights.
+        fn create_nf4_linear(
+            in_features: usize,
+            out_features: usize,
+            block_size: usize,
+            has_bias: bool,
+            device: &Device,
+        ) -> BitsAndBytesLinear {
+            let weight_data: Vec<f32> = (0..in_features * out_features)
+                .map(|i| ((i as f32 * 0.037).sin() * 0.6))
+                .collect();
+            let (packed, absmax_data) = quantize_nf4(&weight_data, block_size);
+
+            let mut linear = BitsAndBytesLinear::new(
+                in_features,
+                out_features,
+                has_bias,
+                BnbQuantType::NF4,
+                block_size,
+                device,
+            )
+            .expect("failed to create NF4 linear");
+
+            let packed_len = packed.len();
+            let absmax_len = absmax_data.len();
+            let mut weights = HashMap::new();
+            weights.insert(
+                "weight".to_string(),
+                Tensor::from_vec(packed, (packed_len,), device).expect("packed tensor"),
+            );
+            weights.insert(
+                "absmax".to_string(),
+                Tensor::from_vec(absmax_data, (absmax_len,), device).expect("absmax tensor"),
+            );
+            if has_bias {
+                let bias_data: Vec<f32> =
+                    (0..out_features).map(|i| (i as f32 * 0.01) - 0.5).collect();
+                weights.insert(
+                    "bias".to_string(),
+                    Tensor::from_vec(bias_data, (out_features,), device).expect("bias tensor"),
+                );
+            }
+            linear.load_weights(&weights).expect("load weights");
+            linear
+        }
+
+        /// Create an INT8 linear layer on the given device with known weights.
+        fn create_int8_linear(
+            in_features: usize,
+            out_features: usize,
+            block_size: usize,
+            device: &Device,
+        ) -> BitsAndBytesLinear {
+            let weight_data: Vec<f32> = (0..in_features * out_features)
+                .map(|i| ((i as f32 * 0.023).cos() * 0.4))
+                .collect();
+            let (quantized, absmax_data) = quantize_int8(&weight_data, block_size);
+
+            let mut linear = BitsAndBytesLinear::new(
+                in_features,
+                out_features,
+                false,
+                BnbQuantType::INT8,
+                block_size,
+                device,
+            )
+            .expect("failed to create INT8 linear");
+
+            let absmax_len = absmax_data.len();
+            let mut weights = HashMap::new();
+            weights.insert(
+                "weight".to_string(),
+                Tensor::from_vec(quantized, (out_features, in_features), device)
+                    .expect("weight tensor"),
+            );
+            weights.insert(
+                "absmax".to_string(),
+                Tensor::from_vec(absmax_data, (absmax_len,), device).expect("absmax tensor"),
+            );
+            linear.load_weights(&weights).expect("load weights");
+            linear
+        }
+
+        #[test]
+        fn test_nf4_fused_vs_unfused_correctness() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping GPU test: no CUDA device");
+                return;
+            };
+
+            let in_f = 64;
+            let out_f = 32;
+            let block_size = 64;
+
+            let linear = create_nf4_linear(in_f, out_f, block_size, false, &device);
+
+            let x = Tensor::ones(&[4, in_f], DType::F32, &device).expect("input tensor");
+
+            // Use forward() which will attempt fused path on CUDA
+            let result = linear.forward(&x).expect("forward pass");
+            assert_eq!(result.dims(), &[4, out_f]);
+
+            // Compare with explicit dequantize-then-matmul
+            let weight = linear.dequantize().expect("dequantize");
+            let expected = x.matmul(&weight.t().expect("transpose")).expect("matmul");
+
+            let result_data: Vec<f32> = result
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1()
+                .expect("to_vec");
+            let expected_data: Vec<f32> = expected
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1()
+                .expect("to_vec");
+
+            for (i, (r, e)) in result_data.iter().zip(expected_data.iter()).enumerate() {
+                let err = (r - e).abs();
+                assert!(
+                    err < 0.01,
+                    "NF4 fused vs unfused mismatch at {i}: fused={r}, expected={e}, err={err}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_int8_fused_vs_unfused_correctness() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping GPU test: no CUDA device");
+                return;
+            };
+
+            let in_f = 64;
+            let out_f = 32;
+            let block_size = 64;
+
+            let linear = create_int8_linear(in_f, out_f, block_size, &device);
+
+            let x = Tensor::ones(&[4, in_f], DType::F32, &device).expect("input tensor");
+
+            let result = linear.forward(&x).expect("forward pass");
+            assert_eq!(result.dims(), &[4, out_f]);
+
+            let weight = linear.dequantize().expect("dequantize");
+            let expected = x.matmul(&weight.t().expect("transpose")).expect("matmul");
+
+            let result_data: Vec<f32> = result
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1()
+                .expect("to_vec");
+            let expected_data: Vec<f32> = expected
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1()
+                .expect("to_vec");
+
+            for (i, (r, e)) in result_data.iter().zip(expected_data.iter()).enumerate() {
+                let err = (r - e).abs();
+                assert!(
+                    err < 0.01,
+                    "INT8 fused vs unfused mismatch at {i}: fused={r}, expected={e}, err={err}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_nf4_fused_with_bias() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping GPU test: no CUDA device");
+                return;
+            };
+
+            let in_f = 32;
+            let out_f = 16;
+            let block_size = 32;
+
+            let linear = create_nf4_linear(in_f, out_f, block_size, true, &device);
+
+            let x = Tensor::ones(&[2, in_f], DType::F32, &device).expect("input tensor");
+            let result = linear.forward(&x).expect("forward pass");
+            assert_eq!(result.dims(), &[2, out_f]);
+        }
+
+        #[test]
+        fn test_nf4_fused_various_sizes() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping GPU test: no CUDA device");
+                return;
+            };
+
+            let sizes: Vec<(usize, usize, usize, usize)> = vec![
+                (1, 32, 16, 32),   // single token, small
+                (8, 64, 32, 64),   // batch, medium
+                (16, 128, 64, 64), // larger batch
+                (4, 256, 128, 64), // wider
+            ];
+
+            for (batch, in_f, out_f, block_size) in sizes {
+                let linear = create_nf4_linear(in_f, out_f, block_size, false, &device);
+                let x = Tensor::ones(&[batch, in_f], DType::F32, &device).expect("input tensor");
+                let result = linear.forward(&x).expect("forward pass");
+                assert_eq!(
+                    result.dims(),
+                    &[batch, out_f],
+                    "Shape mismatch for ({batch}, {in_f}, {out_f})"
+                );
+            }
+        }
     }
 }

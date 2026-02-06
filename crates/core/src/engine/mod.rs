@@ -38,7 +38,8 @@ pub use cuda_graph::{
     ForwardContext, RuntimeMode, WarmupManager, WarmupResult,
 };
 pub use cuda_graph_runner::{
-    CudaGraphRunner, CudaGraphRunnerBuilder, CudaGraphRunnerError, CudaGraphRunnerStats,
+    cuda_memcpy_inplace, CudaGraphRunner, CudaGraphRunnerBuilder, CudaGraphRunnerError,
+    CudaGraphRunnerStats,
 };
 pub use embedding_forward::{pool_embeddings, EmbeddingOutput, ModelForEmbedding, PoolingStrategy};
 pub use handle::EngineHandle;
@@ -517,6 +518,7 @@ mod tests {
                         num_streamed_tokens: 0,
                         streamed_text_len: 0,
                         draft_state: None,
+                        beam_state: None,
                     },
                 );
             }
@@ -979,6 +981,7 @@ mod tests {
                         num_streamed_tokens: 0,
                         streamed_text_len: 0,
                         draft_state: None,
+                        beam_state: None,
                     },
                 );
             }
@@ -1359,5 +1362,327 @@ mod tests {
         // Check detailed stats
         let cache = kv_cache_mgr.prefix_cache().unwrap();
         assert_eq!(cache.num_cached_blocks(), 1);
+    }
+
+    // ─── Beam Search Tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn beam_search_produces_tokens() {
+        // Beam search with width=2 should produce the same tokens as greedy
+        // when the model always outputs the same token with highest logit.
+        let model = MockModel::new(42, 100);
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let config = test_engine_config();
+
+        let prompt = vec![1u32, 2, 3];
+        let max_tokens = 5;
+        let eos_token = 99;
+        let block_size = config.block_size;
+
+        let tokenizer = crate::tokenizer::TokenizerWrapper::for_testing(100);
+        let mut scheduler = crate::scheduler::Scheduler::new(config.scheduler_config);
+        let mut active: HashMap<crate::request::RequestId, ActiveRequest> = HashMap::new();
+        let mut kv_cache_mgr = kv_cache_mgr;
+
+        let beam_config = crate::sampling::BeamSearchConfig {
+            beam_width: 2,
+            ..Default::default()
+        };
+
+        let id = 0u64;
+        let mut state =
+            SequenceState::new(id, prompt.clone(), max_tokens, eos_token, block_size, id);
+        state.sampling_params.beam_search = Some(beam_config);
+
+        scheduler.add_request(id);
+        let (tx, rx) = oneshot::channel();
+        active.insert(
+            id,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                draft_state: None,
+                beam_state: None, // Beam state is initialized during handle_command/prefill
+            },
+        );
+
+        // Re-initialize beam_state on the request (simulating what handle_command does)
+        {
+            let req = active.get_mut(&id).unwrap();
+            let config = req
+                .state
+                .sampling_params
+                .beam_search
+                .as_ref()
+                .unwrap()
+                .clone();
+            req.beam_state = Some(super::context::BeamState {
+                search: crate::sampling::BeamSearchState::new(config, eos_token),
+                beam_block_tables: Vec::new(),
+                beam_seqlen_offsets: Vec::new(),
+            });
+        }
+
+        // Run engine loop manually
+        for _ in 0..100 {
+            if scheduler.is_idle() {
+                break;
+            }
+
+            let states: HashMap<crate::request::RequestId, &SequenceState> =
+                active.iter().map(|(&id, r)| (id, &r.state)).collect();
+            let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
+
+            for schedule in &output.prefill_requests {
+                let _ = execute_prefill(
+                    schedule.request_id,
+                    schedule.chunk_size,
+                    &model,
+                    &mut kv_cache_mgr,
+                    &mut active,
+                    &tokenizer,
+                );
+            }
+
+            // Execute beam decode for beam requests
+            for &req_id in &output.decode_requests {
+                if let Some(req) = active.get(&req_id) {
+                    if req.beam_state.is_some() {
+                        let _ = super::helpers::execute_beam_decode(
+                            req_id,
+                            &model,
+                            &mut kv_cache_mgr,
+                            &mut active,
+                            &tokenizer,
+                        );
+                    }
+                }
+            }
+
+            // Check completion
+            let mut finished = Vec::new();
+            let scheduled_ids: Vec<crate::request::RequestId> = output
+                .prefill_requests
+                .iter()
+                .map(|s| s.request_id)
+                .chain(output.decode_requests.iter().copied())
+                .collect();
+            for &req_id in &scheduled_ids {
+                if let Some(req) = active.get(&req_id) {
+                    let check = if req.beam_state.is_some() {
+                        super::helpers::check_beam_finished(req)
+                    } else {
+                        check_finished(&req.state, &tokenizer)
+                    };
+                    if let Some(check) = check {
+                        finished.push((req_id, check));
+                    }
+                }
+            }
+
+            for (req_id, check) in finished {
+                let mut req = active.remove(&req_id).unwrap();
+                scheduler.remove_request(req_id);
+
+                if req.beam_state.is_some() {
+                    let (text, reason) = super::helpers::finalize_beam_request(
+                        &mut req,
+                        &mut kv_cache_mgr,
+                        &tokenizer,
+                    );
+                    let _ = text;
+                    let _ = reason;
+                }
+
+                let mut bt = req.state.block_table;
+                let _ = kv_cache_mgr.free_request(&mut bt);
+
+                let result = GenerationResult {
+                    request_id: req_id,
+                    generated_text: String::new(),
+                    generated_token_ids: req.state.generated_token_ids,
+                    finish_reason: check.reason,
+                    token_logprobs: None,
+                    top_logprobs: None,
+                    prompt_token_ids: None,
+                    prompt_logprobs: None,
+                };
+                let _ = match req.response {
+                    ResponseChannel::Complete(tx) => tx.send(Ok(result)),
+                    _ => Ok(()),
+                };
+            }
+        }
+
+        let result = rx.await.unwrap().unwrap();
+        assert!(
+            !result.generated_token_ids.is_empty(),
+            "beam search should produce tokens"
+        );
+        assert!(
+            result.generated_token_ids.len() <= max_tokens,
+            "should not exceed max_tokens"
+        );
+    }
+
+    #[test]
+    fn beam_search_width_1_equivalent_to_greedy() {
+        // With beam_width=1, beam search degenerates to greedy search.
+        // The BeamSearchState should produce the same result.
+        let config = crate::sampling::BeamSearchConfig {
+            beam_width: 1,
+            length_penalty: 0.0,
+            ..Default::default()
+        };
+        let eos_token = 99u32;
+        let mut beam_state = crate::sampling::BeamSearchState::new(config, eos_token);
+
+        // Simulate a vocab of 5 tokens, token 3 has highest prob
+        let log_probs = vec![vec![-5.0, -3.0, -10.0, -0.5, -4.0]];
+        let transitions = beam_state.step(&log_probs);
+
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].1, 3); // Should pick token 3 (highest log prob)
+    }
+
+    #[test]
+    fn beam_search_eos_completes_beams() {
+        let config = crate::sampling::BeamSearchConfig {
+            beam_width: 2,
+            early_stopping: true,
+            num_return_beams: 1,
+            length_penalty: 0.0,
+            ..Default::default()
+        };
+        let eos_token = 2u32;
+        let mut beam_state = crate::sampling::BeamSearchState::new(config, eos_token);
+
+        // First step: tokens 0 and 1 are best (not EOS)
+        let log_probs1 = vec![vec![-0.5, -1.0, -10.0, -3.0], vec![-1.0, -0.5, -10.0, -3.0]];
+        beam_state.step(&log_probs1);
+        assert!(beam_state.completed.is_empty());
+
+        // Second step: make EOS (token 2) the best for both beams
+        let log_probs2 = vec![
+            vec![-10.0, -10.0, -0.1, -10.0],
+            vec![-10.0, -10.0, -0.2, -10.0],
+        ];
+        beam_state.step(&log_probs2);
+
+        assert!(
+            !beam_state.completed.is_empty(),
+            "at least one beam should complete via EOS"
+        );
+    }
+
+    #[test]
+    fn check_beam_finished_max_tokens() {
+        let block_size = 16;
+        let eos_token = 99u32;
+        let max_tokens = 3;
+
+        let state = SequenceState::new(0, vec![1, 2, 3], max_tokens, eos_token, block_size, 0);
+
+        let beam_config = crate::sampling::BeamSearchConfig {
+            beam_width: 2,
+            ..Default::default()
+        };
+
+        let mut beam_state = super::context::BeamState {
+            search: crate::sampling::BeamSearchState::new(beam_config, eos_token),
+            beam_block_tables: Vec::new(),
+            beam_seqlen_offsets: Vec::new(),
+        };
+
+        // Simulate 3 tokens generated (reaching max_tokens)
+        beam_state.search.beams[0].token_ids = vec![1, 2, 3];
+        beam_state.search.beams[1].token_ids = vec![4, 5, 6];
+
+        let (tx, _rx) = oneshot::channel();
+        let req = ActiveRequest {
+            state,
+            response: ResponseChannel::Complete(tx),
+            num_streamed_tokens: 0,
+            streamed_text_len: 0,
+            draft_state: None,
+            beam_state: Some(beam_state),
+        };
+
+        let check = super::helpers::check_beam_finished(&req);
+        assert!(check.is_some(), "should detect max_tokens reached");
+        assert_eq!(check.unwrap().reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn check_beam_finished_not_done() {
+        let block_size = 16;
+        let eos_token = 99u32;
+        let max_tokens = 10;
+
+        let state = SequenceState::new(0, vec![1, 2, 3], max_tokens, eos_token, block_size, 0);
+
+        let beam_config = crate::sampling::BeamSearchConfig {
+            beam_width: 2,
+            ..Default::default()
+        };
+
+        let beam_state = super::context::BeamState {
+            search: crate::sampling::BeamSearchState::new(beam_config, eos_token),
+            beam_block_tables: Vec::new(),
+            beam_seqlen_offsets: Vec::new(),
+        };
+
+        let (tx, _rx) = oneshot::channel();
+        let req = ActiveRequest {
+            state,
+            response: ResponseChannel::Complete(tx),
+            num_streamed_tokens: 0,
+            streamed_text_len: 0,
+            draft_state: None,
+            beam_state: Some(beam_state),
+        };
+
+        let check = super::helpers::check_beam_finished(&req);
+        assert!(check.is_none(), "should not be done yet");
+    }
+
+    #[test]
+    fn is_beam_request_detects_beam_state() {
+        let block_size = 16;
+        let (tx, _rx) = oneshot::channel();
+
+        let non_beam_req = ActiveRequest {
+            state: SequenceState::new(0, vec![1, 2], 10, 99, block_size, 0),
+            response: ResponseChannel::Complete(tx),
+            num_streamed_tokens: 0,
+            streamed_text_len: 0,
+            draft_state: None,
+            beam_state: None,
+        };
+        assert!(!super::helpers::is_beam_request(&non_beam_req));
+
+        let beam_config = crate::sampling::BeamSearchConfig {
+            beam_width: 2,
+            ..Default::default()
+        };
+        let beam_state = super::context::BeamState {
+            search: crate::sampling::BeamSearchState::new(beam_config, 99),
+            beam_block_tables: Vec::new(),
+            beam_seqlen_offsets: Vec::new(),
+        };
+
+        let (tx2, _rx2) = oneshot::channel();
+        let beam_req = ActiveRequest {
+            state: SequenceState::new(1, vec![1, 2], 10, 99, block_size, 1),
+            response: ResponseChannel::Complete(tx2),
+            num_streamed_tokens: 0,
+            streamed_text_len: 0,
+            draft_state: None,
+            beam_state: Some(beam_state),
+        };
+        assert!(super::helpers::is_beam_request(&beam_req));
     }
 }

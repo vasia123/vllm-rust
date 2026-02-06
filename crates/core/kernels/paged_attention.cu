@@ -82,16 +82,21 @@ __device__ float block_reduce_max(float val, float* reduce_smem) {
     return reduce_smem[0];
 }
 
-// Paged attention v1: single-pass decode attention with block-table indirection.
+// Shared implementation for paged attention v1 with optional ALiBi support.
 //
 // Each thread block handles one (head, sequence) pair.
-// Each thread handles one dimension of the head (tid ∈ [0, 127]).
+// Each thread handles one dimension of the head (tid in [0, 127]).
+//
+// When alibi_slopes is non-null, the ALiBi bias is added to the scaled QK
+// logits: logit[token_pos] += alibi_slope * (token_pos - (seq_len - 1))
+// This makes distant past tokens receive more negative bias, matching the
+// ALiBi positional encoding used by Bloom and MPT models.
 //
 // Dynamic shared memory layout:
-//   float q_smem[HEAD_DIM]           — query vector (128 floats = 512 bytes)
-//   float logits[max_context_len]    — QK logits (variable)
-//   float reduce_smem[NUM_WARPS]     — reduction workspace (4 floats = 16 bytes)
-extern "C" __global__ void paged_attention_v1_bf16(
+//   float q_smem[HEAD_DIM]           -- query vector (128 floats = 512 bytes)
+//   float reduce_smem[NUM_WARPS]     -- reduction workspace (4 floats = 16 bytes)
+//   float logits[max_context_len]    -- QK logits (variable)
+__device__ void paged_attention_v1_impl(
     __nv_bfloat16* __restrict__ out,           // [num_seqs, num_heads, head_dim]
     const __nv_bfloat16* __restrict__ q,       // [num_seqs, num_heads, head_dim]
     const __nv_bfloat16* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
@@ -101,7 +106,8 @@ extern "C" __global__ void paged_attention_v1_bf16(
     const float scale,
     const int num_heads,
     const int num_kv_heads,
-    const int max_blocks_per_seq
+    const int max_blocks_per_seq,
+    const float* __restrict__ alibi_slopes     // [num_heads] or nullptr
 ) {
     const int head_idx = blockIdx.x;
     const int seq_idx = blockIdx.y;
@@ -114,10 +120,13 @@ extern "C" __global__ void paged_attention_v1_bf16(
     const int seq_len = seq_lens[seq_idx];
     if (seq_len == 0) return;
 
+    // ALiBi slope for this head (0 if not using ALiBi)
+    const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[head_idx] : 0.0f;
+
     // Shared memory layout (fixed offsets to avoid overlap):
-    //   [0, HEAD_DIM)                        — q vector (128 floats)
-    //   [HEAD_DIM, HEAD_DIM + NUM_WARPS)     — reduction workspace (4 floats)
-    //   [HEAD_DIM + NUM_WARPS, ...)           — logits array (seq_len floats)
+    //   [0, HEAD_DIM)                        -- q vector (128 floats)
+    //   [HEAD_DIM, HEAD_DIM + NUM_WARPS)     -- reduction workspace (4 floats)
+    //   [HEAD_DIM + NUM_WARPS, ...)           -- logits array (seq_len floats)
     extern __shared__ float smem[];
     float* q_smem = smem;
     float* reduce_smem = smem + HEAD_DIM;
@@ -132,9 +141,13 @@ extern "C" __global__ void paged_attention_v1_bf16(
     q_smem[tid] = __bfloat162float(q[q_offset]);
     __syncthreads();
 
-    // ─── Phase 1: Compute QK dot products ─────────────────────────────────────
+    // ---- Phase 1: Compute QK dot products ----
     const int num_blocks_used = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
     float qk_max = -FLT_MAX;
+
+    // The query position is the last position: seq_len - 1 (decode produces 1 token).
+    // ALiBi bias for key at position j: alibi_slope * (j - (seq_len - 1))
+    const int query_pos = seq_len - 1;
 
     for (int block_idx = 0; block_idx < num_blocks_used; block_idx++) {
         const int physical_block = block_tables[seq_idx * max_blocks_per_seq + block_idx];
@@ -154,11 +167,16 @@ extern "C" __global__ void paged_attention_v1_bf16(
             // Block-level reduce to get full dot product
             qk = block_reduce_sum(qk, reduce_smem);
 
-            // Thread 0 stores the scaled logit
+            // Thread 0 stores the scaled logit (with optional ALiBi bias)
             if (tid == 0) {
-                const float scaled_qk = qk * scale;
-                const int logit_idx = block_idx * BLOCK_SIZE + token;
-                logits[logit_idx] = scaled_qk;
+                const int token_pos = block_idx * BLOCK_SIZE + token;
+                float scaled_qk = qk * scale;
+                // ALiBi bias: slope * (key_position - query_position)
+                // For causal decode, query_position = seq_len - 1 and
+                // key_position = token_pos, so bias = slope * (token_pos - query_pos)
+                // which is non-positive for past tokens.
+                scaled_qk += alibi_slope * (float)(token_pos - query_pos);
+                logits[token_pos] = scaled_qk;
                 qk_max = fmaxf(qk_max, scaled_qk);
             }
             __syncthreads();
@@ -172,7 +190,7 @@ extern "C" __global__ void paged_attention_v1_bf16(
     __syncthreads();
     qk_max = reduce_smem[0];
 
-    // ─── Phase 2: Softmax ─────────────────────────────────────────────────────
+    // ---- Phase 2: Softmax ----
     float exp_sum = 0.0f;
     for (int i = tid; i < seq_len; i += NUM_THREADS) {
         const float val = __expf(logits[i] - qk_max);
@@ -189,7 +207,7 @@ extern "C" __global__ void paged_attention_v1_bf16(
     }
     __syncthreads();
 
-    // ─── Phase 3: Weighted V accumulation ─────────────────────────────────────
+    // ---- Phase 3: Weighted V accumulation ----
     float acc = 0.0f;
 
     for (int block_idx = 0; block_idx < num_blocks_used; block_idx++) {
@@ -207,7 +225,50 @@ extern "C" __global__ void paged_attention_v1_bf16(
         }
     }
 
-    // ─── Write output ─────────────────────────────────────────────────────────
+    // ---- Write output ----
     const int out_offset = seq_idx * num_heads * HEAD_DIM + head_idx * HEAD_DIM + tid;
     out[out_offset] = __float2bfloat16(acc);
+}
+
+// Original entry point without ALiBi (backward compatible).
+extern "C" __global__ void paged_attention_v1_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const float scale,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks_per_seq
+) {
+    paged_attention_v1_impl(
+        out, q, k_cache, v_cache, block_tables, seq_lens,
+        scale, num_heads, num_kv_heads, max_blocks_per_seq,
+        nullptr  // no ALiBi
+    );
+}
+
+// Entry point with ALiBi positional bias support.
+// alibi_slopes is a float array of length num_heads containing the per-head
+// slope values. The bias applied is: slope[head] * (key_pos - query_pos).
+extern "C" __global__ void paged_attention_v1_bf16_alibi(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const float scale,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks_per_seq,
+    const float* __restrict__ alibi_slopes     // [num_heads]
+) {
+    paged_attention_v1_impl(
+        out, q, k_cache, v_cache, block_tables, seq_lens,
+        scale, num_heads, num_kv_heads, max_blocks_per_seq,
+        alibi_slopes
+    );
 }

@@ -8,7 +8,9 @@ use axum::Json;
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
 use vllm_core::multimodal::{ContentPart, ImageData};
-use vllm_core::sampling::{JsonSchemaConstraint, SamplingConstraint, SamplingParams};
+use vllm_core::sampling::{
+    BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
+};
 use vllm_core::tokenizer::{MessageContent, TokenizerWrapper};
 use vllm_core::tool_parser::{HermesToolParser, ToolCallParser};
 
@@ -94,6 +96,8 @@ pub async fn create_chat_completion(
             ));
         }
 
+        let beam_search = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
+
         let gen_req = GenerationRequest {
             prompt: prompt.clone(),
             max_new_tokens: req.max_tokens,
@@ -107,7 +111,7 @@ pub async fn create_chat_completion(
                 presence_penalty: req.presence_penalty,
                 min_p: req.min_p,
                 seed: req.seed,
-                beam_search: None,
+                beam_search,
                 logit_bias,
             },
             stop_strings: req.stop,
@@ -180,6 +184,9 @@ pub async fn create_chat_completion(
                 &state.tokenizer,
             );
 
+            let iter_beam =
+                build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
+
             let iter_gen_req = GenerationRequest {
                 prompt: prompt.clone(),
                 max_new_tokens: req.max_tokens,
@@ -193,7 +200,7 @@ pub async fn create_chat_completion(
                     presence_penalty: req.presence_penalty,
                     min_p: req.min_p,
                     seed: req.seed,
-                    beam_search: None,
+                    beam_search: iter_beam,
                     logit_bias: logit_bias.clone(),
                 },
                 stop_strings: req.stop.clone(),
@@ -298,6 +305,20 @@ pub async fn create_chat_completion(
 
         Ok(Json(response).into_response())
     }
+}
+
+/// Build a `BeamSearchConfig` from optional API parameters.
+fn build_beam_config(
+    beam_width: Option<usize>,
+    length_penalty: Option<f32>,
+    early_stopping: Option<bool>,
+) -> Option<BeamSearchConfig> {
+    beam_width.map(|bw| BeamSearchConfig {
+        beam_width: bw,
+        length_penalty: length_penalty.unwrap_or(1.0),
+        early_stopping: early_stopping.unwrap_or(false),
+        ..Default::default()
+    })
 }
 
 /// Build ChatLogProbs from GenerationResult (OpenAI chat completion format).

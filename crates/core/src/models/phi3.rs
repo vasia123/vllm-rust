@@ -124,17 +124,7 @@ impl Phi3Attention {
         let num_heads_per_gpu = num_heads / world_size;
         let num_kv_heads_per_gpu = num_kv_heads / world_size;
 
-        let rotary_emb = RotaryEmbedding::new(
-            head_dim,
-            cfg.max_position_embeddings,
-            cfg.rope_theta,
-            vb.dtype(),
-            vb.device(),
-        )?;
-
-        // TODO: Support su-scaled RoPE (longrope) from rope_scaling config.
-        // Phi-3 models with long context use per-dimension scaling factors
-        // stored in rope_scaling.short_factor and rope_scaling.long_factor.
+        let rotary_emb = Self::build_rotary_embedding(cfg, head_dim, vb.dtype(), vb.device())?;
 
         Ok(Self {
             qkv_proj,
@@ -144,6 +134,80 @@ impl Phi3Attention {
             num_kv_heads: num_kv_heads_per_gpu,
             head_dim,
         })
+    }
+
+    /// Build the rotary embedding, selecting su-scaled (LongRoPE) when
+    /// the model config contains `rope_scaling` with type "su" or "longrope".
+    fn build_rotary_embedding(
+        cfg: &ModelConfig,
+        head_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<RotaryEmbedding> {
+        let rope_scaling = cfg.extra.get("rope_scaling");
+        let rope_scaling = match rope_scaling {
+            Some(serde_json::Value::Object(map)) => Some(map),
+            _ => None,
+        };
+
+        if let Some(scaling) = rope_scaling {
+            let rope_type = scaling
+                .get("type")
+                .or_else(|| scaling.get("rope_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+
+            if rope_type == "su" || rope_type == "longrope" {
+                let parse_factors = |key: &str| -> Result<Vec<f64>> {
+                    let arr = scaling.get(key).ok_or_else(|| {
+                        candle_core::Error::Msg(format!(
+                            "rope_scaling.{key} is required for su/longrope"
+                        ))
+                    })?;
+                    let arr = arr.as_array().ok_or_else(|| {
+                        candle_core::Error::Msg(format!("rope_scaling.{key} must be an array"))
+                    })?;
+                    arr.iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            v.as_f64().ok_or_else(|| {
+                                candle_core::Error::Msg(format!(
+                                    "rope_scaling.{key}[{i}] is not a number"
+                                ))
+                            })
+                        })
+                        .collect()
+                };
+
+                let short_factor = parse_factors("short_factor")?;
+                let long_factor = parse_factors("long_factor")?;
+
+                let original_max_pos = scaling
+                    .get("original_max_position_embeddings")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(cfg.max_position_embeddings as u64)
+                    as usize;
+
+                return RotaryEmbedding::new_su_scaled(
+                    head_dim,
+                    cfg.max_position_embeddings,
+                    original_max_pos,
+                    cfg.rope_theta,
+                    &short_factor,
+                    &long_factor,
+                    dtype,
+                    device,
+                );
+            }
+        }
+
+        RotaryEmbedding::new(
+            head_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            dtype,
+            device,
+        )
     }
 
     /// Split fused QKV output into separate Q, K, V tensors.
@@ -828,5 +892,146 @@ mod tests {
         assert_eq!(gqa_groups, 2, "test config uses GQA with 2 groups");
         assert_eq!(cfg.num_attention_heads, 4);
         assert_eq!(cfg.num_key_value_heads, 2);
+    }
+
+    // ─── su-scaled RoPE tests ──────────────────────────────────────────
+
+    fn su_rope_config() -> crate::config::ModelConfig {
+        let half_dim = 8; // head_dim / 2
+        let short_factor: Vec<serde_json::Value> =
+            vec![1.0; half_dim].into_iter().map(|v| v.into()).collect();
+        let long_factor: Vec<serde_json::Value> =
+            vec![2.0; half_dim].into_iter().map(|v| v.into()).collect();
+
+        let mut rope_scaling = serde_json::Map::new();
+        rope_scaling.insert("type".into(), "su".into());
+        rope_scaling.insert("short_factor".into(), short_factor.into());
+        rope_scaling.insert("long_factor".into(), long_factor.into());
+        rope_scaling.insert("original_max_position_embeddings".into(), 256.into());
+
+        let mut cfg = test_config();
+        cfg.max_position_embeddings = 512;
+        cfg.extra.insert("rope_scaling".into(), rope_scaling.into());
+        cfg
+    }
+
+    #[test]
+    fn test_phi3_construction_with_su_rope() {
+        let cfg = su_rope_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        let model = Phi3ForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "Phi3 should construct with su-scaled RoPE: {:?}",
+            model.err()
+        );
+    }
+
+    #[test]
+    fn test_phi3_construction_with_longrope_type() {
+        let mut cfg = su_rope_config();
+        if let Some(serde_json::Value::Object(ref mut map)) = cfg.extra.get_mut("rope_scaling") {
+            map.remove("type");
+            map.insert("rope_type".into(), "longrope".into());
+        }
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Phi3ForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "Phi3 should accept rope_type=longrope: {:?}",
+            model.err()
+        );
+    }
+
+    #[test]
+    fn test_phi3_fallback_standard_rope_no_scaling() {
+        let cfg = test_config(); // no rope_scaling in extra
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Phi3ForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "Should fall back to standard RoPE when no rope_scaling: {:?}",
+            model.err()
+        );
+    }
+
+    #[test]
+    fn test_phi3_fallback_standard_rope_null_scaling() {
+        let mut cfg = test_config();
+        cfg.extra
+            .insert("rope_scaling".into(), serde_json::Value::Null);
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Phi3ForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "Should fall back to standard RoPE when rope_scaling is null: {:?}",
+            model.err()
+        );
+    }
+
+    #[test]
+    fn test_phi3_fallback_standard_rope_default_type() {
+        let mut cfg = test_config();
+        let mut rope_scaling = serde_json::Map::new();
+        rope_scaling.insert("type".into(), "default".into());
+        cfg.extra.insert("rope_scaling".into(), rope_scaling.into());
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Phi3ForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "Should fall back to standard RoPE when type=default: {:?}",
+            model.err()
+        );
+    }
+
+    #[test]
+    fn test_phi3_su_rope_forward_shape() {
+        let cfg = su_rope_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Phi3ForCausalLM::new(&cfg, vb).expect("build model");
+
+        let cache_config = create_cache_config(&cfg, &device);
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let input_ids = Tensor::zeros((1, 4), DType::U32, &device).expect("input");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 4)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, 4);
+
+        let logits = model
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("forward");
+        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_phi3_su_rope_missing_short_factor() {
+        let mut cfg = su_rope_config();
+        if let Some(serde_json::Value::Object(ref mut map)) = cfg.extra.get_mut("rope_scaling") {
+            map.remove("short_factor");
+        }
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Phi3ForCausalLM::new(&cfg, vb);
+        assert!(model.is_err(), "Should fail when short_factor is missing");
     }
 }

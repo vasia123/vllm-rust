@@ -4,15 +4,17 @@
 //! - Token alignment (moe_align_block_size)
 //! - Fused expert GEMM with activation
 //!
-//! # Implementation Status
+//! # Implementation
 //!
 //! - **CPU path**: Fully implemented with batched expert execution.
 //!   Groups tokens by expert assignment and processes each expert's tokens
 //!   as a batch, providing significant speedup over naive per-token routing.
 //!
-//! - **CUDA path**: PTX kernels are compiled and ready, but tensor creation
-//!   from raw GPU allocations requires better I32 support in candle.
-//!   Currently falls back to optimized CPU path.
+//! - **CUDA path**: Uses PTX kernels for fused gate+up+SiLU and down
+//!   projection. Alignment is performed on CPU (lightweight) and integer
+//!   buffers (sorted_token_ids, expert_ids, num_tokens_post_padded) are
+//!   uploaded to GPU via raw cudarc allocations, bypassing candle's
+//!   tensor system which lacks I32 support.
 //!
 //! # Available CUDA Kernels (fused_moe_align.ptx)
 //!
@@ -110,6 +112,274 @@ fn moe_align_block_size_cpu(
 }
 
 // ============================================================================
+// I32 Workaround Utilities
+// ============================================================================
+
+/// Convert a slice of i64 values to i32, validating range.
+#[cfg(feature = "cuda-kernels")]
+fn i64_to_i32_vec(values: &[i64]) -> Result<Vec<i32>> {
+    values
+        .iter()
+        .map(|&v| {
+            i32::try_from(v).map_err(|_| {
+                candle_core::Error::Msg(format!("i64_to_i32: value {v} out of i32 range"))
+            })
+        })
+        .collect()
+}
+
+// ============================================================================
+// CUDA Fused MoE Custom Op
+// ============================================================================
+
+#[cfg(feature = "cuda-kernels")]
+struct FusedMoECudaOp {
+    w13_weights: Tensor,
+    w2_weights: Tensor,
+    routing_weights: Tensor,
+    expert_indices: Tensor,
+    config: FusedMoEBlockConfig,
+    num_experts: usize,
+    top_k: usize,
+}
+
+#[cfg(feature = "cuda-kernels")]
+impl candle_core::CustomOp1 for FusedMoECudaOp {
+    fn name(&self) -> &'static str {
+        "fused_moe_cuda"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("FusedMoECudaOp: CPU path should not be reached via CustomOp")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn cuda_fwd(
+        &self,
+        hs_storage: &candle_core::CudaStorage,
+        hs_layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda::CudaStorageSlice;
+        use candle_core::Storage;
+        let dev = &hs_storage.device;
+        if hs_layout.start_offset() != 0 {
+            candle_core::bail!("fused_moe_cuda: hidden_states must be contiguous from offset 0");
+        }
+        let hs_slice = match &hs_storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("fused_moe_cuda: hidden_states must be BF16"),
+        };
+        let hs_dims = hs_layout.dims();
+        let num_tokens = hs_dims[0];
+        let hidden_size = hs_dims[1];
+        let intermediate_size = self.w2_weights.dim(2)?;
+        let expert_indices_cpu = self.expert_indices.to_device(&Device::Cpu)?;
+        let alignment = moe_align_block_size_cpu(
+            &expert_indices_cpu,
+            self.num_experts,
+            self.config.block_size_m,
+        )?;
+        let num_tokens_post_padded = alignment.num_tokens_post_padded;
+        let num_valid_tokens = alignment.num_valid_tokens;
+        // Upload i32 alignment data via raw cudarc (candle lacks I32 tensors)
+        let sorted_ids_cpu: Vec<i64> = alignment.sorted_token_ids.to_vec1()?;
+        let sorted_ids_i32 = i64_to_i32_vec(&sorted_ids_cpu)?;
+        let expert_ids_cpu: Vec<i64> = alignment.expert_ids.to_vec1()?;
+        let expert_ids_i32 = i64_to_i32_vec(&expert_ids_cpu)?;
+        let num_tokens_pp_i32: Vec<i32> = vec![num_tokens_post_padded as i32];
+        let sorted_ids_dev = dev
+            .htod_copy(sorted_ids_i32)
+            .map_err(|e| candle_core::Error::Msg(format!("htod_copy sorted_ids: {e}")))?;
+        let expert_ids_dev = dev
+            .htod_copy(expert_ids_i32)
+            .map_err(|e| candle_core::Error::Msg(format!("htod_copy expert_ids: {e}")))?;
+        let num_tokens_pp_dev = dev.htod_copy(num_tokens_pp_i32).map_err(|e| {
+            candle_core::Error::Msg(format!("htod_copy num_tokens_post_padded: {e}"))
+        })?;
+        let (w13_guard, w13_layout) = self.w13_weights.storage_and_layout();
+        let w13_slice = match &*w13_guard {
+            Storage::Cuda(cs) => {
+                if w13_layout.start_offset() != 0 {
+                    candle_core::bail!("fused_moe_cuda: w13 must be contiguous from offset 0");
+                }
+                match &cs.slice {
+                    CudaStorageSlice::BF16(s) => s,
+                    _ => candle_core::bail!("fused_moe_cuda: w13 must be BF16"),
+                }
+            }
+            _ => candle_core::bail!("fused_moe_cuda: w13 must be on CUDA"),
+        };
+        let (w2_guard, w2_layout) = self.w2_weights.storage_and_layout();
+        let w2_slice = match &*w2_guard {
+            Storage::Cuda(cs) => {
+                if w2_layout.start_offset() != 0 {
+                    candle_core::bail!("fused_moe_cuda: w2 must be contiguous from offset 0");
+                }
+                match &cs.slice {
+                    CudaStorageSlice::BF16(s) => s,
+                    _ => candle_core::bail!("fused_moe_cuda: w2 must be BF16"),
+                }
+            }
+            _ => candle_core::bail!("fused_moe_cuda: w2 must be on CUDA"),
+        };
+        let (rw_guard, rw_layout) = self.routing_weights.storage_and_layout();
+        let rw_slice = match &*rw_guard {
+            Storage::Cuda(cs) => {
+                if rw_layout.start_offset() != 0 {
+                    candle_core::bail!(
+                        "fused_moe_cuda: routing_weights must be contiguous from offset 0"
+                    );
+                }
+                match &cs.slice {
+                    CudaStorageSlice::F32(s) => s,
+                    _ => candle_core::bail!("fused_moe_cuda: routing_weights must be F32"),
+                }
+            }
+            _ => candle_core::bail!("fused_moe_cuda: routing_weights must be on CUDA"),
+        };
+        let hidden_elem_count = num_tokens_post_padded * intermediate_size;
+        let hidden_intermediate = dev
+            .alloc_zeros::<half::bf16>(hidden_elem_count)
+            .map_err(|e| candle_core::Error::Msg(format!("alloc hidden_intermediate: {e}")))?;
+        let block_size_m = self.config.block_size_m;
+        let threads_per_block: u32 = 256;
+        let num_warps = threads_per_block / 32;
+        let shared_mem_bytes = num_warps * 4;
+        {
+            let gate_up_func = dev.get_or_load_custom_func(
+                "fused_moe_gate_up_silu_kernel",
+                "fused_moe_gemm",
+                MOE_GEMM_PTX,
+            )?;
+            let gate_up_cfg = LaunchConfig {
+                grid_dim: (num_tokens_post_padded as u32, 1, 1),
+                block_dim: (threads_per_block, 1, 1),
+                shared_mem_bytes,
+            };
+            let hidden_size_i32 = hidden_size as i32;
+            let intermediate_size_i32 = intermediate_size as i32;
+            let num_valid_tokens_i32 = num_valid_tokens as i32;
+            let top_k_i32 = self.top_k as i32;
+            let block_size_m_i32 = block_size_m as i32;
+            let mut builder = gate_up_func.builder();
+            builder.arg(hs_slice);
+            builder.arg(w13_slice);
+            builder.arg(&hidden_intermediate);
+            builder.arg(&sorted_ids_dev);
+            builder.arg(&expert_ids_dev);
+            builder.arg(&num_tokens_pp_dev);
+            builder.arg(&hidden_size_i32);
+            builder.arg(&intermediate_size_i32);
+            builder.arg(&num_valid_tokens_i32);
+            builder.arg(&top_k_i32);
+            builder.arg(&block_size_m_i32);
+            // SAFETY: All buffer pointers are valid CUDA device allocations
+            // with sizes matching kernel expectations. PTX is compiled from
+            // verified CUDA source (fused_moe_gemm.cu).
+            unsafe { builder.launch(gate_up_cfg) }.map_err(|e| {
+                candle_core::Error::Msg(format!("fused_moe_gate_up_silu launch: {e}"))
+            })?;
+        }
+        let output_elem_count = num_tokens * hidden_size;
+        let output_slice = dev
+            .alloc_zeros::<half::bf16>(output_elem_count)
+            .map_err(|e| candle_core::Error::Msg(format!("alloc output: {e}")))?;
+        {
+            let down_func = dev.get_or_load_custom_func(
+                "fused_moe_down_reduce_kernel",
+                "fused_moe_gemm",
+                MOE_GEMM_PTX,
+            )?;
+            let down_cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (threads_per_block, 1, 1),
+                shared_mem_bytes,
+            };
+            let hidden_size_i32 = hidden_size as i32;
+            let intermediate_size_i32 = intermediate_size as i32;
+            let num_valid_tokens_i32 = num_valid_tokens as i32;
+            let num_tokens_i32 = num_tokens as i32;
+            let top_k_i32 = self.top_k as i32;
+            let block_size_m_i32 = block_size_m as i32;
+            let mut builder = down_func.builder();
+            builder.arg(&hidden_intermediate);
+            builder.arg(w2_slice);
+            builder.arg(&output_slice);
+            builder.arg(rw_slice);
+            builder.arg(&sorted_ids_dev);
+            builder.arg(&expert_ids_dev);
+            builder.arg(&num_tokens_pp_dev);
+            builder.arg(&hidden_size_i32);
+            builder.arg(&intermediate_size_i32);
+            builder.arg(&num_valid_tokens_i32);
+            builder.arg(&num_tokens_i32);
+            builder.arg(&top_k_i32);
+            builder.arg(&block_size_m_i32);
+            // SAFETY: All buffer pointers are valid CUDA device allocations.
+            // hidden_intermediate was written by the preceding kernel launch.
+            unsafe { builder.launch(down_cfg) }.map_err(|e| {
+                candle_core::Error::Msg(format!("fused_moe_down_reduce launch: {e}"))
+            })?;
+        }
+        drop(w13_guard);
+        drop(w2_guard);
+        drop(rw_guard);
+        let output_storage = candle_core::CudaStorage {
+            slice: CudaStorageSlice::BF16(output_slice),
+            device: dev.clone(),
+        };
+        let output_shape = candle_core::Shape::from_dims(&[num_tokens, hidden_size]);
+        Ok((output_storage, output_shape))
+    }
+}
+
+#[cfg(feature = "cuda-kernels")]
+#[allow(clippy::too_many_arguments)]
+fn fused_moe_forward_cuda(
+    hidden_states: &Tensor,
+    w13_weights: &Tensor,
+    w2_weights: &Tensor,
+    routing_weights: &Tensor,
+    expert_indices: &Tensor,
+    config: &FusedMoEBlockConfig,
+    num_experts: usize,
+    top_k: usize,
+) -> Result<Tensor> {
+    let dtype = hidden_states.dtype();
+    if dtype != DType::BF16 {
+        return fused_moe_forward_cpu(
+            hidden_states,
+            w13_weights,
+            w2_weights,
+            routing_weights,
+            expert_indices,
+            &FusedMoEBlockConfig::default(),
+            num_experts,
+            top_k,
+        );
+    }
+    let hidden_states = hidden_states.contiguous()?;
+    let w13_weights = w13_weights.contiguous()?;
+    let w2_weights = w2_weights.contiguous()?;
+    let routing_weights = routing_weights.contiguous()?.to_dtype(DType::F32)?;
+    let op = FusedMoECudaOp {
+        w13_weights,
+        w2_weights,
+        routing_weights,
+        expert_indices: expert_indices.clone(),
+        config: *config,
+        num_experts,
+        top_k,
+    };
+    hidden_states.apply_op1_no_bwd(&op)
+}
+
+// ============================================================================
 // Fused MoE Forward Pass
 // ============================================================================
 
@@ -155,32 +425,16 @@ pub fn fused_moe_forward(
             top_k,
         ),
         #[cfg(feature = "cuda-kernels")]
-        Device::Cuda(_) => {
-            // TODO: Full CUDA kernel implementation
-            //
-            // Current limitation: candle doesn't have I32 tensor support,
-            // which is needed for the alignment kernel outputs (sorted_token_ids,
-            // expert_ids are i32 in CUDA).
-            //
-            // The CUDA implementation would:
-            // 1. Call moe_align_block_size_kernel to group tokens
-            // 2. Launch fused_moe_gate_up_silu_kernel for SiLU(Wg @ x) * Wu @ x
-            // 3. Launch fused_moe_gemm_simple_weighted for down projection
-            // 4. Launch moe_sum_kernel for reduction across top_k
-            //
-            // PTX kernels are compiled and available in MOE_ALIGN_PTX and MOE_GEMM_PTX.
-            // For now, use the optimized CPU path.
-            fused_moe_forward_cpu(
-                hidden_states,
-                w13_weights,
-                w2_weights,
-                routing_weights,
-                expert_indices,
-                config,
-                num_experts,
-                top_k,
-            )
-        }
+        Device::Cuda(_) => fused_moe_forward_cuda(
+            hidden_states,
+            w13_weights,
+            w2_weights,
+            routing_weights,
+            expert_indices,
+            config,
+            num_experts,
+            top_k,
+        ),
         #[cfg(not(feature = "cuda-kernels"))]
         Device::Cuda(_) => {
             candle_core::bail!("CUDA kernels not compiled. Enable 'cuda-kernels' feature.")
@@ -425,5 +679,219 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.dims(), &[num_tokens, hidden_size]);
+    }
+
+    #[test]
+    fn test_i64_to_i32_roundtrip() {
+        let values: Vec<i64> = vec![0, 1, -1, 42, i32::MAX as i64, i32::MIN as i64];
+        #[cfg(feature = "cuda-kernels")]
+        {
+            let result = i64_to_i32_vec(&values).unwrap();
+            assert_eq!(result, vec![0i32, 1, -1, 42, i32::MAX, i32::MIN]);
+        }
+        #[cfg(not(feature = "cuda-kernels"))]
+        {
+            for v in &values {
+                assert!(i32::try_from(*v).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn test_i64_to_i32_overflow() {
+        #[cfg(feature = "cuda-kernels")]
+        {
+            let values: Vec<i64> = vec![i64::MAX];
+            let result = i64_to_i32_vec(&values);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_fused_moe_output_nonzero() {
+        let device = Device::Cpu;
+
+        let num_tokens = 2;
+        let hidden_size = 4;
+        let intermediate_size = 8;
+        let num_experts = 2;
+        let top_k = 1;
+
+        let hidden_states = Tensor::ones((num_tokens, hidden_size), DType::F32, &device).unwrap();
+
+        let w13_weights = Tensor::full(
+            0.1f32,
+            (num_experts, 2 * intermediate_size, hidden_size),
+            &device,
+        )
+        .unwrap();
+
+        let w2_weights = Tensor::full(
+            0.1f32,
+            (num_experts, hidden_size, intermediate_size),
+            &device,
+        )
+        .unwrap();
+
+        let routing_weights = Tensor::new(&[[1.0f32], [1.0]], &device).unwrap();
+        let expert_indices = Tensor::new(&[[0u32], [1]], &device).unwrap();
+
+        let config = FusedMoEBlockConfig::default();
+
+        let output = fused_moe_forward(
+            &hidden_states,
+            &w13_weights,
+            &w2_weights,
+            &routing_weights,
+            &expert_indices,
+            &config,
+            num_experts,
+            top_k,
+        )
+        .unwrap();
+
+        assert_eq!(output.dims(), &[num_tokens, hidden_size]);
+
+        let output_vec: Vec<f32> = output.flatten_all().unwrap().to_vec1().unwrap();
+        let max_abs = output_vec.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_abs > 1e-6,
+            "Output should be non-zero, got max abs: {max_abs}"
+        );
+    }
+
+    #[test]
+    fn test_fused_moe_multiple_topk_accumulation() {
+        let device = Device::Cpu;
+
+        let num_tokens = 1;
+        let hidden_size = 4;
+        let intermediate_size = 8;
+        let num_experts = 2;
+        let top_k = 2;
+
+        let hidden_states = Tensor::ones((num_tokens, hidden_size), DType::F32, &device).unwrap();
+
+        let w13_weights = Tensor::full(
+            0.1f32,
+            (num_experts, 2 * intermediate_size, hidden_size),
+            &device,
+        )
+        .unwrap();
+
+        let w2_weights = Tensor::full(
+            0.1f32,
+            (num_experts, hidden_size, intermediate_size),
+            &device,
+        )
+        .unwrap();
+
+        let routing_weights = Tensor::new(&[[0.5f32, 0.5]], &device).unwrap();
+        let expert_indices = Tensor::new(&[[0u32, 1]], &device).unwrap();
+
+        let config = FusedMoEBlockConfig::default();
+
+        let output = fused_moe_forward(
+            &hidden_states,
+            &w13_weights,
+            &w2_weights,
+            &routing_weights,
+            &expert_indices,
+            &config,
+            num_experts,
+            top_k,
+        )
+        .unwrap();
+
+        assert_eq!(output.dims(), &[num_tokens, hidden_size]);
+
+        // With symmetric experts, 2x0.5 should equal 1x1.0
+        let routing_weights_single = Tensor::new(&[[1.0f32]], &device).unwrap();
+        let expert_indices_single = Tensor::new(&[[0u32]], &device).unwrap();
+
+        let output_single = fused_moe_forward(
+            &hidden_states,
+            &w13_weights,
+            &w2_weights,
+            &routing_weights_single,
+            &expert_indices_single,
+            &config,
+            num_experts,
+            1,
+        )
+        .unwrap();
+
+        let out_vec: Vec<f32> = output.flatten_all().unwrap().to_vec1().unwrap();
+        let single_vec: Vec<f32> = output_single.flatten_all().unwrap().to_vec1().unwrap();
+
+        for (a, b) in out_vec.iter().zip(single_vec.iter()) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "top_k=2 with 0.5 weights should match top_k=1: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_moe_varying_token_counts() {
+        let device = Device::Cpu;
+
+        for num_tokens in [1, 2, 3, 7, 8, 15, 16, 33] {
+            let hidden_size = 8;
+            let intermediate_size = 16;
+            let num_experts = 4;
+            let top_k = 2;
+
+            let hidden_states =
+                Tensor::randn(0f32, 1.0, (num_tokens, hidden_size), &device).unwrap();
+
+            let w13_weights = Tensor::randn(
+                0f32,
+                0.1,
+                (num_experts, 2 * intermediate_size, hidden_size),
+                &device,
+            )
+            .unwrap();
+
+            let w2_weights = Tensor::randn(
+                0f32,
+                0.1,
+                (num_experts, hidden_size, intermediate_size),
+                &device,
+            )
+            .unwrap();
+
+            let mut rw_data = Vec::with_capacity(num_tokens * top_k);
+            let mut ei_data = Vec::with_capacity(num_tokens * top_k);
+            for t in 0..num_tokens {
+                for k in 0..top_k {
+                    rw_data.push(1.0f32 / top_k as f32);
+                    ei_data.push(((t + k) % num_experts) as u32);
+                }
+            }
+
+            let routing_weights = Tensor::from_vec(rw_data, (num_tokens, top_k), &device).unwrap();
+            let expert_indices = Tensor::from_vec(ei_data, (num_tokens, top_k), &device).unwrap();
+
+            let config = FusedMoEBlockConfig::default();
+
+            let output = fused_moe_forward(
+                &hidden_states,
+                &w13_weights,
+                &w2_weights,
+                &routing_weights,
+                &expert_indices,
+                &config,
+                num_experts,
+                top_k,
+            )
+            .unwrap();
+
+            assert_eq!(
+                output.dims(),
+                &[num_tokens, hidden_size],
+                "Shape mismatch for num_tokens={num_tokens}"
+            );
+        }
     }
 }
