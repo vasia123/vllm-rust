@@ -858,6 +858,160 @@ impl NcclLibrary {
         let result = unsafe { (self.group_end)() };
         self.check_result(result)
     }
+
+    /// All-to-all operation using grouped send/recv.
+    ///
+    /// Each rank sends `count_per_rank` elements to every other rank.
+    /// Uses NCCL's send/recv within a group for efficient implementation.
+    ///
+    /// # Safety
+    /// - `send_buf` must point to valid GPU memory with `count_per_rank * world_size` elements
+    /// - `recv_buf` must point to valid GPU memory with space for `count_per_rank * world_size` elements
+    /// - `comm` must be a valid NCCL communicator
+    /// - `stream` must be a valid CUDA stream
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn all_to_all(
+        &self,
+        send_buf: *const c_void,
+        recv_buf: *mut c_void,
+        count_per_rank: usize,
+        dtype: NcclDataType,
+        world_size: usize,
+        rank: usize,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) -> Result<()> {
+        let dtype_size = Self::dtype_size(dtype);
+        let chunk_bytes = count_per_rank * dtype_size;
+
+        self.group_start()?;
+
+        for peer in 0..world_size {
+            let send_offset = peer * chunk_bytes;
+            let recv_offset = peer * chunk_bytes;
+
+            if peer != rank {
+                // Send to peer
+                (self.send)(
+                    (send_buf as *const u8).add(send_offset) as *const c_void,
+                    count_per_rank,
+                    dtype,
+                    peer as c_int,
+                    comm,
+                    stream,
+                );
+                // Receive from peer
+                (self.recv)(
+                    (recv_buf as *mut u8).add(recv_offset) as *mut c_void,
+                    count_per_rank,
+                    dtype,
+                    peer as c_int,
+                    comm,
+                    stream,
+                );
+            } else {
+                // Local copy for self-send
+                std::ptr::copy_nonoverlapping(
+                    (send_buf as *const u8).add(send_offset),
+                    (recv_buf as *mut u8).add(recv_offset),
+                    chunk_bytes,
+                );
+            }
+        }
+
+        self.group_end()
+    }
+
+    /// Variable-size all-to-all operation using grouped send/recv.
+    ///
+    /// Each rank sends different amounts to each other rank.
+    ///
+    /// # Safety
+    /// - `send_buf` must point to valid GPU memory with sum(send_counts) elements
+    /// - `recv_buf` must point to valid GPU memory with space for sum(recv_counts) elements
+    /// - `send_counts` and `recv_counts` must have length == world_size
+    /// - `comm` must be a valid NCCL communicator
+    /// - `stream` must be a valid CUDA stream
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn all_to_all_v(
+        &self,
+        send_buf: *const c_void,
+        recv_buf: *mut c_void,
+        send_counts: &[usize],
+        recv_counts: &[usize],
+        dtype: NcclDataType,
+        world_size: usize,
+        rank: usize,
+        comm: NcclComm,
+        stream: CudaStream,
+    ) -> Result<()> {
+        debug_assert_eq!(send_counts.len(), world_size);
+        debug_assert_eq!(recv_counts.len(), world_size);
+
+        let dtype_size = Self::dtype_size(dtype);
+
+        // Compute offsets for send and recv buffers
+        let mut send_offsets = Vec::with_capacity(world_size);
+        let mut recv_offsets = Vec::with_capacity(world_size);
+        let mut send_offset = 0usize;
+        let mut recv_offset = 0usize;
+
+        for i in 0..world_size {
+            send_offsets.push(send_offset);
+            recv_offsets.push(recv_offset);
+            send_offset += send_counts[i] * dtype_size;
+            recv_offset += recv_counts[i] * dtype_size;
+        }
+
+        self.group_start()?;
+
+        for peer in 0..world_size {
+            if peer != rank {
+                if send_counts[peer] > 0 {
+                    (self.send)(
+                        (send_buf as *const u8).add(send_offsets[peer]) as *const c_void,
+                        send_counts[peer],
+                        dtype,
+                        peer as c_int,
+                        comm,
+                        stream,
+                    );
+                }
+                if recv_counts[peer] > 0 {
+                    (self.recv)(
+                        (recv_buf as *mut u8).add(recv_offsets[peer]) as *mut c_void,
+                        recv_counts[peer],
+                        dtype,
+                        peer as c_int,
+                        comm,
+                        stream,
+                    );
+                }
+            } else {
+                // Local copy for self-send
+                if send_counts[peer] > 0 {
+                    let copy_bytes = send_counts[peer] * dtype_size;
+                    std::ptr::copy_nonoverlapping(
+                        (send_buf as *const u8).add(send_offsets[peer]),
+                        (recv_buf as *mut u8).add(recv_offsets[peer]),
+                        copy_bytes,
+                    );
+                }
+            }
+        }
+
+        self.group_end()
+    }
+
+    /// Get the size in bytes for a given NCCL data type.
+    fn dtype_size(dtype: NcclDataType) -> usize {
+        match dtype {
+            NcclDataType::Int8 | NcclDataType::Uint8 => 1,
+            NcclDataType::Float16 | NcclDataType::Bfloat16 => 2,
+            NcclDataType::Int32 | NcclDataType::Uint32 | NcclDataType::Float32 => 4,
+            NcclDataType::Int64 | NcclDataType::Uint64 | NcclDataType::Float64 => 8,
+        }
+    }
 }
 
 // Safety: NcclLibrary only contains function pointers and a Library handle,
@@ -1006,6 +1160,456 @@ impl Drop for NcclCommunicator {
 // and NCCL handles are thread-safe when used correctly.
 unsafe impl Send for NcclCommunicator {}
 unsafe impl Sync for NcclCommunicator {}
+
+// ─── DeviceCommunicator Implementation ─────────────────────────────────────────
+
+use super::communicator::{DeviceCommunicator, ReduceOp};
+use super::process_group::ProcessGroup;
+use candle_core::cuda::cudarc::driver::DevicePtr;
+use candle_core::{cuda::CudaStorageSlice, DType, Device, Storage, Tensor};
+
+/// NCCL-based device communicator with process group.
+///
+/// This wraps NcclCommunicator to implement the DeviceCommunicator trait,
+/// providing high-level tensor operations for multi-GPU communication.
+pub struct NcclDeviceCommunicator<P: ProcessGroup> {
+    /// The underlying NCCL communicator.
+    nccl_comm: NcclCommunicator,
+    /// Process group for rank/size information.
+    process_group: P,
+}
+
+impl<P: ProcessGroup> NcclDeviceCommunicator<P> {
+    /// Create a new NCCL device communicator.
+    pub fn new(nccl_comm: NcclCommunicator, process_group: P) -> Self {
+        Self {
+            nccl_comm,
+            process_group,
+        }
+    }
+
+    /// Get the underlying NCCL communicator.
+    pub fn nccl_comm(&self) -> &NcclCommunicator {
+        &self.nccl_comm
+    }
+
+    /// Get raw device pointer from a CUDA tensor.
+    ///
+    /// Returns (pointer, element_count, dtype).
+    /// Synchronizes the tensor's stream before returning to ensure data is ready.
+    fn get_cuda_ptr(tensor: &Tensor) -> Result<(*const c_void, usize, NcclDataType)> {
+        let (storage, layout) = tensor.storage_and_layout();
+
+        // Verify tensor is contiguous
+        if !layout.is_contiguous() {
+            return Err(DistributedError::InvalidTensor(
+                "NCCL operations require contiguous tensors".to_string(),
+            ));
+        }
+
+        let cuda_storage = match &*storage {
+            Storage::Cuda(cs) => cs,
+            _ => {
+                return Err(DistributedError::InvalidTensor(
+                    "NCCL operations require CUDA tensors".to_string(),
+                ))
+            }
+        };
+
+        let elem_count = layout.shape().elem_count();
+        let nccl_dtype = NcclDataType::from_dtype(tensor.dtype()).ok_or_else(|| {
+            DistributedError::InvalidTensor(format!("Unsupported dtype: {:?}", tensor.dtype()))
+        })?;
+
+        // Get raw pointer based on dtype (with sync)
+        let ptr = Self::get_slice_ptr(&cuda_storage.slice, layout.start_offset())?;
+
+        Ok((ptr, elem_count, nccl_dtype))
+    }
+
+    /// Get raw pointer from CudaStorageSlice.
+    ///
+    /// Synchronizes the stream and returns the device pointer.
+    fn get_slice_ptr(slice: &CudaStorageSlice, offset: usize) -> Result<*const c_void> {
+        // Helper macro to get ptr from slice
+        // Uses device_ptr which borrows the stream, so we extract ptr and drop guard
+        macro_rules! get_ptr {
+            ($s:expr, $offset:expr) => {{
+                let view = $s.slice($offset..);
+                let stream = $s.stream();
+                let (ptr, _guard) = view.device_ptr(stream);
+                // The _guard will be dropped here, causing sync
+                ptr as *const c_void
+            }};
+        }
+
+        let ptr = match slice {
+            CudaStorageSlice::U8(s) => get_ptr!(s, offset),
+            CudaStorageSlice::U32(s) => get_ptr!(s, offset),
+            CudaStorageSlice::I64(s) => get_ptr!(s, offset),
+            CudaStorageSlice::BF16(s) => get_ptr!(s, offset),
+            CudaStorageSlice::F16(s) => get_ptr!(s, offset),
+            CudaStorageSlice::F32(s) => get_ptr!(s, offset),
+            CudaStorageSlice::F64(s) => get_ptr!(s, offset),
+        };
+        Ok(ptr)
+    }
+
+    /// Allocate output tensor with same dtype and device as input.
+    fn alloc_output(input: &Tensor, shape: &[usize]) -> Result<Tensor> {
+        Ok(Tensor::zeros(shape, input.dtype(), input.device())?)
+    }
+
+    /// Get mutable device pointer from a tensor.
+    fn get_cuda_ptr_mut(tensor: &Tensor) -> Result<(*mut c_void, usize, NcclDataType)> {
+        let (ptr, count, dtype) = Self::get_cuda_ptr(tensor)?;
+        Ok((ptr as *mut c_void, count, dtype))
+    }
+
+    /// Get the default CUDA stream (stream 0).
+    ///
+    /// For production use, consider using per-device streams.
+    fn default_stream() -> CudaStream {
+        std::ptr::null_mut()
+    }
+
+    /// Assert that a tensor is on the correct CUDA device.
+    ///
+    /// vLLM pattern: verify tensor device matches communicator device
+    /// on every operation to prevent silent data corruption.
+    fn assert_device(&self, tensor: &Tensor) -> Result<()> {
+        use candle_core::DeviceLocation;
+
+        match tensor.device().location() {
+            DeviceLocation::Cuda { gpu_id } if gpu_id == self.nccl_comm.device => Ok(()),
+            DeviceLocation::Cuda { gpu_id } => Err(DistributedError::DeviceMismatch {
+                expected: format!("cuda:{}", self.nccl_comm.device),
+                actual: format!("cuda:{}", gpu_id),
+            }),
+            location => Err(DistributedError::DeviceMismatch {
+                expected: format!("cuda:{}", self.nccl_comm.device),
+                actual: format!("{:?}", location),
+            }),
+        }
+    }
+
+    /// Perform warmup all_reduce to initialize NCCL internal buffers.
+    ///
+    /// vLLM pattern: warmup ensures all ranks are synchronized
+    /// and NCCL allocates its internal buffers before real work.
+    /// Should be called after communicator creation.
+    pub fn warmup(&self) -> Result<()> {
+        if self.process_group.is_single() {
+            return Ok(());
+        }
+
+        let device = Device::cuda_if_available(self.nccl_comm.device)?;
+        let dummy = Tensor::zeros(&[1], DType::F32, &device)?;
+        let _ = self.all_reduce(&dummy, ReduceOp::Sum)?;
+        self.barrier()?;
+
+        tracing::debug!(
+            rank = self.process_group.rank(),
+            world_size = self.process_group.world_size(),
+            "NCCL warmup complete"
+        );
+
+        Ok(())
+    }
+}
+
+impl<P: ProcessGroup + Send + Sync> DeviceCommunicator for NcclDeviceCommunicator<P> {
+    fn process_group(&self) -> &dyn ProcessGroup {
+        &self.process_group
+    }
+
+    fn all_reduce(&self, tensor: &Tensor, op: ReduceOp) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+
+        self.assert_device(tensor)?;
+        let (send_ptr, count, dtype) = Self::get_cuda_ptr(tensor)?;
+        let output = Self::alloc_output(tensor, tensor.dims())?;
+        let (recv_ptr, _, _) = Self::get_cuda_ptr_mut(&output)?;
+
+        let nccl_op = NcclRedOp::from(op);
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.all_reduce(
+                send_ptr,
+                recv_ptr,
+                count,
+                dtype,
+                nccl_op,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    fn all_gather(&self, tensor: &Tensor, gather_dim: usize) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+
+        self.assert_device(tensor)?;
+        let world_size = self.process_group.world_size();
+        let (send_ptr, count, dtype) = Self::get_cuda_ptr(tensor)?;
+
+        // Output shape: dim[gather_dim] *= world_size
+        let mut output_shape = tensor.dims().to_vec();
+        output_shape[gather_dim] *= world_size;
+        let output = Self::alloc_output(tensor, &output_shape)?;
+        let (recv_ptr, _, _) = Self::get_cuda_ptr_mut(&output)?;
+
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.all_gather(
+                send_ptr,
+                recv_ptr,
+                count,
+                dtype,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    fn reduce_scatter(&self, tensor: &Tensor, scatter_dim: usize, op: ReduceOp) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+
+        self.assert_device(tensor)?;
+        let world_size = self.process_group.world_size();
+        let dims = tensor.dims();
+
+        if dims[scatter_dim] % world_size != 0 {
+            return Err(DistributedError::ShapeMismatch {
+                expected: vec![dims[scatter_dim] / world_size],
+                actual: vec![dims[scatter_dim]],
+            });
+        }
+
+        let (send_ptr, _, dtype) = Self::get_cuda_ptr(tensor)?;
+
+        // Output shape: dim[scatter_dim] /= world_size
+        let mut output_shape = dims.to_vec();
+        output_shape[scatter_dim] /= world_size;
+        let output = Self::alloc_output(tensor, &output_shape)?;
+        let (recv_ptr, recv_count, _) = Self::get_cuda_ptr_mut(&output)?;
+
+        let nccl_op = NcclRedOp::from(op);
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.reduce_scatter(
+                send_ptr,
+                recv_ptr,
+                recv_count,
+                dtype,
+                nccl_op,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    fn broadcast(&self, tensor: &Tensor, src_rank: usize) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+
+        self.assert_device(tensor)?;
+        let (send_ptr, count, dtype) = Self::get_cuda_ptr(tensor)?;
+        let output = Self::alloc_output(tensor, tensor.dims())?;
+        let (recv_ptr, _, _) = Self::get_cuda_ptr_mut(&output)?;
+
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.broadcast(
+                send_ptr,
+                recv_ptr,
+                count,
+                dtype,
+                src_rank,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    fn send(&self, tensor: &Tensor, dst_rank: usize) -> Result<()> {
+        if self.process_group.is_single() {
+            return Ok(());
+        }
+
+        self.assert_device(tensor)?;
+        let (send_ptr, count, dtype) = Self::get_cuda_ptr(tensor)?;
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.send(
+                send_ptr,
+                count,
+                dtype,
+                dst_rank,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn recv(&self, shape: &[usize], dtype: candle_core::DType, src_rank: usize) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            let device = Device::cuda_if_available(self.nccl_comm.device)?;
+            return Ok(Tensor::zeros(shape, dtype, &device)?);
+        }
+
+        let device = Device::cuda_if_available(self.nccl_comm.device)?;
+        let output = Tensor::zeros(shape, dtype, &device)?;
+        let (recv_ptr, count, nccl_dtype) = Self::get_cuda_ptr_mut(&output)?;
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.recv(
+                recv_ptr,
+                count,
+                nccl_dtype,
+                src_rank,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    fn barrier(&self) -> Result<()> {
+        if self.process_group.is_single() {
+            return Ok(());
+        }
+
+        // NCCL doesn't have explicit barrier, use small all_reduce as sync point
+        let device = Device::cuda_if_available(self.nccl_comm.device)?;
+        let sync_tensor = Tensor::zeros(&[1], DType::F32, &device)?;
+        let _ = self.all_reduce(&sync_tensor, ReduceOp::Sum)?;
+
+        // Synchronize to ensure completion
+        if let Some(ref cuda_rt) = self.nccl_comm.nccl.cuda_runtime {
+            cuda_rt
+                .device_synchronize()
+                .map_err(DistributedError::NcclError)?;
+        }
+
+        Ok(())
+    }
+
+    fn all_to_all(&self, tensor: &Tensor) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+
+        self.assert_device(tensor)?;
+        let world_size = self.process_group.world_size();
+        let rank = self.process_group.rank();
+        let dims = tensor.dims();
+
+        if dims.is_empty() || dims[0] % world_size != 0 {
+            return Err(DistributedError::ShapeMismatch {
+                expected: vec![world_size],
+                actual: dims.to_vec(),
+            });
+        }
+
+        let count_per_rank = dims.iter().product::<usize>() / world_size;
+        let (send_ptr, _, dtype) = Self::get_cuda_ptr(tensor)?;
+
+        // Output has same shape as input
+        let output = Self::alloc_output(tensor, dims)?;
+        let (recv_ptr, _, _) = Self::get_cuda_ptr_mut(&output)?;
+
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.all_to_all(
+                send_ptr,
+                recv_ptr,
+                count_per_rank,
+                dtype,
+                world_size,
+                rank,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    fn all_to_all_v(
+        &self,
+        tensor: &Tensor,
+        send_splits: &[usize],
+        recv_splits: &[usize],
+    ) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+
+        self.assert_device(tensor)?;
+        let world_size = self.process_group.world_size();
+        let rank = self.process_group.rank();
+
+        if send_splits.len() != world_size || recv_splits.len() != world_size {
+            return Err(DistributedError::ShapeMismatch {
+                expected: vec![world_size],
+                actual: vec![send_splits.len()],
+            });
+        }
+
+        let (send_ptr, _, dtype) = Self::get_cuda_ptr(tensor)?;
+
+        // Output shape: first dim is sum of recv_splits
+        let total_recv: usize = recv_splits.iter().sum();
+        let mut output_shape = tensor.dims().to_vec();
+        output_shape[0] = total_recv;
+        let output = Self::alloc_output(tensor, &output_shape)?;
+        let (recv_ptr, _, _) = Self::get_cuda_ptr_mut(&output)?;
+
+        let stream = Self::default_stream();
+
+        unsafe {
+            self.nccl_comm.nccl.all_to_all_v(
+                send_ptr,
+                recv_ptr,
+                send_splits,
+                recv_splits,
+                dtype,
+                world_size,
+                rank,
+                self.nccl_comm.comm,
+                stream,
+            )?;
+        }
+
+        Ok(output)
+    }
+}
 
 /// Check if NCCL is available on this system.
 pub fn is_nccl_available() -> bool {
@@ -1182,5 +1786,129 @@ mod tests {
         // Test set_cuda_device through NcclLibrary
         nccl.set_cuda_device(0)
             .expect("Failed to set CUDA device via NCCL");
+    }
+
+    // NcclDeviceCommunicator tests
+
+    #[test]
+    fn device_mismatch_error_display() {
+        let err = DistributedError::DeviceMismatch {
+            expected: "cuda:0".to_string(),
+            actual: "cuda:1".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cuda:0"));
+        assert!(msg.contains("cuda:1"));
+        assert!(msg.contains("mismatch"));
+    }
+
+    #[test]
+    fn device_mismatch_error_cpu_tensor() {
+        let err = DistributedError::DeviceMismatch {
+            expected: "cuda:0".to_string(),
+            actual: "Cpu".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cuda:0"));
+        assert!(msg.contains("Cpu"));
+    }
+
+    #[test]
+    #[ignore = "Requires CUDA"]
+    fn nccl_device_communicator_single_rank_passthrough() {
+        use super::super::process_group::LocalProcessGroup;
+
+        // For single rank, operations should just clone the tensor
+        let nccl = Arc::new(NcclLibrary::new().expect("Failed to load NCCL"));
+        let id = nccl.get_unique_id().expect("Failed to get unique ID");
+        let comm = NcclCommunicator::new(nccl, id, 1, 0, 0).expect("Failed to create communicator");
+        let pg = LocalProcessGroup::with_rank(0, 1);
+        let device_comm = NcclDeviceCommunicator::new(comm, pg);
+
+        let device = Device::cuda_if_available(0).expect("Need CUDA");
+        let input = Tensor::zeros(&[4, 4], DType::F32, &device).expect("Failed to create tensor");
+
+        // Single-rank all_reduce should return clone
+        let output = device_comm
+            .all_reduce(&input, ReduceOp::Sum)
+            .expect("all_reduce failed");
+        assert_eq!(output.dims(), input.dims());
+    }
+
+    #[test]
+    #[ignore = "Requires multi-GPU setup"]
+    fn nccl_device_communicator_warmup() {
+        use super::super::process_group::LocalProcessGroup;
+
+        let nccl = Arc::new(NcclLibrary::new().expect("Failed to load NCCL"));
+        let id = nccl.get_unique_id().expect("Failed to get unique ID");
+        let comm = NcclCommunicator::new(nccl, id, 1, 0, 0).expect("Failed to create communicator");
+        let pg = LocalProcessGroup::with_rank(0, 1);
+        let device_comm = NcclDeviceCommunicator::new(comm, pg);
+
+        // Warmup should complete without error
+        device_comm.warmup().expect("warmup failed");
+    }
+
+    #[test]
+    #[ignore = "Requires multi-GPU setup"]
+    fn nccl_device_communicator_all_reduce_shape_preserved() {
+        use super::super::process_group::LocalProcessGroup;
+
+        let nccl = Arc::new(NcclLibrary::new().expect("Failed to load NCCL"));
+        let id = nccl.get_unique_id().expect("Failed to get unique ID");
+        let comm = NcclCommunicator::new(nccl, id, 2, 0, 0).expect("Failed to create communicator");
+        let pg = LocalProcessGroup::with_rank(0, 2);
+        let device_comm = NcclDeviceCommunicator::new(comm, pg);
+
+        let device = Device::cuda_if_available(0).expect("Need CUDA");
+        let input = Tensor::zeros(&[8, 16], DType::F32, &device).expect("Failed to create tensor");
+
+        let output = device_comm
+            .all_reduce(&input, ReduceOp::Sum)
+            .expect("all_reduce failed");
+        assert_eq!(output.dims(), &[8, 16]);
+        assert_eq!(output.dtype(), DType::F32);
+    }
+
+    #[test]
+    #[ignore = "Requires multi-GPU setup"]
+    fn nccl_device_communicator_all_gather_output_shape() {
+        use super::super::process_group::LocalProcessGroup;
+
+        let nccl = Arc::new(NcclLibrary::new().expect("Failed to load NCCL"));
+        let id = nccl.get_unique_id().expect("Failed to get unique ID");
+        let comm = NcclCommunicator::new(nccl, id, 2, 0, 0).expect("Failed to create communicator");
+        let pg = LocalProcessGroup::with_rank(0, 2);
+        let device_comm = NcclDeviceCommunicator::new(comm, pg);
+
+        let device = Device::cuda_if_available(0).expect("Need CUDA");
+        let input = Tensor::zeros(&[4, 8], DType::F32, &device).expect("Failed to create tensor");
+
+        // all_gather on dim 0 should double first dimension
+        let output = device_comm
+            .all_gather(&input, 0)
+            .expect("all_gather failed");
+        assert_eq!(output.dims(), &[8, 8]); // 4 * 2 = 8
+    }
+
+    #[test]
+    #[ignore = "Requires multi-GPU setup"]
+    fn nccl_device_communicator_all_to_all_output_shape() {
+        use super::super::process_group::LocalProcessGroup;
+
+        let nccl = Arc::new(NcclLibrary::new().expect("Failed to load NCCL"));
+        let id = nccl.get_unique_id().expect("Failed to get unique ID");
+        let comm = NcclCommunicator::new(nccl, id, 2, 0, 0).expect("Failed to create communicator");
+        let pg = LocalProcessGroup::with_rank(0, 2);
+        let device_comm = NcclDeviceCommunicator::new(comm, pg);
+
+        let device = Device::cuda_if_available(0).expect("Need CUDA");
+        // Input shape must be divisible by world_size in first dim
+        let input = Tensor::zeros(&[4, 8], DType::F32, &device).expect("Failed to create tensor");
+
+        // all_to_all should preserve shape
+        let output = device_comm.all_to_all(&input).expect("all_to_all failed");
+        assert_eq!(output.dims(), &[4, 8]);
     }
 }

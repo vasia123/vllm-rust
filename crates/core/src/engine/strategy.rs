@@ -91,6 +91,13 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
     use super::types::ResponseChannel;
     use crate::request::FinishReason;
 
+    // Initialize prefix cache on the KVCacheManager so all prefix operations
+    // (match, register, release, eviction) are coordinated through the manager's
+    // block pool. This ensures eviction can reclaim cached blocks when needed.
+    if config.enable_prefix_caching && !kv_cache_mgr.has_prefix_cache() {
+        kv_cache_mgr.enable_prefix_cache();
+    }
+
     loop {
         // Phase 1: Drain incoming commands (non-blocking)
         loop {
@@ -103,7 +110,6 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut state.scheduler,
                         &mut state.requests,
                         config.block_size,
-                        &mut state.prefix_cache,
                         &mut kv_cache_mgr,
                     ) {
                         return; // shutdown
@@ -125,7 +131,6 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut state.scheduler,
                         &mut state.requests,
                         config.block_size,
-                        &mut state.prefix_cache,
                         &mut kv_cache_mgr,
                     ) {
                         return;
@@ -195,19 +200,32 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             strategy.on_request_completed(req_id, &mut state);
 
             let Some(mut req) = state.requests.remove(&req_id) else {
-                // Request was already removed (shouldn't happen, but defensive)
                 continue;
             };
             state.scheduler.remove_request(req_id);
 
             let block_ids = req.state.block_table.release();
-            if let Some(cache) = state.prefix_cache.as_mut() {
-                cache.register_blocks(&req.state.prompt_token_ids, &block_ids);
-                let to_free = cache.release_blocks(&req.state.prompt_token_ids, &block_ids);
+            if kv_cache_mgr.has_prefix_cache() {
+                // Register completed prefix blocks and release the owner reference.
+                // register_prefix adds blocks to the cache (ref_count = 1).
+                // release_prefix decrements ref_count; blocks with ref_count > 0 stay cached.
+                // Only uncached blocks (partial last block, decode blocks) are returned for freeing.
+                kv_cache_mgr.register_prefix(&req.state.prompt_token_ids, &block_ids);
+                let to_free = kv_cache_mgr.release_prefix(&req.state.prompt_token_ids, &block_ids);
                 if !to_free.is_empty() {
                     if let Err(e) = kv_cache_mgr.free_blocks(&to_free) {
-                        warn!(error = %e, blocks = ?to_free, "Failed to free prefix cache blocks");
+                        warn!(error = %e, blocks = ?to_free, "Failed to free uncached blocks");
                     }
+                }
+
+                // Record sliding window metrics for this request
+                if let Some(cache) = kv_cache_mgr.prefix_cache_mut() {
+                    cache.record_request(
+                        req.state.prompt_token_ids.len(),
+                        req.state
+                            .num_computed_tokens
+                            .min(req.state.prompt_token_ids.len()),
+                    );
                 }
             } else if !block_ids.is_empty() {
                 if let Err(e) = kv_cache_mgr.free_blocks(&block_ids) {

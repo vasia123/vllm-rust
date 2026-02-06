@@ -10,31 +10,108 @@
 //!   Groups tokens by expert assignment and processes each expert's tokens
 //!   as a batch, providing significant speedup over naive per-token routing.
 //!
-//! - **CUDA path**: Currently uses CPU fallback. The full CUDA kernel
-//!   implementation is planned but not yet complete. When implemented,
-//!   it will use:
-//!   1. `moe_align_block_size` kernel for token grouping
-//!   2. `fused_moe_gemm` kernel for batched expert computation
+//! - **CUDA path**: PTX kernels are compiled and ready, but tensor creation
+//!   from raw GPU allocations requires better I32 support in candle.
+//!   Currently falls back to optimized CPU path.
 //!
-//! The PTX files are included but the kernel launch code is not yet wired up.
+//! # Available CUDA Kernels (fused_moe_align.ptx)
+//!
+//! - `moe_align_block_size_kernel` - main alignment for large batches
+//! - `moe_align_block_size_small_kernel` - optimized for small batches
+//! - `moe_sort_tokens_kernel` - second pass token sorting
+//! - `moe_sum_kernel` / `moe_sum_bf16_kernel` - reduction kernels
+//!
+//! # Available CUDA Kernels (fused_moe_gemm.ptx)
+//!
+//! - `fused_moe_gemm_64_64_32_weighted` - tiled GEMM with routing weights
+//! - `fused_moe_gemm_64_64_32_unweighted` - tiled GEMM without weights
+//! - `fused_moe_gemm_simple_weighted` - simple GEMM for small batches
+//! - `fused_moe_gemm_simple_unweighted` - simple GEMM without weights
+//! - `fused_moe_gate_up_silu_kernel` - fused gate+up with SiLU activation
+//! - `fused_moe_down_reduce_kernel` - down projection with reduction
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 
 use super::config::FusedMoEBlockConfig;
 use super::token_grouper::MoETokenGrouper;
 
-#[cfg(feature = "cuda-kernels")]
-use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, Layout, Shape, Storage,
-};
-
 /// PTX for moe_align_block_size kernel (compiled from fused_moe_align.cu)
 #[cfg(feature = "cuda-kernels")]
-const MOE_ALIGN_PTX: &str = include_str!("../../kernels/fused_moe_align.ptx");
+#[allow(dead_code)]
+const MOE_ALIGN_PTX: &str = include_str!("../../../kernels/fused_moe_align.ptx");
 
 /// PTX for fused_moe_gemm kernel (compiled from fused_moe_gemm.cu)
 #[cfg(feature = "cuda-kernels")]
-const MOE_GEMM_PTX: &str = include_str!("../../kernels/fused_moe_gemm.ptx");
+#[allow(dead_code)]
+const MOE_GEMM_PTX: &str = include_str!("../../../kernels/fused_moe_gemm.ptx");
+
+// ============================================================================
+// MoE Alignment Output
+// ============================================================================
+
+/// Output of MoE token alignment operation.
+#[derive(Debug)]
+pub struct MoeAlignOutput {
+    /// Sorted token indices, shape [num_tokens_padded].
+    /// Maps output position -> original (token_idx * top_k + k).
+    pub sorted_token_ids: Tensor,
+    /// Expert ID for each processing block, shape [num_blocks].
+    pub expert_ids: Tensor,
+    /// Total number of tokens after padding to block boundaries.
+    pub num_tokens_post_padded: usize,
+    /// Number of valid tokens (before padding).
+    pub num_valid_tokens: usize,
+}
+
+// ============================================================================
+// Token Alignment
+// ============================================================================
+
+/// Align tokens by expert assignment for batched GEMM execution.
+///
+/// Groups tokens by their assigned experts and pads each group to block boundaries.
+/// This is the first step in the fused MoE pipeline.
+///
+/// # Arguments
+/// * `topk_ids` - Expert indices [num_tokens, top_k] as U32
+/// * `num_experts` - Total number of experts
+/// * `block_size` - Block size for GEMM alignment
+///
+/// # Returns
+/// * `MoeAlignOutput` with sorted indices and expert assignments
+pub fn moe_align_block_size(
+    topk_ids: &Tensor,
+    num_experts: usize,
+    block_size: usize,
+) -> Result<MoeAlignOutput> {
+    // CPU implementation handles all cases for now.
+    // CUDA kernels are compiled and available for future use.
+    moe_align_block_size_cpu(topk_ids, num_experts, block_size)
+}
+
+/// CPU implementation of token alignment.
+fn moe_align_block_size_cpu(
+    topk_ids: &Tensor,
+    num_experts: usize,
+    block_size: usize,
+) -> Result<MoeAlignOutput> {
+    let grouper = MoETokenGrouper::new(block_size, num_experts);
+    let aligned = grouper.align_block_size(topk_ids)?;
+
+    let num_tokens_post_padded: Vec<i64> = aligned.num_tokens_post_padded.to_vec1()?;
+    let num_tokens_post_padded = num_tokens_post_padded[0];
+
+    Ok(MoeAlignOutput {
+        sorted_token_ids: aligned.sorted_token_ids,
+        expert_ids: aligned.expert_ids,
+        num_tokens_post_padded: num_tokens_post_padded as usize,
+        num_valid_tokens: aligned.num_valid_tokens,
+    })
+}
+
+// ============================================================================
+// Fused MoE Forward Pass
+// ============================================================================
 
 /// Fused MoE forward pass that combines:
 /// 1. Token alignment/grouping by expert
@@ -78,16 +155,32 @@ pub fn fused_moe_forward(
             top_k,
         ),
         #[cfg(feature = "cuda-kernels")]
-        Device::Cuda(_) => fused_moe_forward_cuda(
-            hidden_states,
-            w13_weights,
-            w2_weights,
-            routing_weights,
-            expert_indices,
-            config,
-            num_experts,
-            top_k,
-        ),
+        Device::Cuda(_) => {
+            // TODO: Full CUDA kernel implementation
+            //
+            // Current limitation: candle doesn't have I32 tensor support,
+            // which is needed for the alignment kernel outputs (sorted_token_ids,
+            // expert_ids are i32 in CUDA).
+            //
+            // The CUDA implementation would:
+            // 1. Call moe_align_block_size_kernel to group tokens
+            // 2. Launch fused_moe_gate_up_silu_kernel for SiLU(Wg @ x) * Wu @ x
+            // 3. Launch fused_moe_gemm_simple_weighted for down projection
+            // 4. Launch moe_sum_kernel for reduction across top_k
+            //
+            // PTX kernels are compiled and available in MOE_ALIGN_PTX and MOE_GEMM_PTX.
+            // For now, use the optimized CPU path.
+            fused_moe_forward_cpu(
+                hidden_states,
+                w13_weights,
+                w2_weights,
+                routing_weights,
+                expert_indices,
+                config,
+                num_experts,
+                top_k,
+            )
+        }
         #[cfg(not(feature = "cuda-kernels"))]
         Device::Cuda(_) => {
             candle_core::bail!("CUDA kernels not compiled. Enable 'cuda-kernels' feature.")
@@ -97,7 +190,7 @@ pub fn fused_moe_forward(
 }
 
 /// CPU fallback implementation using optimized batching.
-/// Still more efficient than naive per-token routing due to batched operations.
+/// Groups tokens by expert and processes each expert's batch together.
 #[allow(clippy::too_many_arguments)]
 fn fused_moe_forward_cpu(
     hidden_states: &Tensor,
@@ -105,7 +198,7 @@ fn fused_moe_forward_cpu(
     w2_weights: &Tensor,
     routing_weights: &Tensor,
     expert_indices: &Tensor,
-    config: &FusedMoEBlockConfig,
+    _config: &FusedMoEBlockConfig,
     num_experts: usize,
     top_k: usize,
 ) -> Result<Tensor> {
@@ -114,11 +207,7 @@ fn fused_moe_forward_cpu(
     let (num_tokens, hidden_size) = hidden_states.dims2()?;
     let intermediate_size = w2_weights.dim(2)?;
 
-    // Step 1: Align tokens by expert (used for CUDA path)
-    let grouper = MoETokenGrouper::from_config(config, num_experts);
-    let _aligned = grouper.align_block_size(expert_indices)?;
-
-    // Step 2: Process each expert's tokens as a batch
+    // Get flat vectors for indexing
     let expert_indices_vec: Vec<u32> = expert_indices.flatten_all()?.to_vec1()?;
     let routing_weights_vec: Vec<f32> = routing_weights
         .flatten_all()?
@@ -209,43 +298,26 @@ fn update_row(tensor: &Tensor, row_idx: usize, values: &Tensor) -> Result<Tensor
     Tensor::cat(&rows, 0)
 }
 
-/// CUDA implementation of fused MoE forward pass.
-#[cfg(feature = "cuda-kernels")]
-fn fused_moe_forward_cuda(
-    hidden_states: &Tensor,
-    w13_weights: &Tensor,
-    w2_weights: &Tensor,
-    routing_weights: &Tensor,
-    expert_indices: &Tensor,
-    config: &FusedMoEBlockConfig,
-    num_experts: usize,
-    top_k: usize,
-) -> Result<Tensor> {
-    // For initial implementation, use the CPU path which is already optimized
-    // with batching. Full CUDA kernel implementation would replace this.
-    //
-    // TODO: Implement full CUDA kernel path:
-    // 1. Call moe_align_block_size kernel
-    // 2. Call fused_moe_gemm kernel for w13 (gate+up)
-    // 3. Apply activation
-    // 4. Call fused_moe_gemm kernel for w2 (down)
-    // 5. Unpermute and reduce
-
-    fused_moe_forward_cpu(
-        hidden_states,
-        w13_weights,
-        w2_weights,
-        routing_weights,
-        expert_indices,
-        config,
-        num_experts,
-        top_k,
-    )
-}
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_moe_align_block_size_cpu() {
+        let device = Device::Cpu;
+        let topk_ids = Tensor::new(&[[0u32, 1], [1, 2], [2, 3], [0, 3]], &device).unwrap();
+
+        let aligned = moe_align_block_size(&topk_ids, 4, 4).unwrap();
+
+        // 8 valid tokens (4 tokens * 2 top_k)
+        assert_eq!(aligned.num_valid_tokens, 8);
+        // Should have padded to block boundaries
+        assert!(aligned.num_tokens_post_padded >= 8);
+    }
 
     #[test]
     fn test_fused_moe_forward_cpu() {
@@ -303,6 +375,55 @@ mod tests {
         .unwrap();
 
         // Check output shape
+        assert_eq!(output.dims(), &[num_tokens, hidden_size]);
+    }
+
+    #[test]
+    fn test_fused_moe_single_expert() {
+        let device = Device::Cpu;
+
+        let num_tokens = 2;
+        let hidden_size = 8;
+        let intermediate_size = 16;
+        let num_experts = 2;
+        let top_k = 1;
+
+        let hidden_states = Tensor::randn(0f32, 1.0, (num_tokens, hidden_size), &device).unwrap();
+
+        let w13_weights = Tensor::randn(
+            0f32,
+            0.1,
+            (num_experts, 2 * intermediate_size, hidden_size),
+            &device,
+        )
+        .unwrap();
+
+        let w2_weights = Tensor::randn(
+            0f32,
+            0.1,
+            (num_experts, hidden_size, intermediate_size),
+            &device,
+        )
+        .unwrap();
+
+        // Each token goes to exactly one expert
+        let routing_weights = Tensor::new(&[[1.0f32], [1.0]], &device).unwrap();
+        let expert_indices = Tensor::new(&[[0u32], [1]], &device).unwrap();
+
+        let config = FusedMoEBlockConfig::default();
+
+        let output = fused_moe_forward(
+            &hidden_states,
+            &w13_weights,
+            &w2_weights,
+            &routing_weights,
+            &expert_indices,
+            &config,
+            num_experts,
+            top_k,
+        )
+        .unwrap();
+
         assert_eq!(output.dims(), &[num_tokens, hidden_size]);
     }
 }

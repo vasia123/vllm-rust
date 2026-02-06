@@ -1,0 +1,68 @@
+# Build artifacts
+target/
+*.pdb
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Reference code (not needed in container)
+reference/
+
+# Test files
+tests/
+*.test
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Local config
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Frontend build artifacts (if any)
+node_modules/
+dist/
+*.lock
+!Cargo.lock
+
+# Python (from reference)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Benchmarks and profiling
+flamegraph.svg
+perf.*
+*.prof

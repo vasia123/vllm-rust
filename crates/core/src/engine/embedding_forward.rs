@@ -19,6 +19,8 @@
 //! let pooled = model.pool(&embeddings, &attention_mask)?;
 //! ```
 
+use std::str::FromStr;
+
 use candle_core::{Device, Result, Tensor};
 
 /// Pooling strategy for aggregating token embeddings into sentence embeddings.
@@ -39,18 +41,37 @@ pub enum PoolingStrategy {
     Eos,
 }
 
-impl PoolingStrategy {
-    /// Parse pooling strategy from string.
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Error returned when parsing an invalid pooling strategy string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePoolingStrategyError(String);
+
+impl std::fmt::Display for ParsePoolingStrategyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid pooling strategy '{}': expected mean, cls, last_token, or eos",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParsePoolingStrategyError {}
+
+impl FromStr for PoolingStrategy {
+    type Err = ParsePoolingStrategyError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "mean" | "average" => Some(Self::Mean),
-            "cls" | "first" => Some(Self::Cls),
-            "last" | "last_token" => Some(Self::LastToken),
-            "eos" => Some(Self::Eos),
-            _ => None,
+            "mean" | "average" => Ok(Self::Mean),
+            "cls" | "first" => Ok(Self::Cls),
+            "last" | "last_token" => Ok(Self::LastToken),
+            "eos" => Ok(Self::Eos),
+            _ => Err(ParsePoolingStrategyError(s.to_string())),
         }
     }
+}
 
+impl PoolingStrategy {
     /// Get the string representation.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -78,11 +99,7 @@ pub trait ModelForEmbedding: Send + 'static {
     ///
     /// # Returns
     /// Token embeddings [batch_size, seq_len, hidden_size]
-    fn embed(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor>;
+    fn embed(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor>;
 
     /// Get the pooling strategy for this model.
     fn pooling_strategy(&self) -> PoolingStrategy {
@@ -97,22 +114,14 @@ pub trait ModelForEmbedding: Send + 'static {
     ///
     /// # Returns
     /// Sentence embeddings [batch_size, hidden_size]
-    fn pool(
-        &self,
-        token_embeddings: &Tensor,
-        attention_mask: &Tensor,
-    ) -> Result<Tensor> {
+    fn pool(&self, token_embeddings: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         pool_embeddings(token_embeddings, attention_mask, self.pooling_strategy())
     }
 
     /// Generate sentence embeddings (embed + pool).
     ///
     /// Convenience method that combines embedding and pooling.
-    fn encode(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    fn encode(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let token_embeddings = self.embed(input_ids, attention_mask)?;
 
         // Create default attention mask if not provided
@@ -142,7 +151,10 @@ pub trait ModelForEmbedding: Send + 'static {
     /// Normalize embeddings to unit length (L2 normalization).
     fn normalize(&self, embeddings: &Tensor) -> Result<Tensor> {
         // L2 normalize along last dimension
-        let norm = embeddings.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
+        let norm = embeddings
+            .sqr()?
+            .sum_keepdim(candle_core::D::Minus1)?
+            .sqrt()?;
         embeddings.broadcast_div(&norm)
     }
 }
@@ -194,7 +206,9 @@ fn last_token_pooling(token_embeddings: &Tensor, attention_mask: &Tensor) -> Res
     let (batch_size, seq_len, _hidden_size) = token_embeddings.dims3()?;
 
     // Find last non-zero position in attention mask for each batch item
-    let mask_vec: Vec<Vec<f32>> = attention_mask.to_dtype(candle_core::DType::F32)?.to_vec2()?;
+    let mask_vec: Vec<Vec<f32>> = attention_mask
+        .to_dtype(candle_core::DType::F32)?
+        .to_vec2()?;
 
     let mut result = Vec::with_capacity(batch_size);
     let embeddings_vec: Vec<Vec<Vec<f32>>> = token_embeddings
@@ -255,11 +269,14 @@ mod tests {
 
     #[test]
     fn test_pooling_strategy_from_str() {
-        assert_eq!(PoolingStrategy::from_str("mean"), Some(PoolingStrategy::Mean));
-        assert_eq!(PoolingStrategy::from_str("MEAN"), Some(PoolingStrategy::Mean));
-        assert_eq!(PoolingStrategy::from_str("cls"), Some(PoolingStrategy::Cls));
-        assert_eq!(PoolingStrategy::from_str("last_token"), Some(PoolingStrategy::LastToken));
-        assert_eq!(PoolingStrategy::from_str("unknown"), None);
+        assert_eq!(PoolingStrategy::from_str("mean"), Ok(PoolingStrategy::Mean));
+        assert_eq!(PoolingStrategy::from_str("MEAN"), Ok(PoolingStrategy::Mean));
+        assert_eq!(PoolingStrategy::from_str("cls"), Ok(PoolingStrategy::Cls));
+        assert_eq!(
+            PoolingStrategy::from_str("last_token"),
+            Ok(PoolingStrategy::LastToken)
+        );
+        assert!(PoolingStrategy::from_str("unknown").is_err());
     }
 
     #[test]
@@ -276,8 +293,16 @@ mod tests {
         // [batch=2, seq_len=3, hidden=4]
         let embeddings = Tensor::new(
             vec![
-                vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0], vec![9.0, 10.0, 11.0, 12.0]],
-                vec![vec![1.0f32, 1.0, 1.0, 1.0], vec![2.0, 2.0, 2.0, 2.0], vec![0.0, 0.0, 0.0, 0.0]],
+                vec![
+                    vec![1.0f32, 2.0, 3.0, 4.0],
+                    vec![5.0, 6.0, 7.0, 8.0],
+                    vec![9.0, 10.0, 11.0, 12.0],
+                ],
+                vec![
+                    vec![1.0f32, 1.0, 1.0, 1.0],
+                    vec![2.0, 2.0, 2.0, 2.0],
+                    vec![0.0, 0.0, 0.0, 0.0],
+                ],
             ],
             &device,
         )

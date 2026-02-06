@@ -449,6 +449,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -462,6 +463,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Fp8E4m3,
+            cpu_offload: None,
         }
     }
 
@@ -475,6 +477,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Int8,
+            cpu_offload: None,
         }
     }
 

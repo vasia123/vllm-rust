@@ -36,12 +36,24 @@ pub struct SamplingParams {
     pub top_k: u32,
     /// Penalty for repeated tokens. 1.0 = none, >1.0 discourages repeats.
     pub repetition_penalty: f32,
+    /// Frequency penalty (OpenAI convention). Range: -2.0 to 2.0.
+    /// Penalizes tokens proportional to their occurrence count in generated_tokens.
+    /// 0.0 = disabled.
+    pub frequency_penalty: f32,
+    /// Presence penalty (OpenAI convention). Range: -2.0 to 2.0.
+    /// Applies a one-time penalty to any token that has appeared in generated_tokens.
+    /// 0.0 = disabled.
+    pub presence_penalty: f32,
     /// Minimum probability relative to max. 0.0 = disabled.
     pub min_p: f32,
     /// Optional seed for deterministic sampling.
     pub seed: Option<u64>,
     /// Beam search configuration. None = disabled (use standard sampling).
     pub beam_search: Option<BeamSearchConfig>,
+    /// Token logit bias: (token_id, bias_value) pairs. Bias is added to the
+    /// raw logit before temperature scaling. Values follow OpenAI convention
+    /// (-100.0 to 100.0). None = no bias.
+    pub logit_bias: Option<Vec<(u32, f32)>>,
 }
 
 impl Default for SamplingParams {
@@ -51,9 +63,12 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: 0,
             repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             min_p: 0.0,
             seed: None,
             beam_search: None,
+            logit_bias: None,
         }
     }
 }
@@ -122,6 +137,21 @@ pub fn sample(
     // Step 1: Apply repetition penalty
     if params.repetition_penalty != 1.0 {
         apply_repetition_penalty(&mut logits, generated_tokens, params.repetition_penalty);
+    }
+
+    // Step 1b: Apply frequency and presence penalties (OpenAI convention)
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        apply_frequency_presence_penalty(
+            &mut logits,
+            generated_tokens,
+            params.frequency_penalty,
+            params.presence_penalty,
+        );
+    }
+
+    // Step 1c: Apply logit bias
+    if let Some(ref bias) = params.logit_bias {
+        apply_logit_bias(&mut logits, bias);
     }
 
     // Compute log-softmax for logprob extraction (before temperature scaling for greedy)
@@ -223,6 +253,42 @@ fn apply_repetition_penalty(logits: &mut [f32], generated_tokens: &[u32], penalt
             } else {
                 logits[idx] *= penalty;
             }
+        }
+    }
+}
+
+/// Apply frequency and presence penalties following the OpenAI convention.
+///
+/// For each token that appears in `generated_tokens`:
+///   logits[token_id] -= frequency_penalty * count + presence_penalty * 1.0
+///
+/// Where `count` is the number of times the token appears in `generated_tokens`.
+fn apply_frequency_presence_penalty(
+    logits: &mut [f32],
+    generated_tokens: &[u32],
+    frequency_penalty: f32,
+    presence_penalty: f32,
+) {
+    // Count occurrences of each token
+    let mut counts = std::collections::HashMap::<u32, u32>::new();
+    for &token_id in generated_tokens {
+        *counts.entry(token_id).or_insert(0) += 1;
+    }
+
+    for (&token_id, &count) in &counts {
+        let idx = token_id as usize;
+        if idx < logits.len() {
+            logits[idx] -= frequency_penalty * count as f32
+                + presence_penalty * if count > 0 { 1.0 } else { 0.0 };
+        }
+    }
+}
+
+fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
+    for &(token_id, bias_value) in bias {
+        let idx = token_id as usize;
+        if idx < logits.len() {
+            logits[idx] += bias_value;
         }
     }
 }
@@ -439,6 +505,7 @@ mod tests {
         assert_eq!(params.repetition_penalty, 1.0);
         assert_eq!(params.min_p, 0.0);
         assert!(params.seed.is_none());
+        assert!(params.logit_bias.is_none());
     }
 
     #[test]
@@ -922,5 +989,285 @@ mod tests {
         // Should not sample token 3 or 4
         assert!(!sampled_tokens.contains(&3), "Token 3 should be filtered");
         assert!(!sampled_tokens.contains(&4), "Token 4 should be filtered");
+    }
+
+    // ==========================================================================
+    // Logit bias tests
+    // ==========================================================================
+
+    #[test]
+    fn logit_bias_increases_token_probability() {
+        // Token 2 has the lowest logit; a large positive bias should make it the argmax
+        let logits = vec![5.0, 4.0, 1.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            logit_bias: Some(vec![(2, 50.0)]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(
+            result.token_id, 2,
+            "Positive bias should boost token 2 to top"
+        );
+    }
+
+    #[test]
+    fn logit_bias_decreases_token_probability() {
+        // Token 0 has the highest logit; a large negative bias should prevent selection
+        let logits = vec![10.0, 5.0, 5.0, 5.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            logit_bias: Some(vec![(0, -20.0)]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_ne!(
+            result.token_id, 0,
+            "Negative bias should prevent token 0 from being selected"
+        );
+    }
+
+    #[test]
+    fn logit_bias_large_negative_effectively_bans_token() {
+        // -100 bias on the would-be argmax should make it essentially impossible
+        let logits = vec![10.0, 1.0, 1.0, 1.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            logit_bias: Some(vec![(0, -100.0)]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        // Sample many times; token 0 should never appear
+        for _ in 0..1000 {
+            let result = sample(&logits, &params, &[], &mut state, None);
+            assert_ne!(
+                result.token_id, 0,
+                "Token 0 should be effectively banned with -100 bias"
+            );
+        }
+    }
+
+    #[test]
+    fn logit_bias_none_is_identity() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params_no_bias = SamplingParams {
+            temperature: 0.0,
+            logit_bias: None,
+            ..Default::default()
+        };
+        let params_default = SamplingParams::greedy();
+
+        let mut state1 = SamplerState::new(Some(42));
+        let mut state2 = SamplerState::new(Some(42));
+
+        let r1 = sample(&logits, &params_no_bias, &[], &mut state1, None);
+        let r2 = sample(&logits, &params_default, &[], &mut state2, None);
+        assert_eq!(
+            r1.token_id, r2.token_id,
+            "None logit_bias should behave identically to default"
+        );
+    }
+
+    #[test]
+    fn logit_bias_out_of_range_token_ignored() {
+        let logits = vec![1.0, 5.0, 3.0];
+        let mut logits_copy = logits.clone();
+        // Token ID 9999 is far beyond vocab_size=3
+        apply_logit_bias(&mut logits_copy, &[(9999, 50.0)]);
+
+        // Logits should be unchanged
+        assert!((logits_copy[0] - 1.0).abs() < 1e-6);
+        assert!((logits_copy[1] - 5.0).abs() < 1e-6);
+        assert!((logits_copy[2] - 3.0).abs() < 1e-6);
+    }
+
+    // ==========================================================================
+    // Frequency and presence penalty tests
+    // ==========================================================================
+
+    #[test]
+    fn frequency_penalty_reduces_repeated_tokens() {
+        // Token 0 appears 3 times, token 1 appears 1 time.
+        // With frequency_penalty, token 0 should be penalized more than token 1.
+        let logits = vec![5.0, 5.0, 5.0, 5.0];
+        let mut logits_copy = logits.clone();
+        let generated = vec![0, 0, 0, 1];
+
+        apply_frequency_presence_penalty(&mut logits_copy, &generated, 1.0, 0.0);
+
+        // Token 0: 5.0 - 1.0 * 3 = 2.0
+        assert!(
+            (logits_copy[0] - 2.0).abs() < 1e-6,
+            "Token 0 should be penalized by freq_pen * 3 = 3.0, got {}",
+            logits_copy[0]
+        );
+        // Token 1: 5.0 - 1.0 * 1 = 4.0
+        assert!(
+            (logits_copy[1] - 4.0).abs() < 1e-6,
+            "Token 1 should be penalized by freq_pen * 1 = 1.0, got {}",
+            logits_copy[1]
+        );
+        // Token 2: unchanged (never generated)
+        assert!(
+            (logits_copy[2] - 5.0).abs() < 1e-6,
+            "Token 2 should be unchanged"
+        );
+        // Token 3: unchanged (never generated)
+        assert!(
+            (logits_copy[3] - 5.0).abs() < 1e-6,
+            "Token 3 should be unchanged"
+        );
+
+        // More frequent token penalized more -> lower logit
+        assert!(
+            logits_copy[0] < logits_copy[1],
+            "Token with count 3 should have lower logit than token with count 1"
+        );
+    }
+
+    #[test]
+    fn presence_penalty_applies_once_per_token() {
+        // Token 0 appears 5 times, token 1 appears 1 time.
+        // With only presence_penalty, both should be penalized equally (once).
+        let logits = vec![5.0, 5.0, 5.0];
+        let mut logits_copy = logits.clone();
+        let generated = vec![0, 0, 0, 0, 0, 1];
+
+        apply_frequency_presence_penalty(&mut logits_copy, &generated, 0.0, 1.5);
+
+        // Token 0: 5.0 - 0.0 * 5 - 1.5 * 1.0 = 3.5
+        assert!(
+            (logits_copy[0] - 3.5).abs() < 1e-6,
+            "Token 0 should be penalized by pres_pen once = 1.5, got {}",
+            logits_copy[0]
+        );
+        // Token 1: 5.0 - 0.0 * 1 - 1.5 * 1.0 = 3.5
+        assert!(
+            (logits_copy[1] - 3.5).abs() < 1e-6,
+            "Token 1 should be penalized by pres_pen once = 1.5, got {}",
+            logits_copy[1]
+        );
+        // Token 2: unchanged (never generated)
+        assert!(
+            (logits_copy[2] - 5.0).abs() < 1e-6,
+            "Token 2 should be unchanged"
+        );
+    }
+
+    #[test]
+    fn combined_frequency_presence_penalty() {
+        // Token 0 appears 3 times, token 1 appears 1 time.
+        // frequency_penalty=0.5, presence_penalty=1.0
+        let logits = vec![10.0, 10.0, 10.0];
+        let mut logits_copy = logits.clone();
+        let generated = vec![0, 0, 0, 1];
+
+        apply_frequency_presence_penalty(&mut logits_copy, &generated, 0.5, 1.0);
+
+        // Token 0: 10.0 - 0.5 * 3 - 1.0 * 1.0 = 10.0 - 1.5 - 1.0 = 7.5
+        assert!(
+            (logits_copy[0] - 7.5).abs() < 1e-6,
+            "Token 0 expected 7.5, got {}",
+            logits_copy[0]
+        );
+        // Token 1: 10.0 - 0.5 * 1 - 1.0 * 1.0 = 10.0 - 0.5 - 1.0 = 8.5
+        assert!(
+            (logits_copy[1] - 8.5).abs() < 1e-6,
+            "Token 1 expected 8.5, got {}",
+            logits_copy[1]
+        );
+        // Token 2: unchanged (never generated)
+        assert!(
+            (logits_copy[2] - 10.0).abs() < 1e-6,
+            "Token 2 should be unchanged"
+        );
+    }
+
+    #[test]
+    fn zero_penalties_are_identity() {
+        let logits = vec![3.0, 7.0, 1.0, 5.0];
+        let mut logits_copy = logits.clone();
+        let generated = vec![0, 1, 1, 2, 0, 0];
+
+        apply_frequency_presence_penalty(&mut logits_copy, &generated, 0.0, 0.0);
+
+        for (orig, modified) in logits.iter().zip(logits_copy.iter()) {
+            assert!(
+                (orig - modified).abs() < 1e-6,
+                "Zero penalties should not change logits"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_penalties_encourage_repetition() {
+        // Negative frequency_penalty should increase logits for repeated tokens
+        let logits = vec![5.0, 5.0, 5.0];
+        let mut logits_copy = logits.clone();
+        let generated = vec![0, 0, 1];
+
+        apply_frequency_presence_penalty(&mut logits_copy, &generated, -1.0, 0.0);
+
+        // Token 0: 5.0 - (-1.0) * 2 = 5.0 + 2.0 = 7.0
+        assert!(
+            (logits_copy[0] - 7.0).abs() < 1e-6,
+            "Negative freq penalty should increase logit, got {}",
+            logits_copy[0]
+        );
+        // Token 1: 5.0 - (-1.0) * 1 = 5.0 + 1.0 = 6.0
+        assert!(
+            (logits_copy[1] - 6.0).abs() < 1e-6,
+            "Negative freq penalty should increase logit, got {}",
+            logits_copy[1]
+        );
+        // Token 2: unchanged
+        assert!(
+            (logits_copy[2] - 5.0).abs() < 1e-6,
+            "Token 2 should be unchanged"
+        );
+
+        // Repeated tokens should now have higher logits
+        assert!(
+            logits_copy[0] > logits[0],
+            "Negative penalty should encourage repeated token"
+        );
+    }
+
+    #[test]
+    fn frequency_presence_penalty_integration_with_sample() {
+        // End-to-end: with greedy sampling, frequency penalty should shift
+        // the argmax away from the most-repeated token.
+        let logits = vec![5.0, 4.9, 4.8, 0.0]; // Token 0 barely leads
+        let params = SamplingParams {
+            temperature: 0.0,
+            frequency_penalty: 2.0,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        // Token 0 appeared 3 times -> penalized by 2.0 * 3 = 6.0 -> logit becomes -1.0
+        // Token 1 appeared 0 times -> stays at 4.9
+        let result = sample(&logits, &params, &[0, 0, 0], &mut state, None);
+        assert_eq!(
+            result.token_id, 1,
+            "Heavily penalized token 0 should lose to token 1"
+        );
+    }
+
+    #[test]
+    fn default_params_include_zero_penalties() {
+        let params = SamplingParams::default();
+        assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.presence_penalty, 0.0);
+    }
+
+    #[test]
+    fn greedy_params_include_zero_penalties() {
+        let params = SamplingParams::greedy();
+        assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.presence_penalty, 0.0);
     }
 }

@@ -96,7 +96,9 @@ impl<M: ModelForward> StandardExecution<M> {
         // Build sequence metadata
         let sequences: Vec<DecodeSequenceMetadata> = dummy_seqs
             .iter()
-            .map(|seq| DecodeSequenceMetadata {
+            .enumerate()
+            .map(|(i, seq)| DecodeSequenceMetadata {
+                request_id: i as u64,
                 seqlen_offset: seq.seqlen_offset,
                 block_ids: seq.block_ids.clone(),
                 slot_mapping: seq.slot_mapping.clone(),
@@ -168,7 +170,9 @@ impl<M: ModelForward> StandardExecution<M> {
 
             let sequences: Vec<DecodeSequenceMetadata> = dummy_seqs
                 .iter()
-                .map(|seq| DecodeSequenceMetadata {
+                .enumerate()
+                .map(|(i, seq)| DecodeSequenceMetadata {
+                    request_id: i as u64,
                     seqlen_offset: seq.seqlen_offset,
                     block_ids: seq.block_ids.clone(),
                     slot_mapping: seq.slot_mapping.clone(),
@@ -319,6 +323,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             }
             req.state.status = RequestStatus::Preempted;
             req.state.generated_token_ids.clear();
+            req.state.num_computed_tokens = 0;
             req.state.seqlen_offset = 0;
         }
     }

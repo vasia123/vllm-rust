@@ -8,6 +8,8 @@ mod free_block_queue;
 pub mod metrics;
 pub mod mla_cache_config;
 pub mod mla_cache_engine;
+pub mod offload;
+pub mod offload_metrics;
 pub mod prefix_cache;
 pub mod prefix_cache_stats;
 pub mod quantization;
@@ -22,6 +24,8 @@ pub use free_block_queue::FreeBlockQueue;
 pub use metrics::{KVCacheMetrics, MetricsSnapshot};
 pub use mla_cache_config::{MLACacheConfig, MLADims};
 pub use mla_cache_engine::MLACacheEngine;
+pub use offload::{CpuOffloadConfig, CpuOffloadManager};
+pub use offload_metrics::{CpuOffloadMetrics, CpuOffloadMetricsSnapshot};
 pub use prefix_cache_stats::{
     export_prometheus_metrics, format_prometheus_output, PrefixCacheStats,
     PrefixCacheStatsSnapshot, PrometheusMetric, PrometheusMetricType, SlidingWindowMetrics,
@@ -147,6 +151,8 @@ pub struct KVCacheManager {
     metrics: Arc<KVCacheMetrics>,
     /// Optional prefix cache for block reuse and eviction coordination
     prefix_cache: Option<PrefixCache>,
+    /// Optional CPU offload manager for storing evicted blocks in host memory
+    cpu_offload: Option<CpuOffloadManager>,
 }
 
 impl KVCacheManager {
@@ -164,12 +170,16 @@ impl KVCacheManager {
         for _ in 0..config.num_layers {
             engines.push(CacheVariant::Standard(CacheEngine::new(config)?));
         }
+
+        let cpu_offload = Self::init_cpu_offload(config)?;
+
         Ok(Self {
             block_pool: BlockPool::new(config.num_blocks),
             engines,
             block_size: config.block_size,
             metrics,
             prefix_cache: None,
+            cpu_offload,
         })
     }
 
@@ -181,6 +191,24 @@ impl KVCacheManager {
         let mut mgr = Self::with_metrics(config, Arc::clone(&metrics))?;
         mgr.prefix_cache = Some(PrefixCache::with_metrics(config.block_size, metrics));
         Ok(mgr)
+    }
+
+    /// Initialize CPU offload manager from config, if configured.
+    fn init_cpu_offload(config: &CacheConfig) -> Result<Option<CpuOffloadManager>, CacheError> {
+        match &config.cpu_offload {
+            Some(offload_cfg) => {
+                let mgr = CpuOffloadManager::new(
+                    offload_cfg.clone(),
+                    config.num_layers,
+                    config.block_size,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.dtype,
+                )?;
+                Ok(Some(mgr))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Create a KVCacheManager with MLA compressed cache (for DeepSeek V2/V3).
@@ -206,6 +234,7 @@ impl KVCacheManager {
             block_size: config.block_size,
             metrics,
             prefix_cache: None,
+            cpu_offload: None,
         })
     }
 
@@ -302,6 +331,29 @@ impl KVCacheManager {
     /// Check if prefix caching is enabled.
     pub fn has_prefix_cache(&self) -> bool {
         self.prefix_cache.is_some()
+    }
+
+    /// Enable prefix caching on this manager after construction.
+    ///
+    /// This initializes a PrefixCache using the manager's block size and metrics.
+    /// No-op if prefix caching is already enabled.
+    pub fn enable_prefix_cache(&mut self) {
+        if self.prefix_cache.is_none() {
+            self.prefix_cache = Some(PrefixCache::with_metrics(
+                self.block_size,
+                Arc::clone(&self.metrics),
+            ));
+        }
+    }
+
+    /// Get a reference to the prefix cache (if enabled).
+    pub fn prefix_cache(&self) -> Option<&PrefixCache> {
+        self.prefix_cache.as_ref()
+    }
+
+    /// Get a mutable reference to the prefix cache (if enabled).
+    pub fn prefix_cache_mut(&mut self) -> Option<&mut PrefixCache> {
+        self.prefix_cache.as_mut()
     }
 
     /// Match prefix from cache (if enabled).
@@ -401,6 +453,95 @@ impl KVCacheManager {
             .as_ref()
             .map(|c| (c.num_cached_blocks(), c.num_evictable_blocks()))
     }
+
+    // ─── CPU offload integration ─────────────────────────────────────────────
+
+    /// Check if CPU offloading is enabled.
+    pub fn has_cpu_offload(&self) -> bool {
+        self.cpu_offload.is_some()
+    }
+
+    /// Offload a GPU block to CPU storage by its content hash.
+    ///
+    /// The block data is copied from the GPU cache engines into CPU memory.
+    /// This is a no-op if CPU offload is not configured or if the cache
+    /// variant is MLA (only standard caches are supported).
+    pub fn offload_block(
+        &mut self,
+        block_hash: u64,
+        gpu_block_id: BlockId,
+    ) -> Result<(), CacheError> {
+        let offload = match &mut self.cpu_offload {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+
+        let engine_refs: Vec<&CacheEngine> = self
+            .engines
+            .iter()
+            .filter_map(|v| v.try_as_standard().ok())
+            .collect();
+
+        if engine_refs.is_empty() {
+            return Ok(());
+        }
+
+        offload.store_block_from_refs(gpu_block_id, block_hash, &engine_refs)
+    }
+
+    /// Try to load a block from CPU offload cache back into GPU.
+    ///
+    /// Returns `Some(gpu_block_id)` if the block was found in CPU cache and
+    /// loaded into a freshly allocated GPU block, or `None` if not found or
+    /// offload is disabled.
+    pub fn try_load_from_cpu(&mut self, block_hash: u64) -> Result<Option<BlockId>, CacheError> {
+        // Check presence without mutable borrow.
+        let has_block = self
+            .cpu_offload
+            .as_ref()
+            .map(|o| o.has_block(block_hash))
+            .unwrap_or(false);
+
+        if !has_block {
+            return Ok(None);
+        }
+
+        // Allocate a GPU block for the loaded data.
+        let gpu_block_ids = self.block_pool.allocate(1)?;
+        let gpu_block_id = gpu_block_ids[0];
+        self.metrics.record_allocation(1);
+
+        let mut engine_refs: Vec<&mut CacheEngine> = self
+            .engines
+            .iter_mut()
+            .filter_map(|v| v.try_as_standard_mut().ok())
+            .collect();
+
+        if engine_refs.is_empty() {
+            self.block_pool.free(&[gpu_block_id])?;
+            self.metrics.record_free(1);
+            return Ok(None);
+        }
+
+        let loaded = self
+            .cpu_offload
+            .as_mut()
+            .expect("checked has_block above")
+            .load_block_from_refs(block_hash, gpu_block_id, &mut engine_refs)?;
+
+        if loaded {
+            Ok(Some(gpu_block_id))
+        } else {
+            self.block_pool.free(&[gpu_block_id])?;
+            self.metrics.record_free(1);
+            Ok(None)
+        }
+    }
+
+    /// Get a reference to the CPU offload metrics, if offloading is enabled.
+    pub fn cpu_offload_metrics(&self) -> Option<&offload_metrics::CpuOffloadMetrics> {
+        self.cpu_offload.as_ref().map(|o| o.metrics())
+    }
 }
 
 #[cfg(test)]
@@ -418,6 +559,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -1060,5 +1202,98 @@ mod tests {
         let (kv_c_out, k_pe_out) = mgr.mla_engine(0).read_raw(&[0], 2).unwrap();
         assert_eq!(kv_c_out.dims(), &[2, 32]);
         assert_eq!(k_pe_out.dims(), &[2, 8]);
+    }
+
+    // ─── CPU offload integration tests ───────────────────────────────────────
+
+    fn test_config_with_offload() -> CacheConfig {
+        CacheConfig {
+            block_size: 4,
+            num_blocks: 8,
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: Some(offload::CpuOffloadConfig {
+                max_cpu_blocks: 4,
+                use_pinned_memory: false,
+                prefetch_count: 2,
+            }),
+        }
+    }
+
+    #[test]
+    fn cpu_offload_disabled_by_default() {
+        let config = test_config();
+        let mgr = KVCacheManager::new(&config).unwrap();
+        assert!(!mgr.has_cpu_offload());
+        assert!(mgr.cpu_offload_metrics().is_none());
+    }
+
+    #[test]
+    fn cpu_offload_enabled_when_configured() {
+        let config = test_config_with_offload();
+        let mgr = KVCacheManager::new(&config).unwrap();
+        assert!(mgr.has_cpu_offload());
+        assert!(mgr.cpu_offload_metrics().is_some());
+    }
+
+    #[test]
+    fn cpu_offload_store_and_load_through_manager() {
+        let config = test_config_with_offload();
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        // Write data to GPU block 0 in all layers.
+        let k_data: Vec<f32> = (0..2 * 3 * 8).map(|i| (i + 1) as f32).collect();
+        let k = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
+
+        for layer in 0..2 {
+            mgr.engine_mut(layer).write(&k, &v, &[0, 1, 2]).unwrap();
+        }
+
+        // Offload block 0 with hash 42.
+        mgr.offload_block(42, 0).unwrap();
+
+        // Verify metrics.
+        let metrics = mgr.cpu_offload_metrics().unwrap();
+        assert_eq!(metrics.stores(), 1);
+
+        // Load it back into a new GPU block via try_load_from_cpu.
+        let loaded_block = mgr.try_load_from_cpu(42).unwrap();
+        assert!(loaded_block.is_some());
+
+        let gpu_block = loaded_block.unwrap();
+
+        // Verify the data is correct in the newly allocated GPU block.
+        for layer in 0..2 {
+            let (k_out, v_out) = mgr.engine(layer).read(&[gpu_block], 3).unwrap();
+            let k_flat: Vec<f32> = k_out.flatten_all().unwrap().to_vec1().unwrap();
+            let v_flat: Vec<f32> = v_out.flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(k_flat, k_data);
+            assert_eq!(v_flat, k_data);
+        }
+    }
+
+    #[test]
+    fn cpu_offload_miss_returns_none() {
+        let config = test_config_with_offload();
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        let result = mgr.try_load_from_cpu(999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cpu_offload_noop_when_disabled() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        // These should be no-ops, not errors.
+        mgr.offload_block(42, 0).unwrap();
+        let result = mgr.try_load_from_cpu(42).unwrap();
+        assert!(result.is_none());
     }
 }

@@ -10,8 +10,16 @@
 //! # Row Parallel Linear
 //! Splits the input dimension: each GPU has a portion of the weight.
 //! Used for: second linear in MLP, output projection.
+//!
+//! # Weight Loading
+//!
+//! Weights are loaded from safetensors files which contain FULL (unsharded) tensors.
+//! Each parallel layer loads the full weight and extracts its shard at runtime:
+//! - ColumnParallel: slices output dimension (dim 0 of weight)
+//! - RowParallel: slices input dimension (dim 1 of weight)
+//! - VocabParallel: slices vocabulary dimension (dim 0 of embedding)
 
-use candle_core::Tensor;
+use candle_core::{IndexOp, Tensor};
 use candle_nn::VarBuilder;
 
 use super::communicator::{DeviceCommunicator, ReduceOp};
@@ -41,6 +49,9 @@ pub struct ColumnParallelLinear {
 impl ColumnParallelLinear {
     /// Create a new column-parallel linear layer.
     ///
+    /// Loads FULL weights from VarBuilder and shards them at runtime.
+    /// This is necessary because safetensors files contain unsharded weights.
+    ///
     /// # Arguments
     /// * `in_features` - Input dimension (not split)
     /// * `out_features` - Output dimension (split across TP)
@@ -61,17 +72,27 @@ impl ColumnParallelLinear {
 
         // Each GPU gets out_features/tp_size columns
         let out_per_gpu = out_features / tp_size;
-        assert_eq!(
-            out_features % tp_size,
-            0,
-            "out_features must be divisible by tp_size"
-        );
+        if out_features % tp_size != 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "out_features ({}) must be divisible by tp_size ({})",
+                out_features, tp_size
+            )));
+        }
 
-        // Weight shape: [out_per_gpu, in_features]
-        let weight = vb.get((out_per_gpu, in_features), "weight")?;
+        // Load FULL weight: [out_features, in_features]
+        let full_weight = vb.get((out_features, in_features), "weight")?;
+
+        // Shard: extract rows [tp_rank * out_per_gpu .. (tp_rank + 1) * out_per_gpu]
+        // Call .contiguous() to ensure the sliced tensor has contiguous memory layout
+        let start_idx = tp_rank * out_per_gpu;
+        let end_idx = start_idx + out_per_gpu;
+        let weight = full_weight.i(start_idx..end_idx)?.contiguous()?;
 
         let bias = if bias {
-            Some(vb.get(out_per_gpu, "bias")?)
+            // Load FULL bias: [out_features]
+            let full_bias = vb.get(out_features, "bias")?;
+            // Shard: extract [start_idx..end_idx]
+            Some(full_bias.i(start_idx..end_idx)?.contiguous()?)
         } else {
             None
         };
@@ -174,6 +195,9 @@ pub struct RowParallelLinear {
 impl RowParallelLinear {
     /// Create a new row-parallel linear layer.
     ///
+    /// Loads FULL weights from VarBuilder and shards them at runtime.
+    /// This is necessary because safetensors files contain unsharded weights.
+    ///
     /// # Arguments
     /// * `in_features` - Input dimension (split across TP if input_is_parallel)
     /// * `out_features` - Output dimension (not split)
@@ -192,17 +216,27 @@ impl RowParallelLinear {
         let tp_size = pg.world_size();
         let tp_rank = pg.rank();
 
-        // Each GPU gets in_features/tp_size rows
+        // Each GPU gets in_features/tp_size columns
         let in_per_gpu = in_features / tp_size;
-        assert_eq!(
-            in_features % tp_size,
-            0,
-            "in_features must be divisible by tp_size"
-        );
+        if in_features % tp_size != 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "in_features ({}) must be divisible by tp_size ({})",
+                in_features, tp_size
+            )));
+        }
 
-        // Weight shape: [out_features, in_per_gpu]
-        let weight = vb.get((out_features, in_per_gpu), "weight")?;
+        // Load FULL weight: [out_features, in_features]
+        let full_weight = vb.get((out_features, in_features), "weight")?;
 
+        // Shard: extract columns [tp_rank * in_per_gpu .. (tp_rank + 1) * in_per_gpu]
+        // Weight is [out_features, in_features], we slice dim 1
+        // Call .contiguous() to ensure the sliced tensor has contiguous memory layout
+        let start_idx = tp_rank * in_per_gpu;
+        let end_idx = start_idx + in_per_gpu;
+        let weight = full_weight.i((.., start_idx..end_idx))?.contiguous()?;
+
+        // Bias is NOT sharded for row-parallel - it's added after all_reduce
+        // Only rank 0 should add bias, or we add after reduce
         let bias = if bias {
             Some(vb.get(out_features, "bias")?)
         } else {
@@ -311,6 +345,9 @@ pub struct VocabParallelEmbedding {
 
 impl VocabParallelEmbedding {
     /// Create a new vocabulary-parallel embedding.
+    ///
+    /// Loads FULL embedding table from VarBuilder and shards at runtime.
+    /// This is necessary because safetensors files contain unsharded weights.
     pub fn new(
         vocab_size: usize,
         hidden_size: usize,
@@ -324,9 +361,13 @@ impl VocabParallelEmbedding {
         let vocab_per_gpu = vocab_size.div_ceil(tp_size);
         let vocab_start = tp_rank * vocab_per_gpu;
         let vocab_end = ((tp_rank + 1) * vocab_per_gpu).min(vocab_size);
-        let actual_size = vocab_end - vocab_start;
 
-        let embeddings = vb.get((actual_size, hidden_size), "weight")?;
+        // Load FULL embedding table: [vocab_size, hidden_size]
+        let full_embeddings = vb.get((vocab_size, hidden_size), "weight")?;
+
+        // Shard: extract rows [vocab_start..vocab_end]
+        // Call .contiguous() to ensure the sliced tensor has contiguous memory layout
+        let embeddings = full_embeddings.i(vocab_start..vocab_end)?.contiguous()?;
 
         Ok(Self {
             embeddings,
@@ -362,6 +403,11 @@ impl VocabParallelEmbedding {
     /// Forward pass: lookup embeddings for token IDs.
     ///
     /// Uses all_reduce to combine embeddings from different vocab partitions.
+    ///
+    /// # Algorithm
+    /// 1. Map token IDs to local indices (masked lookup)
+    /// 2. Lookup embeddings (zero for out-of-range tokens)
+    /// 3. All-reduce to sum embeddings from all partitions
     pub fn forward(&self, input_ids: &Tensor, comm: &dyn DeviceCommunicator) -> Result<Tensor> {
         let device = self.embeddings.device();
         let dtype = self.embeddings.dtype();
@@ -370,7 +416,6 @@ impl VocabParallelEmbedding {
         // Get input shape for output
         let input_shape = input_ids.dims();
         let flat_input = input_ids.flatten_all()?;
-        let seq_len = flat_input.dim(0)?;
 
         if self.tp_size == 1 {
             // Single GPU: direct lookup
@@ -380,28 +425,43 @@ impl VocabParallelEmbedding {
             return Ok(output.reshape(out_shape.as_slice())?);
         }
 
-        // Multi-GPU: masked lookup + all_reduce
-        let input_vec: Vec<u32> = flat_input.to_vec1()?;
-        let mut output_data = vec![0f32; seq_len * hidden_size];
+        // Multi-GPU: GPU-native masked lookup + all_reduce
+        //
+        // Strategy: Create a mask for tokens in our partition, then do masked embedding lookup.
+        // For tokens outside our range, the lookup will use index 0 but we zero them out with mask.
 
-        for (i, &token_id) in input_vec.iter().enumerate() {
-            let token_id = token_id as usize;
-            if token_id >= self.vocab_start && token_id < self.vocab_end {
-                // This token is on our partition
-                let local_idx = token_id - self.vocab_start;
-                let embedding = self.embeddings.get(local_idx)?;
-                let emb_vec: Vec<f32> = embedding.to_vec1()?;
-                output_data[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&emb_vec);
-            }
-            // Tokens not on this partition remain zeros
-        }
+        // Cast input_ids to i64 for arithmetic
+        let input_i64 = flat_input.to_dtype(candle_core::DType::I64)?;
 
-        let output = Tensor::from_vec(output_data, (seq_len, hidden_size), device)?;
-        let output = output.to_dtype(dtype)?;
+        // Create mask: 1 if token is in our partition [vocab_start, vocab_end), else 0
+        let vocab_start_t =
+            Tensor::new(&[self.vocab_start as i64], device)?.broadcast_as(input_i64.shape())?;
+        let vocab_end_t =
+            Tensor::new(&[self.vocab_end as i64], device)?.broadcast_as(input_i64.shape())?;
+
+        // mask = (input_ids >= vocab_start) & (input_ids < vocab_end)
+        let ge_start = input_i64.ge(&vocab_start_t)?;
+        let lt_end = input_i64.lt(&vocab_end_t)?;
+        let mask = ge_start.mul(&lt_end)?; // element-wise AND via multiplication
+
+        // Local indices: clamp to valid range [0, vocab_end - vocab_start - 1]
+        // For out-of-range tokens, we'll use 0 but mask out the result
+        let local_indices = (input_i64 - vocab_start_t)?;
+        let max_local_idx = (self.vocab_end - self.vocab_start).saturating_sub(1) as i64;
+        let local_indices = local_indices.clamp(0i64, max_local_idx)?;
+        let local_indices = local_indices.to_dtype(candle_core::DType::U32)?;
+
+        // Lookup embeddings
+        let embeddings = self.embeddings.embedding(&local_indices)?;
+
+        // Apply mask: zero out embeddings for tokens not in our partition
+        // mask shape: [seq_len], embeddings shape: [seq_len, hidden_size]
+        let mask_f = mask.to_dtype(dtype)?.unsqueeze(1)?; // [seq_len, 1]
+        let masked_embeddings = embeddings.broadcast_mul(&mask_f)?;
 
         // All-reduce: sum embeddings across partitions
-        // (each token only has non-zero embedding on one GPU)
-        let output = comm.all_reduce(&output, ReduceOp::Sum)?;
+        // Each token has non-zero embedding on exactly one GPU
+        let output = comm.all_reduce(&masked_embeddings, ReduceOp::Sum)?;
 
         let mut out_shape: Vec<usize> = input_shape.to_vec();
         out_shape.push(hidden_size);
@@ -534,22 +594,42 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "out_features must be divisible by tp_size")]
     fn divisibility_check_column() {
         let pg = LocalProcessGroup::with_rank(0, 4);
         let vb = make_vb(&Device::Cpu);
 
-        // 101 not divisible by 4 -> should panic
-        let _ = ColumnParallelLinear::new(64, 101, false, false, vb.pp("test"), &pg);
+        // 101 not divisible by 4 -> should return error
+        let result = ColumnParallelLinear::new(64, 101, false, false, vb.pp("test"), &pg);
+        match result {
+            Ok(_) => panic!("Expected divisibility error"),
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("divisible"),
+                    "Expected divisibility error, got: {}",
+                    err_msg
+                );
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "in_features must be divisible by tp_size")]
     fn divisibility_check_row() {
         let pg = LocalProcessGroup::with_rank(0, 4);
         let vb = make_vb(&Device::Cpu);
 
-        // 101 not divisible by 4 -> should panic
-        let _ = RowParallelLinear::new(101, 64, false, false, vb.pp("test"), &pg);
+        // 101 not divisible by 4 -> should return error
+        let result = RowParallelLinear::new(101, 64, false, false, vb.pp("test"), &pg);
+        match result {
+            Ok(_) => panic!("Expected divisibility error"),
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("divisible"),
+                    "Expected divisibility error, got: {}",
+                    err_msg
+                );
+            }
+        }
     }
 }

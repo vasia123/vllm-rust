@@ -51,7 +51,7 @@ __device__ __forceinline__ __nv_bfloat16 silu_bf16(__nv_bfloat16 x) {
     return __float2bfloat16(silu(fx));
 }
 
-// Fused MoE GEMM kernel for single projection.
+// Fused MoE GEMM device function for single projection.
 // Computes: C[sorted_idx] = A[token_idx] @ B[expert]
 //
 // Parameters:
@@ -70,7 +70,7 @@ __device__ __forceinline__ __nv_bfloat16 silu_bf16(__nv_bfloat16 x) {
 // Grid: (num_pid_m * num_pid_n, 1, 1)
 // Block: (BLOCK_SIZE_K, 1, 1) or custom
 template <int BLOCK_M, int BLOCK_N, int BLOCK_K, bool MUL_ROUTED_WEIGHT>
-__global__ void fused_moe_gemm_kernel(
+__device__ void fused_moe_gemm_impl(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -223,9 +223,9 @@ __global__ void fused_moe_gemm_kernel(
     }
 }
 
-// Simplified GEMM for small batches - one thread block per output row
+// Simplified GEMM device function for small batches - one thread block per output row
 template <bool MUL_ROUTED_WEIGHT>
-__global__ void fused_moe_gemm_simple_kernel(
+__device__ void fused_moe_gemm_simple_impl(
     const __nv_bfloat16* __restrict__ A,     // [num_tokens, K]
     const __nv_bfloat16* __restrict__ B,     // [num_experts, N, K]
     __nv_bfloat16* __restrict__ C,           // [num_tokens_padded * top_k, N]
@@ -263,7 +263,8 @@ __global__ void fused_moe_gemm_simple_kernel(
     }
 
     // Compute output for this row
-    extern __shared__ float reduce_smem[];
+    extern __shared__ char simple_smem_raw[];
+    float* reduce_smem = (float*)simple_smem_raw;
     const int tid = threadIdx.x;
     const int NUM_THREADS = blockDim.x;
 
@@ -296,7 +297,7 @@ __global__ void fused_moe_gemm_simple_kernel(
 //
 // w13_weight layout: [num_experts, 2*intermediate_size, hidden_size]
 // First half is gate_proj, second half is up_proj
-__global__ void fused_moe_gate_up_silu_kernel(
+extern "C" __global__ void fused_moe_gate_up_silu_kernel(
     const __nv_bfloat16* __restrict__ A,        // [num_tokens, hidden_size]
     const __nv_bfloat16* __restrict__ W13,      // [num_experts, 2*intermediate, hidden]
     __nv_bfloat16* __restrict__ hidden,         // [num_tokens_padded * top_k, intermediate]
@@ -323,7 +324,8 @@ __global__ void fused_moe_gate_up_silu_kernel(
 
     const int original_token = token_idx / top_k;
     const int tid = threadIdx.x;
-    extern __shared__ float smem[];
+    extern __shared__ char smem_raw[];
+    float* smem = (float*)smem_raw;
 
     // For each output dimension
     for (int i = 0; i < intermediate_size; ++i) {
@@ -370,7 +372,7 @@ __global__ void fused_moe_gate_up_silu_kernel(
 
 // Down projection with routing weight application.
 // Computes: output[token] = routing_weight * down_proj(hidden)
-__global__ void fused_moe_down_reduce_kernel(
+extern "C" __global__ void fused_moe_down_reduce_kernel(
     const __nv_bfloat16* __restrict__ hidden,    // [num_tokens_padded * top_k, intermediate]
     const __nv_bfloat16* __restrict__ W2,        // [num_experts, hidden_size, intermediate]
     __nv_bfloat16* __restrict__ output,          // [num_tokens, hidden_size]
@@ -389,7 +391,8 @@ __global__ void fused_moe_down_reduce_kernel(
     if (token_out >= num_tokens) return;
 
     const int tid = threadIdx.x;
-    extern __shared__ float smem[];
+    extern __shared__ char smem_raw[];
+    float* smem = (float*)smem_raw;
 
     // For each output dimension
     for (int h = 0; h < hidden_size; ++h) {
@@ -440,23 +443,103 @@ __global__ void fused_moe_down_reduce_kernel(
     }
 }
 
-// Instantiate kernels with common block sizes
-template __global__ void fused_moe_gemm_kernel<64, 64, 32, true>(
-    const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*,
-    const float*, const int32_t*, const int32_t*, const int32_t*,
-    int, int, int, int, int, int, int, int, int, int);
+// ============================================================================
+// extern "C" Wrappers for cudarc PTX loading
+// ============================================================================
 
-template __global__ void fused_moe_gemm_kernel<64, 64, 32, false>(
-    const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*,
-    const float*, const int32_t*, const int32_t*, const int32_t*,
-    int, int, int, int, int, int, int, int, int, int);
+// Wrapper for fused_moe_gemm_impl<64, 64, 32, true> (with routing weights)
+extern "C" __global__ void fused_moe_gemm_64_64_32_weighted(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_post_padded_ptr,
+    const int N,
+    const int K,
+    const int num_valid_tokens,
+    const int top_k,
+    const int stride_am,
+    const int stride_be,
+    const int stride_bk,
+    const int stride_bn,
+    const int stride_cm,
+    const int stride_cn
+) {
+    fused_moe_gemm_impl<64, 64, 32, true>(
+        A, B, C, topk_weights, sorted_token_ids, expert_ids,
+        num_tokens_post_padded_ptr, N, K, num_valid_tokens, top_k,
+        stride_am, stride_be, stride_bk, stride_bn, stride_cm, stride_cn
+    );
+}
 
-template __global__ void fused_moe_gemm_simple_kernel<true>(
-    const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*,
-    const float*, const int32_t*, const int32_t*, const int32_t*,
-    int, int, int, int, int);
+// Wrapper for fused_moe_gemm_impl<64, 64, 32, false> (without routing weights)
+extern "C" __global__ void fused_moe_gemm_64_64_32_unweighted(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    const float* __restrict__ topk_weights,  // Unused but kept for consistent interface
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_post_padded_ptr,
+    const int N,
+    const int K,
+    const int num_valid_tokens,
+    const int top_k,
+    const int stride_am,
+    const int stride_be,
+    const int stride_bk,
+    const int stride_bn,
+    const int stride_cm,
+    const int stride_cn
+) {
+    fused_moe_gemm_impl<64, 64, 32, false>(
+        A, B, C, topk_weights, sorted_token_ids, expert_ids,
+        num_tokens_post_padded_ptr, N, K, num_valid_tokens, top_k,
+        stride_am, stride_be, stride_bk, stride_bn, stride_cm, stride_cn
+    );
+}
 
-template __global__ void fused_moe_gemm_simple_kernel<false>(
-    const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*,
-    const float*, const int32_t*, const int32_t*, const int32_t*,
-    int, int, int, int, int);
+// Wrapper for fused_moe_gemm_simple_impl<true> (with routing weights)
+extern "C" __global__ void fused_moe_gemm_simple_weighted(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_post_padded_ptr,
+    const int N,
+    const int K,
+    const int num_valid_tokens,
+    const int top_k,
+    const int num_experts
+) {
+    fused_moe_gemm_simple_impl<true>(
+        A, B, C, topk_weights, sorted_token_ids, expert_ids,
+        num_tokens_post_padded_ptr, N, K, num_valid_tokens, top_k, num_experts
+    );
+}
+
+// Wrapper for fused_moe_gemm_simple_impl<false> (without routing weights)
+extern "C" __global__ void fused_moe_gemm_simple_unweighted(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    const float* __restrict__ topk_weights,  // Unused but kept for consistent interface
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_post_padded_ptr,
+    const int N,
+    const int K,
+    const int num_valid_tokens,
+    const int top_k,
+    const int num_experts
+) {
+    fused_moe_gemm_simple_impl<false>(
+        A, B, C, topk_weights, sorted_token_ids, expert_ids,
+        num_tokens_post_padded_ptr, N, K, num_valid_tokens, top_k, num_experts
+    );
+}
+

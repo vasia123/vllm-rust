@@ -1,6 +1,7 @@
 //! Admin API for monitoring and management.
 
 pub mod metrics;
+pub mod prometheus;
 pub mod restart;
 pub mod static_files;
 pub mod types;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -98,8 +100,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/live", get(live))
         .route("/metrics", get(metrics::get_metrics))
         .route("/metrics/stream", get(metrics::metrics_stream))
+        .route("/metrics/prometheus", get(prometheus::prometheus_metrics))
         .route("/config", get(get_config).post(save_config))
         .with_state(state)
         .route("/restart", post(restart_handler))
@@ -109,7 +114,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/{*path}", get(static_files::static_handler))
 }
 
-/// GET /admin/health - Health check endpoint.
+/// GET /admin/health - Health check endpoint (detailed status).
 async fn health(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
     let stats = state
         .engine
@@ -139,6 +144,38 @@ async fn health(State(state): State<AdminState>) -> Result<impl IntoResponse, Ap
     }))
 }
 
+/// GET /admin/ready - Kubernetes readiness probe.
+/// Returns 200 if server is ready to accept traffic, 503 otherwise.
+async fn ready(State(state): State<AdminState>) -> impl IntoResponse {
+    // Check if server is accepting requests
+    if !state.accepting_requests() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    // Check if engine is responsive
+    match state.engine.get().get_stats().await {
+        Ok(stats) => {
+            // Consider not ready if no free blocks (can't accept new requests)
+            if stats.num_free_blocks == 0 {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// GET /admin/live - Kubernetes liveness probe.
+/// Returns 200 if server is alive (process is running), 503 if unhealthy.
+async fn live(State(state): State<AdminState>) -> impl IntoResponse {
+    // Liveness just checks if the engine can respond at all
+    match state.engine.get().get_stats().await {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 /// GET /admin/config - Get current runtime configuration.
 async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.config.read().await.clone())
@@ -161,6 +198,11 @@ async fn save_config(
         max_tokens_per_step: Some(request.config.max_tokens_per_step),
         enable_chunked_prefill: Some(request.config.enable_chunked_prefill),
         enable_prefix_caching: Some(request.config.enable_prefix_caching),
+        max_requests_per_second: None, // Rate limiting configured via CLI
+        max_queue_depth: None,         // Queue depth configured via CLI
+        allowed_origins: None,         // CORS configured via CLI
+        allowed_methods: None,
+        allowed_headers: None,
     };
 
     let path = config

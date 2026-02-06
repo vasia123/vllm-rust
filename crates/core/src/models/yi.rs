@@ -14,8 +14,11 @@ use candle_core::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
+use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, KVCacheManager};
+
+pub use super::tp_layers::TpContext;
 
 // Yi uses the same architecture as Llama
 use super::llama::LlamaForCausalLM;
@@ -29,10 +32,19 @@ pub struct YiForCausalLM {
 }
 
 impl YiForCausalLM {
+    /// Create a new Yi model for single GPU.
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        // Yi uses the same architecture as Llama
-        // Configuration differences (RoPE scaling) are handled in ModelConfig
-        let inner = LlamaForCausalLM::new(cfg, vb)?;
+        Self::new_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
+    }
+
+    /// Create a new Yi model with tensor parallelism.
+    pub fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
+        let inner = LlamaForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?;
         Ok(Self { inner })
     }
 
@@ -44,12 +56,21 @@ impl YiForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.inner
-            .forward(input_ids, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        self.inner.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     pub fn device(&self) -> &Device {
         self.inner.device()
+    }
+
+    pub fn tp_context(&self) -> &TpContext {
+        self.inner.tp_context()
     }
 }
 
@@ -93,8 +114,8 @@ impl crate::engine::ModelForward for YiForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use candle_core::DType;
 
     fn test_config() -> crate::config::ModelConfig {
         crate::config::ModelConfig {
@@ -129,6 +150,7 @@ mod tests {
             dtype: DType::F32,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -139,7 +161,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
         let model = YiForCausalLM::new(&cfg, vb);
-        assert!(model.is_ok(), "YiForCausalLM should construct with zero weights");
+        assert!(
+            model.is_ok(),
+            "YiForCausalLM should construct with zero weights"
+        );
     }
 
     #[test]
@@ -185,5 +210,21 @@ mod tests {
         let cfg = test_config();
         let gqa_groups = cfg.num_attention_heads / cfg.num_key_value_heads;
         assert_eq!(gqa_groups, 2, "test config uses GQA with 2 groups");
+    }
+
+    #[test]
+    fn test_yi_tp_construction() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let pg = LocalProcessGroup::new();
+        let tp_ctx = TpContext::single_gpu();
+
+        let model = YiForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx);
+        assert!(
+            model.is_ok(),
+            "YiForCausalLM should construct with TP: {:?}",
+            model.err()
+        );
     }
 }

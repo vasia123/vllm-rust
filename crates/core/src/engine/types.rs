@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::kv_cache::{MetricsSnapshot, PrefixCacheStatsSnapshot, SlidingWindowSnapshot};
 use crate::lora::LoraRequest;
+use crate::multimodal::ImageData;
 use crate::request::{FinishReason, RequestId};
 use crate::sampling::{SamplingConstraint, SamplingParams};
 
@@ -16,6 +17,10 @@ pub enum StreamEvent {
     Token {
         token_id: u32,
         token_text: String,
+        /// Log probability of the sampled token (present when logprobs requested).
+        logprob: Option<f32>,
+        /// Top-k alternative tokens with their log probabilities.
+        top_logprobs: Option<Vec<(u32, f32)>>,
     },
     Done {
         finish_reason: FinishReason,
@@ -56,6 +61,9 @@ pub struct GenerationRequest {
     pub lora_request: Option<LoraRequest>,
     /// Sampling constraint for structured output (JSON schema, regex, etc.).
     pub constraint: Option<Box<dyn SamplingConstraint>>,
+    /// Image inputs for multimodal models (e.g. LLaVA).
+    /// Extracted from chat message content parts and decoded from data URIs.
+    pub image_inputs: Vec<ImageData>,
 }
 
 impl Default for GenerationRequest {
@@ -72,6 +80,7 @@ impl Default for GenerationRequest {
             echo: false,
             lora_request: None,
             constraint: None,
+            image_inputs: Vec::new(),
         }
     }
 }

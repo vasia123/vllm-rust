@@ -10,6 +10,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use super::awq::{AwqConfig, AwqLinear};
+use super::bitsandbytes::{BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType};
 use super::config::{QuantizationConfig, QuantizedLinear};
 use super::fp8::{Fp8Config, Fp8Linear};
 use super::gptq::{GptqConfig, GptqLinear};
@@ -450,6 +451,115 @@ impl QuantizedWeightLoader for AwqWeightLoader {
     }
 }
 
+/// Weight loader for BitsAndBytes quantized models.
+pub struct BitsAndBytesWeightLoader {
+    vb: VarBuilder<'static>,
+    config: BitsAndBytesConfig,
+    device: Device,
+    dtype: DType,
+}
+
+impl BitsAndBytesWeightLoader {
+    /// Create a new BitsAndBytes weight loader.
+    pub fn new(vb: VarBuilder<'static>, config: BitsAndBytesConfig) -> Self {
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        Self {
+            vb,
+            config,
+            device,
+            dtype,
+        }
+    }
+}
+
+impl QuantizedWeightLoader for BitsAndBytesWeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        // Skip quantization for ignored layers
+        if self.config.is_layer_skipped(prefix) {
+            let vb = self.vb.pp(prefix);
+            let weight = vb.get((out_features, in_features), "weight")?;
+            let bias_tensor = if bias {
+                Some(vb.get(out_features, "bias")?)
+            } else {
+                None
+            };
+            return Ok(Box::new(LoadedUnquantizedLinear {
+                weight,
+                bias: bias_tensor,
+                in_features,
+                out_features,
+            }));
+        }
+
+        let vb = self.vb.pp(prefix);
+        let total_elements = out_features * in_features;
+
+        let mut linear = BitsAndBytesLinear::new(
+            in_features,
+            out_features,
+            bias,
+            self.config.quant_type,
+            self.config.block_size,
+            &self.device,
+        )?;
+
+        let mut weights = HashMap::new();
+
+        match self.config.quant_type {
+            BnbQuantType::NF4 => {
+                // NF4: packed uint8, shape [n*k/2] (flattened)
+                let packed_len = total_elements.div_ceil(2);
+                if let Ok(w) = vb.get(packed_len, "weight") {
+                    weights.insert("weight".to_string(), w);
+                }
+                // Per-block absmax scales
+                let num_blocks = total_elements.div_ceil(self.config.block_size);
+                if let Ok(a) = vb.get(num_blocks, "weight.absmax") {
+                    weights.insert("absmax".to_string(), a);
+                }
+            }
+            BnbQuantType::INT8 => {
+                // INT8: shape [out_features, in_features]
+                if let Ok(w) = vb.get((out_features, in_features), "weight") {
+                    weights.insert("weight".to_string(), w);
+                }
+                // INT8 scales (SCB naming convention)
+                if let Ok(s) = vb.get(out_features, "weight.SCB") {
+                    weights.insert("SCB".to_string(), s);
+                }
+            }
+        }
+
+        if bias {
+            if let Ok(b) = vb.get(out_features, "bias") {
+                weights.insert("bias".to_string(), b);
+            }
+        }
+
+        linear.load_weights(&weights)?;
+        Ok(Box::new(linear))
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::BitsAndBytes
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
 /// Create an appropriate weight loader for a model directory.
 ///
 /// This function detects the quantization method from the model config
@@ -490,6 +600,10 @@ pub fn create_weight_loader_from_config(
             let awq_config = AwqConfig::default();
             Box::new(AwqWeightLoader::new(vb, awq_config))
         }
+        QuantizationMethod::BitsAndBytes => {
+            let bnb_config = BitsAndBytesConfig::default();
+            Box::new(BitsAndBytesWeightLoader::new(vb, bnb_config))
+        }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }
 }
@@ -521,6 +635,10 @@ pub fn create_weight_loader_with_params(
             let awq_config =
                 AwqConfig::from_detected(detected.bits, detected.group_size, &detected.raw_config);
             Box::new(AwqWeightLoader::new(vb, awq_config))
+        }
+        QuantizationMethod::BitsAndBytes => {
+            let bnb_config = BitsAndBytesConfig::from_detected(&detected.raw_config);
+            Box::new(BitsAndBytesWeightLoader::new(vb, bnb_config))
         }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }

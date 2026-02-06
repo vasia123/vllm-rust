@@ -42,5 +42,5 @@ mod kernel_wrapper;
 mod token_grouper;
 
 pub use config::{FusedMoEBlockConfig, FusedMoEConfig};
-pub use kernel_wrapper::fused_moe_forward;
+pub use kernel_wrapper::{fused_moe_forward, moe_align_block_size, MoeAlignOutput};
 pub use token_grouper::{AlignedTokens, MoETokenGrouper};

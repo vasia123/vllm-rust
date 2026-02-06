@@ -14,5 +14,9 @@ pub mod quantization;
 pub mod request;
 pub mod sampling;
 pub mod scheduler;
+pub mod ssm;
 pub mod tokenizer;
 pub mod tool_parser;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testing;

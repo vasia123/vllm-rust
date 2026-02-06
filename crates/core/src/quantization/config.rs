@@ -29,6 +29,10 @@ pub enum QuantizationMethod {
     SqueezeLlm,
     /// Marlin optimized format (for GPTQ/AWQ)
     Marlin,
+    /// Compressed-Tensors quantization (NVIDIA/Neural Magic)
+    CompressedTensors,
+    /// TorchAO quantization (PyTorch native)
+    Torchao,
 }
 
 impl Default for QuantizationMethod {
@@ -48,6 +52,8 @@ impl std::fmt::Display for QuantizationMethod {
             Self::BitsAndBytes => write!(f, "bitsandbytes"),
             Self::SqueezeLlm => write!(f, "squeezellm"),
             Self::Marlin => write!(f, "marlin"),
+            Self::CompressedTensors => write!(f, "compressed-tensors"),
+            Self::Torchao => write!(f, "torchao"),
         }
     }
 }

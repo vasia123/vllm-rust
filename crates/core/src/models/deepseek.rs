@@ -677,6 +677,7 @@ mod tests {
         // Decode 1 token using forward_decode_batch
         let decode_input = Tensor::zeros((1, 1), DType::U32, &device).unwrap();
         let sequences = vec![DecodeSequenceMetadata {
+            request_id: 0,
             seqlen_offset: 3,
             block_ids: block_table.block_ids().to_vec(),
             slot_mapping: vec![3],

@@ -11,47 +11,63 @@
 //! Reference: https://huggingface.co/tiiuae/falcon-7b
 
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, VarBuilder};
+use candle_nn::{layer_norm, LayerNorm, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding};
+
+pub use super::tp_layers::TpContext;
+use super::tp_layers::{TpEmbedding, TpLinear};
 
 // ─── MLP ──────────────────────────────────────────────────────────────────────
 
 /// Falcon MLP with GELU activation.
 struct FalconMlp {
-    dense_h_to_4h: Linear, // hidden -> 4*hidden
-    dense_4h_to_h: Linear, // 4*hidden -> hidden
+    dense_h_to_4h: TpLinear, // hidden -> 4*hidden
+    dense_4h_to_h: TpLinear, // 4*hidden -> hidden
 }
 
 impl FalconMlp {
-    fn new(hidden_size: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(hidden_size: usize, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let intermediate_size = 4 * hidden_size;
         // Falcon uses bias in MLP
-        let dense_h_to_4h = linear(hidden_size, intermediate_size, vb.pp("dense_h_to_4h"))?;
-        let dense_4h_to_h = linear(intermediate_size, hidden_size, vb.pp("dense_4h_to_h"))?;
+        let dense_h_to_4h = TpLinear::column_parallel(
+            hidden_size,
+            intermediate_size,
+            true,  // bias
+            false, // no gather
+            vb.pp("dense_h_to_4h"),
+            pg,
+        )?;
+        let dense_4h_to_h = TpLinear::row_parallel(
+            intermediate_size,
+            hidden_size,
+            true, // bias
+            true, // input is parallel
+            vb.pp("dense_4h_to_h"),
+            pg,
+        )?;
         Ok(Self {
             dense_h_to_4h,
             dense_4h_to_h,
         })
     }
-}
 
-impl Module for FalconMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = self.dense_h_to_4h.forward(xs)?;
+    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+        let xs = self.dense_h_to_4h.forward(xs, tp_ctx)?;
         let xs = xs.gelu_erf()?; // Falcon uses GELU
-        self.dense_4h_to_h.forward(&xs)
+        self.dense_4h_to_h.forward(&xs, tp_ctx)
     }
 }
 
 // ─── Attention ────────────────────────────────────────────────────────────────
 
 struct FalconAttention {
-    query_key_value: Linear, // fused QKV projection
-    dense: Linear,           // output projection
+    query_key_value: TpLinear, // fused QKV projection
+    dense: TpLinear,           // output projection
     rotary_emb: RotaryEmbedding,
     num_heads: usize,
     num_kv_heads: usize,
@@ -61,18 +77,51 @@ struct FalconAttention {
 }
 
 impl FalconAttention {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
+        let world_size = pg.world_size();
+
+        if world_size > 1 {
+            if num_heads % world_size != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
+                )));
+            }
+            if num_kv_heads % world_size != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
+                )));
+            }
+        }
 
         let q_size = num_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
         let qkv_size = q_size + 2 * kv_size;
 
-        // Falcon uses fused QKV with bias
-        let query_key_value = linear(cfg.hidden_size, qkv_size, vb.pp("query_key_value"))?;
-        let dense = linear(q_size, cfg.hidden_size, vb.pp("dense"))?;
+        // Falcon uses fused QKV with bias - column parallel splits output
+        let query_key_value = TpLinear::column_parallel(
+            cfg.hidden_size,
+            qkv_size,
+            true,  // bias
+            false, // no gather
+            vb.pp("query_key_value"),
+            pg,
+        )?;
+        let dense = TpLinear::row_parallel(
+            q_size,
+            cfg.hidden_size,
+            true, // bias
+            true, // input is parallel
+            vb.pp("dense"),
+            pg,
+        )?;
+
+        let num_heads_per_gpu = num_heads / world_size;
+        let num_kv_heads_per_gpu = num_kv_heads / world_size;
+        let q_size_per_gpu = num_heads_per_gpu * head_dim;
+        let kv_size_per_gpu = num_kv_heads_per_gpu * head_dim;
 
         let rotary_emb = RotaryEmbedding::new(
             head_dim,
@@ -86,14 +135,15 @@ impl FalconAttention {
             query_key_value,
             dense,
             rotary_emb,
-            num_heads,
-            num_kv_heads,
+            num_heads: num_heads_per_gpu,
+            num_kv_heads: num_kv_heads_per_gpu,
             head_dim,
-            q_size,
-            kv_size,
+            q_size: q_size_per_gpu,
+            kv_size: kv_size_per_gpu,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
@@ -102,11 +152,12 @@ impl FalconAttention {
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
         // Fused QKV projection
-        let qkv = self.query_key_value.forward(xs)?;
+        let qkv = self.query_key_value.forward(xs, tp_ctx)?;
         let (q, k, v) = self.split_qkv(&qkv)?;
 
         let q = q
@@ -136,7 +187,7 @@ impl FalconAttention {
             self.head_dim,
         )?;
 
-        attn_output.apply(&self.dense)
+        self.dense.forward(&attn_output, tp_ctx)
     }
 
     fn forward_decode_batch(
@@ -144,10 +195,11 @@ impl FalconAttention {
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
-        let qkv = self.query_key_value.forward(xs)?;
+        let qkv = self.query_key_value.forward(xs, tp_ctx)?;
         let (q, k, v) = self.split_qkv(&qkv)?;
 
         let q = q
@@ -213,7 +265,7 @@ impl FalconAttention {
                 max_seq_len,
             )?;
 
-            attn_output.apply(&self.dense)?.unsqueeze(1)
+            self.dense.forward(&attn_output, tp_ctx)?.unsqueeze(1)
         }
 
         #[cfg(not(feature = "cuda-kernels"))]
@@ -243,7 +295,7 @@ impl FalconAttention {
             }
 
             let attn_output = Tensor::cat(&outputs, 0)?;
-            attn_output.apply(&self.dense)
+            self.dense.forward(&attn_output, tp_ctx)
         }
     }
 
@@ -275,9 +327,9 @@ struct FalconDecoderLayer {
 }
 
 impl FalconDecoderLayer {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let self_attention = FalconAttention::new(cfg, vb.pp("self_attention"))?;
-        let mlp = FalconMlp::new(cfg.hidden_size, vb.pp("mlp"))?;
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+        let self_attention = FalconAttention::new_with_tp(cfg, vb.pp("self_attention"), pg)?;
+        let mlp = FalconMlp::new(cfg.hidden_size, vb.pp("mlp"), pg)?;
 
         let layer_norm_eps = cfg.rms_norm_eps; // reuse rms_norm_eps for layer_norm_epsilon
         let input_layernorm =
@@ -300,6 +352,7 @@ impl FalconDecoderLayer {
         layer_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
 
@@ -314,10 +367,11 @@ impl FalconDecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             block_table,
             slot_mapping,
+            tp_ctx,
         )?;
 
         // MLP output (from same normalized input - parallel attention)
-        let mlp_output = self.mlp.forward(&xs)?;
+        let mlp_output = self.mlp.forward(&xs, tp_ctx)?;
 
         // Parallel: residual + attention + mlp
         (residual + attn_output + mlp_output)?.contiguous()
@@ -329,6 +383,7 @@ impl FalconDecoderLayer {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
@@ -337,9 +392,10 @@ impl FalconDecoderLayer {
             &xs,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
+            tp_ctx,
         )?;
 
-        let mlp_output = self.mlp.forward(&xs)?;
+        let mlp_output = self.mlp.forward(&xs, tp_ctx)?;
 
         (residual + attn_output + mlp_output)?.contiguous()
     }
@@ -348,33 +404,71 @@ impl FalconDecoderLayer {
 // ─── Model ────────────────────────────────────────────────────────────────────
 
 pub struct FalconForCausalLM {
-    word_embeddings: Embedding,
+    word_embeddings: TpEmbedding,
     layers: Vec<FalconDecoderLayer>,
     ln_f: LayerNorm,
-    lm_head: Linear,
+    lm_head: TpLinear,
+    tp_ctx: TpContext,
     device: Device,
     dtype: DType,
 }
 
 impl FalconForCausalLM {
+    /// Create a new Falcon model for single GPU.
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
+    }
+
+    /// Create a new Falcon model with tensor parallelism.
+    pub fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
         let vb_t = vb.pp("transformer");
-        let word_embeddings = embedding(cfg.vocab_size, cfg.hidden_size, vb_t.pp("word_embeddings"))?;
+        let world_size = pg.world_size();
+
+        let word_embeddings = TpEmbedding::new(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb_t.pp("word_embeddings"),
+            pg,
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_h = vb_t.pp("h");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(FalconDecoderLayer::new(cfg, vb_h.pp(i))?);
+            layers.push(FalconDecoderLayer::new_with_tp(cfg, vb_h.pp(i), pg)?);
         }
 
         let layer_norm_eps = cfg.rms_norm_eps;
         let ln_f = layer_norm(cfg.hidden_size, layer_norm_eps, vb_t.pp("ln_f"))?;
 
-        // Falcon typically ties word embeddings
-        let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(word_embeddings.embeddings().clone(), None)
+        let lm_head = if cfg.tie_word_embeddings && world_size == 1 {
+            let emb_weights = word_embeddings
+                .embeddings()
+                .expect("single GPU should have accessible embeddings")
+                .clone();
+            TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
+        } else if cfg.tie_word_embeddings {
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true,
+                vb_t.pp("word_embeddings"),
+                pg,
+            )?
         } else {
-            linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true,
+                vb.pp("lm_head"),
+                pg,
+            )?
         };
 
         Ok(Self {
@@ -382,6 +476,7 @@ impl FalconForCausalLM {
             layers,
             ln_f,
             lm_head,
+            tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -407,7 +502,7 @@ impl FalconForCausalLM {
             )?)
         };
 
-        let mut xs = self.word_embeddings.forward(input_ids)?;
+        let mut xs = self.word_embeddings.forward(input_ids, &self.tp_ctx)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
                 &xs,
@@ -417,15 +512,19 @@ impl FalconForCausalLM {
                 layer_idx,
                 block_table,
                 slot_mapping,
+                &self.tp_ctx,
             )?;
         }
         let xs = self.ln_f.forward(&xs)?;
-        let logits = self.lm_head.forward(&xs)?;
-        Ok(logits)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn tp_context(&self) -> &TpContext {
+        &self.tp_ctx
     }
 }
 
@@ -438,7 +537,8 @@ impl crate::engine::ModelForward for FalconForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(
+        FalconForCausalLM::forward(
+            self,
             input_ids,
             seqlen_offset,
             kv_cache_mgr,
@@ -453,15 +553,20 @@ impl crate::engine::ModelForward for FalconForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        let mut xs = self.word_embeddings.forward(input_ids)?;
+        let mut xs = self.word_embeddings.forward(input_ids, &self.tp_ctx)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
+            xs = layer.forward_decode_batch(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                &self.tp_ctx,
+            )?;
         }
 
         let xs = self.ln_f.forward(&xs)?;
-        let logits = self.lm_head.forward(&xs)?;
-        Ok(logits)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     fn device(&self) -> &Device {
@@ -516,6 +621,7 @@ mod tests {
             dtype: DType::F32,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -665,5 +771,24 @@ mod tests {
             )
             .expect("decode");
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_falcon_tp_construction() {
+        let cfg = test_config_gqa();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let pg = LocalProcessGroup::new();
+        let tp_ctx = TpContext::single_gpu();
+
+        let model = FalconForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx);
+        assert!(
+            model.is_ok(),
+            "FalconForCausalLM should construct with TP: {:?}",
+            model.err()
+        );
+
+        let model = model.unwrap();
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
     }
 }

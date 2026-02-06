@@ -123,6 +123,8 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("awq") => QuantizationMethod::Awq,
         Some("bitsandbytes") => QuantizationMethod::BitsAndBytes,
         Some("squeezellm") => QuantizationMethod::SqueezeLlm,
+        Some("compressed-tensors") => QuantizationMethod::CompressedTensors,
+        Some("torchao") => QuantizationMethod::Torchao,
         _ => return None,
     };
 
@@ -202,6 +204,8 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "awq" => QuantizationMethod::Awq,
                 "bitsandbytes" => QuantizationMethod::BitsAndBytes,
                 "squeezellm" => QuantizationMethod::SqueezeLlm,
+                "compressed-tensors" => QuantizationMethod::CompressedTensors,
+                "torchao" => QuantizationMethod::Torchao,
                 _ => QuantizationMethod::None,
             };
 

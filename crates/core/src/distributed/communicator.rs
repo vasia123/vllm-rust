@@ -63,6 +63,34 @@ pub trait DeviceCommunicator: Send + Sync {
 
     /// Barrier: synchronize all ranks.
     fn barrier(&self) -> Result<()>;
+
+    /// All-to-all: each rank sends distinct data to each other rank.
+    ///
+    /// Input tensor is split into `world_size` equal chunks along dimension 0.
+    /// Chunk i is sent to rank i, and this rank receives chunk j from rank j.
+    ///
+    /// Input shape: [world_size * chunk_size, ...]
+    /// Output shape: [world_size * chunk_size, ...] (same shape, different data)
+    ///
+    /// For single GPU, this is identity.
+    fn all_to_all(&self, tensor: &Tensor) -> Result<Tensor>;
+
+    /// Variable-size all-to-all: each rank sends/receives different amounts to/from each rank.
+    ///
+    /// # Arguments
+    /// * `tensor` - Input tensor, total size along dim 0 equals sum of send_splits
+    /// * `send_splits` - Number of elements to send to each rank (length = world_size)
+    /// * `recv_splits` - Number of elements to receive from each rank (length = world_size)
+    ///
+    /// Output tensor has size sum(recv_splits) along dimension 0.
+    ///
+    /// For single GPU, this is identity (send_splits and recv_splits must be equal).
+    fn all_to_all_v(
+        &self,
+        tensor: &Tensor,
+        send_splits: &[usize],
+        recv_splits: &[usize],
+    ) -> Result<Tensor>;
 }
 
 /// Mock communicator for single-GPU execution.
@@ -136,6 +164,70 @@ impl<P: ProcessGroup + Send + Sync> DeviceCommunicator for MockCommunicator<P> {
     fn barrier(&self) -> Result<()> {
         // No-op for mock
         Ok(())
+    }
+
+    fn all_to_all(&self, tensor: &Tensor) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            return Ok(tensor.clone());
+        }
+        // For testing multi-GPU: simulate by permuting chunks
+        // In a real all-to-all, chunk i from rank j goes to rank i from rank j
+        // For mock with simulated multi-rank, we just return identity
+        // since we can't actually communicate between processes
+        Ok(tensor.clone())
+    }
+
+    fn all_to_all_v(
+        &self,
+        tensor: &Tensor,
+        send_splits: &[usize],
+        recv_splits: &[usize],
+    ) -> Result<Tensor> {
+        if self.process_group.is_single() {
+            // For single GPU, send_splits should equal recv_splits
+            debug_assert_eq!(send_splits, recv_splits);
+            return Ok(tensor.clone());
+        }
+
+        // For mock multi-GPU testing:
+        // We can't actually exchange data between processes, but we can
+        // simulate the shape transformation for flow testing.
+        let total_send: usize = send_splits.iter().sum();
+        let total_recv: usize = recv_splits.iter().sum();
+        let dims = tensor.dims();
+
+        if dims.is_empty() {
+            return Err(super::error::DistributedError::ShapeMismatch {
+                expected: vec![total_recv],
+                actual: dims.to_vec(),
+            });
+        }
+
+        // If sizes match, return tensor as-is (best mock for flow testing)
+        if total_send == total_recv {
+            return Ok(tensor.clone());
+        }
+
+        // If sizes differ, we need to reshape output
+        // For smaller recv: narrow the tensor
+        // For larger recv: pad with zeros
+        let mut new_dims = dims.to_vec();
+        new_dims[0] = total_recv;
+
+        if total_recv <= total_send {
+            // Take first total_recv elements
+            Ok(tensor.narrow(0, 0, total_recv)?)
+        } else {
+            // Pad with zeros
+            let output = Tensor::zeros(new_dims.as_slice(), tensor.dtype(), tensor.device())?;
+            // Copy existing data to start of output
+            let indices = Tensor::from_vec(
+                (0..total_send as u32).collect::<Vec<u32>>(),
+                total_send,
+                tensor.device(),
+            )?;
+            Ok(output.index_add(&indices, tensor, 0)?)
+        }
     }
 }
 
@@ -262,5 +354,82 @@ mod tests {
         let pg_ref = comm.process_group();
         assert_eq!(pg_ref.rank(), 2);
         assert_eq!(pg_ref.world_size(), 8);
+    }
+
+    #[test]
+    fn mock_all_to_all_single_gpu() {
+        let pg = LocalProcessGroup::new();
+        let comm = MockCommunicator::new(pg);
+
+        let input = make_test_tensor(&[4, 3]);
+        let output = comm.all_to_all(&input).unwrap();
+
+        // Single GPU: identity
+        assert_eq!(output.dims(), input.dims());
+    }
+
+    #[test]
+    fn mock_all_to_all_multi_gpu_simulation() {
+        let pg = LocalProcessGroup::with_rank(0, 4);
+        let comm = MockCommunicator::new(pg);
+
+        // Input: [world_size * chunk_size, hidden]
+        let input = make_test_tensor(&[8, 3]); // 4 ranks, 2 elements each
+        let output = comm.all_to_all(&input).unwrap();
+
+        // Mock returns identity for simulated multi-GPU
+        assert_eq!(output.dims(), &[8, 3]);
+    }
+
+    #[test]
+    fn mock_all_to_all_v_single_gpu() {
+        let pg = LocalProcessGroup::new();
+        let comm = MockCommunicator::new(pg);
+
+        let input = make_test_tensor(&[5, 3]);
+        let send_splits = vec![5];
+        let recv_splits = vec![5];
+
+        let output = comm
+            .all_to_all_v(&input, &send_splits, &recv_splits)
+            .unwrap();
+
+        // Single GPU: identity
+        assert_eq!(output.dims(), input.dims());
+    }
+
+    #[test]
+    fn mock_all_to_all_v_multi_gpu_simulation() {
+        let pg = LocalProcessGroup::with_rank(0, 4);
+        let comm = MockCommunicator::new(pg);
+
+        // Sending different amounts to each rank
+        let input = make_test_tensor(&[10, 3]); // Total 10 tokens to send
+        let send_splits = vec![2, 3, 2, 3]; // Send 2,3,2,3 to ranks 0,1,2,3
+        let recv_splits = vec![1, 4, 2, 3]; // Receive 1,4,2,3 from ranks 0,1,2,3
+
+        let output = comm
+            .all_to_all_v(&input, &send_splits, &recv_splits)
+            .unwrap();
+
+        // Output should have sum(recv_splits) = 10 along dim 0
+        assert_eq!(output.dims(), &[10, 3]);
+    }
+
+    #[test]
+    fn mock_all_to_all_v_variable_output_size() {
+        let pg = LocalProcessGroup::with_rank(1, 2);
+        let comm = MockCommunicator::new(pg);
+
+        let input = make_test_tensor(&[6, 4]);
+        let send_splits = vec![2, 4]; // Send 2 to rank 0, 4 to rank 1
+        let recv_splits = vec![3, 5]; // Receive 3 from rank 0, 5 from rank 1
+
+        let output = comm
+            .all_to_all_v(&input, &send_splits, &recv_splits)
+            .unwrap();
+
+        // Output shape based on recv_splits sum
+        assert_eq!(output.dims(), &[8, 4]);
     }
 }

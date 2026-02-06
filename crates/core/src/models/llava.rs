@@ -150,15 +150,13 @@ pub trait LanguageModelCore: Send + 'static {
 
 impl LLaVAForConditionalGeneration {
     /// Create a new LLaVA model.
-    pub fn new(
-        cfg: &LLaVAConfig,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    pub fn new(cfg: &LLaVAConfig, vb: VarBuilder) -> Result<Self> {
         // Vision encoder
         let vision_encoder = VisionEncoder::new(&cfg.vision_config, vb.pp("vision_tower"))?;
 
         // Projector
-        let projector = MultimodalProjector::new(&cfg.projector_config, vb.pp("multi_modal_projector"))?;
+        let projector =
+            MultimodalProjector::new(&cfg.projector_config, vb.pp("multi_modal_projector"))?;
 
         // Embedding layer
         let embed_tokens = candle_nn::embedding(
@@ -183,6 +181,23 @@ impl LLaVAForConditionalGeneration {
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
+    }
+
+    /// Create a LLaVA model from a generic ModelConfig.
+    ///
+    /// Extracts vision and projector configuration from the ModelConfig's extra
+    /// fields, falling back to LLaVA 1.5 defaults when not specified.
+    pub fn from_model_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        // Determine LLaVA variant from extra config fields
+        let llava_cfg = if cfg.extra.contains_key("vision_config") {
+            // TODO: Parse full vision config from extra fields when available.
+            // For now, use LLaVA 1.5 defaults as a reasonable fallback.
+            LLaVAConfig::llava_1_5(cfg.clone())
+        } else {
+            LLaVAConfig::llava_1_5(cfg.clone())
+        };
+
+        Self::new(&llava_cfg, vb)
     }
 
     /// Encode images using the vision encoder and projector.
@@ -401,8 +416,11 @@ impl crate::engine::ModelForward for LLaVAForConditionalGeneration {
     ) -> Result<Tensor> {
         // During decode, no image tokens (already processed in prefill)
         let embeddings = self.embed_tokens.forward(input_ids)?;
-        self.language_model
-            .forward_decode_batch_with_embeddings(&embeddings, sequences, kv_cache_mgr)
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
     }
 
     fn supports_multimodal(&self) -> bool {

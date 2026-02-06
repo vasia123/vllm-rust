@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::kv_cache::{prefix_cache::PrefixCache, BlockTable};
+use crate::kv_cache::BlockTable;
 use crate::request::{RequestId, SequenceState};
 use crate::scheduler::Scheduler;
 
@@ -26,10 +26,13 @@ pub(crate) struct ActiveRequest {
 }
 
 /// Owned execution state for strategies.
+///
+/// Prefix caching is managed by `KVCacheManager` (not stored here) so that
+/// all prefix operations (match, register, release, eviction) are coordinated
+/// through the manager's block pool.
 pub(crate) struct OwnedExecutionState {
     pub scheduler: Scheduler,
     pub requests: HashMap<RequestId, ActiveRequest>,
-    pub prefix_cache: Option<PrefixCache>,
     pub next_id: RequestId,
     /// CUDA Graph dispatcher for graph capture/replay
     pub cuda_graph_dispatcher: Arc<std::sync::RwLock<CudaGraphDispatcher>>,
@@ -38,11 +41,6 @@ pub(crate) struct OwnedExecutionState {
 impl OwnedExecutionState {
     pub fn new(config: &EngineConfig) -> Self {
         let scheduler = Scheduler::new(config.scheduler_config);
-        let prefix_cache = if config.enable_prefix_caching {
-            Some(PrefixCache::new(config.block_size))
-        } else {
-            None
-        };
 
         let cuda_graph_dispatcher = Arc::new(std::sync::RwLock::new(CudaGraphDispatcher::new(
             config.cuda_graph_config.clone(),
@@ -51,7 +49,6 @@ impl OwnedExecutionState {
         Self {
             scheduler,
             requests: HashMap::new(),
-            prefix_cache,
             next_id: 0,
             cuda_graph_dispatcher,
         }

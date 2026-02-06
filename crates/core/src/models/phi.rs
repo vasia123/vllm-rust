@@ -9,46 +9,67 @@
 //! Reference: https://huggingface.co/microsoft/phi-1_5
 
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, VarBuilder};
+use candle_nn::{layer_norm, LayerNorm, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding};
 
-// ─── MLP ──────────────────────────────────────────────────────────────────────
+pub use super::tp_layers::TpContext;
+use super::tp_layers::{TpEmbedding, TpLinear};
+
+// ── MLP ──────────────────────────────────────────────────────────────────────
 
 /// Phi MLP with GELU activation.
 /// Uses fc1 and fc2 (not gate/up/down like SwiGLU).
 struct PhiMlp {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: TpLinear,
+    fc2: TpLinear,
 }
 
 impl PhiMlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         // Phi uses bias in MLP layers
-        let fc1 = linear(hidden_size, intermediate_size, vb.pp("fc1"))?;
-        let fc2 = linear(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc1 = TpLinear::column_parallel(
+            hidden_size,
+            intermediate_size,
+            true,  // bias
+            false, // no gather
+            vb.pp("fc1"),
+            pg,
+        )?;
+        let fc2 = TpLinear::row_parallel(
+            intermediate_size,
+            hidden_size,
+            true, // bias
+            true, // input is parallel
+            vb.pp("fc2"),
+            pg,
+        )?;
         Ok(Self { fc1, fc2 })
     }
-}
 
-impl Module for PhiMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = self.fc1.forward(xs)?;
+    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+        let xs = self.fc1.forward(xs, tp_ctx)?;
         let xs = xs.gelu_erf()?; // Phi uses GELU activation
-        self.fc2.forward(&xs)
+        self.fc2.forward(&xs, tp_ctx)
     }
 }
 
-// ─── Attention ────────────────────────────────────────────────────────────────
+// ── Attention ────────────────────────────────────────────────────────────────
 
 struct PhiAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    dense: Linear, // output projection (called "dense" in Phi)
+    q_proj: TpLinear,
+    k_proj: TpLinear,
+    v_proj: TpLinear,
+    dense: TpLinear, // output projection (called "dense" in Phi)
     rotary_emb: RotaryEmbedding,
     num_heads: usize,
     num_kv_heads: usize,
@@ -56,16 +77,61 @@ struct PhiAttention {
 }
 
 impl PhiAttention {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
+        let world_size = pg.world_size();
+
+        if world_size > 1 {
+            if num_heads % world_size != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
+                )));
+            }
+            if num_kv_heads % world_size != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
+                )));
+            }
+        }
 
         // Phi uses bias in attention projections
-        let q_proj = linear(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let dense = linear(num_heads * head_dim, cfg.hidden_size, vb.pp("dense"))?;
+        let q_proj = TpLinear::column_parallel(
+            cfg.hidden_size,
+            num_heads * head_dim,
+            true,  // bias
+            false, // no gather
+            vb.pp("q_proj"),
+            pg,
+        )?;
+        let k_proj = TpLinear::column_parallel(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            true,  // bias
+            false, // no gather
+            vb.pp("k_proj"),
+            pg,
+        )?;
+        let v_proj = TpLinear::column_parallel(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            true,  // bias
+            false, // no gather
+            vb.pp("v_proj"),
+            pg,
+        )?;
+        let dense = TpLinear::row_parallel(
+            num_heads * head_dim,
+            cfg.hidden_size,
+            true, // bias
+            true, // input is parallel
+            vb.pp("dense"),
+            pg,
+        )?;
+
+        let num_heads_per_gpu = num_heads / world_size;
+        let num_kv_heads_per_gpu = num_kv_heads / world_size;
 
         let rotary_emb = RotaryEmbedding::new(
             head_dim,
@@ -81,12 +147,13 @@ impl PhiAttention {
             v_proj,
             dense,
             rotary_emb,
-            num_heads,
-            num_kv_heads,
+            num_heads: num_heads_per_gpu,
+            num_kv_heads: num_kv_heads_per_gpu,
             head_dim,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
@@ -95,12 +162,13 @@ impl PhiAttention {
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let q = self.q_proj.forward(xs, tp_ctx)?;
+        let k = self.k_proj.forward(xs, tp_ctx)?;
+        let v = self.v_proj.forward(xs, tp_ctx)?;
 
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -129,7 +197,7 @@ impl PhiAttention {
             self.head_dim,
         )?;
 
-        attn_output.apply(&self.dense)
+        self.dense.forward(&attn_output, tp_ctx)
     }
 
     fn forward_decode_batch(
@@ -137,12 +205,13 @@ impl PhiAttention {
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let q = self.q_proj.forward(xs, tp_ctx)?;
+        let k = self.k_proj.forward(xs, tp_ctx)?;
+        let v = self.v_proj.forward(xs, tp_ctx)?;
 
         let q = q
             .reshape((batch_size, 1, self.num_heads, self.head_dim))?
@@ -207,7 +276,7 @@ impl PhiAttention {
                 max_seq_len,
             )?;
 
-            attn_output.apply(&self.dense)?.unsqueeze(1)
+            self.dense.forward(&attn_output, tp_ctx)?.unsqueeze(1)
         }
 
         #[cfg(not(feature = "cuda-kernels"))]
@@ -237,23 +306,23 @@ impl PhiAttention {
             }
 
             let attn_output = Tensor::cat(&outputs, 0)?;
-            attn_output.apply(&self.dense)
+            self.dense.forward(&attn_output, tp_ctx)
         }
     }
 }
 
-// ─── Decoder Layer ────────────────────────────────────────────────────────────
+// ── Decoder Layer ────────────────────────────────────────────────────────────
 
 struct PhiDecoderLayer {
     self_attn: PhiAttention,
     mlp: PhiMlp,
     input_layernorm: LayerNorm, // Phi uses LayerNorm, not RMSNorm
-    // NOTE: Phi has no post_attention_layernorm - uses parallel attn+mlp
+                                // NOTE: Phi has no post_attention_layernorm - uses parallel attn+mlp
 }
 
 impl PhiDecoderLayer {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let self_attn = PhiAttention::new(cfg, vb.pp("self_attn"))?;
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+        let self_attn = PhiAttention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
 
         // Phi intermediate size: default is 4 * hidden_size if not specified
         let intermediate_size = if cfg.intermediate_size > 0 {
@@ -261,7 +330,7 @@ impl PhiDecoderLayer {
         } else {
             4 * cfg.hidden_size
         };
-        let mlp = PhiMlp::new(cfg.hidden_size, intermediate_size, vb.pp("mlp"))?;
+        let mlp = PhiMlp::new(cfg.hidden_size, intermediate_size, vb.pp("mlp"), pg)?;
 
         // Phi uses layer_norm_eps (typically 1e-5)
         let layer_norm_eps = cfg.rms_norm_eps; // reuse rms_norm_eps field
@@ -285,6 +354,7 @@ impl PhiDecoderLayer {
         layer_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
 
@@ -299,10 +369,11 @@ impl PhiDecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             block_table,
             slot_mapping,
+            tp_ctx,
         )?;
 
         // MLP output (from same normalized input)
-        let mlp_output = self.mlp.forward(&xs)?;
+        let mlp_output = self.mlp.forward(&xs, tp_ctx)?;
 
         // Parallel: residual + attention + mlp
         (residual + attn_output + mlp_output)?.contiguous()
@@ -314,6 +385,7 @@ impl PhiDecoderLayer {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
@@ -322,34 +394,50 @@ impl PhiDecoderLayer {
             &xs,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
+            tp_ctx,
         )?;
 
-        let mlp_output = self.mlp.forward(&xs)?;
+        let mlp_output = self.mlp.forward(&xs, tp_ctx)?;
 
         (residual + attn_output + mlp_output)?.contiguous()
     }
 }
 
-// ─── Model ────────────────────────────────────────────────────────────────────
+// ── Model ────────────────────────────────────────────────────────────────────
 
 pub struct PhiForCausalLM {
-    embed_tokens: Embedding,
+    embed_tokens: TpEmbedding,
     layers: Vec<PhiDecoderLayer>,
     final_layernorm: LayerNorm,
-    lm_head: Linear, // Phi uses bias in lm_head
+    lm_head: TpLinear, // Phi uses bias in lm_head
+    tp_ctx: TpContext,
     device: Device,
     dtype: DType,
 }
 
 impl PhiForCausalLM {
+    /// Create a new Phi model for single GPU.
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
+    }
+
+    /// Create a new Phi model with tensor parallelism.
+    pub fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let world_size = pg.world_size();
+
+        let embed_tokens =
+            TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(PhiDecoderLayer::new(cfg, vb_l.pp(i))?);
+            layers.push(PhiDecoderLayer::new_with_tp(cfg, vb_l.pp(i), pg)?);
         }
 
         let layer_norm_eps = cfg.rms_norm_eps;
@@ -357,13 +445,38 @@ impl PhiForCausalLM {
             layer_norm(cfg.hidden_size, layer_norm_eps, vb_m.pp("final_layernorm"))?;
 
         // Phi uses bias in lm_head (unlike Llama)
-        let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let lm_head = if cfg.tie_word_embeddings && world_size == 1 {
+            let emb_weights = embed_tokens
+                .embeddings()
+                .expect("single GPU should have accessible embeddings")
+                .clone();
+            TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
+        } else if cfg.tie_word_embeddings {
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true,
+                vb_m.pp("embed_tokens"),
+                pg,
+            )?
+        } else {
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                true, // Phi lm_head has bias
+                true,
+                vb.pp("lm_head"),
+                pg,
+            )?
+        };
 
         Ok(Self {
             embed_tokens,
             layers,
             final_layernorm,
             lm_head,
+            tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -389,7 +502,7 @@ impl PhiForCausalLM {
             )?)
         };
 
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
                 &xs,
@@ -399,15 +512,19 @@ impl PhiForCausalLM {
                 layer_idx,
                 block_table,
                 slot_mapping,
+                &self.tp_ctx,
             )?;
         }
         let xs = self.final_layernorm.forward(&xs)?;
-        let logits = self.lm_head.forward(&xs)?;
-        Ok(logits)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn tp_context(&self) -> &TpContext {
+        &self.tp_ctx
     }
 }
 
@@ -420,7 +537,8 @@ impl crate::engine::ModelForward for PhiForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(
+        PhiForCausalLM::forward(
+            self,
             input_ids,
             seqlen_offset,
             kv_cache_mgr,
@@ -435,15 +553,20 @@ impl crate::engine::ModelForward for PhiForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
+            xs = layer.forward_decode_batch(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                &self.tp_ctx,
+            )?;
         }
 
         let xs = self.final_layernorm.forward(&xs)?;
-        let logits = self.lm_head.forward(&xs)?;
-        Ok(logits)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     fn device(&self) -> &Device {
@@ -489,6 +612,7 @@ mod tests {
             dtype: DType::F32,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -627,5 +751,24 @@ mod tests {
             )
             .expect("decode");
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_phi_tp_construction() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let pg = LocalProcessGroup::new();
+        let tp_ctx = TpContext::single_gpu();
+
+        let model = PhiForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx);
+        assert!(
+            model.is_ok(),
+            "PhiForCausalLM should construct with TP: {:?}",
+            model.err()
+        );
+
+        let model = model.unwrap();
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
     }
 }

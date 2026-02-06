@@ -101,6 +101,7 @@ impl EngineBuilder for ProductionEngineBuilder {
             dtype,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         };
         eprintln!(
             "Allocating KV cache ({} blocks)...",
@@ -132,6 +133,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                 dtype,
                 device: device.clone(),
                 kv_cache_dtype: KVCacheDtype::Auto,
+                cpu_offload: None,
             };
             eprintln!(
                 "Allocating draft KV cache ({} blocks)...",

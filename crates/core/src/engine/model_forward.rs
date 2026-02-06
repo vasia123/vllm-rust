@@ -10,6 +10,8 @@ use super::cuda_graph::ForwardContext;
 
 /// Per-sequence metadata for batched decode (one token per sequence).
 pub struct DecodeSequenceMetadata {
+    /// Unique request identifier for per-request state tracking (e.g., SSM state).
+    pub request_id: u64,
     pub seqlen_offset: usize,
     pub block_ids: Vec<BlockId>,
     pub slot_mapping: Vec<usize>,

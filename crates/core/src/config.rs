@@ -93,6 +93,148 @@ impl ModelConfig {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
     }
+
+    // ─── GLM Model Config Getters ───────────────────────────────────────────────
+
+    /// Get partial rotary factor for GLM models (default 1.0 = full rotation).
+    /// GLM models use 0.5 to only rotate half of head_dim.
+    pub fn partial_rotary_factor(&self) -> f64 {
+        self.extra
+            .get("partial_rotary_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+    }
+
+    /// Check if neox-style rotation is used (interleaved vs split).
+    /// GLM models use false (split style).
+    pub fn is_neox_style(&self) -> bool {
+        // "original_rope" = true means use standard (neox) style
+        // GLM uses !original_rope which defaults to split style
+        self.extra
+            .get("original_rope")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    /// Get rope ratio multiplier (ChatGLM specific).
+    pub fn rope_ratio(&self) -> f64 {
+        self.extra
+            .get("rope_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+    }
+
+    /// Get multi_query_group_num for ChatGLM MQA.
+    pub fn multi_query_group_num(&self) -> Option<usize> {
+        self.extra
+            .get("multi_query_group_num")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    // ─── MoE Config Getters (Qwen MoE, GLM4 MoE) ────────────────────────────────
+
+    /// Get shared expert intermediate size (Qwen2-MoE).
+    pub fn shared_expert_intermediate_size(&self) -> Option<usize> {
+        self.extra
+            .get("shared_expert_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get decoder sparse step - which layers are MoE (Qwen2-MoE, Qwen3-MoE).
+    /// If decoder_sparse_step = 2, every 2nd layer is MoE.
+    pub fn decoder_sparse_step(&self) -> Option<usize> {
+        self.extra
+            .get("decoder_sparse_step")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get first_k_dense_replace - first K layers are dense (GLM4-MoE).
+    pub fn first_k_dense_replace(&self) -> Option<usize> {
+        self.extra
+            .get("first_k_dense_replace")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get MoE intermediate size (different from standard intermediate_size).
+    pub fn moe_intermediate_size(&self) -> Option<usize> {
+        self.extra
+            .get("moe_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get number of expert groups (GLM4-MoE grouped top-k).
+    pub fn n_group(&self) -> Option<usize> {
+        self.extra
+            .get("n_group")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get top-k per expert group (GLM4-MoE grouped top-k).
+    pub fn topk_group(&self) -> Option<usize> {
+        self.extra
+            .get("topk_group")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get number of shared experts (GLM4-MoE).
+    pub fn n_shared_experts(&self) -> Option<usize> {
+        self.extra
+            .get("n_shared_experts")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
+
+    /// Get routed scaling factor (GLM4-MoE output scaling).
+    pub fn routed_scaling_factor(&self) -> f64 {
+        self.extra
+            .get("routed_scaling_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+    }
+
+    /// Check if QK normalization is used (GLM4-MoE, Qwen3-MoE).
+    pub fn use_qk_norm(&self) -> bool {
+        self.extra
+            .get("use_qk_norm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Check if top-k probabilities should be renormalized.
+    pub fn norm_topk_prob(&self) -> bool {
+        self.extra
+            .get("norm_topk_prob")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    /// Get MLP-only layers list (Qwen MoE models).
+    pub fn mlp_only_layers(&self) -> Vec<usize> {
+        self.extra
+            .get("mlp_only_layers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get the number of experts for generic MoE (num_experts field).
+    pub fn num_experts(&self) -> Option<usize> {
+        self.extra
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+    }
 }
 
 #[cfg(test)]

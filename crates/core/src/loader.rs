@@ -119,6 +119,8 @@ pub fn quantization_info(files: &ModelFiles) -> String {
         QuantizationMethod::BitsAndBytes => "BitsAndBytes".to_string(),
         QuantizationMethod::SqueezeLlm => "SqueezeLLM".to_string(),
         QuantizationMethod::Marlin => "Marlin".to_string(),
+        QuantizationMethod::CompressedTensors => "Compressed-Tensors".to_string(),
+        QuantizationMethod::Torchao => "TorchAO".to_string(),
     }
 }
 

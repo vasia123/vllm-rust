@@ -335,6 +335,7 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
 
             req.state.status = RequestStatus::Preempted;
             req.state.generated_token_ids.clear();
+            req.state.num_computed_tokens = 0;
             req.state.seqlen_offset = 0;
         }
     }

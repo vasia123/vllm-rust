@@ -23,6 +23,7 @@
 mod attention;
 mod communicator;
 mod error;
+mod launcher;
 mod nccl;
 mod parallel_layers;
 mod pipeline;
@@ -31,13 +32,17 @@ mod process_group;
 pub use attention::{TensorParallelAttention, TensorParallelMLP};
 pub use communicator::{DeviceCommunicator, MockCommunicator, ReduceOp};
 pub use error::DistributedError;
-pub use nccl::{is_nccl_available, NcclCommunicator, NcclDataType, NcclLibrary, NcclUniqueId};
+pub use launcher::{DistributedConfig, NcclProcessGroup};
+pub use nccl::{
+    is_nccl_available, NcclCommunicator, NcclDataType, NcclDeviceCommunicator, NcclLibrary,
+    NcclUniqueId,
+};
 pub use parallel_layers::{ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding};
 pub use pipeline::{
     merge_microbatches, optimal_microbatches, split_microbatches, PipelineCommunicator,
     PipelineSchedule, PipelineStageConfig, SyncPipelineExecutor,
 };
-pub use process_group::{LocalProcessGroup, ParallelConfig, ProcessGroup};
+pub use process_group::{EPContext, LocalProcessGroup, ParallelConfig, ProcessGroup};
 
 #[cfg(test)]
 mod tests {

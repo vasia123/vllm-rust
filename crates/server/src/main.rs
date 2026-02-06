@@ -17,10 +17,13 @@ use vllm_core::{
 };
 
 use vllm_server::api::{
-    self, admin::types::RuntimeConfig, AdminState, AppState, AtomicEngineHandle,
-    ProductionEngineBuilder,
+    self,
+    admin::{prometheus, types::RuntimeConfig},
+    AdminState, AppState, AtomicEngineHandle, ProductionEngineBuilder,
 };
 use vllm_server::config::ServerConfig;
+use vllm_server::logging;
+use vllm_server::shutdown::shutdown_signal;
 
 #[derive(Parser)]
 #[command(name = "vllm-server", about = "Rust LLM inference engine")]
@@ -69,6 +72,30 @@ enum Command {
         /// Example: --lora-adapter sql=./sql-adapter --lora-adapter code=./code-adapter
         #[arg(long = "lora-adapter")]
         lora_adapters: Vec<String>,
+
+        /// Enable prefix caching for KV cache reuse
+        #[arg(long)]
+        enable_prefix_caching: bool,
+
+        /// Enable chunked prefill for long prompts
+        #[arg(long)]
+        enable_chunked_prefill: bool,
+
+        /// Graceful shutdown timeout in seconds (force shutdown after this duration)
+        #[arg(long, default_value_t = 30)]
+        shutdown_timeout: u64,
+
+        /// Comma-separated list of allowed CORS origins ("*" allows all)
+        #[arg(long, default_value = "*")]
+        allowed_origins: String,
+
+        /// Comma-separated list of allowed CORS HTTP methods
+        #[arg(long, default_value = "GET,POST,OPTIONS")]
+        allowed_methods: String,
+
+        /// Comma-separated list of allowed CORS headers ("*" allows all)
+        #[arg(long, default_value = "*")]
+        allowed_headers: String,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -121,6 +148,12 @@ async fn main() -> anyhow::Result<()> {
             max_requests,
             multi_step_count,
             lora_adapters,
+            enable_prefix_caching,
+            enable_chunked_prefill,
+            shutdown_timeout,
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = if model == "Qwen/Qwen3-0.6B" {
@@ -161,6 +194,35 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 multi_step_count
             };
+            // Bool flags: CLI flag (true) takes precedence, otherwise fall back to file config
+            let enable_prefix_caching =
+                enable_prefix_caching || file_config.enable_prefix_caching.unwrap_or(false);
+            let enable_chunked_prefill =
+                enable_chunked_prefill || file_config.enable_chunked_prefill.unwrap_or(false);
+
+            // CORS: CLI defaults are the wildcard values; fall back to file config
+            // only when CLI has the default.
+            let allowed_origins = if allowed_origins == "*" {
+                file_config.allowed_origins.unwrap_or(allowed_origins)
+            } else {
+                allowed_origins
+            };
+            let allowed_methods = if allowed_methods == "GET,POST,OPTIONS" {
+                file_config.allowed_methods.unwrap_or(allowed_methods)
+            } else {
+                allowed_methods
+            };
+            let allowed_headers = if allowed_headers == "*" {
+                file_config.allowed_headers.unwrap_or(allowed_headers)
+            } else {
+                allowed_headers
+            };
+
+            let cors_config = api::CorsConfig {
+                allowed_origins,
+                allowed_methods,
+                allowed_headers,
+            };
 
             run_server(
                 model,
@@ -172,6 +234,10 @@ async fn main() -> anyhow::Result<()> {
                 max_requests,
                 multi_step_count,
                 lora_adapters,
+                enable_prefix_caching,
+                enable_chunked_prefill,
+                shutdown_timeout,
+                cors_config,
             )
             .await
         }
@@ -212,8 +278,13 @@ async fn run_server(
     max_requests: usize,
     multi_step_count: usize,
     lora_adapters: Vec<String>,
+    enable_prefix_caching: bool,
+    enable_chunked_prefill: bool,
+    shutdown_timeout: u64,
+    cors_config: api::CorsConfig,
 ) -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    logging::init();
+    prometheus::init_metrics();
 
     eprintln!("Loading model: {model_id}");
     let files = loader::fetch_model(&model_id)?;
@@ -289,6 +360,7 @@ async fn run_server(
         dtype,
         device: device.clone(),
         kv_cache_dtype: KVCacheDtype::Auto,
+        cpu_offload: None,
     };
     eprintln!(
         "Allocating KV cache ({} blocks)...",
@@ -321,6 +393,7 @@ async fn run_server(
             dtype,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         };
         eprintln!(
             "Allocating draft KV cache ({} blocks)...",
@@ -332,15 +405,15 @@ async fn run_server(
             scheduler_config: SchedulerConfig {
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
-                enable_chunked_prefill: false,
-                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                enable_chunked_prefill,
+                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
             multi_step_count: 1,
-            enable_prefix_caching: false,
+            enable_prefix_caching,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
 
@@ -358,13 +431,13 @@ async fn run_server(
             scheduler_config: SchedulerConfig {
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
-                enable_chunked_prefill: false,
-                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                enable_chunked_prefill,
+                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: None,
             multi_step_count,
-            enable_prefix_caching: false,
+            enable_prefix_caching,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
         };
 
@@ -376,12 +449,14 @@ async fn run_server(
     let accepting = Arc::new(AtomicBool::new(true));
     let engine_builder: Arc<ProductionEngineBuilder> = Arc::new(ProductionEngineBuilder);
 
+    let max_model_len = num_blocks * 16;
     let state = AppState::new(
         atomic_engine.clone(),
         model_id.clone(),
         tokenizer,
         chat_template,
         eos_token_id,
+        max_model_len,
         accepting.clone(),
     );
 
@@ -397,9 +472,9 @@ async fn run_server(
         block_size: 16,
         max_requests,
         max_tokens_per_step: 2048,
-        enable_chunked_prefill: false,
+        enable_chunked_prefill,
         multi_step_count,
-        enable_prefix_caching: false,
+        enable_prefix_caching,
         dtype: "bf16".to_string(),
         device: "cuda:0".to_string(),
     };
@@ -414,15 +489,49 @@ async fn run_server(
         engine_builder,
     );
 
-    let app = api::create_full_router(state, admin_state);
+    let cors_layer = api::build_cors_layer(&cors_config);
+    let app = api::create_full_router_with_cors_and_rate_limit(
+        state,
+        admin_state,
+        cors_layer,
+        api::middleware::RateLimitState::unlimited(),
+    );
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("Serving on http://{addr}/v1");
-    eprintln!("Admin panel: http://{addr}/admin/");
+    tracing::info!("Serving on http://{addr}/v1");
+    tracing::info!("Admin panel: http://{addr}/admin/");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
-    atomic_engine.get().shutdown().await?;
+    tracing::info!(
+        timeout_secs = shutdown_timeout,
+        "Server stopped accepting connections, waiting for in-flight requests to complete"
+    );
+
+    // Give in-flight engine work a bounded window to finish before forcing shutdown.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(shutdown_timeout),
+        atomic_engine.get().shutdown(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            tracing::info!("Engine shut down cleanly");
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Engine shutdown returned an error: {e}");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = shutdown_timeout,
+                "Engine shutdown timed out, forcing exit"
+            );
+        }
+    }
+
+    tracing::info!("Shutdown complete");
     Ok(())
 }
 
@@ -460,6 +569,7 @@ async fn run_generate(
         dtype,
         device: device.clone(),
         kv_cache_dtype: KVCacheDtype::Auto,
+        cpu_offload: None,
     };
     eprintln!(
         "Allocating KV cache ({} blocks)...",
@@ -491,6 +601,7 @@ async fn run_generate(
             dtype,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         };
         eprintln!(
             "Allocating draft KV cache ({} blocks)...",
@@ -503,7 +614,7 @@ async fn run_generate(
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
-                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: Some(SpeculativeConfig {
@@ -534,7 +645,7 @@ async fn run_generate(
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
-                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
             block_size: 16,
             speculative_config: None,

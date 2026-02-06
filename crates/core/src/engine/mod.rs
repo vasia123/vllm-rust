@@ -25,6 +25,7 @@ mod embedding_forward;
 mod handle;
 mod helpers;
 mod model_forward;
+pub mod spec_decode;
 mod speculative;
 mod standard;
 mod strategy;
@@ -39,11 +40,13 @@ pub use cuda_graph::{
 pub use cuda_graph_runner::{
     CudaGraphRunner, CudaGraphRunnerBuilder, CudaGraphRunnerError, CudaGraphRunnerStats,
 };
+pub use embedding_forward::{pool_embeddings, EmbeddingOutput, ModelForEmbedding, PoolingStrategy};
 pub use handle::EngineHandle;
-pub use embedding_forward::{
-    pool_embeddings, EmbeddingOutput, ModelForEmbedding, PoolingStrategy,
-};
 pub use model_forward::{DecodeSequenceMetadata, ModelForward};
+pub use spec_decode::{
+    DraftModelProposer, EagleConfig, EagleProposer, MedusaHead, MedusaProposer, NGramConfig,
+    NGramProposer, SpeculationTree, SpeculativeProposer, SuffixArrayConfig, SuffixArrayProposer,
+};
 pub use types::{
     EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest, GenerationResult,
     SpeculativeConfig, StreamEvent,
@@ -457,6 +460,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -533,6 +537,7 @@ mod tests {
                     let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
                     req.state.status = RequestStatus::Preempted;
                     req.state.generated_token_ids.clear();
+                    req.state.num_computed_tokens = 0;
                     req.state.seqlen_offset = 0;
                 }
 
@@ -608,6 +613,22 @@ mod tests {
         output
     }
 
+    fn chunked_engine_config(max_tokens_per_step: usize) -> EngineConfig {
+        EngineConfig {
+            scheduler_config: SchedulerConfig {
+                max_running_requests: 8,
+                max_tokens_per_step,
+                enable_chunked_prefill: true,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            block_size: 16,
+            speculative_config: None,
+            multi_step_count: 1,
+            enable_prefix_caching: false,
+            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+        }
+    }
+
     #[tokio::test]
     async fn single_request_generates_tokens() {
         let cache_config = test_cache_config();
@@ -680,5 +701,663 @@ mod tests {
             results[2].as_ref().unwrap().generated_token_ids,
             vec![42, 42]
         );
+    }
+
+    // ─── Chunked Prefill Tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chunked_prefill_long_prompt_split_into_chunks() {
+        // 25-token prompt with max_tokens_per_step=10 should be split
+        // into chunks of 10, 10, 5 tokens across 3 engine steps.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = chunked_engine_config(10);
+
+        let prompt: Vec<u32> = (1..=25).collect();
+        let results =
+            run_engine_with_pretokenized(model, kv_cache_mgr, config, vec![(prompt, 3, 999)]).await;
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42, 42]);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_matches_non_chunked_output() {
+        // Same prompt and model should produce identical tokens whether
+        // chunked prefill is enabled or not.
+        let prompt: Vec<u32> = (1..=30).collect();
+        let max_new_tokens = 5;
+        let eos_token = 999u32;
+
+        // Non-chunked
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = test_engine_config();
+        let results_no_chunk = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(prompt.clone(), max_new_tokens, eos_token)],
+        )
+        .await;
+
+        // Chunked (budget=8, so 30 tokens -> chunks of 8,8,8,6)
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = chunked_engine_config(8);
+        let results_chunked = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(prompt, max_new_tokens, eos_token)],
+        )
+        .await;
+
+        let r1 = results_no_chunk[0].as_ref().unwrap();
+        let r2 = results_chunked[0].as_ref().unwrap();
+        assert_eq!(r1.generated_token_ids, r2.generated_token_ids);
+        assert_eq!(r1.finish_reason, r2.finish_reason);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_eos_after_chunked_prompt() {
+        // The model should still stop at EOS even when prefill was chunked.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        // CountingMockModel: emits output_token for first N calls, then eos.
+        // Call 0 = prefill chunk 1 (10 tokens), call 1 = chunk 2 (10 tokens),
+        // call 2 = final chunk (5 tokens, transitions to decode + samples token 42),
+        // call 3 = decode step (token 42),
+        // call 4 = decode step (eos=999).
+        let model = CountingMockModel::new(42, 999, 1000, 4);
+        let config = chunked_engine_config(10);
+
+        let prompt: Vec<u32> = (1..=25).collect();
+        let results =
+            run_engine_with_pretokenized(model, kv_cache_mgr, config, vec![(prompt, 10, 999)])
+                .await;
+
+        let result = results[0].as_ref().unwrap();
+        // Prefill chunks: 10, 10, 5 (3 forward calls). Then decode produces tokens.
+        // call 0,1,2 = prefill (token 42 sampled from call 2 = final chunk)
+        // call 3 = decode (token 42)
+        // call 4 = decode (eos 999)
+        assert_eq!(result.generated_token_ids, vec![42, 42, 999]);
+        assert_eq!(result.finish_reason, FinishReason::Eos);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_decode_interleaves_with_prefill() {
+        // One short request that enters decode quickly, and a long request
+        // that takes multiple prefill chunks. Both should complete correctly.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        // Budget of 10 tokens per step. The short request (3 tokens) enters
+        // decode in step 1. The long request (25 tokens) takes multiple steps
+        // to prefill. Decode tokens for the short request interleave with
+        // prefill chunks for the long request.
+        let config = chunked_engine_config(10);
+
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![
+                (vec![1, 2, 3], 3, 999),      // Short: prefilled in 1 chunk
+                ((1..=25).collect(), 3, 999), // Long: chunked prefill
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        let r0 = results[0].as_ref().unwrap();
+        let r1 = results[1].as_ref().unwrap();
+        assert_eq!(r0.generated_token_ids, vec![42, 42, 42]);
+        assert_eq!(r0.finish_reason, FinishReason::Length);
+        assert_eq!(r1.generated_token_ids, vec![42, 42, 42]);
+        assert_eq!(r1.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_prompt_fits_in_single_chunk() {
+        // A short prompt that fits entirely within the token budget
+        // should work exactly like a non-chunked prefill.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = chunked_engine_config(100); // budget >> prompt length
+
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(vec![1, 2, 3, 4, 5], 4, 999)],
+        )
+        .await;
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42, 42, 42]);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_multiple_long_requests() {
+        // Two long requests that both require chunking.
+        // With budget=10 and max_running=8, both should be admitted but
+        // each will take multiple steps to prefill.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = chunked_engine_config(15);
+
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![
+                ((1..=20).collect(), 2, 999),
+                ((100..=120).collect(), 2, 999),
+            ],
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        let r0 = results[0].as_ref().unwrap();
+        let r1 = results[1].as_ref().unwrap();
+        assert_eq!(r0.generated_token_ids, vec![42, 42]);
+        assert_eq!(r0.finish_reason, FinishReason::Length);
+        assert_eq!(r1.generated_token_ids, vec![42, 42]);
+        assert_eq!(r1.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_exact_boundary() {
+        // Prompt length is an exact multiple of the budget.
+        // 20 tokens with budget=10 -> 2 exact chunks of 10.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = chunked_engine_config(10);
+
+        let prompt: Vec<u32> = (1..=20).collect();
+        let results =
+            run_engine_with_pretokenized(model, kv_cache_mgr, config, vec![(prompt, 3, 999)]).await;
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42, 42]);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn chunked_prefill_single_token_budget() {
+        // Extreme case: budget=1 means each step processes only 1 prefill token.
+        // A 5-token prompt takes 5 steps for prefill.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = chunked_engine_config(1);
+
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(vec![1, 2, 3, 4, 5], 2, 999)],
+        )
+        .await;
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42]);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    // ─── Prefix Cache Integration Tests ──────────────────────────────────
+
+    /// Helper: run pretokenized requests with prefix caching enabled.
+    /// Handles register/release of prefix blocks on completion.
+    async fn run_engine_with_prefix_caching<M: ModelForward>(
+        model: M,
+        mut kv_cache_mgr: KVCacheManager,
+        config: EngineConfig,
+        requests: Vec<(Vec<u32>, usize, u32)>,
+    ) -> (Vec<Result<GenerationResult, EngineError>>, KVCacheManager) {
+        use crate::scheduler::Scheduler;
+
+        let block_size = config.block_size;
+        let num_requests = requests.len();
+
+        // Enable prefix cache on the manager (same as run_engine_loop does)
+        if config.enable_prefix_caching && !kv_cache_mgr.has_prefix_cache() {
+            kv_cache_mgr.enable_prefix_cache();
+        }
+
+        let handle = tokio::spawn(async move {
+            let tokenizer = TokenizerWrapper::for_testing(1000);
+            let mut scheduler = Scheduler::new(config.scheduler_config);
+            let mut active: HashMap<crate::request::RequestId, ActiveRequest> = HashMap::new();
+            let mut kv_cache_mgr = kv_cache_mgr;
+
+            for (id, (prompt_ids, max_tokens, eos_token)) in (0u64..).zip(requests.iter()) {
+                let mut state = SequenceState::new(
+                    id,
+                    prompt_ids.clone(),
+                    *max_tokens,
+                    *eos_token,
+                    block_size,
+                    id,
+                );
+
+                // Prefix cache lookup on admission (mirrors admit_request)
+                if kv_cache_mgr.has_prefix_cache() {
+                    let (cached_blocks, _) = kv_cache_mgr.match_prefix(&state.prompt_token_ids);
+                    if !cached_blocks.is_empty() {
+                        let max_cached = state.prompt_token_ids.len().saturating_sub(1);
+                        let blocks_to_use = (max_cached / block_size).min(cached_blocks.len());
+                        if blocks_to_use > 0 {
+                            let tokens_covered = blocks_to_use * block_size;
+                            state
+                                .block_table
+                                .append_blocks(&cached_blocks[..blocks_to_use]);
+                            state.block_table.advance(tokens_covered);
+                            state.num_computed_tokens = tokens_covered;
+                            state.seqlen_offset = tokens_covered;
+                        }
+                    }
+                }
+
+                scheduler.add_request(id);
+                let (tx, _rx) = oneshot::channel();
+                active.insert(
+                    id,
+                    ActiveRequest {
+                        state,
+                        response: ResponseChannel::Complete(tx),
+                        num_streamed_tokens: 0,
+                        streamed_text_len: 0,
+                        draft_state: None,
+                    },
+                );
+            }
+
+            let mut results: HashMap<crate::request::RequestId, GenerationResult> = HashMap::new();
+
+            for _ in 0..10000 {
+                if scheduler.is_idle() {
+                    break;
+                }
+
+                let states: HashMap<crate::request::RequestId, &SequenceState> =
+                    active.iter().map(|(&id, r)| (id, &r.state)).collect();
+                let output = scheduler.schedule(&states, kv_cache_mgr.num_free_blocks());
+
+                for &req_id in &output.preempted_requests {
+                    let req = active.get_mut(&req_id).expect("preempted request missing");
+                    let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
+                    req.state.status = RequestStatus::Preempted;
+                    req.state.generated_token_ids.clear();
+                    req.state.num_computed_tokens = 0;
+                    req.state.seqlen_offset = 0;
+                }
+
+                for schedule in &output.prefill_requests {
+                    let _ = execute_prefill(
+                        schedule.request_id,
+                        schedule.chunk_size,
+                        &model,
+                        &mut kv_cache_mgr,
+                        &mut active,
+                        &tokenizer,
+                    );
+                }
+
+                if !output.decode_requests.is_empty() {
+                    let _failed = execute_batched_decode(
+                        &output.decode_requests,
+                        &model,
+                        &mut kv_cache_mgr,
+                        &mut active,
+                    );
+                }
+
+                let mut finished = Vec::new();
+                let scheduled_ids: Vec<crate::request::RequestId> = output
+                    .prefill_requests
+                    .iter()
+                    .map(|s| s.request_id)
+                    .chain(output.decode_requests.iter().copied())
+                    .collect();
+                for &req_id in &scheduled_ids {
+                    if let Some(req) = active.get(&req_id) {
+                        if let Some(check) = check_finished(&req.state, &tokenizer) {
+                            finished.push((req_id, check));
+                        }
+                    }
+                }
+
+                for (req_id, check) in finished {
+                    let req = active.remove(&req_id).expect("finished request missing");
+                    scheduler.remove_request(req_id);
+                    let prompt_tokens = req.state.prompt_token_ids.clone();
+                    let mut bt = req.state.block_table;
+                    let block_ids = bt.release();
+
+                    // Register and release prefix blocks (mirrors run_engine_loop)
+                    if kv_cache_mgr.has_prefix_cache() {
+                        kv_cache_mgr.register_prefix(&prompt_tokens, &block_ids);
+                        let to_free = kv_cache_mgr.release_prefix(&prompt_tokens, &block_ids);
+                        if !to_free.is_empty() {
+                            let _ = kv_cache_mgr.free_blocks(&to_free);
+                        }
+                    } else if !block_ids.is_empty() {
+                        let _ = kv_cache_mgr.free_blocks(&block_ids);
+                    }
+
+                    results.insert(
+                        req_id,
+                        GenerationResult {
+                            request_id: req_id,
+                            generated_text: String::new(),
+                            generated_token_ids: req.state.generated_token_ids,
+                            finish_reason: check.reason,
+                            token_logprobs: None,
+                            top_logprobs: None,
+                            prompt_token_ids: None,
+                            prompt_logprobs: None,
+                        },
+                    );
+                }
+            }
+
+            (results, kv_cache_mgr)
+        });
+
+        let (results, kv_cache_mgr) = handle.await.expect("engine task panicked");
+        let mut output: Vec<Result<GenerationResult, EngineError>> = Vec::new();
+        for i in 0..num_requests {
+            if let Some(r) = results.get(&(i as u64)) {
+                output.push(Ok(r.clone()));
+            } else {
+                output.push(Err(EngineError::Shutdown));
+            }
+        }
+        (output, kv_cache_mgr)
+    }
+
+    fn prefix_cache_engine_config() -> EngineConfig {
+        EngineConfig {
+            scheduler_config: SchedulerConfig {
+                max_running_requests: 4,
+                max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            block_size: 16,
+            speculative_config: None,
+            multi_step_count: 1,
+            enable_prefix_caching: true,
+            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_match_skips_tokens_during_prefill() {
+        // Run first request to populate the prefix cache, then run a second
+        // request with the same prefix. The second request should reuse
+        // cached blocks and skip those tokens during prefill.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = prefix_cache_engine_config();
+
+        // block_size=16, prompt=32 tokens -> 2 full blocks
+        let prompt: Vec<u32> = (1..=32).collect();
+
+        // First request: populates the prefix cache
+        let (results, kv_cache_mgr) = run_engine_with_prefix_caching(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(prompt.clone(), 2, 999)],
+        )
+        .await;
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42]);
+
+        // Verify prefix cache has entries
+        let (cached, _evictable) = kv_cache_mgr.prefix_cache_stats().unwrap();
+        assert_eq!(cached, 2); // 2 blocks of 16 tokens each
+
+        // Second request: same prompt, should hit prefix cache
+        let model = MockModel::new(42, 1000);
+        let config = prefix_cache_engine_config();
+
+        let (results, _kv_cache_mgr) =
+            run_engine_with_prefix_caching(model, kv_cache_mgr, config, vec![(prompt, 3, 999)])
+                .await;
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42, 42]);
+        assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_registered_prefixes_found_on_subsequent_requests() {
+        // Verify that after one request completes, the next request with
+        // the same prefix actually finds blocks in the cache.
+        use std::sync::Arc;
+        let cache_config = test_cache_config();
+        let metrics = Arc::new(crate::kv_cache::KVCacheMetrics::new());
+        let kv_cache_mgr = KVCacheManager::with_metrics(&cache_config, metrics).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = prefix_cache_engine_config();
+
+        // Run first request with a 32-token prompt (2 full blocks of 16)
+        let prompt: Vec<u32> = (1..=32).collect();
+        let (results, kv_cache_mgr) = run_engine_with_prefix_caching(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(prompt.clone(), 1, 999)],
+        )
+        .await;
+        assert!(results[0].is_ok());
+
+        // Verify blocks are in the cache
+        let (cached, evictable) = kv_cache_mgr.prefix_cache_stats().unwrap();
+        assert!(cached > 0, "prefix cache should have entries");
+        assert_eq!(
+            evictable, cached,
+            "all blocks should be evictable after owner releases"
+        );
+
+        // Directly test match_prefix on the manager
+        let mut kv_cache_mgr = kv_cache_mgr;
+        let (matched, num_cached) = kv_cache_mgr.match_prefix(&prompt);
+        assert_eq!(matched.len(), 2, "should match 2 cached blocks");
+        assert_eq!(num_cached, 32, "should cover 32 tokens");
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_eviction_when_blocks_run_out() {
+        // With limited blocks and prefix caching enabled, eviction should
+        // reclaim unreferenced cached blocks to make room for new requests.
+        use crate::kv_cache::KVCacheDtype;
+        let cache_config = CacheConfig {
+            block_size: 4,
+            num_blocks: 8, // Very limited
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = EngineConfig {
+            scheduler_config: SchedulerConfig {
+                max_running_requests: 4,
+                max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            block_size: 4,
+            speculative_config: None,
+            multi_step_count: 1,
+            enable_prefix_caching: true,
+            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+        };
+
+        // First request: 8 tokens (2 blocks of 4) + 1 generated token (needs 1 more block) = 3 blocks
+        let prompt1: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let (results, kv_cache_mgr) =
+            run_engine_with_prefix_caching(model, kv_cache_mgr, config, vec![(prompt1, 1, 999)])
+                .await;
+        assert!(results[0].is_ok());
+
+        // After completion: 2 blocks cached (prompt), 1 decode block freed
+        // Cached: 2 blocks, Free: 8 - 2 = 6 blocks
+        let (cached, evictable) = kv_cache_mgr.prefix_cache_stats().unwrap();
+        assert_eq!(cached, 2);
+        assert_eq!(evictable, 2);
+
+        // Second request: different prompt, needs 6 blocks for prompt + 1 for decode = 7
+        // We have 6 free + 2 evictable = 8 total available. Should succeed via eviction.
+        let model = MockModel::new(42, 1000);
+        let config = EngineConfig {
+            scheduler_config: SchedulerConfig {
+                max_running_requests: 4,
+                max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            block_size: 4,
+            speculative_config: None,
+            multi_step_count: 1,
+            enable_prefix_caching: true,
+            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+        };
+        let prompt2: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let (results, _kv_cache_mgr) =
+            run_engine_with_prefix_caching(model, kv_cache_mgr, config, vec![(prompt2, 1, 999)])
+                .await;
+        // Should succeed because eviction freed cached blocks
+        assert!(results[0].is_ok());
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.generated_token_ids, vec![42]);
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_partial_prefix_match() {
+        // Verify partial prefix matching: first half matches, second half differs.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = prefix_cache_engine_config();
+
+        // First request: 32 tokens in 2 blocks
+        let prompt1: Vec<u32> = (1..=32).collect();
+        let (results, kv_cache_mgr) =
+            run_engine_with_prefix_caching(model, kv_cache_mgr, config, vec![(prompt1, 1, 999)])
+                .await;
+        assert!(results[0].is_ok());
+
+        // Second request: same first 16 tokens, different second 16
+        let mut prompt2: Vec<u32> = (1..=16).collect();
+        prompt2.extend(100..=115); // Different second block
+
+        let mut kv_cache_mgr = kv_cache_mgr;
+        let (matched, num_cached) = kv_cache_mgr.match_prefix(&prompt2);
+        assert_eq!(matched.len(), 1, "only first block should match");
+        assert_eq!(num_cached, 16, "first block covers 16 tokens");
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_generation_produces_correct_tokens() {
+        // End-to-end: prefix caching should not affect correctness.
+        // Same prompt should produce identical tokens with and without prefix caching.
+        let prompt: Vec<u32> = (1..=32).collect();
+
+        // Without prefix caching
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = test_engine_config();
+        let results_no_cache = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![(prompt.clone(), 5, 999)],
+        )
+        .await;
+
+        // With prefix caching
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = prefix_cache_engine_config();
+        let (results_with_cache, _) =
+            run_engine_with_prefix_caching(model, kv_cache_mgr, config, vec![(prompt, 5, 999)])
+                .await;
+
+        let r1 = results_no_cache[0].as_ref().unwrap();
+        let r2 = results_with_cache[0].as_ref().unwrap();
+        assert_eq!(r1.generated_token_ids, r2.generated_token_ids);
+        assert_eq!(r1.finish_reason, r2.finish_reason);
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_enable_on_kv_cache_manager() {
+        // Verify that enable_prefix_cache() works and the manager reports
+        // correct state before and after enabling.
+        let cache_config = test_cache_config();
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+
+        assert!(!kv_cache_mgr.has_prefix_cache());
+        assert!(kv_cache_mgr.prefix_cache_stats().is_none());
+
+        kv_cache_mgr.enable_prefix_cache();
+
+        assert!(kv_cache_mgr.has_prefix_cache());
+        let (cached, evictable) = kv_cache_mgr.prefix_cache_stats().unwrap();
+        assert_eq!(cached, 0);
+        assert_eq!(evictable, 0);
+
+        // Double-enable is a no-op
+        kv_cache_mgr.enable_prefix_cache();
+        assert!(kv_cache_mgr.has_prefix_cache());
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_stats_available_via_manager() {
+        // Verify that prefix cache statistics are accessible through the
+        // KVCacheManager after enabling prefix caching.
+        let cache_config = test_cache_config();
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        kv_cache_mgr.enable_prefix_cache();
+
+        // Register a prefix manually
+        let prompt: Vec<u32> = (1..=16).collect();
+        let mut block_table = BlockTable::new(cache_config.block_size);
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 16)
+            .unwrap();
+        block_table.advance(16);
+        let block_ids = block_table.block_ids().to_vec();
+        kv_cache_mgr.register_prefix(&prompt, &block_ids);
+
+        // Check stats
+        let (cached, _) = kv_cache_mgr.prefix_cache_stats().unwrap();
+        assert_eq!(cached, 1);
+
+        // Check detailed stats
+        let cache = kv_cache_mgr.prefix_cache().unwrap();
+        assert_eq!(cache.num_cached_blocks(), 1);
     }
 }

@@ -28,6 +28,7 @@
 //! )?;
 //! ```
 
+pub mod auto_select;
 mod backend;
 pub mod flash;
 pub mod flashinfer;
@@ -42,6 +43,7 @@ pub use backend::{
 pub use ops::{apply_per_head_norm, repeat_kv};
 
 // Re-export backend implementations
+pub use auto_select::{AttentionBackendSelector, AttentionRequirements, GpuCapability};
 pub use flash::FlashAttentionBackend;
 pub use flashinfer::FlashInferBackend;
 pub use mla::MLAAttention;

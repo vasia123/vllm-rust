@@ -617,6 +617,7 @@ mod tests {
             dtype: DType::F32,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 

@@ -1,5 +1,6 @@
 use candle_core::{DType, Device};
 
+use super::offload::CpuOffloadConfig;
 use super::quantization::KVCacheDtype;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,9 @@ pub struct CacheConfig {
     pub device: Device,
     /// KV cache storage dtype: Auto (no quantization), Fp8E4m3, or Int8
     pub kv_cache_dtype: KVCacheDtype,
+    /// Optional CPU offload configuration. When `Some`, evicted GPU blocks
+    /// are stored in CPU memory for potential reuse instead of being discarded.
+    pub cpu_offload: Option<CpuOffloadConfig>,
 }
 
 impl CacheConfig {
@@ -75,6 +79,7 @@ impl CacheConfig {
             dtype,
             device,
             kv_cache_dtype,
+            cpu_offload: None,
         }
     }
 
@@ -278,6 +283,7 @@ mod tests {
             dtype: DType::BF16,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         };
         assert_eq!(config.bytes_per_block(), 256);
 
@@ -300,6 +306,7 @@ mod tests {
             dtype: DType::BF16,
             device: Device::Cpu,
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         };
         // 256 bytes per block * 10 blocks = 2560 bytes
         assert_eq!(config.total_memory_bytes(), 2560);

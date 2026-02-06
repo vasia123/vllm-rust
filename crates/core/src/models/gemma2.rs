@@ -1,11 +1,16 @@
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
+use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::attention::repeat_kv;
 use crate::layers::RotaryEmbedding;
+
+// Re-export for public API
+pub use super::tp_layers::TpContext;
+use super::tp_layers::{TpEmbedding, TpGeGluMlp, TpLinear};
 
 // ─── Gemma2 RMSNorm ──────────────────────────────────────────────────────────
 //
@@ -32,12 +37,6 @@ impl Module for Gemma2RmsNorm {
         let scale = (&self.weight.to_dtype(DType::F32)? + 1.0)?;
         xs_normed.broadcast_mul(&scale)?.to_dtype(dtype)
     }
-}
-
-// ─── GELU Activation ─────────────────────────────────────────────────────────
-
-fn gelu_tanh(xs: &Tensor) -> Result<Tensor> {
-    xs.gelu_erf()
 }
 
 // ─── Soft Capping ────────────────────────────────────────────────────────────
@@ -92,42 +91,13 @@ fn sliding_window_mask(
     Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
 }
 
-// ─── Gemma2 MLP ──────────────────────────────────────────────────────────────
-
-struct Gemma2Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Gemma2Mlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
-    }
-}
-
-impl Module for Gemma2Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = gelu_tanh(&self.gate_proj.forward(xs)?)?;
-        let up = self.up_proj.forward(xs)?;
-        (gate * up)?.apply(&self.down_proj)
-    }
-}
-
 // ─── Attention ───────────────────────────────────────────────────────────────
 
 struct Gemma2Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: TpLinear,
+    k_proj: TpLinear,
+    v_proj: TpLinear,
+    o_proj: TpLinear,
     rotary_emb: RotaryEmbedding,
     num_heads: usize,
     num_kv_heads: usize,
@@ -140,15 +110,69 @@ struct Gemma2Attention {
 }
 
 impl Gemma2Attention {
-    fn new(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+    fn new_with_tp(
+        cfg: &ModelConfig,
+        layer_idx: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
+        let world_size = pg.world_size();
 
-        let q_proj = linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+        // For TP: num_heads and num_kv_heads must be divisible by world_size
+        if world_size > 1 {
+            if num_heads % world_size != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
+                )));
+            }
+            if num_kv_heads % world_size != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
+                )));
+            }
+        }
+
+        // Q/K/V are column-parallel (split output heads)
+        // O is row-parallel (reduce partial outputs)
+        let q_proj = TpLinear::column_parallel(
+            cfg.hidden_size,
+            num_heads * head_dim,
+            false,
+            false,
+            vb.pp("q_proj"),
+            pg,
+        )?;
+        let k_proj = TpLinear::column_parallel(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            false,
+            false,
+            vb.pp("k_proj"),
+            pg,
+        )?;
+        let v_proj = TpLinear::column_parallel(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            false,
+            false,
+            vb.pp("v_proj"),
+            pg,
+        )?;
+        let o_proj = TpLinear::row_parallel(
+            num_heads * head_dim,
+            cfg.hidden_size,
+            false,
+            true,
+            vb.pp("o_proj"),
+            pg,
+        )?;
+
+        // For TP: each GPU handles num_heads/world_size heads
+        let num_heads_per_gpu = num_heads / world_size;
+        let num_kv_heads_per_gpu = num_kv_heads / world_size;
 
         let rotary_emb = RotaryEmbedding::new(
             head_dim,
@@ -186,8 +210,8 @@ impl Gemma2Attention {
             v_proj,
             o_proj,
             rotary_emb,
-            num_heads,
-            num_kv_heads,
+            num_heads: num_heads_per_gpu,
+            num_kv_heads: num_kv_heads_per_gpu,
             head_dim,
             scaling,
             attn_logit_softcap,
@@ -195,6 +219,7 @@ impl Gemma2Attention {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
@@ -203,14 +228,15 @@ impl Gemma2Attention {
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         let device = xs.device();
         let dtype = xs.dtype();
 
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let q = self.q_proj.forward(xs, tp_ctx)?;
+        let k = self.k_proj.forward(xs, tp_ctx)?;
+        let v = self.v_proj.forward(xs, tp_ctx)?;
 
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -279,7 +305,7 @@ impl Gemma2Attention {
                 .transpose(1, 2)?
                 .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
 
-        attn_output.apply(&self.o_proj)
+        self.o_proj.forward(&attn_output, tp_ctx)
     }
 
     fn forward_decode_batch(
@@ -287,14 +313,15 @@ impl Gemma2Attention {
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
         let device = xs.device();
         let dtype = xs.dtype();
 
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let q = self.q_proj.forward(xs, tp_ctx)?;
+        let k = self.k_proj.forward(xs, tp_ctx)?;
+        let v = self.v_proj.forward(xs, tp_ctx)?;
 
         let q = q
             .reshape((batch_size, 1, self.num_heads, self.head_dim))?
@@ -369,7 +396,7 @@ impl Gemma2Attention {
         }
 
         let attn_output = Tensor::cat(&outputs, 0)?;
-        attn_output.apply(&self.o_proj)
+        self.o_proj.forward(&attn_output, tp_ctx)
     }
 }
 
@@ -379,7 +406,7 @@ impl Gemma2Attention {
 
 struct Gemma2DecoderLayer {
     self_attn: Gemma2Attention,
-    mlp: Gemma2Mlp,
+    mlp: TpGeGluMlp,
     input_layernorm: Gemma2RmsNorm,
     post_attention_layernorm: Gemma2RmsNorm,
     pre_feedforward_layernorm: Gemma2RmsNorm,
@@ -387,9 +414,14 @@ struct Gemma2DecoderLayer {
 }
 
 impl Gemma2DecoderLayer {
-    fn new(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Gemma2Attention::new(cfg, layer_idx, vb.pp("self_attn"))?;
-        let mlp = Gemma2Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
+    fn new_with_tp(
+        cfg: &ModelConfig,
+        layer_idx: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
+        let self_attn = Gemma2Attention::new_with_tp(cfg, layer_idx, vb.pp("self_attn"), pg)?;
+        let mlp = TpGeGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
             Gemma2RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = Gemma2RmsNorm::new(
@@ -427,6 +459,7 @@ impl Gemma2DecoderLayer {
         layer_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         // Pre-attention norm
         let residual = xs;
@@ -440,6 +473,7 @@ impl Gemma2DecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             block_table,
             slot_mapping,
+            tp_ctx,
         )?;
 
         // Post-attention norm (Gemma2 specific)
@@ -453,7 +487,7 @@ impl Gemma2DecoderLayer {
         let hidden_states = self.pre_feedforward_layernorm.forward(&hidden_states)?;
 
         // MLP
-        let hidden_states = self.mlp.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states, tp_ctx)?;
 
         // Post-feedforward norm (Gemma2 specific)
         let hidden_states = self.post_feedforward_layernorm.forward(&hidden_states)?;
@@ -468,6 +502,7 @@ impl Gemma2DecoderLayer {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
         let hidden_states = self.input_layernorm.forward(xs)?;
@@ -476,6 +511,7 @@ impl Gemma2DecoderLayer {
             &hidden_states,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
+            tp_ctx,
         )?;
 
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -483,7 +519,7 @@ impl Gemma2DecoderLayer {
         let residual = &hidden_states;
 
         let hidden_states = self.pre_feedforward_layernorm.forward(&hidden_states)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states, tp_ctx)?;
         let hidden_states = self.post_feedforward_layernorm.forward(&hidden_states)?;
 
         residual + hidden_states
@@ -493,31 +529,70 @@ impl Gemma2DecoderLayer {
 // ─── Model ───────────────────────────────────────────────────────────────────
 
 pub struct Gemma2ForCausalLM {
-    embed_tokens: Embedding,
+    embed_tokens: TpEmbedding,
     layers: Vec<Gemma2DecoderLayer>,
     norm: Gemma2RmsNorm,
-    lm_head: Linear,
+    lm_head: TpLinear,
     hidden_size: usize,
     final_logit_softcap: Option<f64>,
+    tp_ctx: TpContext,
     device: Device,
     dtype: DType,
 }
 
 impl Gemma2ForCausalLM {
+    /// Create a new Gemma2 model for single GPU.
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
+    }
+
+    /// Create a new Gemma2 model with tensor parallelism.
+    ///
+    /// # Arguments
+    /// * `cfg` - Model configuration
+    /// * `vb` - VarBuilder for weight loading
+    /// * `pg` - Process group for tensor parallelism
+    /// * `tp_ctx` - Tensor parallelism context (holds communicator)
+    pub fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let world_size = pg.world_size();
+
+        let embed_tokens =
+            TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(Gemma2DecoderLayer::new(cfg, i, vb_l.pp(i))?);
+            layers.push(Gemma2DecoderLayer::new_with_tp(cfg, i, vb_l.pp(i), pg)?);
         }
 
         let norm = Gemma2RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
+        // LM head: output projection to vocabulary
         // Gemma2 always uses tied embeddings
-        let lm_head = Linear::new(embed_tokens.embeddings().clone(), None);
+        let lm_head = if world_size == 1 {
+            // Single GPU with tied embeddings: reuse embedding weights
+            let emb_weights = embed_tokens
+                .embeddings()
+                .expect("single GPU should have accessible embeddings")
+                .clone();
+            TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
+        } else {
+            // TP with tied embeddings: load from embed_tokens path
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true, // gather output to get full vocab logits
+                vb_m.pp("embed_tokens"),
+                pg,
+            )?
+        };
 
         // Final logit soft capping
         let final_logit_softcap = cfg
@@ -532,6 +607,7 @@ impl Gemma2ForCausalLM {
             lm_head,
             hidden_size: cfg.hidden_size,
             final_logit_softcap,
+            tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -559,7 +635,7 @@ impl Gemma2ForCausalLM {
 
         // Gemma2 normalizes embeddings by sqrt(hidden_size)
         let normalizer = (self.hidden_size as f64).sqrt();
-        let mut xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
+        let mut xs = (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
@@ -570,11 +646,12 @@ impl Gemma2ForCausalLM {
                 layer_idx,
                 block_table,
                 slot_mapping,
+                &self.tp_ctx,
             )?;
         }
 
         let xs = self.norm.forward(&xs)?;
-        let mut logits = self.lm_head.forward(&xs)?;
+        let mut logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
 
         // Apply final logit soft capping
         if let Some(cap) = self.final_logit_softcap {
@@ -587,6 +664,11 @@ impl Gemma2ForCausalLM {
     pub fn device(&self) -> &Device {
         &self.device
     }
+
+    /// Get a reference to the TP context.
+    pub fn tp_context(&self) -> &TpContext {
+        &self.tp_ctx
+    }
 }
 
 impl crate::engine::ModelForward for Gemma2ForCausalLM {
@@ -598,7 +680,8 @@ impl crate::engine::ModelForward for Gemma2ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        self.forward(
+        Gemma2ForCausalLM::forward(
+            self,
             input_ids,
             seqlen_offset,
             kv_cache_mgr,
@@ -614,14 +697,20 @@ impl crate::engine::ModelForward for Gemma2ForCausalLM {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let normalizer = (self.hidden_size as f64).sqrt();
-        let mut xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
+        let mut xs = (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
+            xs = layer.forward_decode_batch(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                &self.tp_ctx,
+            )?;
         }
 
         let xs = self.norm.forward(&xs)?;
-        let mut logits = self.lm_head.forward(&xs)?;
+        let mut logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
 
         if let Some(cap) = self.final_logit_softcap {
             logits = soft_cap(&logits, cap)?;
@@ -687,6 +776,7 @@ mod tests {
             dtype: DType::F32,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
         }
     }
 
@@ -758,7 +848,7 @@ mod tests {
         }
 
         // 0 should stay 0
-        assert!(capped_vec[2].abs() < 0.01, "soft_cap(0) should be ≈0");
+        assert!(capped_vec[2].abs() < 0.01, "soft_cap(0) should be ~0");
 
         // Large positive should approach cap
         assert!(capped_vec[4] > 29.0, "soft_cap(100) should be close to cap");
@@ -830,7 +920,8 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
         // This tests that the layer constructs with all 4 norms
-        let layer = Gemma2DecoderLayer::new(&cfg, 0, vb).expect("build layer");
+        let pg = LocalProcessGroup::new();
+        let layer = Gemma2DecoderLayer::new_with_tp(&cfg, 0, vb, &pg).expect("build layer");
 
         // Forward should work with the extra norms
         let cache_config = create_cache_config(&cfg, &device);
@@ -843,6 +934,7 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 1);
 
         let x = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).expect("input");
+        let tp_ctx = TpContext::single_gpu();
         let result = layer.forward(
             &x,
             None,
@@ -851,6 +943,7 @@ mod tests {
             0,
             &block_table,
             &slot_mapping,
+            &tp_ctx,
         );
         assert!(result.is_ok());
     }
@@ -866,5 +959,150 @@ mod tests {
             .unwrap();
 
         assert_eq!(query_pre_attn_scalar, 256.0);
+    }
+
+    // ─── Tensor Parallelism Tests ────────────────────────────────────────────────
+
+    fn test_config_tp_compatible() -> ModelConfig {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "query_pre_attn_scalar".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(256.0).unwrap()),
+        );
+        extra.insert(
+            "attn_logit_softcapping".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(50.0).unwrap()),
+        );
+        extra.insert(
+            "final_logit_softcapping".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(30.0).unwrap()),
+        );
+
+        // Config with heads divisible by 2 for TP=2 testing
+        ModelConfig {
+            architectures: vec!["Gemma2ForCausalLM".to_string()],
+            hidden_size: 64,
+            num_attention_heads: 4, // divisible by 2
+            num_key_value_heads: 2, // divisible by 2
+            num_hidden_layers: 4,   // Need 4 layers for alternating sliding window
+            intermediate_size: 128,
+            vocab_size: 256,
+            max_position_embeddings: 512,
+            head_dim: 16,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: true,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            sliding_window: Some(256),
+            attention_bias: Some(false),
+            extra,
+        }
+    }
+
+    #[test]
+    fn test_gemma2_tp_construction_world_size_2() {
+        let cfg = test_config_tp_compatible();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        // Simulate TP with world_size=2 (ProcessGroup and TpContext must match)
+        let pg = LocalProcessGroup::with_rank(0, 2);
+        let tp_ctx = TpContext::mock_multi_gpu(0, 2);
+
+        let model = Gemma2ForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx);
+        assert!(
+            model.is_ok(),
+            "Gemma2ForCausalLM should construct with TP=2: {:?}",
+            model.err()
+        );
+
+        let model = model.unwrap();
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+    }
+
+    #[test]
+    fn test_gemma2_tp_forward_world_size_2() {
+        let cfg = test_config_tp_compatible();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        // Create model with TP=2 simulation (ProcessGroup and TpContext must match)
+        let tp_size = 2;
+        let pg = LocalProcessGroup::with_rank(0, tp_size);
+        let tp_ctx = TpContext::mock_multi_gpu(0, tp_size);
+        let model = Gemma2ForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx).expect("build model");
+
+        // Create cache with LOCAL kv_heads (divided by tp_size)
+        let local_kv_heads = cfg.num_key_value_heads / tp_size;
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 8,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: local_kv_heads, // Important: local heads, not global
+            head_dim: cfg.head_dim,
+            dtype: DType::F32,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let batch_size = 1;
+        let seq_len = 3;
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("forward");
+
+        // With TP=2 and MockCommunicator's all_gather simulation,
+        // the output should be gathered to full vocab_size
+        assert_eq!(
+            logits.dims(),
+            &[batch_size, seq_len, cfg.vocab_size],
+            "logits shape should be [batch, seq_len, vocab_size]"
+        );
+    }
+
+    #[test]
+    fn test_gemma2_tp_heads_divisibility_check() {
+        // Test that TP fails with error when heads aren't divisible
+        let mut cfg = test_config();
+        cfg.num_key_value_heads = 3; // Not divisible by 2
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        // Try TP=2 with 3 kv_heads - should return error
+        let pg = LocalProcessGroup::with_rank(0, 2);
+        let tp_ctx = TpContext::mock_multi_gpu(0, 2);
+
+        let result = Gemma2ForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx);
+
+        match result {
+            Ok(_) => panic!("Should fail when num_kv_heads is not divisible by world_size"),
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("divisible"),
+                    "Error should mention divisibility: {}",
+                    err_msg
+                );
+            }
+        }
     }
 }

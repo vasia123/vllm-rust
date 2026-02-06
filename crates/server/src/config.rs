@@ -56,6 +56,26 @@ pub struct ServerConfig {
     /// Enable prefix caching.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_prefix_caching: Option<bool>,
+
+    /// Maximum requests per second (rate limit). 0 or None means no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_second: Option<u32>,
+
+    /// Maximum pending requests in queue before rejecting with 503.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_queue_depth: Option<usize>,
+
+    /// Comma-separated list of allowed CORS origins. "*" allows all origins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_origins: Option<String>,
+
+    /// Comma-separated list of allowed CORS HTTP methods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_methods: Option<String>,
+
+    /// Comma-separated list of allowed CORS headers. "*" allows all headers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_headers: Option<String>,
 }
 
 impl ServerConfig {
@@ -130,6 +150,21 @@ impl ServerConfig {
         }
         if other.enable_prefix_caching.is_some() {
             self.enable_prefix_caching = other.enable_prefix_caching;
+        }
+        if other.max_requests_per_second.is_some() {
+            self.max_requests_per_second = other.max_requests_per_second;
+        }
+        if other.max_queue_depth.is_some() {
+            self.max_queue_depth = other.max_queue_depth;
+        }
+        if other.allowed_origins.is_some() {
+            self.allowed_origins = other.allowed_origins.clone();
+        }
+        if other.allowed_methods.is_some() {
+            self.allowed_methods = other.allowed_methods.clone();
+        }
+        if other.allowed_headers.is_some() {
+            self.allowed_headers = other.allowed_headers.clone();
         }
     }
 }

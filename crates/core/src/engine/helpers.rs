@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use candle_core::Tensor;
 
-use crate::kv_cache::{prefix_cache::PrefixCache, KVCacheManager};
+use crate::kv_cache::KVCacheManager;
 use crate::request::{FinishReason, RequestId, RequestStatus, SequenceState};
 use crate::sampling::{self, SamplerState};
 use crate::scheduler::Scheduler;
@@ -36,7 +36,6 @@ pub(crate) fn handle_command(
     scheduler: &mut Scheduler,
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
-    prefix_cache: &mut Option<PrefixCache>,
     kv_cache_mgr: &mut KVCacheManager,
 ) -> bool {
     match cmd {
@@ -52,7 +51,7 @@ pub(crate) fn handle_command(
                 scheduler,
                 requests,
                 block_size,
-                prefix_cache,
+                kv_cache_mgr,
             );
             false
         }
@@ -65,19 +64,20 @@ pub(crate) fn handle_command(
                 scheduler,
                 requests,
                 block_size,
-                prefix_cache,
+                kv_cache_mgr,
             );
             false
         }
         EngineCommand::GetStats { response_tx } => {
-            // Get detailed prefix cache stats if available
-            let (prefix_cache_detailed_stats, prefix_cache_recent_stats) = match prefix_cache {
-                Some(cache) => (
-                    Some(cache.get_stats()),
-                    Some(cache.get_sliding_window_stats()),
-                ),
-                None => (None, None),
-            };
+            // Get detailed prefix cache stats from the KVCacheManager
+            let (prefix_cache_detailed_stats, prefix_cache_recent_stats) =
+                match kv_cache_mgr.prefix_cache() {
+                    Some(cache) => (
+                        Some(cache.get_stats()),
+                        Some(cache.get_sliding_window_stats()),
+                    ),
+                    None => (None, None),
+                };
 
             let stats = EngineStats {
                 num_running_requests: scheduler.num_running(),
@@ -106,7 +106,7 @@ fn admit_request(
     scheduler: &mut Scheduler,
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
-    prefix_cache: &mut Option<PrefixCache>,
+    kv_cache_mgr: &mut KVCacheManager,
 ) {
     let prompt_ids = match tokenizer.encode(&request.prompt) {
         Ok(ids) => ids,
@@ -137,10 +137,12 @@ fn admit_request(
     state.lora_request = request.lora_request;
     state.constraint = request.constraint;
 
-    // Check prefix cache for reusable blocks
-    if let Some(cache) = prefix_cache.as_mut() {
-        let (cached_blocks, _) = cache.match_prefix(&state.prompt_token_ids);
+    // Check prefix cache for reusable blocks via the KVCacheManager
+    if kv_cache_mgr.has_prefix_cache() {
+        let (cached_blocks, _) = kv_cache_mgr.match_prefix(&state.prompt_token_ids);
         if !cached_blocks.is_empty() {
+            // Don't cache the entire prompt - leave at least 1 token for prefill
+            // to ensure the model produces logits for the final position.
             let max_cached = state.prompt_token_ids.len().saturating_sub(1);
             let blocks_to_use = (max_cached / block_size).min(cached_blocks.len());
             if blocks_to_use > 0 {
@@ -198,9 +200,17 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     let actual_chunk = chunk_end - offset;
     let is_final_chunk = chunk_end == prompt_len;
 
-    kv_cache_mgr
-        .allocate_for_request(&mut req.state.block_table, actual_chunk)
-        .map_err(|e| EngineError::Cache(e.to_string()))?;
+    // Use eviction-aware allocation when prefix caching is enabled.
+    // This allows evicting unreferenced cached blocks to make room for new requests.
+    if kv_cache_mgr.has_prefix_cache() {
+        kv_cache_mgr
+            .allocate_with_eviction(&mut req.state.block_table, actual_chunk)
+            .map_err(|e| EngineError::Cache(e.to_string()))?;
+    } else {
+        kv_cache_mgr
+            .allocate_for_request(&mut req.state.block_table, actual_chunk)
+            .map_err(|e| EngineError::Cache(e.to_string()))?;
+    }
     let slot_mapping = req.state.block_table.slot_mapping(offset, actual_chunk);
 
     let chunk_tokens = &req.state.prompt_token_ids[offset..chunk_end];
@@ -427,6 +437,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             .slot_mapping(req.state.seqlen_offset, 1);
         token_ids.push(last_token);
         sequences.push(DecodeSequenceMetadata {
+            request_id: req_id,
             seqlen_offset: req.state.seqlen_offset,
             block_ids: req.state.block_table.block_ids().to_vec(),
             slot_mapping,
@@ -729,9 +740,24 @@ pub(crate) fn send_stream_token(
             .unwrap_or_default();
         let token_text = text_so_far[req.streamed_text_len..].to_string();
         req.streamed_text_len = text_so_far.len();
+
+        // Include logprob data when the request has logprobs enabled
+        let logprob = if req.state.num_top_logprobs.is_some() {
+            req.state.token_logprobs.get(i).copied()
+        } else {
+            None
+        };
+        let top_logprobs = if req.state.num_top_logprobs.is_some() {
+            req.state.top_logprobs.get(i).cloned()
+        } else {
+            None
+        };
+
         let _ = tx.try_send(StreamEvent::Token {
             token_id,
             token_text,
+            logprob,
+            top_logprobs,
         });
     }
     req.num_streamed_tokens = end;

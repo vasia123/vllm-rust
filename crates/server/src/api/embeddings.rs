@@ -168,7 +168,12 @@ pub struct EmbeddingUsage {
 
 impl EmbeddingResponse {
     /// Create a new embedding response.
-    pub fn new(embeddings: Vec<Vec<f32>>, model: String, token_counts: Vec<usize>, encoding_format: EncodingFormat) -> Self {
+    pub fn new(
+        embeddings: Vec<Vec<f32>>,
+        model: String,
+        token_counts: Vec<usize>,
+        encoding_format: EncodingFormat,
+    ) -> Self {
         let total_tokens: usize = token_counts.iter().sum();
 
         let data: Vec<EmbeddingData> = embeddings
@@ -180,10 +185,7 @@ impl EmbeddingResponse {
                     EncodingFormat::Float => EmbeddingVector::Float(emb),
                     EncodingFormat::Base64 => {
                         // Convert f32 array to bytes and base64 encode
-                        let bytes: Vec<u8> = emb
-                            .iter()
-                            .flat_map(|f| f.to_le_bytes())
-                            .collect();
+                        let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
                         EmbeddingVector::Base64(base64_encode(&bytes))
                     }
                 },
@@ -245,7 +247,9 @@ pub async fn create_embedding(
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     // Validate request
     if request.input.is_empty() {
-        return Err(ApiError::InvalidRequest("Input cannot be empty".to_string()));
+        return Err(ApiError::InvalidRequest(
+            "Input cannot be empty".to_string(),
+        ));
     }
 
     // Convert inputs to token IDs
@@ -255,12 +259,10 @@ pub async fn create_embedding(
 
     for input in inputs {
         let token_ids = match input {
-            InputItem::Text(text) => {
-                state
-                    .tokenizer
-                    .encode(&text)
-                    .map_err(|e| ApiError::InvalidRequest(format!("Tokenization failed: {}", e)))?
-            }
+            InputItem::Text(text) => state
+                .tokenizer
+                .encode(&text)
+                .map_err(|e| ApiError::InvalidRequest(format!("Tokenization failed: {}", e)))?,
             InputItem::TokenIds(ids) => ids,
         };
         token_counts.push(token_ids.len());

@@ -14,6 +14,12 @@ marlin = ["cuda-kernels"]
 image-loading = ["dep:image", "dep:base64"]
 audio = ["dep:symphonia"]
 
+# Test tiers based on GPU memory requirements
+gpu-test-small = []      # Tests requiring < 2GB VRAM
+gpu-test-medium = ["gpu-test-small"]  # Tests requiring < 6GB VRAM
+gpu-test-large = ["gpu-test-medium"]  # Tests requiring > 6GB VRAM
+multi-gpu-test = ["gpu-test-large"]   # Tests requiring multiple GPUs
+
 [dependencies]
 tokio.workspace = true
 thiserror.workspace = true

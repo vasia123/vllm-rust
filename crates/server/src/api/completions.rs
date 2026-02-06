@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -10,11 +11,13 @@ use vllm_core::lora::LoraRequest;
 use vllm_core::sampling::{JsonSchemaConstraint, SamplingConstraint, SamplingParams};
 use vllm_core::tokenizer::TokenizerWrapper;
 
+use super::admin::prometheus;
 use super::error::ApiError;
-use super::streaming::completion_sse_stream;
+use super::response_format::validate_response_format;
+use super::streaming::{completion_sse_stream, StreamingOptions};
 use super::types::{
-    finish_reason_str, timestamp_now, CompletionChoice, CompletionLogProbs, CompletionRequest,
-    CompletionResponse, PromptInput, ResponseFormat, Usage,
+    finish_reason_str, system_fingerprint, timestamp_now, CompletionChoice, CompletionLogProbs,
+    CompletionRequest, CompletionResponse, PromptInput, ResponseFormat, Usage,
 };
 use super::AppState;
 
@@ -22,22 +25,42 @@ pub async fn create_completion(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let start_time = Instant::now();
+    prometheus::inc_requests_total();
+
     if req.model != state.model_id {
+        prometheus::inc_requests_error();
         return Err(ApiError::ModelNotFound(format!(
             "model '{}' not found",
             req.model
         )));
     }
 
+    super::validation::validate_completion_request(&req)?;
+
     let inputs = req.prompt.clone().into_inputs();
 
+    let logit_bias = req.logit_bias.as_ref().map(|bias| {
+        bias.iter()
+            .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v)))
+            .collect::<Vec<_>>()
+    });
+
     if req.stream {
-        // Streaming only supports single prompt (logprobs not yet supported in streaming)
+        // Streaming supports single prompt
         let input = inputs
             .into_iter()
             .next()
             .unwrap_or(PromptInput::Text(String::new()));
         let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
+
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .is_some_and(|opts| opts.include_usage);
+
+        // Capture logprobs count before req fields are moved
+        let logprobs_count = req.logprobs;
 
         // Convert lora_name to LoraRequest (references a pre-loaded adapter by name)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
@@ -55,20 +78,23 @@ pub async fn create_completion(
                 top_p: req.top_p,
                 top_k: req.top_k,
                 repetition_penalty: req.repetition_penalty,
+                frequency_penalty: req.frequency_penalty,
+                presence_penalty: req.presence_penalty,
                 min_p: req.min_p,
                 seed: req.seed,
+                // TODO: Wire beam_search from API when engine supports it in streaming mode
                 beam_search: None,
+                logit_bias: logit_bias.clone(),
             },
             stop_strings: req.stop,
             stop_token_ids: req.stop_token_ids,
             include_stop_str_in_output: req.include_stop_str_in_output,
-            logprobs: None, // Streaming doesn't support logprobs yet
-            echo: false,
+            logprobs: logprobs_count,
+            echo: req.echo,
             lora_request,
             constraint,
+            image_inputs: Vec::new(),
         };
-
-        let _ = prompt_tokens; // Used for non-streaming only
 
         let rx = state
             .engine
@@ -78,9 +104,34 @@ pub async fn create_completion(
             .map_err(|e| ApiError::EngineError(e.to_string()))?;
 
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
-        Ok(completion_sse_stream(request_id, state.model_id.clone(), rx).into_response())
+        let include_logprobs = logprobs_count.is_some();
+        let streaming_opts = StreamingOptions {
+            include_usage,
+            prompt_tokens,
+            include_logprobs,
+            tokenizer: if include_logprobs {
+                Some(state.tokenizer.clone())
+            } else {
+                None
+            },
+        };
+        Ok(
+            completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)
+                .into_response(),
+        )
     } else {
         // Non-streaming supports batch of prompts
+        let best_of = req.best_of;
+        let user_requested_logprobs = req.logprobs;
+
+        // When best_of > 1, we need logprobs to score candidates even if the
+        // user didn't ask for them. Request at least 1 logprob internally.
+        let internal_logprobs = if best_of > 1 && user_requested_logprobs.is_none() {
+            Some(1)
+        } else {
+            user_requested_logprobs
+        };
+
         let mut choices = Vec::with_capacity(inputs.len());
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
@@ -88,67 +139,113 @@ pub async fn create_completion(
         // Convert lora_name to LoraRequest (for batch requests, same adapter for all)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
-        // Create constraint from response_format (same for all prompts in batch)
-        let constraint =
-            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+        // Check if response_format requires constraints (used to decide whether
+        // to recreate per-iteration)
+        let has_constraint =
+            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+                .is_some();
 
         for (index, input) in inputs.into_iter().enumerate() {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
-
-            // Clone constraint for each request in batch (constraints are stateful)
-            let request_constraint = if constraint.is_some() {
-                create_constraint_from_response_format(
-                    req.response_format.as_ref(),
-                    &state.tokenizer,
-                )
-            } else {
-                None
-            };
-
-            let gen_req = GenerationRequest {
-                prompt,
-                max_new_tokens: req.max_tokens,
-                eos_token_id: state.eos_token_id,
-                sampling_params: SamplingParams {
-                    temperature: req.temperature,
-                    top_p: req.top_p,
-                    top_k: req.top_k,
-                    repetition_penalty: req.repetition_penalty,
-                    min_p: req.min_p,
-                    seed: req.seed,
-                    beam_search: None,
-                },
-                stop_strings: req.stop.clone(),
-                stop_token_ids: req.stop_token_ids.clone(),
-                include_stop_str_in_output: req.include_stop_str_in_output,
-                logprobs: req.logprobs,
-                echo: req.echo,
-                lora_request: lora_request.clone(),
-                constraint: request_constraint,
-            };
-
-            let result = state
-                .engine
-                .get()
-                .generate(gen_req)
-                .await
-                .map_err(|e| ApiError::EngineError(e.to_string()))?;
-
             total_prompt_tokens += prompt_tokens;
-            total_completion_tokens += result.generated_token_ids.len();
 
-            // Build logprobs if requested
-            let logprobs = if req.logprobs.is_some() {
-                Some(build_logprobs(&result, &state.tokenizer, req.echo))
+            // Generate `best_of` candidates for this prompt and pick the best
+            let mut candidates: Vec<(GenerationResult, Option<CompletionLogProbs>)> =
+                Vec::with_capacity(best_of);
+
+            for _ in 0..best_of {
+                // Recreate constraint for each generation call (constraints are stateful)
+                let request_constraint = if has_constraint {
+                    create_constraint_from_response_format(
+                        req.response_format.as_ref(),
+                        &state.tokenizer,
+                    )
+                } else {
+                    None
+                };
+
+                let gen_req = GenerationRequest {
+                    prompt: prompt.clone(),
+                    max_new_tokens: req.max_tokens,
+                    eos_token_id: state.eos_token_id,
+                    sampling_params: SamplingParams {
+                        temperature: req.temperature,
+                        top_p: req.top_p,
+                        top_k: req.top_k,
+                        repetition_penalty: req.repetition_penalty,
+                        frequency_penalty: req.frequency_penalty,
+                        presence_penalty: req.presence_penalty,
+                        min_p: req.min_p,
+                        seed: req.seed,
+                        beam_search: None,
+                        logit_bias: logit_bias.clone(),
+                    },
+                    stop_strings: req.stop.clone(),
+                    stop_token_ids: req.stop_token_ids.clone(),
+                    include_stop_str_in_output: req.include_stop_str_in_output,
+                    logprobs: internal_logprobs,
+                    echo: req.echo,
+                    lora_request: lora_request.clone(),
+                    constraint: request_constraint,
+                    image_inputs: Vec::new(),
+                };
+
+                let result = state.engine.get().generate(gen_req).await.map_err(|e| {
+                    prometheus::inc_requests_error();
+                    ApiError::EngineError(e.to_string())
+                })?;
+
+                // Validate output against response_format after generation completes.
+                if let Err(e) =
+                    validate_response_format(&result.generated_text, req.response_format.as_ref())
+                {
+                    prometheus::inc_requests_error();
+                    return Err(ApiError::InvalidRequest(e.to_string()));
+                }
+
+                let logprobs_data = if internal_logprobs.is_some() {
+                    Some(build_logprobs(&result, &state.tokenizer, req.echo))
+                } else {
+                    None
+                };
+
+                candidates.push((result, logprobs_data));
+            }
+
+            // Select the best candidate by sum of token logprobs
+            let best_idx = if best_of > 1 {
+                candidates
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, (a, _)), (_, (b, _))| {
+                        let score_a = sum_token_logprobs(a);
+                        let score_b = sum_token_logprobs(b);
+                        score_a
+                            .partial_cmp(&score_b)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            let (best_result, best_logprobs) = candidates.swap_remove(best_idx);
+
+            total_completion_tokens += best_result.generated_token_ids.len();
+
+            // Strip logprobs from the response if the user didn't request them
+            let final_logprobs = if user_requested_logprobs.is_some() {
+                best_logprobs
             } else {
                 None
             };
 
             choices.push(CompletionChoice {
-                text: result.generated_text,
+                text: best_result.generated_text,
                 index: index as u32,
-                finish_reason: Some(finish_reason_str(&result.finish_reason)),
-                logprobs,
+                finish_reason: Some(finish_reason_str(&best_result.finish_reason)),
+                logprobs: final_logprobs,
             });
         }
 
@@ -157,6 +254,7 @@ pub async fn create_completion(
             object: "text_completion",
             created: timestamp_now(),
             model: state.model_id.clone(),
+            system_fingerprint: system_fingerprint(),
             choices,
             usage: Usage {
                 prompt_tokens: total_prompt_tokens,
@@ -164,6 +262,14 @@ pub async fn create_completion(
                 total_tokens: total_prompt_tokens + total_completion_tokens,
             },
         };
+
+        // Record metrics
+        let elapsed = start_time.elapsed().as_secs_f64();
+        prometheus::observe_e2e_latency(elapsed);
+        if total_completion_tokens > 0 && elapsed > 0.0 {
+            prometheus::observe_tps(total_completion_tokens as f64 / elapsed);
+        }
+        prometheus::inc_requests_success();
 
         Ok(Json(response).into_response())
     }
@@ -188,6 +294,16 @@ fn resolve_prompt_input(state: &AppState, input: PromptInput) -> Result<(String,
             Ok((text, token_count))
         }
     }
+}
+
+/// Score a generation result by the sum of its token logprobs.
+/// Higher (less negative) scores indicate more confident completions.
+fn sum_token_logprobs(result: &GenerationResult) -> f64 {
+    result
+        .token_logprobs
+        .as_ref()
+        .map(|lps| lps.iter().map(|&lp| lp as f64).sum())
+        .unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Create a sampling constraint from response_format.

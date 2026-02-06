@@ -25,6 +25,7 @@
 //! ```
 
 pub mod awq;
+pub mod bitsandbytes;
 mod config;
 mod detection;
 pub mod fp8;
@@ -41,6 +42,9 @@ pub mod weight_loader;
 
 // Re-export public types
 pub use awq::{AwqConfig, AwqLinear, AwqVersion};
+pub use bitsandbytes::{
+    quantize_int8, quantize_nf4, unpack_nf4, BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType,
+};
 pub use config::{
     ActivationScheme, NoQuantizationConfig, QuantizationConfig, QuantizationMethod,
     QuantizedLinear, UnquantizedLinear,
@@ -66,8 +70,8 @@ pub use marlin::{
 pub use marlin_cuda::marlin_gemm;
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
-    AwqWeightLoader, Fp8WeightLoader, GptqWeightLoader, QuantizedWeightLoader,
-    UnquantizedWeightLoader,
+    AwqWeightLoader, BitsAndBytesWeightLoader, Fp8WeightLoader, GptqWeightLoader,
+    QuantizedWeightLoader, UnquantizedWeightLoader,
 };
 
 use std::path::Path;
@@ -112,6 +116,9 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
                 &detected.raw_config,
             ))
         }
+        QuantizationMethod::BitsAndBytes => {
+            Box::new(BitsAndBytesConfig::from_detected(&detected.raw_config))
+        }
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -147,7 +154,9 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::Gguf => 0,  // CPU supported
         QuantizationMethod::BitsAndBytes => 70,
         QuantizationMethod::SqueezeLlm => 70,
-        QuantizationMethod::Marlin => 80, // Ampere
+        QuantizationMethod::Marlin => 80,            // Ampere
+        QuantizationMethod::CompressedTensors => 70, // Volta
+        QuantizationMethod::Torchao => 70,           // Volta
     };
     capability >= min_cap
 }

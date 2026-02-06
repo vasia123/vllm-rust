@@ -122,6 +122,7 @@ impl MoELayer {
             num_experts: config.num_experts,
             top_k: config.top_k,
             renormalize: config.renormalize,
+            ..Default::default()
         };
 
         let router = TopKRouter::new(router_config, vb.pp("gate"))?;
@@ -213,8 +214,10 @@ impl MoELayer {
                 token_output = token_output.add(&weighted)?;
             }
 
-            // Update output tensor at token_idx
-            output = scatter_add_1d(&output, token_idx, &token_output)?;
+            // Update output tensor at token_idx using index_add
+            let indices = Tensor::new(&[token_idx as u32], device)?;
+            let token_output_2d = token_output.unsqueeze(0)?;
+            output = output.index_add(&indices, &token_output_2d, 0)?;
         }
 
         // Reshape back to original shape
@@ -288,17 +291,16 @@ impl MoELayer {
             // Batched expert forward
             let expert_output = expert.forward(&batch_input)?;
 
-            // Scatter weighted results back to output
-            for (batch_idx, &(token_idx, _, weight)) in tokens.iter().enumerate() {
-                let row_output = expert_output.i(batch_idx)?;
-                let weight_tensor = Tensor::new(&[weight], device)?.to_dtype(dtype)?;
-                let weighted = row_output.broadcast_mul(&weight_tensor)?;
+            // Apply weights and scatter back using index_add (O(n) instead of O(n²))
+            let weights_vec: Vec<f32> = tokens.iter().map(|(_, _, w)| *w).collect();
+            let weights_tensor =
+                Tensor::from_vec(weights_vec, batch_size, device)?.to_dtype(dtype)?;
+            let weights_expanded = weights_tensor.reshape((batch_size, 1))?;
+            let weighted_output = expert_output.broadcast_mul(&weights_expanded)?;
 
-                // Add to output
-                let current = output.i(token_idx)?;
-                let updated = current.add(&weighted)?;
-                output = scatter_add_1d(&output, token_idx, &updated)?;
-            }
+            let indices: Vec<u32> = tokens.iter().map(|(idx, _, _)| *idx as u32).collect();
+            let index_tensor = Tensor::from_vec(indices, batch_size, device)?;
+            output = output.index_add(&index_tensor, &weighted_output, 0)?;
         }
 
         // Reshape back to original shape
@@ -326,21 +328,255 @@ impl MoELayer {
     }
 }
 
-/// Helper to update a single row in a 2D tensor.
-fn scatter_add_1d(tensor: &Tensor, row_idx: usize, values: &Tensor) -> Result<Tensor> {
-    let (num_rows, _hidden_size) = tensor.dims2()?;
+// ─── MoE Layer with Shared Expert ───────────────────────────────────────────
 
-    // Build a new tensor with the updated row
-    let mut rows = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        if i == row_idx {
-            rows.push(values.unsqueeze(0)?);
-        } else {
-            rows.push(tensor.i(i)?.unsqueeze(0)?);
+/// Configuration for MoE layer with shared expert support.
+///
+/// Used by Qwen2-MoE and GLM4-MoE models.
+#[derive(Debug, Clone)]
+pub struct MoELayerWithSharedConfig {
+    /// Hidden size.
+    pub hidden_size: usize,
+    /// Intermediate (FFN) size for routed experts.
+    pub intermediate_size: usize,
+    /// Intermediate size for shared expert (may differ from routed).
+    pub shared_expert_intermediate_size: Option<usize>,
+    /// Number of routed experts.
+    pub num_experts: usize,
+    /// Number of experts to activate per token.
+    pub top_k: usize,
+    /// Whether to renormalize routing weights.
+    pub renormalize: bool,
+    /// Scoring function (Softmax or Sigmoid).
+    pub scoring_func: super::router::ScoringFunc,
+    /// Scaling factor for routed expert output (GLM4-MoE).
+    pub routed_scaling_factor: f64,
+    /// Whether shared expert output is gated (Qwen2-MoE uses sigmoid gate).
+    pub gated_shared_expert: bool,
+    /// Whether to use grouped top-k.
+    pub use_grouped_topk: bool,
+    /// Number of expert groups.
+    pub num_expert_groups: Option<usize>,
+    /// Top-k per group.
+    pub topk_per_group: Option<usize>,
+}
+
+impl Default for MoELayerWithSharedConfig {
+    fn default() -> Self {
+        Self {
+            hidden_size: 0,
+            intermediate_size: 0,
+            shared_expert_intermediate_size: None,
+            num_experts: 0,
+            top_k: 2,
+            renormalize: true,
+            scoring_func: super::router::ScoringFunc::Softmax,
+            routed_scaling_factor: 1.0,
+            gated_shared_expert: false,
+            use_grouped_topk: false,
+            num_expert_groups: None,
+            topk_per_group: None,
         }
     }
+}
 
-    Tensor::cat(&rows, 0)
+/// MoE Layer with shared expert support.
+///
+/// This layer supports:
+/// - A shared expert that processes all tokens (Qwen2-MoE, GLM4-MoE)
+/// - Optional gating on shared expert output (Qwen2-MoE)
+/// - Routed expert output scaling (GLM4-MoE)
+/// - Sigmoid scoring with bias correction (GLM4-MoE)
+pub struct MoELayerWithShared {
+    router: TopKRouter,
+    experts: Vec<MoEExpert>,
+    shared_expert: Option<MoEExpert>,
+    /// Optional gate for shared expert (sigmoid(gate(x)) * shared_output)
+    shared_expert_gate: Option<candle_nn::Linear>,
+    config: MoELayerWithSharedConfig,
+    block_config: FusedMoEBlockConfig,
+}
+
+impl MoELayerWithShared {
+    /// Create a new MoE layer with shared expert.
+    pub fn new(config: MoELayerWithSharedConfig, vb: VarBuilder) -> Result<Self> {
+        let router_config = RouterConfig {
+            hidden_size: config.hidden_size,
+            num_experts: config.num_experts,
+            top_k: config.top_k,
+            renormalize: config.renormalize,
+            scoring_func: config.scoring_func,
+            use_grouped_topk: config.use_grouped_topk,
+            num_expert_groups: config.num_expert_groups,
+            topk_per_group: config.topk_per_group,
+        };
+
+        let router = TopKRouter::new(router_config, vb.pp("gate"))?;
+
+        let expert_config = MoEExpertConfig {
+            hidden_size: config.hidden_size,
+            intermediate_size: config.intermediate_size,
+        };
+
+        let mut experts = Vec::with_capacity(config.num_experts);
+        for i in 0..config.num_experts {
+            let expert = MoEExpert::new(&expert_config, vb.pp(format!("experts.{}", i)))?;
+            experts.push(expert);
+        }
+
+        // Create shared expert if intermediate size is specified
+        let shared_expert = if let Some(shared_size) = config.shared_expert_intermediate_size {
+            let shared_config = MoEExpertConfig {
+                hidden_size: config.hidden_size,
+                intermediate_size: shared_size,
+            };
+            Some(MoEExpert::new(&shared_config, vb.pp("shared_expert"))?)
+        } else {
+            None
+        };
+
+        // Create shared expert gate if enabled
+        let shared_expert_gate = if config.gated_shared_expert && shared_expert.is_some() {
+            Some(candle_nn::linear_no_bias(
+                config.hidden_size,
+                1,
+                vb.pp("shared_expert_gate"),
+            )?)
+        } else {
+            None
+        };
+
+        let block_config =
+            FusedMoEBlockConfig::auto_select(128, config.hidden_size, config.intermediate_size);
+
+        Ok(Self {
+            router,
+            experts,
+            shared_expert,
+            shared_expert_gate,
+            config,
+            block_config,
+        })
+    }
+
+    /// Forward pass through the MoE layer with shared expert.
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let orig_shape = hidden_states.dims().to_vec();
+        let hidden_size = *orig_shape.last().ok_or_else(|| {
+            candle_core::Error::Msg("Tensor must have at least 1 dimension".to_string())
+        })?;
+
+        // Flatten to [num_tokens, hidden_size] for routing
+        let num_tokens: usize = orig_shape.iter().take(orig_shape.len() - 1).product();
+        let flat_hidden = hidden_states.reshape((num_tokens, hidden_size))?;
+
+        // Route tokens to experts
+        let (routing_weights, expert_indices) = self.router.route(&flat_hidden)?;
+
+        // Initialize output tensor
+        let device = hidden_states.device();
+        let dtype = hidden_states.dtype();
+        let mut output = Tensor::zeros((num_tokens, hidden_size), dtype, device)?;
+
+        // Process routed experts
+        let expert_indices_vec: Vec<u32> = expert_indices.flatten_all()?.to_vec1()?;
+        let routing_weights_vec: Vec<f32> = routing_weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1()?;
+
+        // Build token groups per expert
+        let mut expert_tokens: Vec<Vec<(usize, usize, f32)>> =
+            vec![Vec::new(); self.config.num_experts];
+
+        for token_idx in 0..num_tokens {
+            for k in 0..self.config.top_k {
+                let flat_idx = token_idx * self.config.top_k + k;
+                let expert_id = expert_indices_vec[flat_idx] as usize;
+                let weight = routing_weights_vec[flat_idx];
+                if expert_id < self.config.num_experts {
+                    expert_tokens[expert_id].push((token_idx, k, weight));
+                }
+            }
+        }
+
+        // Process each expert's tokens as a batch
+        for (expert_id, tokens) in expert_tokens.iter().enumerate() {
+            if tokens.is_empty() {
+                continue;
+            }
+
+            let expert = &self.experts[expert_id];
+            let batch_size = tokens.len();
+
+            // Gather input tokens for this expert
+            let mut input_rows = Vec::with_capacity(batch_size);
+            for &(token_idx, _, _) in tokens {
+                input_rows.push(flat_hidden.i(token_idx)?.unsqueeze(0)?);
+            }
+            let batch_input = Tensor::cat(&input_rows, 0)?;
+
+            // Batched expert forward
+            let expert_output = expert.forward(&batch_input)?;
+
+            // Apply weights and scatter back using index_add (O(n) instead of O(n²))
+            let weights_vec: Vec<f32> = tokens.iter().map(|(_, _, w)| *w).collect();
+            let weights_tensor =
+                Tensor::from_vec(weights_vec, batch_size, device)?.to_dtype(dtype)?;
+            let weights_expanded = weights_tensor.reshape((batch_size, 1))?;
+            let weighted_output = expert_output.broadcast_mul(&weights_expanded)?;
+
+            let indices: Vec<u32> = tokens.iter().map(|(idx, _, _)| *idx as u32).collect();
+            let index_tensor = Tensor::from_vec(indices, batch_size, device)?;
+            output = output.index_add(&index_tensor, &weighted_output, 0)?;
+        }
+
+        // Apply routed scaling factor
+        if (self.config.routed_scaling_factor - 1.0).abs() > 1e-9 {
+            let scale = Tensor::new(&[self.config.routed_scaling_factor as f32], device)?
+                .to_dtype(dtype)?;
+            output = output.broadcast_mul(&scale)?;
+        }
+
+        // Add shared expert output if present
+        if let Some(ref shared_expert) = self.shared_expert {
+            let shared_output = shared_expert.forward(&flat_hidden)?;
+
+            // Apply gate if present
+            let shared_output = if let Some(ref gate) = self.shared_expert_gate {
+                let gate_output = gate.forward(&flat_hidden)?;
+                let gate_weight = candle_nn::ops::sigmoid(&gate_output)?;
+                shared_output.broadcast_mul(&gate_weight)?
+            } else {
+                shared_output
+            };
+
+            output = output.add(&shared_output)?;
+        }
+
+        // Reshape back to original shape
+        output.reshape(orig_shape)
+    }
+
+    /// Get number of routed experts.
+    pub fn num_experts(&self) -> usize {
+        self.config.num_experts
+    }
+
+    /// Get top-k value.
+    pub fn top_k(&self) -> usize {
+        self.config.top_k
+    }
+
+    /// Check if this layer has a shared expert.
+    pub fn has_shared_expert(&self) -> bool {
+        self.shared_expert.is_some()
+    }
+
+    /// Get the block configuration for fused kernels.
+    pub fn block_config(&self) -> &FusedMoEBlockConfig {
+        &self.block_config
+    }
 }
 
 #[cfg(test)]
@@ -528,5 +764,125 @@ mod tests {
                 batch_size
             );
         }
+    }
+
+    // ─── MoELayerWithShared Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_moe_with_shared_creation() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            shared_expert_intermediate_size: Some(128),
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        assert_eq!(moe.num_experts(), 4);
+        assert_eq!(moe.top_k(), 2);
+        assert!(moe.has_shared_expert());
+    }
+
+    #[test]
+    fn test_moe_with_shared_no_shared_expert() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            shared_expert_intermediate_size: None, // No shared expert
+            num_experts: 4,
+            top_k: 2,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        assert!(!moe.has_shared_expert());
+    }
+
+    #[test]
+    fn test_moe_with_shared_forward() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            shared_expert_intermediate_size: Some(64),
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+
+        // Test with 2D input [num_tokens, hidden_size]
+        let input = Tensor::randn(0f32, 1.0, (5, 16), &device).unwrap();
+        let output = moe.forward(&input).unwrap();
+        assert_eq!(output.dims(), &[5, 16]);
+    }
+
+    #[test]
+    fn test_moe_with_shared_gated() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            shared_expert_intermediate_size: Some(64),
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            gated_shared_expert: true, // Enable gated shared expert
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        assert!(moe.has_shared_expert());
+
+        let input = Tensor::randn(0f32, 1.0, (3, 16), &device).unwrap();
+        let output = moe.forward(&input).unwrap();
+        assert_eq!(output.dims(), &[3, 16]);
+    }
+
+    #[test]
+    fn test_moe_with_shared_scaling() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            shared_expert_intermediate_size: Some(64),
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            routed_scaling_factor: 0.5, // GLM4-MoE uses scaling
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+
+        let input = Tensor::randn(0f32, 1.0, (3, 16), &device).unwrap();
+        let output = moe.forward(&input).unwrap();
+        assert_eq!(output.dims(), &[3, 16]);
+    }
+
+    #[test]
+    fn test_moe_with_shared_config_default() {
+        let config = MoELayerWithSharedConfig::default();
+        assert_eq!(config.routed_scaling_factor, 1.0);
+        assert!(!config.gated_shared_expert);
+        assert!(!config.use_grouped_topk);
+        assert!(config.shared_expert_intermediate_size.is_none());
     }
 }

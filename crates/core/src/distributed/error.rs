@@ -28,6 +28,10 @@ pub enum DistributedError {
     #[error("NCCL error: {0}")]
     NcclError(String),
 
+    /// Invalid tensor for collective operation.
+    #[error("invalid tensor: {0}")]
+    InvalidTensor(String),
+
     /// Communication timeout.
     #[error("communication timeout after {timeout_ms}ms")]
     Timeout { timeout_ms: u64 },
@@ -38,3 +42,9 @@ pub enum DistributedError {
 }
 
 pub type Result<T> = std::result::Result<T, DistributedError>;
+
+impl From<DistributedError> for candle_core::Error {
+    fn from(err: DistributedError) -> Self {
+        candle_core::Error::Msg(err.to_string())
+    }
+}

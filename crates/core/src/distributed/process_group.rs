@@ -10,13 +10,16 @@ pub struct ParallelConfig {
     pub tensor_parallel_size: usize,
     /// Number of GPUs for pipeline parallelism (splitting stages).
     pub pipeline_parallel_size: usize,
+    /// Number of GPUs for expert parallelism (MoE expert distribution).
+    /// Must divide total_experts evenly. When EP > 1, TP is disabled within experts.
+    pub expert_parallel_size: usize,
 }
 
 impl ParallelConfig {
     /// Create a new parallel configuration.
     ///
     /// # Panics
-    /// Panics if either size is 0.
+    /// Panics if any size is 0.
     pub fn new(tensor_parallel_size: usize, pipeline_parallel_size: usize) -> Self {
         assert!(tensor_parallel_size > 0, "tensor_parallel_size must be > 0");
         assert!(
@@ -26,6 +29,29 @@ impl ParallelConfig {
         Self {
             tensor_parallel_size,
             pipeline_parallel_size,
+            expert_parallel_size: 1,
+        }
+    }
+
+    /// Create with all parallelism dimensions.
+    ///
+    /// # Panics
+    /// Panics if any size is 0.
+    pub fn new_with_ep(
+        tensor_parallel_size: usize,
+        pipeline_parallel_size: usize,
+        expert_parallel_size: usize,
+    ) -> Self {
+        assert!(tensor_parallel_size > 0, "tensor_parallel_size must be > 0");
+        assert!(
+            pipeline_parallel_size > 0,
+            "pipeline_parallel_size must be > 0"
+        );
+        assert!(expert_parallel_size > 0, "expert_parallel_size must be > 0");
+        Self {
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            expert_parallel_size,
         }
     }
 
@@ -34,6 +60,7 @@ impl ParallelConfig {
         Self {
             tensor_parallel_size: 1,
             pipeline_parallel_size: 1,
+            expert_parallel_size: 1,
         }
     }
 
@@ -47,20 +74,75 @@ impl ParallelConfig {
         Self::new(1, size)
     }
 
+    /// Expert parallelism only (for MoE models).
+    pub fn expert_parallel(size: usize) -> Self {
+        Self {
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            expert_parallel_size: size,
+        }
+    }
+
     /// Total number of GPUs required.
+    ///
+    /// Note: EP ranks share the same physical GPUs as TP ranks.
+    /// EP and TP are mutually exclusive for expert layers.
     pub fn world_size(&self) -> usize {
         self.tensor_parallel_size * self.pipeline_parallel_size
     }
 
     /// Whether this is effectively single-GPU execution.
     pub fn is_single_gpu(&self) -> bool {
-        self.world_size() == 1
+        self.world_size() == 1 && self.expert_parallel_size == 1
+    }
+
+    /// Whether expert parallelism is enabled.
+    pub fn uses_expert_parallelism(&self) -> bool {
+        self.expert_parallel_size > 1
     }
 }
 
 impl Default for ParallelConfig {
     fn default() -> Self {
         Self::no_parallelism()
+    }
+}
+
+/// Context for Expert Parallelism within a process group.
+///
+/// Provides the EP rank and size for expert placement decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EPContext {
+    /// This rank's position in the EP group (0..ep_size).
+    pub ep_rank: usize,
+    /// Total number of EP ranks.
+    pub ep_size: usize,
+}
+
+impl EPContext {
+    /// Create a new EP context.
+    pub fn new(ep_rank: usize, ep_size: usize) -> Self {
+        assert!(ep_rank < ep_size, "ep_rank must be < ep_size");
+        Self { ep_rank, ep_size }
+    }
+
+    /// Create context for single-GPU (no EP).
+    pub fn single_gpu() -> Self {
+        Self {
+            ep_rank: 0,
+            ep_size: 1,
+        }
+    }
+
+    /// Whether this is effectively single-GPU EP.
+    pub fn is_single(&self) -> bool {
+        self.ep_size == 1
+    }
+}
+
+impl Default for EPContext {
+    fn default() -> Self {
+        Self::single_gpu()
     }
 }
 
