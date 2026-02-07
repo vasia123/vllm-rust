@@ -105,10 +105,13 @@ pub struct CompletionRequest {
     /// A unique identifier representing the end-user (for tracking/abuse detection).
     #[serde(default)]
     pub user: Option<String>,
-    /// Generate `best_of` completions and return the best one.
-    /// Must be >= n if n is set. Default is 1.
-    #[serde(default = "default_best_of")]
-    pub best_of: usize,
+    /// Number of completions to return for each prompt. Default is 1.
+    #[serde(default = "default_n")]
+    pub n: usize,
+    /// Generate `best_of` completions and return the best `n`.
+    /// Must be >= n. Default is 1 (or n when n > 1).
+    #[serde(default)]
+    pub best_of: Option<usize>,
     /// Beam search width. When set (> 1), uses beam search decoding instead of sampling.
     #[serde(default)]
     pub beam_width: Option<usize>,
@@ -253,6 +256,10 @@ pub struct ChatCompletionRequest {
     /// Number of chat completion choices to generate. Default 1.
     #[serde(default = "default_n")]
     pub n: usize,
+    /// Generate `best_of` completions and return the best `n`.
+    /// Must be >= n. Default is n (no extra candidates).
+    #[serde(default)]
+    pub best_of: Option<usize>,
     /// Beam search width. When set (> 1), uses beam search decoding instead of sampling.
     #[serde(default)]
     pub beam_width: Option<usize>,
@@ -417,10 +424,6 @@ fn default_top_p() -> f32 {
 
 fn default_repetition_penalty() -> f32 {
     1.0
-}
-
-fn default_best_of() -> usize {
-    1
 }
 
 fn default_n() -> usize {
@@ -1255,17 +1258,59 @@ mod tests {
             "best_of": 5
         }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.best_of, 5);
+        assert_eq!(req.best_of, Some(5));
     }
 
     #[test]
-    fn completion_request_best_of_defaults_to_one() {
+    fn completion_request_best_of_defaults_to_none() {
         let json = r#"{
             "model": "test-model",
             "prompt": "hello"
         }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.best_of, 1);
+        assert_eq!(req.best_of, None);
+    }
+
+    #[test]
+    fn completion_request_n_explicit_value() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "hello",
+            "n": 3
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.n, 3);
+    }
+
+    #[test]
+    fn completion_request_n_defaults_to_one() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "hello"
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.n, 1);
+    }
+
+    #[test]
+    fn chat_request_best_of_explicit_value() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "best_of": 5
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.best_of, Some(5));
+    }
+
+    #[test]
+    fn chat_request_best_of_defaults_to_none() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.best_of, None);
     }
 
     // ─── n field deserialization ──────────────────────────────────────

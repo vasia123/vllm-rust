@@ -167,6 +167,8 @@ pub async fn create_chat_completion(
         )
     } else {
         let n = req.n;
+        // best_of defaults to n when not specified
+        let best_of = req.best_of.unwrap_or(n);
 
         let prompt_tokens = state
             .tokenizer
@@ -174,10 +176,18 @@ pub async fn create_chat_completion(
             .map(|ids| ids.len())
             .unwrap_or(0);
 
-        let mut choices = Vec::with_capacity(n);
-        let mut total_completion_tokens = 0;
+        // When best_of > n, we need logprobs to score candidates even if the
+        // user didn't ask for them. Request at least 1 top logprob internally.
+        let internal_logprobs_count = if best_of > n && logprobs_count.is_none() {
+            Some(1)
+        } else {
+            logprobs_count
+        };
 
-        for i in 0..n {
+        // Generate `best_of` candidates
+        let mut candidates: Vec<GenerationResult> = Vec::with_capacity(best_of);
+
+        for _ in 0..best_of {
             // Recreate constraint for each iteration (constraints are stateful)
             let iter_constraint = create_constraint_from_response_format(
                 req.response_format.as_ref(),
@@ -206,7 +216,7 @@ pub async fn create_chat_completion(
                 stop_strings: req.stop.clone(),
                 stop_token_ids: req.stop_token_ids.clone(),
                 include_stop_str_in_output: req.include_stop_str_in_output,
-                logprobs: logprobs_count,
+                logprobs: internal_logprobs_count,
                 echo: false,
                 lora_request: lora_request.clone(),
                 constraint: iter_constraint,
@@ -231,6 +241,16 @@ pub async fn create_chat_completion(
                 return Err(ApiError::InvalidRequest(e.to_string()));
             }
 
+            candidates.push(result);
+        }
+
+        // Select the top `n` candidates by cumulative log probability
+        let selected = select_top_n_chat_candidates(candidates, n);
+
+        let mut choices = Vec::with_capacity(n);
+        let mut total_completion_tokens = 0;
+
+        for (i, result) in selected.into_iter().enumerate() {
             total_completion_tokens += result.generated_token_ids.len();
 
             // Parse tool calls if tools were provided
@@ -262,7 +282,7 @@ pub async fn create_chat_completion(
                 )
             };
 
-            // Build logprobs if requested
+            // Build logprobs if the user requested them
             let logprobs = if logprobs_count.is_some() {
                 Some(build_chat_logprobs(&result, &state.tokenizer))
             } else {
@@ -305,6 +325,51 @@ pub async fn create_chat_completion(
 
         Ok(Json(response).into_response())
     }
+}
+
+/// Select the top `n` candidates from a list, ranked by cumulative log probability.
+///
+/// If `n >= candidates.len()`, returns all candidates in their original order.
+/// If `n < candidates.len()`, scores each by cumulative logprob and returns the
+/// top `n` sorted by descending score.
+fn select_top_n_chat_candidates(
+    mut candidates: Vec<GenerationResult>,
+    n: usize,
+) -> Vec<GenerationResult> {
+    if n >= candidates.len() {
+        return candidates;
+    }
+
+    // Score each candidate and sort by descending logprob score
+    let mut scored: Vec<(usize, f64)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, result)| (i, sum_token_logprobs(result)))
+        .collect();
+
+    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Take top n indices (sorted descending by index so swap_remove doesn't shift)
+    let mut top_indices: Vec<usize> = scored.iter().take(n).map(|(i, _)| *i).collect();
+    top_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut selected = Vec::with_capacity(n);
+    for idx in top_indices {
+        selected.push(candidates.swap_remove(idx));
+    }
+    // Reverse to restore original relative ordering (highest score first)
+    selected.reverse();
+    selected
+}
+
+/// Score a generation result by the sum of its token logprobs.
+/// Higher (less negative) scores indicate more confident completions.
+fn sum_token_logprobs(result: &GenerationResult) -> f64 {
+    result
+        .token_logprobs
+        .as_ref()
+        .map(|lps| lps.iter().map(|&lp| lp as f64).sum())
+        .unwrap_or(f64::NEG_INFINITY)
 }
 
 /// Build a `BeamSearchConfig` from optional API parameters.

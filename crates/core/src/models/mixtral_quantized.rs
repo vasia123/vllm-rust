@@ -375,6 +375,8 @@ impl QuantizedMixtralAttention {
                 self.num_kv_heads,
                 max_blocks_per_seq,
                 max_seq_len,
+                self.head_dim,
+                cache_engine.block_size(),
             )?;
 
             self.o_proj.forward(&attn_output.unsqueeze(1)?)

@@ -22,6 +22,7 @@ mod context;
 pub mod cuda_graph;
 pub mod cuda_graph_runner;
 mod embedding_forward;
+mod encoder_decoder;
 mod handle;
 mod helpers;
 mod model_forward;
@@ -42,6 +43,7 @@ pub use cuda_graph_runner::{
     CudaGraphRunnerStats,
 };
 pub use embedding_forward::{pool_embeddings, EmbeddingOutput, ModelForEmbedding, PoolingStrategy};
+pub use encoder_decoder::{EncoderOutput, ModelForEncoderDecoder};
 pub use handle::EngineHandle;
 pub use model_forward::{DecodeSequenceMetadata, ModelForward};
 pub use spec_decode::{

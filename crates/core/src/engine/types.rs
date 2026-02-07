@@ -148,6 +148,10 @@ pub(crate) enum EngineCommand {
         request: GenerationRequest,
         stream_tx: mpsc::Sender<StreamEvent>,
     },
+    /// Abort a running request, freeing its GPU resources.
+    Abort {
+        request_id: crate::request::RequestId,
+    },
     GetStats {
         response_tx: oneshot::Sender<EngineStats>,
     },

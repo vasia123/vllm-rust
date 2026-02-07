@@ -294,6 +294,8 @@ impl ExaoneAttention {
                 self.num_kv_heads,
                 max_blocks_per_seq,
                 max_seq_len,
+                self.head_dim,
+                cache_engine.block_size(),
             )?;
 
             self.out_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)

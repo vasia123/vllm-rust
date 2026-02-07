@@ -29,9 +29,14 @@ pub mod audio;
 mod inputs;
 mod processor;
 mod projector;
+pub mod video;
 mod vision;
 
-pub use inputs::{ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage};
+pub use inputs::{
+    ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage, ProcessedVideo,
+    VideoData, VideoSource, VideoUrl,
+};
 pub use processor::{MultimodalProcessor, ProcessorConfig};
 pub use projector::{MultimodalProjector, ProjectorConfig, ProjectorType};
+pub use video::{FrameSamplingStrategy, VideoEncoder, VideoEncoderConfig, VideoPlaceholderConfig};
 pub use vision::{VisionEncoder, VisionEncoderConfig, VisionEncoderType};

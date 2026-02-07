@@ -118,6 +118,71 @@ static TOKENS_PER_SECOND: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to register vllm_tokens_per_second")
 });
 
+// Per-token latency
+static TIME_PER_OUTPUT_TOKEN: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "vllm_time_per_output_token_seconds",
+        "Time per output token in seconds",
+        vec![0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5]
+    )
+    .expect("failed to register vllm_time_per_output_token_seconds")
+});
+
+// Model forward pass time
+static MODEL_FORWARD_TIME: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "vllm_model_forward_time_seconds",
+        "Time for model forward pass in seconds",
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+    )
+    .expect("failed to register vllm_model_forward_time_seconds")
+});
+
+// Token counters
+static PROMPT_TOKENS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "vllm_prompt_tokens_total",
+        "Total number of prompt tokens processed"
+    )
+    .expect("failed to register vllm_prompt_tokens_total")
+});
+
+static GENERATION_TOKENS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "vllm_generation_tokens_total",
+        "Total number of tokens generated"
+    )
+    .expect("failed to register vllm_generation_tokens_total")
+});
+
+// Scheduler metrics
+static NUM_PREEMPTIONS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "vllm_num_preemptions_total",
+        "Total number of request preemptions"
+    )
+    .expect("failed to register vllm_num_preemptions_total")
+});
+
+// Prefix cache hit ratio
+static PREFIX_CACHE_HIT_RATIO: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "vllm_prefix_cache_hit_ratio",
+        "Prefix cache hit ratio (0.0 - 1.0)"
+    )
+    .expect("failed to register vllm_prefix_cache_hit_ratio")
+});
+
+// Batch size tracking
+static BATCH_SIZE: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "vllm_batch_size",
+        "Number of sequences per forward pass",
+        vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+    )
+    .expect("failed to register vllm_batch_size")
+});
+
 // Server health
 static SERVER_ACCEPTING: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
@@ -148,6 +213,13 @@ pub fn init_metrics() {
     let _ = &*TIME_TO_FIRST_TOKEN;
     let _ = &*E2E_LATENCY;
     let _ = &*TOKENS_PER_SECOND;
+    let _ = &*TIME_PER_OUTPUT_TOKEN;
+    let _ = &*MODEL_FORWARD_TIME;
+    let _ = &*PROMPT_TOKENS_TOTAL;
+    let _ = &*GENERATION_TOKENS_TOTAL;
+    let _ = &*NUM_PREEMPTIONS;
+    let _ = &*PREFIX_CACHE_HIT_RATIO;
+    let _ = &*BATCH_SIZE;
     let _ = &*SERVER_ACCEPTING;
     let _ = &*SERVER_UPTIME;
 }
@@ -182,6 +254,36 @@ pub fn observe_tps(tokens_per_second: f64) {
     TOKENS_PER_SECOND.observe(tokens_per_second);
 }
 
+/// Record time per output token.
+pub fn observe_time_per_token(seconds: f64) {
+    TIME_PER_OUTPUT_TOKEN.observe(seconds);
+}
+
+/// Record model forward pass duration.
+pub fn observe_model_forward_time(seconds: f64) {
+    MODEL_FORWARD_TIME.observe(seconds);
+}
+
+/// Record prompt tokens processed.
+pub fn inc_prompt_tokens(count: u64) {
+    PROMPT_TOKENS_TOTAL.inc_by(count);
+}
+
+/// Record generation tokens produced.
+pub fn inc_generation_tokens(count: u64) {
+    GENERATION_TOKENS_TOTAL.inc_by(count);
+}
+
+/// Record a preemption event.
+pub fn inc_preemptions() {
+    NUM_PREEMPTIONS.inc();
+}
+
+/// Record batch size for a forward pass.
+pub fn observe_batch_size(size: f64) {
+    BATCH_SIZE.observe(size);
+}
+
 /// GET /admin/metrics/prometheus - Prometheus format metrics.
 pub async fn prometheus_metrics(State(state): State<AdminState>) -> Result<Response, ApiError> {
     // Update gauges from current engine state
@@ -210,6 +312,17 @@ pub async fn prometheus_metrics(State(state): State<AdminState>) -> Result<Respo
     if let Some((cached, evictable)) = engine_stats.prefix_cache_stats {
         PREFIX_CACHE_BLOCKS.set(cached as i64);
         PREFIX_CACHE_EVICTABLE.set(evictable as i64);
+    }
+
+    // Update prefix cache hit ratio from detailed stats
+    if let Some(ref detailed) = engine_stats.prefix_cache_detailed_stats {
+        let total = detailed.num_hits + detailed.num_misses;
+        if total > 0 {
+            let ratio = detailed.num_hits as f64 / total as f64;
+            PREFIX_CACHE_HIT_RATIO.set(ratio);
+        }
+    } else if let Some(ref recent) = engine_stats.prefix_cache_recent_stats {
+        PREFIX_CACHE_HIT_RATIO.set(recent.hit_rate);
     }
 
     // Update server health

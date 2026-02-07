@@ -1,5 +1,6 @@
 pub mod alibi;
 pub mod attention;
+pub mod cross_attention;
 pub mod mask;
 pub mod mlp;
 pub mod rotary;

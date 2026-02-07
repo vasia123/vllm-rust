@@ -1,106 +1,244 @@
 use std::process::Command;
 
-fn main() {
-    println!("cargo:rerun-if-changed=kernels/paged_attention.cu");
-    println!("cargo:rerun-if-changed=kernels/fp8_quant.cu");
-    println!("cargo:rerun-if-changed=kernels/fp8_gemm.cu");
-    println!("cargo:rerun-if-changed=kernels/gptq_dequant.cu");
-    println!("cargo:rerun-if-changed=kernels/fused_moe_align.cu");
-    println!("cargo:rerun-if-changed=kernels/fused_moe_gemm.cu");
-    println!("cargo:rerun-if-changed=kernels/swiglu.cu");
-    println!("cargo:rerun-if-changed=kernels/topk_softmax.cu");
-    println!("cargo:rerun-if-changed=kernels/bnb_fused_matmul.cu");
+/// Minimum SM version required for each kernel category.
+///
+/// - sm_75 (Turing, T4): basic integer ops, no bf16
+/// - sm_80 (Ampere, A100): native bf16, tf32
+/// - sm_89 (Ada, L4/RTX 4090): native fp8 (e4m3/e5m2)
+/// - sm_90 (Hopper, H100): fp8 tensor cores, TMA
+struct KernelDef {
+    source: &'static str,
+    output: &'static str,
+    min_sm: u32,
+}
 
-    // Only compile CUDA kernels when the feature is enabled
+const KERNELS: &[KernelDef] = &[
+    // BF16 attention — requires sm_80+ for __nv_bfloat16 arithmetic
+    KernelDef {
+        source: "kernels/paged_attention.cu",
+        output: "kernels/paged_attention.ptx",
+        min_sm: 80,
+    },
+    // FP8 kernels — require sm_89+ for native FP8 types
+    KernelDef {
+        source: "kernels/fp8_quant.cu",
+        output: "kernels/fp8_quant.ptx",
+        min_sm: 89,
+    },
+    KernelDef {
+        source: "kernels/fp8_gemm.cu",
+        output: "kernels/fp8_gemm.ptx",
+        min_sm: 89,
+    },
+    // GPTQ uses integer arithmetic — works on sm_75+
+    KernelDef {
+        source: "kernels/gptq_dequant.cu",
+        output: "kernels/gptq_dequant.ptx",
+        min_sm: 75,
+    },
+    // MoE kernels use bf16
+    KernelDef {
+        source: "kernels/fused_moe_align.cu",
+        output: "kernels/fused_moe_align.ptx",
+        min_sm: 75,
+    },
+    KernelDef {
+        source: "kernels/fused_moe_gemm.cu",
+        output: "kernels/fused_moe_gemm.ptx",
+        min_sm: 80,
+    },
+    // SwiGLU supports bf16/fp16/fp32
+    KernelDef {
+        source: "kernels/swiglu.cu",
+        output: "kernels/swiglu.ptx",
+        min_sm: 80,
+    },
+    // Top-k softmax — f32 arithmetic, but uses bf16 variants
+    KernelDef {
+        source: "kernels/topk_softmax.cu",
+        output: "kernels/topk_softmax.ptx",
+        min_sm: 80,
+    },
+    // BitsAndBytes — uses bf16
+    KernelDef {
+        source: "kernels/bnb_fused_matmul.cu",
+        output: "kernels/bnb_fused_matmul.ptx",
+        min_sm: 80,
+    },
+    // RMSNorm/LayerNorm — uses bf16/fp16/fp32
+    KernelDef {
+        source: "kernels/layernorm.cu",
+        output: "kernels/layernorm.ptx",
+        min_sm: 80,
+    },
+    // Fused RoPE — uses bf16/fp16/fp32
+    KernelDef {
+        source: "kernels/rope.cu",
+        output: "kernels/rope.ptx",
+        min_sm: 80,
+    },
+    // GELU/GeGLU/SiLU activations — uses bf16/fp16/fp32
+    KernelDef {
+        source: "kernels/activations.cu",
+        output: "kernels/activations.ptx",
+        min_sm: 80,
+    },
+    // Cache reshape/copy operations — uses bf16/fp16
+    KernelDef {
+        source: "kernels/cache_ops.cu",
+        output: "kernels/cache_ops.ptx",
+        min_sm: 80,
+    },
+    // GPU-side sampling (argmax, top-k/top-p, softmax) — uses bf16
+    KernelDef {
+        source: "kernels/sampling.cu",
+        output: "kernels/sampling.ptx",
+        min_sm: 80,
+    },
+    // Marlin fused dequant+GEMM for GPTQ/AWQ INT4/INT8 — uses bf16
+    KernelDef {
+        source: "kernels/marlin_gemm.cu",
+        output: "kernels/marlin_gemm.ptx",
+        min_sm: 80,
+    },
+    // Fused LayerNorm/RMSNorm + FP8 quantization — requires sm_89+ for FP8
+    KernelDef {
+        source: "kernels/layernorm_quant.cu",
+        output: "kernels/layernorm_quant.ptx",
+        min_sm: 89,
+    },
+    // Fused QK-RMSNorm + RoPE — uses bf16/fp16
+    KernelDef {
+        source: "kernels/qknorm_rope.cu",
+        output: "kernels/qknorm_rope.ptx",
+        min_sm: 80,
+    },
+    // Custom all-reduce for multi-GPU tensor parallelism — uses bf16/f32
+    // P2P kernel that is 2-3x faster than NCCL for small tensors (< 8MB)
+    KernelDef {
+        source: "kernels/custom_allreduce.cu",
+        output: "kernels/custom_allreduce.ptx",
+        min_sm: 80,
+    },
+];
+
+fn parse_sm_version(arch: &str) -> u32 {
+    // Parse "sm_XX" or "compute_XX" format
+    arch.trim_start_matches("sm_")
+        .trim_start_matches("compute_")
+        .parse::<u32>()
+        .unwrap_or(89)
+}
+
+fn detect_gpu_arch() -> Option<String> {
+    // Try nvidia-smi to detect the GPU compute capability
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let cap = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+
+    // Convert "8.9" -> "sm_89", "9.0" -> "sm_90"
+    let parts: Vec<&str> = cap.split('.').collect();
+    if parts.len() == 2 {
+        if let (Ok(major), Ok(minor)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+            return Some(format!("sm_{}{}", major, minor));
+        }
+    }
+
+    None
+}
+
+fn main() {
+    // Register rerun triggers for all kernel sources.
+    // Also track kernels that may be added later (build.rs itself triggers rerun).
+    for kernel in KERNELS {
+        println!("cargo:rerun-if-changed={}", kernel.source);
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=CUDA_MULTI_ARCH");
+
     if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_err() {
         return;
     }
 
-    // Detect GPU architecture (default to sm_89 for Ada Lovelace with FP8 support)
-    let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
+    // Determine target architecture:
+    // 1. CUDA_ARCH env var (explicit override)
+    // 2. Auto-detect from installed GPU via nvidia-smi
+    // 3. Default: sm_80 (Ampere — broadest useful compatibility)
+    let target_arch = std::env::var("CUDA_ARCH").ok().or_else(detect_gpu_arch);
+    let target_sm = target_arch.as_deref().map(parse_sm_version).unwrap_or(80);
 
-    // Kernel definitions: (source, output, extra_flags)
-    let kernels: Vec<(&str, &str, Vec<&str>)> = vec![
-        (
-            "kernels/paged_attention.cu",
-            "kernels/paged_attention.ptx",
-            vec![],
-        ),
-        (
-            "kernels/fp8_quant.cu",
-            "kernels/fp8_quant.ptx",
-            vec![], // FP8 requires sm_89+ which we set as default
-        ),
-        (
-            "kernels/fp8_gemm.cu",
-            "kernels/fp8_gemm.ptx",
-            vec![], // FP8 GEMM kernel
-        ),
-        (
-            "kernels/gptq_dequant.cu",
-            "kernels/gptq_dequant.ptx",
-            vec![], // GPTQ dequantization kernel
-        ),
-        (
-            "kernels/fused_moe_align.cu",
-            "kernels/fused_moe_align.ptx",
-            vec![], // Fused MoE token alignment kernel
-        ),
-        (
-            "kernels/fused_moe_gemm.cu",
-            "kernels/fused_moe_gemm.ptx",
-            vec![], // Fused MoE GEMM kernel
-        ),
-        (
-            "kernels/swiglu.cu",
-            "kernels/swiglu.ptx",
-            vec![], // Fused SwiGLU activation kernel
-        ),
-        (
-            "kernels/topk_softmax.cu",
-            "kernels/topk_softmax.ptx",
-            vec![], // Fused top-k softmax for MoE routing
-        ),
-        (
-            "kernels/bnb_fused_matmul.cu",
-            "kernels/bnb_fused_matmul.ptx",
-            vec![], // BitsAndBytes fused dequantize + GEMM
-        ),
-    ];
+    let arch_str = format!("sm_{target_sm}");
+    println!("cargo:warning=CUDA target architecture: {arch_str}");
 
-    for (src_path, out_path, extra_flags) in kernels {
-        let mut args = vec![
+    // Export the detected SM version so Rust code can query it at build time
+    println!("cargo:rustc-env=CUDA_TARGET_SM={target_sm}");
+
+    let mut compiled = 0;
+    let mut skipped = 0;
+
+    for kernel in KERNELS {
+        if target_sm < kernel.min_sm {
+            println!(
+                "cargo:warning=Skipping {} (requires sm_{}, target is sm_{})",
+                kernel.source, kernel.min_sm, target_sm
+            );
+            skipped += 1;
+            continue;
+        }
+
+        // Compile at the target arch (or kernel minimum, whichever is higher).
+        // PTX is forward-compatible: sm_80 PTX will JIT to sm_89+ at load time.
+        let compile_sm = std::cmp::max(target_sm, kernel.min_sm);
+        let compile_arch = format!("sm_{compile_sm}");
+
+        let args = vec![
             "--ptx".to_string(),
-            format!("-arch={arch}"),
+            format!("-arch={compile_arch}"),
             "-O3".to_string(),
             "--use_fast_math".to_string(),
             "-o".to_string(),
-            out_path.to_string(),
-            src_path.to_string(),
+            kernel.output.to_string(),
+            kernel.source.to_string(),
         ];
-
-        for flag in extra_flags {
-            args.push(flag.to_string());
-        }
 
         let status = Command::new("nvcc").args(&args).status();
 
         match status {
             Ok(s) if s.success() => {
-                println!("cargo:warning=Compiled {src_path} -> {out_path}");
+                println!(
+                    "cargo:warning=Compiled {} -> {} ({})",
+                    kernel.source, kernel.output, compile_arch
+                );
+                compiled += 1;
             }
             Ok(s) => {
                 panic!(
-                    "nvcc failed for {src_path} with exit code: {s}. \
-                     Ensure CUDA toolkit is installed."
+                    "nvcc failed for {} with exit code: {}. \
+                     Ensure CUDA toolkit is installed.",
+                    kernel.source, s
                 );
             }
             Err(e) => {
                 panic!(
-                    "Failed to run nvcc for {src_path}: {e}. \
-                     Ensure CUDA toolkit is installed and nvcc is in PATH."
+                    "Failed to run nvcc for {}: {}. \
+                     Ensure CUDA toolkit is installed and nvcc is in PATH.",
+                    kernel.source, e
                 );
             }
         }
     }
+
+    println!("cargo:warning=CUDA kernels: {compiled} compiled, {skipped} skipped (sm_{target_sm})");
 }

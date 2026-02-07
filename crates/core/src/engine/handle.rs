@@ -42,6 +42,19 @@ impl EngineHandle {
         Ok(stream_rx)
     }
 
+    /// Abort a running request, freeing its GPU resources.
+    ///
+    /// This is used when a client disconnects before generation completes.
+    /// The engine will remove the request from the scheduler and free its
+    /// KV cache blocks. If the request is not found (already completed or
+    /// never existed), this is a no-op.
+    pub async fn abort(&self, request_id: crate::request::RequestId) -> Result<(), EngineError> {
+        self.cmd_tx
+            .send(EngineCommand::Abort { request_id })
+            .await
+            .map_err(|_| EngineError::Shutdown)
+    }
+
     /// Shutdown the engine.
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         self.cmd_tx

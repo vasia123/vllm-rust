@@ -309,3 +309,158 @@ extern "C" __global__ void fp8_quantize_input_bf16(
         row_out[k] = __nv_fp8_e4m3(val);
     }
 }
+
+// ============================================================================
+// Scaled MM: W8A8 FP8 GEMM with per-tensor/per-channel scaling
+// ============================================================================
+//
+// Implements: output = (a_scale * A_fp8) @ (b_scale * B_fp8).T
+// where both A and B are in FP8 E4M3 format.
+//
+// This is the key operation for FP8 quantized inference (H100/Ada):
+// - Both activations and weights are FP8
+// - Scales are applied during accumulation in FP32
+// - Output is BF16
+//
+// Supports:
+// - Per-tensor scaling: a_scale [1], b_scale [1]
+// - Per-channel scaling: a_scale [M] (per-row), b_scale [N] (per-col)
+// - Per-token-per-channel: a_scale [M], b_scale [N]
+//
+// Grid: (ceil(N/16), ceil(M/16))
+// Block: (16, 16)
+extern "C" __global__ void fp8_scaled_mm_bf16(
+    __nv_bfloat16* __restrict__ out,           // [M, N]
+    const __nv_fp8_e4m3* __restrict__ A,       // [M, K] FP8
+    const __nv_fp8_e4m3* __restrict__ B,       // [N, K] FP8 (transposed)
+    const float* __restrict__ a_scale,         // [1] or [M]
+    const float* __restrict__ b_scale,         // [1] or [N]
+    const __nv_bfloat16* __restrict__ bias,    // [N] or nullptr
+    const int M,
+    const int N,
+    const int K,
+    const int a_scale_mode,  // 0=per-tensor, 1=per-row
+    const int b_scale_mode,  // 0=per-tensor, 1=per-col
+    const int has_bias
+) {
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int row = tile_row * 16 + ty;
+    const int col = tile_col * 16 + tx;
+
+    __shared__ float a_tile[16][TILE_K + 1];
+    __shared__ float b_tile[16][TILE_K + 1];
+
+    float acc = 0.0f;
+
+    // Pre-load scales
+    const float s_a = (row < M) ? (a_scale_mode == 1 ? a_scale[row] : a_scale[0]) : 0.0f;
+    const float s_b = (col < N) ? (b_scale_mode == 1 ? b_scale[col] : b_scale[0]) : 0.0f;
+
+    for (int k_tile = 0; k_tile < K; k_tile += TILE_K) {
+        // Load A tile with dequant and scale
+        for (int k = tx; k < TILE_K && (k_tile + k) < K; k += 16) {
+            if (row < M) {
+                a_tile[ty][k] = fp8_to_float(A[row * K + k_tile + k]) * s_a;
+            } else {
+                a_tile[ty][k] = 0.0f;
+            }
+        }
+
+        // Load B tile with dequant and scale
+        for (int k = ty; k < TILE_K && (k_tile + k) < K; k += 16) {
+            if (col < N) {
+                b_tile[tx][k] = fp8_to_float(B[col * K + k_tile + k]) * s_b;
+            } else {
+                b_tile[tx][k] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        const int k_end = min(TILE_K, K - k_tile);
+        #pragma unroll 8
+        for (int k = 0; k < k_end; k++) {
+            acc += a_tile[ty][k] * b_tile[tx][k];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        if (has_bias && bias != nullptr) {
+            acc += __bfloat162float(bias[col]);
+        }
+        out[row * N + col] = __float2bfloat16(acc);
+    }
+}
+
+// ============================================================================
+// Scaled MM with FP32 output (for intermediate accumulation)
+// ============================================================================
+//
+// Same as above but outputs F32 instead of BF16.
+// Useful when the output feeds into another kernel (e.g., fused LayerNorm).
+extern "C" __global__ void fp8_scaled_mm_f32(
+    float* __restrict__ out,
+    const __nv_fp8_e4m3* __restrict__ A,
+    const __nv_fp8_e4m3* __restrict__ B,
+    const float* __restrict__ a_scale,
+    const float* __restrict__ b_scale,
+    const int M,
+    const int N,
+    const int K,
+    const int a_scale_mode,
+    const int b_scale_mode
+) {
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int row = tile_row * 16 + ty;
+    const int col = tile_col * 16 + tx;
+
+    __shared__ float a_tile[16][TILE_K + 1];
+    __shared__ float b_tile[16][TILE_K + 1];
+
+    float acc = 0.0f;
+
+    const float s_a = (row < M) ? (a_scale_mode == 1 ? a_scale[row] : a_scale[0]) : 0.0f;
+    const float s_b = (col < N) ? (b_scale_mode == 1 ? b_scale[col] : b_scale[0]) : 0.0f;
+
+    for (int k_tile = 0; k_tile < K; k_tile += TILE_K) {
+        for (int k = tx; k < TILE_K && (k_tile + k) < K; k += 16) {
+            if (row < M) {
+                a_tile[ty][k] = fp8_to_float(A[row * K + k_tile + k]) * s_a;
+            } else {
+                a_tile[ty][k] = 0.0f;
+            }
+        }
+
+        for (int k = ty; k < TILE_K && (k_tile + k) < K; k += 16) {
+            if (col < N) {
+                b_tile[tx][k] = fp8_to_float(B[col * K + k_tile + k]) * s_b;
+            } else {
+                b_tile[tx][k] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        const int k_end = min(TILE_K, K - k_tile);
+        #pragma unroll 8
+        for (int k = 0; k < k_end; k++) {
+            acc += a_tile[ty][k] * b_tile[tx][k];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        out[row * N + col] = acc;
+    }
+}

@@ -93,6 +93,15 @@ pub(crate) fn handle_command(
             let _ = response_tx.send(stats);
             false
         }
+        EngineCommand::Abort { request_id } => {
+            if let Some(mut active) = requests.remove(&request_id) {
+                // Free KV cache blocks
+                let _ = kv_cache_mgr.free_request(&mut active.state.block_table);
+                scheduler.remove_request(request_id);
+                tracing::debug!(request_id, "Request aborted, resources freed");
+            }
+            false
+        }
         EngineCommand::Shutdown => true,
     }
 }

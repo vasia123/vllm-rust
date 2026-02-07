@@ -273,6 +273,8 @@ impl GPT2Attention {
                 self.num_heads,
                 max_blocks_per_seq,
                 max_seq_len,
+                self.head_dim,
+                cache_engine.block_size(),
             )?;
 
             self.c_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)

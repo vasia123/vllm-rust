@@ -14,6 +14,7 @@ vllm-server = { path = "crates/server" }
 tokio = { version = "1", features = ["full"] }
 candle-core = { version = "0.9", features = ["cuda"] }
 candle-nn = { version = "0.9", features = ["cuda"] }
+serde = { workspace = true }
 serde_json = "1"
 tempfile = "3"
 
@@ -50,3 +51,11 @@ regex = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 base64 = "0.22"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "mp3", "isomp4", "aac"] }
+
+[[test]]
+name = "reference_comparison"
+path = "tests/correctness/reference_comparison.rs"
+
+[[test]]
+name = "concurrent_requests"
+path = "tests/stress/concurrent_requests.rs"

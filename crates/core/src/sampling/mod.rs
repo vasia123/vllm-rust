@@ -7,9 +7,15 @@
 
 mod beam;
 mod constraint;
+pub mod gpu;
+pub mod logits_processor;
 
 pub use beam::{beam_search_top_k, BeamHypothesis, BeamSearchConfig, BeamSearchState};
 pub use constraint::{ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, SamplingConstraint};
+pub use logits_processor::{
+    BadWordsProcessor, FrequencyPresencePenaltyProcessor, LogitBiasProcessor, LogitsProcessor,
+    LogitsProcessorPipeline, MinTokensProcessor, RepetitionPenaltyProcessor,
+};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -114,6 +120,130 @@ impl SamplerState {
         };
         Self { rng }
     }
+}
+
+/// Draw N independent samples from the same logit distribution.
+///
+/// For greedy decoding (temperature ~0), all N results will be identical (the argmax).
+/// For stochastic sampling, each draw is independent using the same `SamplerState` RNG,
+/// so successive samples are different but reproducible given the same seed.
+///
+/// This avoids redundant logit processing (penalties, temperature, top-k/top-p filtering)
+/// by computing the probability distribution once and sampling from it N times.
+pub fn sample_n(
+    logits: &[f32],
+    params: &SamplingParams,
+    generated_tokens: &[u32],
+    sampler_state: &mut SamplerState,
+    num_top_logprobs: Option<usize>,
+    n: usize,
+) -> Vec<SamplingResult> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![sample(
+            logits,
+            params,
+            generated_tokens,
+            sampler_state,
+            num_top_logprobs,
+        )];
+    }
+
+    // For greedy decoding, all N results are identical
+    if params.is_greedy() {
+        let result = sample(
+            logits,
+            params,
+            generated_tokens,
+            sampler_state,
+            num_top_logprobs,
+        );
+        return vec![result; n];
+    }
+
+    // Stochastic path: compute the distribution once, sample N times
+    let vocab_size = logits.len();
+    let mut logits = logits.to_vec();
+
+    // Apply penalties
+    if params.repetition_penalty != 1.0 {
+        apply_repetition_penalty(&mut logits, generated_tokens, params.repetition_penalty);
+    }
+    if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+        apply_frequency_presence_penalty(
+            &mut logits,
+            generated_tokens,
+            params.frequency_penalty,
+            params.presence_penalty,
+        );
+    }
+    if let Some(ref bias) = params.logit_bias {
+        apply_logit_bias(&mut logits, bias);
+    }
+
+    // Apply temperature
+    if params.temperature != 1.0 {
+        let inv_temp = 1.0 / params.temperature;
+        for logit in logits.iter_mut() {
+            *logit *= inv_temp;
+        }
+    }
+
+    // Compute log-softmax for logprob extraction
+    let log_probs = if num_top_logprobs.is_some() {
+        Some(log_softmax(&logits))
+    } else {
+        None
+    };
+
+    // Convert to probabilities and apply filtering
+    let mut probs = softmax(&logits);
+
+    if params.min_p > 0.0 {
+        apply_min_p(&mut probs, params.min_p);
+    }
+    if params.top_k > 0 && (params.top_k as usize) < vocab_size {
+        apply_top_k(&mut probs, params.top_k as usize);
+    }
+    if params.top_p < 1.0 && params.top_p > 0.0 {
+        apply_top_p(&mut probs, params.top_p);
+    }
+
+    // Renormalize
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 && sum != 1.0 {
+        let inv_sum = 1.0 / sum;
+        for p in probs.iter_mut() {
+            *p *= inv_sum;
+        }
+    }
+
+    // Pre-compute top-k logprobs (shared across all samples)
+    let shared_top_logprobs = log_probs
+        .as_ref()
+        .and_then(|lp| num_top_logprobs.map(|k| extract_top_k_logprobs(lp, k)));
+
+    // Sample N times from the same distribution
+    let mut results = Vec::with_capacity(n);
+    for _ in 0..n {
+        let token_id = sample_from_probs(&probs, &mut sampler_state.rng);
+
+        let (logprob, top_logprobs) = if let Some(ref lp) = log_probs {
+            (lp[token_id as usize], shared_top_logprobs.clone())
+        } else {
+            (f32::NEG_INFINITY, None)
+        };
+
+        results.push(SamplingResult {
+            token_id,
+            logprob,
+            top_logprobs,
+        });
+    }
+
+    results
 }
 
 /// Sample a token from logits given sampling parameters.
@@ -1269,5 +1399,189 @@ mod tests {
         let params = SamplingParams::greedy();
         assert_eq!(params.frequency_penalty, 0.0);
         assert_eq!(params.presence_penalty, 0.0);
+    }
+
+    // ==========================================================================
+    // sample_n tests
+    // ==========================================================================
+
+    #[test]
+    fn sample_n_zero_returns_empty() {
+        let logits = vec![1.0, 5.0, 3.0];
+        let params = SamplingParams::default();
+        let mut state = SamplerState::new(Some(42));
+        let results = sample_n(&logits, &params, &[], &mut state, None, 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn sample_n_one_matches_single_sample() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+
+        let mut state1 = SamplerState::new(Some(42));
+        let mut state2 = SamplerState::new(Some(42));
+
+        let single = sample(&logits, &params, &[], &mut state1, None);
+        let multi = sample_n(&logits, &params, &[], &mut state2, None, 1);
+
+        assert_eq!(multi.len(), 1);
+        assert_eq!(multi[0].token_id, single.token_id);
+    }
+
+    #[test]
+    fn sample_n_greedy_returns_identical_results() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams::greedy();
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, None, 5);
+
+        assert_eq!(results.len(), 5);
+        // All should be the argmax (token 1)
+        for r in &results {
+            assert_eq!(
+                r.token_id, 1,
+                "Greedy sample_n should return argmax for all"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_n_stochastic_returns_n_results() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, None, 10);
+        assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn sample_n_stochastic_produces_varied_results() {
+        // With uniform logits and enough samples, we should see variety
+        let logits = vec![1.0; 5];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, None, 100);
+        let unique: std::collections::HashSet<u32> = results.iter().map(|r| r.token_id).collect();
+
+        assert!(
+            unique.len() > 1,
+            "Stochastic sample_n should produce varied results with uniform logits"
+        );
+    }
+
+    #[test]
+    fn sample_n_deterministic_with_seed() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+
+        let mut state1 = SamplerState::new(Some(123));
+        let mut state2 = SamplerState::new(Some(123));
+
+        let results1 = sample_n(&logits, &params, &[], &mut state1, None, 10);
+        let results2 = sample_n(&logits, &params, &[], &mut state2, None, 10);
+
+        let ids1: Vec<u32> = results1.iter().map(|r| r.token_id).collect();
+        let ids2: Vec<u32> = results2.iter().map(|r| r.token_id).collect();
+        assert_eq!(ids1, ids2, "Same seed should produce identical sequences");
+    }
+
+    #[test]
+    fn sample_n_with_logprobs() {
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams::greedy();
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, Some(3), 3);
+
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.logprob.is_finite());
+            assert!(r.logprob < 0.0);
+            let top = r.top_logprobs.as_ref().expect("should have top logprobs");
+            assert_eq!(top.len(), 3);
+        }
+    }
+
+    #[test]
+    fn sample_n_stochastic_with_logprobs_shares_top_logprobs() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, Some(2), 3);
+
+        // Top logprobs should be the same for all samples (computed once from same distribution)
+        let top0 = results[0].top_logprobs.as_ref().unwrap();
+        for r in &results[1..] {
+            let top = r.top_logprobs.as_ref().unwrap();
+            assert_eq!(
+                top.len(),
+                top0.len(),
+                "All samples should share the same top logprobs"
+            );
+            for (a, b) in top0.iter().zip(top.iter()) {
+                assert_eq!(a.0, b.0, "Top logprob token IDs should match");
+                assert!((a.1 - b.1).abs() < 1e-6, "Top logprob values should match");
+            }
+        }
+    }
+
+    #[test]
+    fn sample_n_applies_repetition_penalty() {
+        // Token 0 is the argmax, but with repetition penalty and greedy,
+        // we want to confirm penalty is applied
+        let logits = vec![5.0, 4.9, 4.8, 0.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        // Token 0 was already generated, should be penalized: 5.0 / 2.0 = 2.5
+        // Token 1 should now be argmax at 4.9
+        let results = sample_n(&logits, &params, &[0], &mut state, None, 3);
+        for r in &results {
+            assert_eq!(
+                r.token_id, 1,
+                "With penalty on token 0, token 1 should be argmax"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_n_applies_top_k() {
+        // With top_k=1, only the max should survive
+        let logits = vec![1.0, 3.0, 2.0, 0.5];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 1,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, None, 10);
+        for r in &results {
+            assert_eq!(r.token_id, 1, "top_k=1 should only allow the argmax");
+        }
     }
 }

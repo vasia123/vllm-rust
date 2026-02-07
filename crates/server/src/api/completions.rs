@@ -49,6 +49,14 @@ pub async fn create_completion(
     });
 
     if req.stream {
+        // Streaming only supports n=1
+        if req.n > 1 {
+            prometheus::inc_requests_error();
+            return Err(ApiError::InvalidRequest(
+                "n > 1 is not supported with streaming".to_string(),
+            ));
+        }
+
         // Streaming supports single prompt
         let input = inputs
             .into_iter()
@@ -123,21 +131,24 @@ pub async fn create_completion(
                 .into_response(),
         )
     } else {
-        // Non-streaming supports batch of prompts
-        let best_of = req.best_of;
+        // Non-streaming supports batch of prompts with n and best_of
+        let n = req.n;
+        // best_of defaults to n when not specified
+        let best_of = req.best_of.unwrap_or(n);
         let user_requested_logprobs = req.logprobs;
 
-        // When best_of > 1, we need logprobs to score candidates even if the
+        // When best_of > n, we need logprobs to score candidates even if the
         // user didn't ask for them. Request at least 1 logprob internally.
-        let internal_logprobs = if best_of > 1 && user_requested_logprobs.is_none() {
+        let internal_logprobs = if best_of > n && user_requested_logprobs.is_none() {
             Some(1)
         } else {
             user_requested_logprobs
         };
 
-        let mut choices = Vec::with_capacity(inputs.len());
+        let mut choices = Vec::new();
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
+        let mut choice_index = 0u32;
 
         // Convert lora_name to LoraRequest (for batch requests, same adapter for all)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
@@ -148,11 +159,11 @@ pub async fn create_completion(
             create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
                 .is_some();
 
-        for (index, input) in inputs.into_iter().enumerate() {
+        for input in inputs {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
             total_prompt_tokens += prompt_tokens;
 
-            // Generate `best_of` candidates for this prompt and pick the best
+            // Generate `best_of` candidates for this prompt
             let mut candidates: Vec<(GenerationResult, Option<CompletionLogProbs>)> =
                 Vec::with_capacity(best_of);
 
@@ -218,41 +229,27 @@ pub async fn create_completion(
                 candidates.push((result, logprobs_data));
             }
 
-            // Select the best candidate by sum of token logprobs
-            let best_idx = if best_of > 1 {
-                candidates
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, (a, _)), (_, (b, _))| {
-                        let score_a = sum_token_logprobs(a);
-                        let score_b = sum_token_logprobs(b);
-                        score_a
-                            .partial_cmp(&score_b)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            // Select the top `n` candidates by cumulative log probability
+            let selected = select_top_n_candidates(candidates, n);
 
-            let (best_result, best_logprobs) = candidates.swap_remove(best_idx);
+            for (result, logprobs_data) in selected {
+                total_completion_tokens += result.generated_token_ids.len();
 
-            total_completion_tokens += best_result.generated_token_ids.len();
+                // Strip logprobs from the response if the user didn't request them
+                let final_logprobs = if user_requested_logprobs.is_some() {
+                    logprobs_data
+                } else {
+                    None
+                };
 
-            // Strip logprobs from the response if the user didn't request them
-            let final_logprobs = if user_requested_logprobs.is_some() {
-                best_logprobs
-            } else {
-                None
-            };
-
-            choices.push(CompletionChoice {
-                text: best_result.generated_text,
-                index: index as u32,
-                finish_reason: Some(finish_reason_str(&best_result.finish_reason)),
-                logprobs: final_logprobs,
-            });
+                choices.push(CompletionChoice {
+                    text: result.generated_text,
+                    index: choice_index,
+                    finish_reason: Some(finish_reason_str(&result.finish_reason)),
+                    logprobs: final_logprobs,
+                });
+                choice_index += 1;
+            }
         }
 
         let response = CompletionResponse {
@@ -314,6 +311,41 @@ fn build_beam_config(
         early_stopping: early_stopping.unwrap_or(false),
         ..Default::default()
     })
+}
+
+/// Select the top `n` candidates from a list, ranked by cumulative log probability.
+///
+/// If `n >= candidates.len()`, returns all candidates in their original order.
+/// If `n < candidates.len()`, scores each by cumulative logprob and returns the
+/// top `n` sorted by descending score.
+fn select_top_n_candidates(
+    mut candidates: Vec<(GenerationResult, Option<CompletionLogProbs>)>,
+    n: usize,
+) -> Vec<(GenerationResult, Option<CompletionLogProbs>)> {
+    if n >= candidates.len() {
+        return candidates;
+    }
+
+    // Score each candidate and sort by descending logprob score
+    let mut scored: Vec<(usize, f64)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, (result, _))| (i, sum_token_logprobs(result)))
+        .collect();
+
+    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Take top n indices (sorted descending by index so swap_remove doesn't shift)
+    let mut top_indices: Vec<usize> = scored.iter().take(n).map(|(i, _)| *i).collect();
+    top_indices.sort_unstable_by(|a, b| b.cmp(a));
+
+    let mut selected = Vec::with_capacity(n);
+    for idx in top_indices {
+        selected.push(candidates.swap_remove(idx));
+    }
+    // Reverse to restore original relative ordering (highest score first)
+    selected.reverse();
+    selected
 }
 
 /// Score a generation result by the sum of its token logprobs.

@@ -9,6 +9,7 @@ flash-attn = ["dep:candle-flash-attn"]
 flashinfer = ["dep:flashinfer-rs"]
 cuda-kernels = []
 cuda-fused-activations = ["cuda-kernels"]
+cuda-layernorm = ["cuda-kernels"]
 cuda-moe = ["cuda-kernels"]
 marlin = ["cuda-kernels"]
 image-loading = ["dep:image", "dep:base64"]
@@ -44,3 +45,18 @@ libloading.workspace = true
 tracing.workspace = true
 regex.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sampling_bench"
+harness = false
+
+[[bench]]
+name = "attention_bench"
+harness = false
+
+[[bench]]
+name = "quantization_bench"
+harness = false

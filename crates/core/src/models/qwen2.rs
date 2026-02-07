@@ -246,6 +246,8 @@ impl Qwen2Attention {
                 self.num_kv_heads,
                 max_blocks_per_seq,
                 max_seq_len,
+                self.head_dim,
+                cache_engine.block_size(),
             )?;
 
             // [batch, hidden] -> [batch, 1, hidden] to match residual shape

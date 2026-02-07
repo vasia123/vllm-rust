@@ -143,6 +143,12 @@ impl MultimodalProcessor {
                     text_parts.push(self.config.image_placeholder.clone());
                     images.push(self.parse_image_url(&image_url.url)?);
                 }
+                // TODO: Video support not yet implemented in processor
+                ContentPart::Video { .. } => {
+                    return Err(ProcessorError::InvalidContent(
+                        "video content not yet supported".to_string(),
+                    ));
+                }
             }
         }
 

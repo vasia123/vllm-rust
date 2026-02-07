@@ -7,7 +7,8 @@ pub fn validate_completion_request(req: &CompletionRequest) -> Result<(), ApiErr
     validate_frequency_penalty(req.frequency_penalty)?;
     validate_presence_penalty(req.presence_penalty)?;
     validate_max_tokens(req.max_tokens)?;
-    validate_best_of(req.best_of)?;
+    validate_n(req.n)?;
+    validate_best_of_n(req.best_of, req.n)?;
     validate_beam_search(req.beam_width, req.response_format.as_ref(), req.stream)?;
 
     if let Some(logprobs) = req.logprobs {
@@ -28,6 +29,7 @@ pub fn validate_chat_completion_request(req: &ChatCompletionRequest) -> Result<(
     validate_presence_penalty(req.presence_penalty)?;
     validate_max_tokens(req.max_tokens)?;
     validate_n(req.n)?;
+    validate_best_of_n(req.best_of, req.n)?;
     validate_beam_search(req.beam_width, req.response_format.as_ref(), req.stream)?;
 
     if let Some(top_logprobs) = req.top_logprobs {
@@ -91,11 +93,18 @@ fn validate_max_tokens(max_tokens: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_best_of(best_of: usize) -> Result<(), ApiError> {
-    if best_of < 1 {
-        return Err(ApiError::InvalidRequest(
-            "best_of must be at least 1".to_string(),
-        ));
+fn validate_best_of_n(best_of: Option<usize>, n: usize) -> Result<(), ApiError> {
+    if let Some(bo) = best_of {
+        if bo < 1 {
+            return Err(ApiError::InvalidRequest(
+                "best_of must be at least 1".to_string(),
+            ));
+        }
+        if bo < n {
+            return Err(ApiError::InvalidRequest(format!(
+                "best_of ({bo}) must be greater than or equal to n ({n})"
+            )));
+        }
     }
     Ok(())
 }
@@ -317,12 +326,12 @@ mod tests {
         assert!(validate_completion_request(&req).is_ok());
     }
 
-    // ─── best_of (completions only) ──────────────────────────────────
+    // ─── best_of ─────────────────────────────────────────────────────
 
     #[test]
     fn best_of_zero_fails() {
         let mut req = minimal_completion_request();
-        req.best_of = 0;
+        req.best_of = Some(0);
         let err = validate_completion_request(&req).unwrap_err();
         assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("best_of")));
     }
@@ -330,14 +339,76 @@ mod tests {
     #[test]
     fn best_of_one_passes() {
         let mut req = minimal_completion_request();
-        req.best_of = 1;
+        req.best_of = Some(1);
         assert!(validate_completion_request(&req).is_ok());
     }
 
-    // ─── n (chat only) ──────────────────────────────────────────────
+    #[test]
+    fn best_of_less_than_n_fails() {
+        let mut req = minimal_completion_request();
+        req.n = 3;
+        req.best_of = Some(2);
+        let err = validate_completion_request(&req).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("best_of") && msg.contains("greater than or equal"))
+        );
+    }
 
     #[test]
-    fn n_zero_fails() {
+    fn best_of_equal_to_n_passes() {
+        let mut req = minimal_completion_request();
+        req.n = 3;
+        req.best_of = Some(3);
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn best_of_greater_than_n_passes() {
+        let mut req = minimal_completion_request();
+        req.n = 2;
+        req.best_of = Some(5);
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn best_of_none_with_n_greater_than_one_passes() {
+        let mut req = minimal_completion_request();
+        req.n = 3;
+        req.best_of = None;
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn chat_best_of_less_than_n_fails() {
+        let mut req = minimal_chat_request();
+        req.n = 4;
+        req.best_of = Some(2);
+        let err = validate_chat_completion_request(&req).unwrap_err();
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("best_of") && msg.contains("greater than or equal"))
+        );
+    }
+
+    #[test]
+    fn chat_best_of_equal_to_n_passes() {
+        let mut req = minimal_chat_request();
+        req.n = 3;
+        req.best_of = Some(3);
+        assert!(validate_chat_completion_request(&req).is_ok());
+    }
+
+    // ─── n ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn n_zero_fails_completion() {
+        let mut req = minimal_completion_request();
+        req.n = 0;
+        let err = validate_completion_request(&req).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("n must")));
+    }
+
+    #[test]
+    fn n_zero_fails_chat() {
         let mut req = minimal_chat_request();
         req.n = 0;
         let err = validate_chat_completion_request(&req).unwrap_err();
@@ -345,7 +416,14 @@ mod tests {
     }
 
     #[test]
-    fn n_one_passes() {
+    fn n_one_passes_completion() {
+        let mut req = minimal_completion_request();
+        req.n = 1;
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn n_one_passes_chat() {
         let mut req = minimal_chat_request();
         req.n = 1;
         assert!(validate_chat_completion_request(&req).is_ok());
