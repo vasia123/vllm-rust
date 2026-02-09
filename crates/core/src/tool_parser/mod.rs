@@ -4,6 +4,9 @@
 //! - **Hermes**: `<tool_call>{"name": ..., "arguments": ...}</tool_call>`
 //! - **GLM-4**: `<tool_call>name\n<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
 //! - **JSON**: Raw JSON tool call arrays
+//! - **Llama**: `<|python_tag|>{"name": ..., "arguments": ...}` (semicolon-separated)
+//! - **Mistral**: `[TOOL_CALLS]` with v11+ or pre-v11 formats
+//! - **DeepSeek V3**: Unicode token-delimited with ` ```json ` blocks
 //!
 //! # Example
 //!
@@ -15,13 +18,19 @@
 //! let calls = parser.parse(output)?;
 //! ```
 
+mod deepseek_v3;
 mod glm4;
 mod hermes;
 mod json_parser;
+mod llama;
+mod mistral;
 
+pub use deepseek_v3::DeepSeekV3ToolParser;
 pub use glm4::Glm4ToolParser;
 pub use hermes::HermesToolParser;
 pub use json_parser::JsonToolParser;
+pub use llama::LlamaToolParser;
+pub use mistral::MistralToolParser;
 
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +115,54 @@ pub struct ToolChoiceSpecific {
 pub struct ToolChoiceFunction {
     /// Name of the function to call
     pub name: String,
+}
+
+/// Find complete JSON objects at the top level of a string.
+///
+/// Tracks brace depth to correctly handle nested objects and
+/// string escaping. Returns slices of each complete `{...}` object.
+pub(super) fn find_json_objects(s: &str) -> Vec<&str> {
+    let mut objects = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = None;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, ch) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s_idx) = start {
+                        objects.push(&s[s_idx..=i]);
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
 }
 
 /// Trait for parsing tool calls from LLM output.
@@ -216,5 +273,50 @@ mod tests {
         let json = serde_json::to_string(&choice).unwrap();
         assert!(json.contains("get_weather"));
         assert!(json.contains("function"));
+    }
+
+    #[test]
+    fn find_json_objects_single() {
+        let objs = find_json_objects(r#"{"a": 1}"#);
+        assert_eq!(objs, vec![r#"{"a": 1}"#]);
+    }
+
+    #[test]
+    fn find_json_objects_multiple_semicolon_separated() {
+        let objs = find_json_objects(r#"{"a": 1}; {"b": 2}"#);
+        assert_eq!(objs, vec![r#"{"a": 1}"#, r#"{"b": 2}"#]);
+    }
+
+    #[test]
+    fn find_json_objects_nested() {
+        let input = r#"{"a": {"b": {"c": 1}}}"#;
+        let objs = find_json_objects(input);
+        assert_eq!(objs, vec![input]);
+    }
+
+    #[test]
+    fn find_json_objects_braces_in_strings() {
+        let input = r#"{"msg": "hello {world}"}"#;
+        let objs = find_json_objects(input);
+        assert_eq!(objs, vec![input]);
+    }
+
+    #[test]
+    fn find_json_objects_escaped_quotes() {
+        let input = r#"{"msg": "say \"hi\""}"#;
+        let objs = find_json_objects(input);
+        assert_eq!(objs, vec![input]);
+    }
+
+    #[test]
+    fn find_json_objects_no_objects() {
+        assert!(find_json_objects("no json here").is_empty());
+        assert!(find_json_objects("").is_empty());
+    }
+
+    #[test]
+    fn find_json_objects_adjacent() {
+        let objs = find_json_objects(r#"{"a":1}{"b":2}"#);
+        assert_eq!(objs, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
     }
 }

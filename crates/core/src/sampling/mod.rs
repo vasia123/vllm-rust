@@ -13,8 +13,9 @@ pub mod logits_processor;
 pub use beam::{beam_search_top_k, BeamHypothesis, BeamSearchConfig, BeamSearchState};
 pub use constraint::{ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, SamplingConstraint};
 pub use logits_processor::{
-    BadWordsProcessor, FrequencyPresencePenaltyProcessor, LogitBiasProcessor, LogitsProcessor,
-    LogitsProcessorPipeline, MinTokensProcessor, RepetitionPenaltyProcessor,
+    AllowedTokenIdsProcessor, BadWordsProcessor, FrequencyPresencePenaltyProcessor,
+    LogitBiasProcessor, LogitsProcessor, LogitsProcessorPipeline, MinTokensProcessor,
+    RepetitionPenaltyProcessor,
 };
 
 use rand::rngs::StdRng;
@@ -60,6 +61,17 @@ pub struct SamplingParams {
     /// raw logit before temperature scaling. Values follow OpenAI convention
     /// (-100.0 to 100.0). None = no bias.
     pub logit_bias: Option<Vec<(u32, f32)>>,
+    /// Minimum number of tokens to generate before allowing EOS.
+    /// Requires `eos_token_id` to be set. 0 = disabled.
+    pub min_tokens: usize,
+    /// EOS token ID for min_tokens enforcement. Required when min_tokens > 0.
+    pub eos_token_id: Option<u32>,
+    /// Token IDs that are banned from generation. These tokens will have
+    /// their logits set to -inf at every step.
+    pub banned_token_ids: Option<Vec<u32>>,
+    /// If set, only these token IDs are allowed in generation. All other
+    /// tokens will have their logits set to -inf.
+    pub allowed_token_ids: Option<Vec<u32>>,
 }
 
 impl Default for SamplingParams {
@@ -75,6 +87,10 @@ impl Default for SamplingParams {
             seed: None,
             beam_search: None,
             logit_bias: None,
+            min_tokens: 0,
+            eos_token_id: None,
+            banned_token_ids: None,
+            allowed_token_ids: None,
         }
     }
 }
@@ -182,6 +198,26 @@ pub fn sample_n(
     if let Some(ref bias) = params.logit_bias {
         apply_logit_bias(&mut logits, bias);
     }
+    if let Some(ref banned) = params.banned_token_ids {
+        if !banned.is_empty() {
+            apply_banned_tokens(&mut logits, banned);
+        }
+    }
+    if let Some(ref allowed) = params.allowed_token_ids {
+        if !allowed.is_empty() {
+            apply_allowed_tokens(&mut logits, allowed);
+        }
+    }
+    if params.min_tokens > 0 {
+        if let Some(eos_id) = params.eos_token_id {
+            apply_min_tokens_suppression(
+                &mut logits,
+                eos_id,
+                params.min_tokens,
+                generated_tokens.len(),
+            );
+        }
+    }
 
     // Apply temperature
     if params.temperature != 1.0 {
@@ -282,6 +318,32 @@ pub fn sample(
     // Step 1c: Apply logit bias
     if let Some(ref bias) = params.logit_bias {
         apply_logit_bias(&mut logits, bias);
+    }
+
+    // Step 1d: Apply banned token IDs
+    if let Some(ref banned) = params.banned_token_ids {
+        if !banned.is_empty() {
+            apply_banned_tokens(&mut logits, banned);
+        }
+    }
+
+    // Step 1e: Apply allowed token IDs (whitelist)
+    if let Some(ref allowed) = params.allowed_token_ids {
+        if !allowed.is_empty() {
+            apply_allowed_tokens(&mut logits, allowed);
+        }
+    }
+
+    // Step 1f: Suppress EOS until min_tokens generated
+    if params.min_tokens > 0 {
+        if let Some(eos_id) = params.eos_token_id {
+            apply_min_tokens_suppression(
+                &mut logits,
+                eos_id,
+                params.min_tokens,
+                generated_tokens.len(),
+            );
+        }
     }
 
     // Compute log-softmax for logprob extraction (before temperature scaling for greedy)
@@ -419,6 +481,37 @@ fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
         let idx = token_id as usize;
         if idx < logits.len() {
             logits[idx] += bias_value;
+        }
+    }
+}
+
+fn apply_banned_tokens(logits: &mut [f32], banned: &[u32]) {
+    for &token_id in banned {
+        let idx = token_id as usize;
+        if idx < logits.len() {
+            logits[idx] = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn apply_allowed_tokens(logits: &mut [f32], allowed: &[u32]) {
+    for (idx, logit) in logits.iter_mut().enumerate() {
+        if !allowed.contains(&(idx as u32)) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn apply_min_tokens_suppression(
+    logits: &mut [f32],
+    eos_id: u32,
+    min_tokens: usize,
+    generated_len: usize,
+) {
+    if generated_len < min_tokens {
+        let idx = eos_id as usize;
+        if idx < logits.len() {
+            logits[idx] = f32::NEG_INFINITY;
         }
     }
 }
@@ -1583,5 +1676,231 @@ mod tests {
         for r in &results {
             assert_eq!(r.token_id, 1, "top_k=1 should only allow the argmax");
         }
+    }
+
+    // ==========================================================================
+    // Banned / allowed token IDs and min_tokens inline tests
+    // ==========================================================================
+
+    #[test]
+    fn banned_tokens_suppresses_in_sample() {
+        // Token 1 is the greedy argmax (5.0), but ban it
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            banned_token_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        // Token 1 banned → next best is token 2 (3.0)
+        assert_eq!(result.token_id, 2, "Banned token should not be selected");
+    }
+
+    #[test]
+    fn banned_tokens_multiple() {
+        let logits = vec![1.0, 5.0, 4.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            banned_token_ids: Some(vec![1, 2]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        // Tokens 1, 2 banned → next best is token 3 (3.0)
+        assert_eq!(result.token_id, 3);
+    }
+
+    #[test]
+    fn banned_tokens_empty_is_noop() {
+        let logits = vec![1.0, 5.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            banned_token_ids: Some(vec![]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(result.token_id, 1);
+    }
+
+    #[test]
+    fn allowed_tokens_restricts_in_sample() {
+        // Only allow tokens 0 and 3
+        let logits = vec![1.0, 5.0, 4.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            allowed_token_ids: Some(vec![0, 3]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        // Only tokens 0 (1.0) and 3 (3.0) allowed → greedy picks 3
+        assert_eq!(result.token_id, 3);
+    }
+
+    #[test]
+    fn allowed_tokens_single() {
+        let logits = vec![1.0, 5.0, 4.0, 3.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            allowed_token_ids: Some(vec![2]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        for _ in 0..100 {
+            let result = sample(&logits, &params, &[], &mut state, None);
+            assert_eq!(result.token_id, 2, "Only token 2 should be allowed");
+        }
+    }
+
+    #[test]
+    fn min_tokens_suppresses_eos_early() {
+        // EOS token (id=1) is the greedy argmax
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_tokens: 5,
+            eos_token_id: Some(1),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        // Only 2 tokens generated so far (< min_tokens=5) → EOS suppressed
+        let result = sample(&logits, &params, &[10, 20], &mut state, None);
+        assert_ne!(result.token_id, 1, "EOS should be suppressed before min_tokens");
+        assert_eq!(result.token_id, 2, "Next best after suppressed EOS");
+    }
+
+    #[test]
+    fn min_tokens_allows_eos_after_threshold() {
+        // After enough tokens, EOS should be allowed
+        let logits = vec![1.0, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_tokens: 3,
+            eos_token_id: Some(1),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        // 3 tokens already generated (= min_tokens) → EOS allowed
+        let result = sample(&logits, &params, &[10, 20, 30], &mut state, None);
+        assert_eq!(result.token_id, 1, "EOS should be allowed once min_tokens reached");
+    }
+
+    #[test]
+    fn min_tokens_without_eos_id_is_noop() {
+        let logits = vec![1.0, 5.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_tokens: 10,
+            eos_token_id: None,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_eq!(result.token_id, 1, "Without eos_token_id, min_tokens has no effect");
+    }
+
+    #[test]
+    fn sample_n_applies_banned_tokens() {
+        let logits = vec![1.0, 5.0, 4.0, 3.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            banned_token_ids: Some(vec![1]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, None, 50);
+        for r in &results {
+            assert_ne!(r.token_id, 1, "Banned token should never appear in sample_n");
+        }
+    }
+
+    #[test]
+    fn sample_n_applies_allowed_tokens() {
+        let logits = vec![1.0, 5.0, 4.0, 3.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            allowed_token_ids: Some(vec![0, 2]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        let results = sample_n(&logits, &params, &[], &mut state, None, 50);
+        for r in &results {
+            assert!(
+                r.token_id == 0 || r.token_id == 2,
+                "Only allowed tokens should appear, got {}",
+                r.token_id
+            );
+        }
+    }
+
+    #[test]
+    fn sample_n_applies_min_tokens() {
+        // EOS is token 1 (highest logit)
+        let logits = vec![1.0, 5.0, 4.0, 3.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            min_tokens: 5,
+            eos_token_id: Some(1),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(Some(42));
+
+        // Only 1 token generated → EOS suppressed
+        let results = sample_n(&logits, &params, &[10], &mut state, None, 3);
+        for r in &results {
+            assert_ne!(r.token_id, 1, "EOS should be suppressed in sample_n too");
+        }
+    }
+
+    #[test]
+    fn apply_banned_tokens_helper() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        apply_banned_tokens(&mut logits, &[1, 3]);
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], 3.0);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn apply_banned_tokens_out_of_range() {
+        let mut logits = vec![1.0, 2.0];
+        apply_banned_tokens(&mut logits, &[999]);
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], 2.0);
+    }
+
+    #[test]
+    fn apply_allowed_tokens_helper() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        apply_allowed_tokens(&mut logits, &[1, 3]);
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert_eq!(logits[1], 2.0);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits[3], 4.0);
+    }
+
+    #[test]
+    fn apply_min_tokens_suppression_helper() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        apply_min_tokens_suppression(&mut logits, 1, 5, 3); // 3 < 5 → suppress
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], 3.0);
+    }
+
+    #[test]
+    fn apply_min_tokens_suppression_allows_after_threshold() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        apply_min_tokens_suppression(&mut logits, 1, 5, 5); // 5 >= 5 → no suppression
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], 2.0);
+        assert_eq!(logits[2], 3.0);
     }
 }

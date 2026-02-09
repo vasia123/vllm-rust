@@ -121,6 +121,15 @@ pub struct CompletionRequest {
     /// Whether to stop early when all beams have finished in beam search.
     #[serde(default)]
     pub early_stopping: Option<bool>,
+    /// Minimum number of tokens to generate before allowing EOS.
+    #[serde(default)]
+    pub min_tokens: usize,
+    /// Token IDs that are banned from generation.
+    #[serde(default)]
+    pub banned_token_ids: Option<Vec<u32>>,
+    /// If set, only these token IDs are allowed in generation.
+    #[serde(default)]
+    pub allowed_token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +278,15 @@ pub struct ChatCompletionRequest {
     /// Whether to stop early when all beams have finished in beam search.
     #[serde(default)]
     pub early_stopping: Option<bool>,
+    /// Minimum number of tokens to generate before allowing EOS.
+    #[serde(default)]
+    pub min_tokens: usize,
+    /// Token IDs that are banned from generation.
+    #[serde(default)]
+    pub banned_token_ids: Option<Vec<u32>>,
+    /// If set, only these token IDs are allowed in generation.
+    #[serde(default)]
+    pub allowed_token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]

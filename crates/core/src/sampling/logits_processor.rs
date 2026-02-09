@@ -146,6 +146,35 @@ impl LogitsProcessor for BadWordsProcessor {
     }
 }
 
+/// Allowed token IDs processor — masks all tokens except an allow-list.
+///
+/// Sets logits of all tokens not in `allowed_ids` to `-inf`,
+/// restricting generation to the specified vocabulary subset.
+pub struct AllowedTokenIdsProcessor {
+    allowed_ids: Vec<u32>,
+}
+
+impl AllowedTokenIdsProcessor {
+    pub fn new(allowed_ids: Vec<u32>) -> Self {
+        Self { allowed_ids }
+    }
+}
+
+impl LogitsProcessor for AllowedTokenIdsProcessor {
+    fn process(&self, logits: &mut [f32], _generated_tokens: &[u32]) {
+        // Build a mask: only allowed tokens survive
+        for (idx, logit) in logits.iter_mut().enumerate() {
+            if !self.allowed_ids.contains(&(idx as u32)) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "allowed_token_ids"
+    }
+}
+
 /// Min-tokens processor — prevents EOS token until min_tokens generated.
 pub struct MinTokensProcessor {
     min_tokens: usize,
@@ -231,6 +260,27 @@ impl LogitsProcessorPipeline {
         if let Some(ref biases) = params.logit_bias {
             if !biases.is_empty() {
                 pipeline.push(Box::new(LogitBiasProcessor::new(biases.clone())));
+            }
+        }
+
+        if let Some(ref banned) = params.banned_token_ids {
+            if !banned.is_empty() {
+                pipeline.push(Box::new(BadWordsProcessor::new(banned.clone())));
+            }
+        }
+
+        if let Some(ref allowed) = params.allowed_token_ids {
+            if !allowed.is_empty() {
+                pipeline.push(Box::new(AllowedTokenIdsProcessor::new(allowed.clone())));
+            }
+        }
+
+        if params.min_tokens > 0 {
+            if let Some(eos_id) = params.eos_token_id {
+                pipeline.push(Box::new(MinTokensProcessor::new(
+                    params.min_tokens,
+                    eos_id,
+                )));
             }
         }
 
@@ -355,5 +405,117 @@ mod tests {
         // Token 0: 2.0 / 2.0 = 1.0, then +1.0 = 2.0
         assert!((logits[0] - 2.0).abs() < 1e-6);
         assert!((logits[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_allowed_token_ids_processor() {
+        let proc = AllowedTokenIdsProcessor::new(vec![1, 3]);
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0, 5.0];
+        proc.process(&mut logits, &[]);
+
+        // Only tokens 1 and 3 should survive
+        assert!(logits[0] == f32::NEG_INFINITY);
+        assert!((logits[1] - 5.0).abs() < 1e-6);
+        assert!(logits[2] == f32::NEG_INFINITY);
+        assert!((logits[3] - 5.0).abs() < 1e-6);
+        assert!(logits[4] == f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_allowed_token_ids_empty_allows_nothing() {
+        let proc = AllowedTokenIdsProcessor::new(vec![]);
+        let mut logits = vec![5.0, 5.0, 5.0];
+        proc.process(&mut logits, &[]);
+
+        // Empty allow-list → all tokens blocked
+        assert!(logits.iter().all(|&l| l == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_pipeline_from_params_with_banned_tokens() {
+        let params = super::super::SamplingParams {
+            banned_token_ids: Some(vec![1, 2]),
+            ..Default::default()
+        };
+
+        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        assert_eq!(pipeline.len(), 1);
+
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0];
+        pipeline.process(&mut logits, &[]);
+        assert!(logits[1] == f32::NEG_INFINITY);
+        assert!(logits[2] == f32::NEG_INFINITY);
+        assert!((logits[0] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pipeline_from_params_with_allowed_tokens() {
+        let params = super::super::SamplingParams {
+            allowed_token_ids: Some(vec![0, 2]),
+            ..Default::default()
+        };
+
+        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        assert_eq!(pipeline.len(), 1);
+
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0];
+        pipeline.process(&mut logits, &[]);
+        assert!((logits[0] - 5.0).abs() < 1e-6);
+        assert!(logits[1] == f32::NEG_INFINITY);
+        assert!((logits[2] - 5.0).abs() < 1e-6);
+        assert!(logits[3] == f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_pipeline_from_params_with_min_tokens() {
+        let params = super::super::SamplingParams {
+            min_tokens: 5,
+            eos_token_id: Some(2),
+            ..Default::default()
+        };
+
+        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        assert_eq!(pipeline.len(), 1);
+
+        // Not enough tokens generated — EOS blocked
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0];
+        pipeline.process(&mut logits, &[10, 11]);
+        assert!(logits[2] == f32::NEG_INFINITY);
+
+        // Enough tokens generated — EOS allowed
+        let mut logits = vec![5.0, 5.0, 5.0, 5.0];
+        pipeline.process(&mut logits, &[10, 11, 12, 13, 14]);
+        assert!((logits[2] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pipeline_from_params_min_tokens_needs_eos_id() {
+        // min_tokens without eos_token_id → no processor added
+        let params = super::super::SamplingParams {
+            min_tokens: 5,
+            eos_token_id: None,
+            ..Default::default()
+        };
+
+        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        assert!(pipeline.is_empty());
+    }
+
+    #[test]
+    fn test_pipeline_from_params_all_features() {
+        let params = super::super::SamplingParams {
+            repetition_penalty: 1.2,
+            frequency_penalty: 0.5,
+            logit_bias: Some(vec![(0, 1.0)]),
+            banned_token_ids: Some(vec![5]),
+            allowed_token_ids: Some(vec![0, 1, 2, 3]),
+            min_tokens: 3,
+            eos_token_id: Some(1),
+            ..Default::default()
+        };
+
+        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        // rep_pen + freq_pres + logit_bias + banned + allowed + min_tokens = 6
+        assert_eq!(pipeline.len(), 6);
     }
 }
