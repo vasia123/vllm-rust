@@ -3,6 +3,7 @@ mod macros;
 pub mod baichuan;
 pub mod bert;
 pub mod bloom;
+pub mod colbert;
 pub mod cohere;
 pub mod dbrx;
 pub mod deepseek;
@@ -52,6 +53,7 @@ pub mod qwen3_quantized;
 pub mod registry;
 pub mod starcoder2;
 pub mod tp_layers;
+pub mod voyage;
 pub mod yi;
 
 // Re-export tensor parallelism abstractions
@@ -60,9 +62,10 @@ pub use tp_layers::{TpContext, TpEmbedding, TpGeGluMlp, TpGeluMlp, TpLinear, TpS
 pub use baichuan::BaichuanForCausalLM;
 pub use bert::BertForSequenceEmbedding;
 pub use bloom::BloomForCausalLM;
+pub use colbert::ColBERTForRetrieval;
 pub use cohere::CohereForCausalLM;
 pub use dbrx::DbrxForCausalLM;
-pub use deepseek::DeepSeekForCausalLM;
+pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use exaone::ExaoneForCausalLM;
 pub use falcon::FalconForCausalLM;
@@ -110,6 +113,7 @@ pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
 pub use starcoder2::StarCoder2ForCausalLM;
+pub use voyage::VoyageForEmbedding;
 pub use yi::YiForCausalLM;
 
 use std::path::Path;
@@ -148,7 +152,7 @@ fn get_arch(cfg: &ModelConfig) -> Result<&str, ModelError> {
 pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelForward>, ModelError> {
     let arch = get_arch(cfg)?;
     match arch {
-        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => {
+        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" | "GlmMoeDsaForCausalLM" => {
             Ok(Box::new(DeepSeekForCausalLM::new(cfg, vb)?))
         }
         "GemmaForCausalLM" => Ok(Box::new(GemmaForCausalLM::new(cfg, vb)?)),
@@ -190,6 +194,10 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         )),
         "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))
+        }
+        "HF_ColBERT" | "ColBERTModel" => Ok(Box::new(ColBERTForRetrieval::new(cfg, vb)?)),
+        "VoyageQwen3BidirectionalEmbedModel" => {
+            Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?))
         }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
@@ -284,9 +292,13 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" => Ok(Box::new(
-            QuantizedDeepSeekForCausalLM::new(cfg, vb, weight_loader.as_ref())?,
-        )),
+        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" | "GlmMoeDsaForCausalLM" => Ok(
+            Box::new(QuantizedDeepSeekForCausalLM::new(
+                cfg,
+                vb,
+                weight_loader.as_ref(),
+            )?),
+        ),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

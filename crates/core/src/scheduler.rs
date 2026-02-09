@@ -95,7 +95,7 @@ impl RequestQueue {
     }
 
     /// Peek at the highest-priority request without removing it.
-    pub fn peek(&self) -> Option<RequestId> {
+    pub fn peek(&mut self) -> Option<RequestId> {
         match self {
             Self::Fcfs(q) => q.peek(),
             Self::Priority(q) => q.peek(),
@@ -175,7 +175,7 @@ impl FcfsRequestQueue {
         self.queue.pop_front().map(|(id, _, _)| id)
     }
 
-    pub fn peek(&self) -> Option<RequestId> {
+    pub fn peek(&mut self) -> Option<RequestId> {
         self.queue.front().map(|(id, _, _)| *id)
     }
 
@@ -210,8 +210,11 @@ impl FcfsRequestQueue {
 /// Ties are broken by arrival time (earlier arrivals first).
 pub struct PriorityRequestQueue {
     heap: BinaryHeap<PriorityEntry>,
-    /// Track removed request IDs for lazy deletion.
+    /// Track removed request IDs for lazy deletion from the heap.
     removed: HashSet<RequestId>,
+    /// Set of active (non-removed) request IDs. Provides O(1) membership
+    /// checks for remove() and O(1) len()/is_empty().
+    active: HashSet<RequestId>,
 }
 
 impl PriorityRequestQueue {
@@ -219,6 +222,7 @@ impl PriorityRequestQueue {
         Self {
             heap: BinaryHeap::new(),
             removed: HashSet::new(),
+            active: HashSet::new(),
         }
     }
 
@@ -239,17 +243,9 @@ impl PriorityRequestQueue {
         }
     }
 
-    /// Count non-removed entries.
-    fn active_count(&self) -> usize {
-        self.heap
-            .iter()
-            .filter(|e| !self.removed.contains(&e.request_id))
-            .count()
-    }
-
     pub fn add(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
-        // If this request was previously marked as removed, unmark it.
         self.removed.remove(&request_id);
+        self.active.insert(request_id);
         self.heap.push(PriorityEntry {
             priority,
             arrival_time,
@@ -259,32 +255,26 @@ impl PriorityRequestQueue {
 
     pub fn pop(&mut self) -> Option<RequestId> {
         self.cleanup_top();
-        self.heap.pop().map(|entry| entry.request_id)
+        if let Some(entry) = self.heap.pop() {
+            self.active.remove(&entry.request_id);
+            Some(entry.request_id)
+        } else {
+            None
+        }
     }
 
-    pub fn peek(&self) -> Option<RequestId> {
-        // Skip removed entries manually since we can't mutate.
-        // BinaryHeap iteration is not guaranteed to be in heap order,
-        // so we need to find the minimum manually.
-        self.heap
-            .iter()
-            .filter(|e| !self.removed.contains(&e.request_id))
-            .max() // max because our Ord is reversed
-            .map(|e| e.request_id)
+    pub fn peek(&mut self) -> Option<RequestId> {
+        self.cleanup_top();
+        self.heap.peek().map(|e| e.request_id)
     }
 
     pub fn remove(&mut self, request_id: RequestId) -> bool {
-        // Use lazy deletion: mark as removed, clean up during pop.
-        let exists = self
-            .heap
-            .iter()
-            .any(|e| e.request_id == request_id && !self.removed.contains(&request_id));
-        if exists {
-            self.removed.insert(request_id);
-            true
-        } else {
-            false
+        // O(1): only succeed if the request is actually active.
+        if !self.active.remove(&request_id) {
+            return false;
         }
+        self.removed.insert(request_id);
+        true
     }
 
     pub fn prepend(&mut self, request_id: RequestId, priority: RequestPriority, arrival_time: u64) {
@@ -294,11 +284,11 @@ impl PriorityRequestQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.active_count() == 0
+        self.active.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.active_count()
+        self.active.len()
     }
 
     pub fn iter_in_order(&self) -> Vec<RequestId> {

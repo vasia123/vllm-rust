@@ -1,6 +1,6 @@
 //! Core types for the inference engine.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,6 +37,8 @@ pub enum StreamEvent {
 pub enum EngineError {
     #[error("engine has shut down")]
     Shutdown,
+    #[error("engine is paused")]
+    Paused,
     #[error("tokenization error: {0}")]
     Tokenization(String),
     #[error("model error: {0}")]
@@ -112,6 +114,31 @@ pub struct EngineConfig {
     pub cuda_graph_config: super::cuda_graph::CudaGraphConfig,
 }
 
+// ─── Pause mode ──────────────────────────────────────────────────────────
+
+/// How to handle in-flight requests when pausing the engine.
+///
+/// Mirrors vLLM's `PauseMode` (PR #32351) for reinforcement learning
+/// workflows where model weights are updated between batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseMode {
+    /// Abort all in-flight requests immediately. Default.
+    Abort,
+    /// Wait for in-flight requests to complete, then pause.
+    /// New generation requests are rejected while draining.
+    Wait,
+    /// Freeze requests in the scheduler queue; they resume on `resume()`.
+    /// No scheduling occurs while frozen.
+    Keep,
+}
+
+impl Default for PauseMode {
+    fn default() -> Self {
+        Self::Abort
+    }
+}
+
 // ─── Engine Stats ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,6 +148,8 @@ pub struct EngineStats {
     pub num_free_blocks: usize,
     pub num_total_blocks: usize,
     pub block_size: usize,
+    /// Whether the engine is currently paused.
+    pub is_paused: bool,
     pub kv_cache_metrics: MetricsSnapshot,
     /// Legacy prefix cache stats: (num_cached_blocks, num_evictable_blocks)
     pub prefix_cache_stats: Option<(usize, usize)>,
@@ -155,6 +184,19 @@ pub(crate) enum EngineCommand {
     GetStats {
         response_tx: oneshot::Sender<EngineStats>,
     },
+    /// Pause the engine, controlling how in-flight requests are handled.
+    Pause {
+        mode: PauseMode,
+        response_tx: oneshot::Sender<Result<(), EngineError>>,
+    },
+    /// Resume a paused engine.
+    Resume {
+        response_tx: oneshot::Sender<Result<(), EngineError>>,
+    },
+    /// Query whether the engine is currently paused.
+    IsPaused {
+        response_tx: oneshot::Sender<bool>,
+    },
     Shutdown,
 }
 
@@ -171,5 +213,71 @@ impl Default for GenerationParams {
             max_new_tokens: 128,
             eos_token_id: 151645,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_mode_default_is_abort() {
+        assert_eq!(PauseMode::default(), PauseMode::Abort);
+    }
+
+    #[test]
+    fn pause_mode_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PauseMode::Abort).unwrap(),
+            "\"abort\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PauseMode::Wait).unwrap(),
+            "\"wait\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PauseMode::Keep).unwrap(),
+            "\"keep\""
+        );
+    }
+
+    #[test]
+    fn pause_mode_deserializes_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<PauseMode>("\"abort\"").unwrap(),
+            PauseMode::Abort
+        );
+        assert_eq!(
+            serde_json::from_str::<PauseMode>("\"wait\"").unwrap(),
+            PauseMode::Wait
+        );
+        assert_eq!(
+            serde_json::from_str::<PauseMode>("\"keep\"").unwrap(),
+            PauseMode::Keep
+        );
+    }
+
+    #[test]
+    fn engine_error_paused_display() {
+        let err = EngineError::Paused;
+        assert_eq!(err.to_string(), "engine is paused");
+    }
+
+    #[test]
+    fn engine_stats_includes_is_paused() {
+        let stats = EngineStats {
+            num_running_requests: 0,
+            num_waiting_requests: 0,
+            num_free_blocks: 10,
+            num_total_blocks: 10,
+            block_size: 16,
+            is_paused: true,
+            kv_cache_metrics: Default::default(),
+            prefix_cache_stats: None,
+            prefix_cache_detailed_stats: None,
+            prefix_cache_recent_stats: None,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["is_paused"], true);
     }
 }

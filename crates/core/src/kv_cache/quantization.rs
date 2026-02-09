@@ -100,6 +100,17 @@ impl KVScales {
         self.calibrate_v(v)?;
         Ok(())
     }
+
+    /// Reset scales back to identity (1.0).
+    ///
+    /// Called during cache reset to ensure stale calibration data
+    /// from previous requests doesn't affect new requests.
+    pub fn reset(&mut self) -> Result<()> {
+        let device = self.k_scale.device().clone();
+        self.k_scale = Tensor::ones(1, DType::F32, &device)?;
+        self.v_scale = Tensor::ones(1, DType::F32, &device)?;
+        Ok(())
+    }
 }
 
 // ============================================================================

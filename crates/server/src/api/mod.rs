@@ -6,6 +6,8 @@ pub mod error;
 pub mod middleware;
 pub mod models;
 pub mod response_format;
+pub mod responses;
+pub mod responses_types;
 pub mod streaming;
 pub mod tokenize;
 pub mod types;
@@ -162,6 +164,7 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .route("/v1/responses", post(responses::create_response))
         .route("/v1/embeddings", post(embeddings::create_embedding))
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))

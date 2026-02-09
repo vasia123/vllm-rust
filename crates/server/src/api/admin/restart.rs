@@ -449,6 +449,7 @@ mod tests {
                             num_free_blocks: 100,
                             num_total_blocks: 100,
                             block_size: 16,
+                            is_paused: false,
                             kv_cache_metrics: Default::default(),
                             prefix_cache_stats: None,
                             prefix_cache_detailed_stats: None,

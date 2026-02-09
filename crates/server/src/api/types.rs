@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use vllm_core::tokenizer::ChatMessage;
@@ -158,10 +158,10 @@ pub struct CompletionLogProbs {
 
 #[derive(Debug, Serialize)]
 pub struct CompletionChunk {
-    pub id: String,
+    pub id: Arc<str>,
     pub object: &'static str,
     pub created: u64,
-    pub model: String,
+    pub model: Arc<str>,
     pub system_fingerprint: &'static str,
     pub choices: Vec<CompletionChunkChoice>,
     /// Usage statistics, included in the final chunk when stream_options.include_usage is true.
@@ -331,15 +331,20 @@ pub struct ChatMessageResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Deprecated alias for backward compatibility with clients expecting `reasoning_content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionChunk {
-    pub id: String,
+    pub id: Arc<str>,
     pub object: &'static str,
     pub created: u64,
-    pub model: String,
+    pub model: Arc<str>,
     pub system_fingerprint: &'static str,
     pub choices: Vec<ChatCompletionChunkChoice>,
     /// Usage statistics, included in the final chunk when stream_options.include_usage is true.
@@ -363,6 +368,11 @@ pub struct ChatDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Deprecated alias for backward compatibility with clients expecting `reasoning_content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 // ─── Models ───────────────────────────────────────────────────────────────
@@ -699,10 +709,10 @@ mod tests {
     #[test]
     fn chat_chunk_without_usage_omits_field() {
         let chunk = ChatCompletionChunk {
-            id: "chatcmpl-123".to_string(),
+            id: "chatcmpl-123".into(),
             object: "chat.completion.chunk",
             created: 1234567890,
-            model: "test-model".to_string(),
+            model: "test-model".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
             usage: None,
@@ -714,10 +724,10 @@ mod tests {
     #[test]
     fn chat_chunk_with_usage_includes_field() {
         let chunk = ChatCompletionChunk {
-            id: "chatcmpl-123".to_string(),
+            id: "chatcmpl-123".into(),
             object: "chat.completion.chunk",
             created: 1234567890,
-            model: "test-model".to_string(),
+            model: "test-model".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
             usage: Some(Usage {
@@ -738,10 +748,10 @@ mod tests {
     #[test]
     fn completion_chunk_without_usage_omits_field() {
         let chunk = CompletionChunk {
-            id: "cmpl-123".to_string(),
+            id: "cmpl-123".into(),
             object: "text_completion",
             created: 1234567890,
-            model: "test-model".to_string(),
+            model: "test-model".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![CompletionChunkChoice {
                 text: "hello".to_string(),
@@ -758,10 +768,10 @@ mod tests {
     #[test]
     fn completion_chunk_with_usage_includes_field() {
         let chunk = CompletionChunk {
-            id: "cmpl-123".to_string(),
+            id: "cmpl-123".into(),
             object: "text_completion",
             created: 1234567890,
-            model: "test-model".to_string(),
+            model: "test-model".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
             usage: Some(Usage {
@@ -822,6 +832,8 @@ mod tests {
             delta: ChatDelta {
                 role: Some("assistant".to_string()),
                 content: Some("hello".to_string()),
+                reasoning: None,
+                reasoning_content: None,
             },
             index: 0,
             finish_reason: None,
@@ -837,6 +849,8 @@ mod tests {
             delta: ChatDelta {
                 role: None,
                 content: Some("hello".to_string()),
+                reasoning: None,
+                reasoning_content: None,
             },
             index: 0,
             finish_reason: None,
@@ -941,6 +955,8 @@ mod tests {
                 message: ChatMessageResponse {
                     role: "assistant".to_string(),
                     content: Some("Hello!".to_string()),
+                    reasoning: None,
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 index: 0,
@@ -1404,10 +1420,10 @@ mod tests {
     #[test]
     fn completion_chunk_serializes_system_fingerprint() {
         let chunk = CompletionChunk {
-            id: "cmpl-test".to_string(),
+            id: "cmpl-test".into(),
             object: "text_completion",
             created: 0,
-            model: "m".to_string(),
+            model: "m".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
             usage: None,
@@ -1420,10 +1436,10 @@ mod tests {
     #[test]
     fn chat_completion_chunk_serializes_system_fingerprint() {
         let chunk = ChatCompletionChunk {
-            id: "chatcmpl-test".to_string(),
+            id: "chatcmpl-test".into(),
             object: "chat.completion.chunk",
             created: 0,
-            model: "m".to_string(),
+            model: "m".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
             usage: None,
@@ -1565,5 +1581,94 @@ mod tests {
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(req.beam_width.is_none());
+    }
+
+    // ─── reasoning / interleaved thinking ───────────────────────────
+
+    #[test]
+    fn chat_message_response_omits_reasoning_when_none() {
+        let msg = ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: Some("Hello".to_string()),
+            reasoning: None,
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json.get("reasoning").is_none());
+        assert!(json.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn chat_message_response_includes_reasoning_when_present() {
+        let msg = ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: Some("42".to_string()),
+            reasoning: Some("Let me think...".to_string()),
+            reasoning_content: Some("Let me think...".to_string()),
+            tool_calls: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["reasoning"], "Let me think...");
+        assert_eq!(json["reasoning_content"], "Let me think...");
+    }
+
+    #[test]
+    fn chat_delta_omits_reasoning_when_none() {
+        let delta = ChatDelta {
+            role: None,
+            content: Some("hello".to_string()),
+            reasoning: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_value(&delta).unwrap();
+        assert!(json.get("reasoning").is_none());
+        assert!(json.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn chat_delta_includes_reasoning_when_present() {
+        let delta = ChatDelta {
+            role: Some("assistant".to_string()),
+            content: None,
+            reasoning: Some("thinking...".to_string()),
+            reasoning_content: Some("thinking...".to_string()),
+        };
+        let json = serde_json::to_value(&delta).unwrap();
+        assert_eq!(json["reasoning"], "thinking...");
+        assert_eq!(json["reasoning_content"], "thinking...");
+        assert!(json.get("content").is_none());
+    }
+
+    #[test]
+    fn chat_request_with_reasoning_message() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4", "reasoning": "Simple arithmetic"}
+            ]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(
+            req.messages[1].reasoning.as_deref(),
+            Some("Simple arithmetic")
+        );
+    }
+
+    #[test]
+    fn chat_request_with_reasoning_content_legacy() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [
+                {"role": "assistant", "content": "Yes.", "reasoning_content": "I think so"}
+            ]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.messages[0].reasoning.as_deref(),
+            Some("I think so")
+        );
     }
 }

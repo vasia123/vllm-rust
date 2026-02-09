@@ -3,7 +3,8 @@
 use tokio::sync::{mpsc, oneshot};
 
 use super::types::{
-    EngineCommand, EngineError, EngineStats, GenerationRequest, GenerationResult, StreamEvent,
+    EngineCommand, EngineError, EngineStats, GenerationRequest, GenerationResult, PauseMode,
+    StreamEvent,
 };
 
 /// Handle to the inference engine, cloneable for sharing across tasks.
@@ -68,6 +69,47 @@ impl EngineHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCommand::GetStats {
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+        resp_rx.await.map_err(|_| EngineError::Shutdown)
+    }
+
+    /// Pause the engine with the specified mode.
+    ///
+    /// - `Abort`: abort all in-flight requests immediately.
+    /// - `Wait`: reject new requests, let existing ones finish.
+    /// - `Keep`: freeze the scheduler; requests resume on `resume()`.
+    pub async fn pause(&self, mode: PauseMode) -> Result<(), EngineError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Pause {
+                mode,
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+        resp_rx.await.map_err(|_| EngineError::Shutdown)?
+    }
+
+    /// Resume a paused engine, accepting new requests again.
+    pub async fn resume(&self) -> Result<(), EngineError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Resume {
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+        resp_rx.await.map_err(|_| EngineError::Shutdown)?
+    }
+
+    /// Query whether the engine is currently paused.
+    pub async fn is_paused(&self) -> Result<bool, EngineError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::IsPaused {
                 response_tx: resp_tx,
             })
             .await

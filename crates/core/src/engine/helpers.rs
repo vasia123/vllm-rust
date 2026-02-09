@@ -16,8 +16,8 @@ use super::cuda_graph::{BatchDescriptor, CudaGraphDispatcher, ForwardContext};
 use super::cuda_graph_runner::CudaGraphRunner;
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::types::{
-    EngineCommand, EngineError, EngineStats, GenerationRequest, GenerationResult, ResponseChannel,
-    StreamEvent,
+    EngineCommand, EngineError, EngineStats, GenerationRequest, GenerationResult, PauseMode,
+    ResponseChannel, StreamEvent,
 };
 use crate::lora::LoraContext;
 
@@ -28,6 +28,10 @@ pub(crate) struct FinishCheck {
 }
 
 /// Handle an incoming command. Returns true if shutdown was requested.
+///
+/// `paused` and `frozen` track the engine pause state:
+/// - `paused`: new generation requests are rejected.
+/// - `frozen`: scheduling is completely skipped (Keep mode).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_command(
     cmd: EngineCommand,
@@ -37,12 +41,18 @@ pub(crate) fn handle_command(
     requests: &mut HashMap<RequestId, ActiveRequest>,
     block_size: usize,
     kv_cache_mgr: &mut KVCacheManager,
+    paused: &mut bool,
+    frozen: &mut bool,
 ) -> bool {
     match cmd {
         EngineCommand::Generate {
             request,
             response_tx,
         } => {
+            if *paused {
+                let _ = response_tx.send(Err(EngineError::Paused));
+                return false;
+            }
             admit_request(
                 request,
                 ResponseChannel::Complete(response_tx),
@@ -56,6 +66,12 @@ pub(crate) fn handle_command(
             false
         }
         EngineCommand::GenerateStream { request, stream_tx } => {
+            if *paused {
+                let _ = stream_tx.try_send(StreamEvent::Error {
+                    error: EngineError::Paused.to_string(),
+                });
+                return false;
+            }
             admit_request(
                 request,
                 ResponseChannel::Stream(stream_tx),
@@ -85,6 +101,7 @@ pub(crate) fn handle_command(
                 num_free_blocks: kv_cache_mgr.num_free_blocks(),
                 num_total_blocks: kv_cache_mgr.num_total_blocks(),
                 block_size,
+                is_paused: *paused,
                 kv_cache_metrics: kv_cache_mgr.metrics().snapshot(),
                 prefix_cache_stats: kv_cache_mgr.prefix_cache_stats(),
                 prefix_cache_detailed_stats,
@@ -100,6 +117,61 @@ pub(crate) fn handle_command(
                 scheduler.remove_request(request_id);
                 tracing::debug!(request_id, "Request aborted, resources freed");
             }
+            false
+        }
+        EngineCommand::Pause { mode, response_tx } => {
+            if *paused {
+                let _ = response_tx.send(Ok(()));
+                return false;
+            }
+            match mode {
+                PauseMode::Abort => {
+                    // Abort all active requests
+                    let request_ids: Vec<RequestId> = requests.keys().copied().collect();
+                    for req_id in request_ids {
+                        if let Some(mut active) = requests.remove(&req_id) {
+                            let _ = kv_cache_mgr.free_request(&mut active.state.block_table);
+                            scheduler.remove_request(req_id);
+                            send_error(active.response, EngineError::Paused);
+                        }
+                    }
+                    *paused = true;
+                    *frozen = false;
+                    tracing::info!("Engine paused (abort mode): all requests aborted");
+                }
+                PauseMode::Wait => {
+                    // Reject new requests but let existing ones finish
+                    *paused = true;
+                    *frozen = false;
+                    tracing::info!(
+                        active_requests = requests.len(),
+                        "Engine paused (wait mode): draining active requests"
+                    );
+                }
+                PauseMode::Keep => {
+                    // Freeze scheduling entirely
+                    *paused = true;
+                    *frozen = true;
+                    tracing::info!(
+                        active_requests = requests.len(),
+                        "Engine paused (keep mode): requests frozen"
+                    );
+                }
+            }
+            let _ = response_tx.send(Ok(()));
+            false
+        }
+        EngineCommand::Resume { response_tx } => {
+            if *paused {
+                *paused = false;
+                *frozen = false;
+                tracing::info!("Engine resumed");
+            }
+            let _ = response_tx.send(Ok(()));
+            false
+        }
+        EngineCommand::IsPaused { response_tx } => {
+            let _ = response_tx.send(*paused);
             false
         }
         EngineCommand::Shutdown => true,

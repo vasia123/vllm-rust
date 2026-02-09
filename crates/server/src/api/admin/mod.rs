@@ -22,7 +22,8 @@ use self::restart::{
     RestartCoordinator, RestartState,
 };
 use self::types::{
-    ConfigSaveRequest, ConfigSaveResponse, HealthResponse, HealthStatus, RuntimeConfig,
+    ConfigSaveRequest, ConfigSaveResponse, HealthResponse, HealthStatus, IsPausedResponse,
+    PauseRequest, PauseResponse, RuntimeConfig,
 };
 use crate::api::error::ApiError;
 use crate::config::ServerConfig;
@@ -106,6 +107,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/metrics/stream", get(metrics::metrics_stream))
         .route("/metrics/prometheus", get(prometheus::prometheus_metrics))
         .route("/config", get(get_config).post(save_config))
+        .route("/pause", post(pause_engine))
+        .route("/resume", post(resume_engine))
+        .route("/is_paused", get(is_engine_paused))
         .with_state(state)
         .route("/restart", post(restart_handler))
         .route("/restart/status", get(restart_status_stream))
@@ -179,6 +183,67 @@ async fn live(State(state): State<AdminState>) -> impl IntoResponse {
 /// GET /admin/config - Get current runtime configuration.
 async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.config.read().await.clone())
+}
+
+/// POST /admin/pause - Pause the engine.
+async fn pause_engine(
+    State(state): State<AdminState>,
+    Json(request): Json<PauseRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .engine
+        .get()
+        .pause(request.mode)
+        .await
+        .map_err(|e| ApiError::EngineError(e.to_string()))?;
+
+    let message = match request.mode {
+        vllm_core::engine::PauseMode::Abort => {
+            "Engine paused: all in-flight requests aborted".to_string()
+        }
+        vllm_core::engine::PauseMode::Wait => {
+            "Engine paused: draining in-flight requests".to_string()
+        }
+        vllm_core::engine::PauseMode::Keep => {
+            "Engine paused: requests frozen in queue".to_string()
+        }
+    };
+
+    Ok(Json(PauseResponse {
+        paused: true,
+        message,
+    }))
+}
+
+/// POST /admin/resume - Resume a paused engine.
+async fn resume_engine(
+    State(state): State<AdminState>,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .engine
+        .get()
+        .resume()
+        .await
+        .map_err(|e| ApiError::EngineError(e.to_string()))?;
+
+    Ok(Json(PauseResponse {
+        paused: false,
+        message: "Engine resumed".to_string(),
+    }))
+}
+
+/// GET /admin/is_paused - Check if engine is paused.
+async fn is_engine_paused(
+    State(state): State<AdminState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let paused = state
+        .engine
+        .get()
+        .is_paused()
+        .await
+        .map_err(|e| ApiError::EngineError(e.to_string()))?;
+
+    Ok(Json(IsPausedResponse { paused }))
 }
 
 /// POST /admin/config - Save configuration to file.

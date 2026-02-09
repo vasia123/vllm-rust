@@ -6,13 +6,26 @@ use crate::multimodal::ContentPart;
 
 pub struct TokenizerWrapper {
     inner: Tokenizer,
+    /// Maximum character length of any single token in the vocabulary.
+    /// Used for early-fail validation: a text of C characters produces
+    /// at least ceil(C / max_chars_per_token) tokens.
+    max_chars_per_token: usize,
 }
 
 impl TokenizerWrapper {
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let inner =
             Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
-        Ok(Self { inner })
+        let max_chars_per_token = inner
+            .get_vocab(true)
+            .keys()
+            .map(|k| k.len())
+            .max()
+            .unwrap_or(1);
+        Ok(Self {
+            inner,
+            max_chars_per_token,
+        })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -31,7 +44,12 @@ impl TokenizerWrapper {
             .expect("build test tokenizer model");
         let mut tokenizer = Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(Whitespace {}));
-        Self { inner: tokenizer }
+        // Test tokens are "t0".."tN" — max length is the longest token string
+        let max_chars_per_token = format!("t{}", vocab_size.saturating_sub(1)).len();
+        Self {
+            inner: tokenizer,
+            max_chars_per_token,
+        }
     }
 
     pub fn encode(&self, text: &str) -> anyhow::Result<Vec<u32>> {
@@ -46,6 +64,11 @@ impl TokenizerWrapper {
         self.inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("decode: {e}"))
+    }
+
+    /// Maximum character length of any single token in the vocabulary.
+    pub fn max_chars_per_token(&self) -> usize {
+        self.max_chars_per_token
     }
 }
 
@@ -130,6 +153,14 @@ impl From<&str> for MessageContent {
 pub struct ChatMessage {
     pub role: String,
     pub content: MessageContent,
+    /// Reasoning/thinking content for interleaved thinking models (e.g. DeepSeek R1, Qwen3).
+    /// Also accepts the deprecated `reasoning_content` field name.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning_content"
+    )]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -138,6 +169,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: MessageContent::Text(content.into()),
+            reasoning: None,
         }
     }
 
@@ -146,6 +178,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: MessageContent::Parts(parts),
+            reasoning: None,
         }
     }
 
@@ -409,6 +442,20 @@ mod tests {
     }
 
     #[test]
+    fn test_max_chars_per_token() {
+        let tok = TokenizerWrapper::for_testing(100);
+        // Tokens are "t0".."t99", longest is "t99" (3 chars)
+        assert_eq!(tok.max_chars_per_token(), 3);
+    }
+
+    #[test]
+    fn test_max_chars_per_token_small_vocab() {
+        let tok = TokenizerWrapper::for_testing(5);
+        // Tokens are "t0".."t4", longest is "t4" (2 chars)
+        assert_eq!(tok.max_chars_per_token(), 2);
+    }
+
+    #[test]
     fn test_message_content_text() {
         let content = MessageContent::Text("Hello".to_string());
         assert_eq!(content.as_text(), "Hello");
@@ -445,6 +492,36 @@ mod tests {
         );
         assert_eq!(msg.role, "user");
         assert!(msg.has_images());
+    }
+
+    #[test]
+    fn test_chat_message_reasoning_field() {
+        let json = r#"{"role": "assistant", "content": "The answer is 4.", "reasoning": "2+2=4"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning.as_deref(), Some("2+2=4"));
+    }
+
+    #[test]
+    fn test_chat_message_reasoning_content_alias() {
+        // Deprecated field name should be deserialized into `reasoning`
+        let json =
+            r#"{"role": "assistant", "content": "Yes.", "reasoning_content": "Let me think..."}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning.as_deref(), Some("Let me think..."));
+    }
+
+    #[test]
+    fn test_chat_message_reasoning_defaults_to_none() {
+        let json = r#"{"role": "user", "content": "Hello"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_chat_message_reasoning_serialization_omits_none() {
+        let msg = ChatMessage::new("user", "Hello");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json.get("reasoning").is_none());
     }
 
     #[test]

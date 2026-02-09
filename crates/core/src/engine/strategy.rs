@@ -99,6 +99,10 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
         kv_cache_mgr.enable_prefix_cache();
     }
 
+    // Pause state: `paused` rejects new requests, `frozen` skips scheduling.
+    let mut paused = false;
+    let mut frozen = false;
+
     loop {
         // Phase 1: Drain incoming commands (non-blocking)
         loop {
@@ -112,6 +116,8 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut state.requests,
                         config.block_size,
                         &mut kv_cache_mgr,
+                        &mut paused,
+                        &mut frozen,
                     ) {
                         return; // shutdown
                     }
@@ -121,7 +127,31 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             }
         }
 
-        // Phase 2: If idle, block-wait for next command
+        // Phase 2: If frozen (Keep mode), block-wait for commands only.
+        // No scheduling occurs while frozen — requests stay in the queue.
+        if frozen {
+            match cmd_rx.recv().await {
+                Some(cmd) => {
+                    if handle_command(
+                        cmd,
+                        &mut state.next_id,
+                        &tokenizer,
+                        &mut state.scheduler,
+                        &mut state.requests,
+                        config.block_size,
+                        &mut kv_cache_mgr,
+                        &mut paused,
+                        &mut frozen,
+                    ) {
+                        return;
+                    }
+                    continue;
+                }
+                None => return,
+            }
+        }
+
+        // Phase 2b: If idle, block-wait for next command
         if state.scheduler.is_idle() {
             match cmd_rx.recv().await {
                 Some(cmd) => {
@@ -133,6 +163,8 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut state.requests,
                         config.block_size,
                         &mut kv_cache_mgr,
+                        &mut paused,
+                        &mut frozen,
                     ) {
                         return;
                     }

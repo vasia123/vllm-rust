@@ -90,6 +90,14 @@ pub struct MoELayerConfig {
     pub top_k: usize,
     /// Whether to renormalize routing weights.
     pub renormalize: bool,
+    /// Whether to reuse the input buffer as the output buffer.
+    /// Saves one allocation per forward pass. Currently a no-op in
+    /// Candle (tensors are immutable); reserved for future CUDA kernel use.
+    pub inplace: bool,
+    /// Whether experts use fused activation-and-multiply (SwiGLU).
+    /// When true, each expert has gate+up projections with SiLU gating.
+    /// When false, a plain activation is used without gating.
+    pub is_act_and_mul: bool,
 }
 
 /// MoE Layer that combines routing and expert execution.
@@ -112,6 +120,9 @@ pub struct MoELayer {
     config: MoELayerConfig,
     /// Block configuration for fused kernels
     block_config: FusedMoEBlockConfig,
+    /// Whether inplace output is enabled (see [`MoELayerConfig::inplace`]).
+    #[allow(dead_code)]
+    inplace: bool,
 }
 
 impl MoELayer {
@@ -141,11 +152,14 @@ impl MoELayer {
         let block_config =
             FusedMoEBlockConfig::auto_select(128, config.hidden_size, config.intermediate_size);
 
+        let inplace = config.inplace;
+
         Ok(Self {
             router,
             experts,
             config,
             block_config,
+            inplace,
         })
     }
 
@@ -326,6 +340,11 @@ impl MoELayer {
     pub fn set_block_config(&mut self, config: FusedMoEBlockConfig) {
         self.block_config = config;
     }
+
+    /// Whether inplace output is enabled.
+    pub fn inplace(&self) -> bool {
+        self.inplace
+    }
 }
 
 // ─── MoE Layer with Shared Expert ───────────────────────────────────────────
@@ -359,6 +378,12 @@ pub struct MoELayerWithSharedConfig {
     pub num_expert_groups: Option<usize>,
     /// Top-k per group.
     pub topk_per_group: Option<usize>,
+    /// Whether to reuse the input buffer as the output buffer.
+    /// Automatically disabled when shared experts are present (they need
+    /// the original input). Currently a no-op in Candle.
+    pub inplace: bool,
+    /// Whether experts use fused activation-and-multiply (SwiGLU).
+    pub is_act_and_mul: bool,
 }
 
 impl Default for MoELayerWithSharedConfig {
@@ -376,6 +401,8 @@ impl Default for MoELayerWithSharedConfig {
             use_grouped_topk: false,
             num_expert_groups: None,
             topk_per_group: None,
+            inplace: false,
+            is_act_and_mul: true,
         }
     }
 }
@@ -395,6 +422,10 @@ pub struct MoELayerWithShared {
     shared_expert_gate: Option<candle_nn::Linear>,
     config: MoELayerWithSharedConfig,
     block_config: FusedMoEBlockConfig,
+    /// Effective inplace flag: disabled when shared experts are present
+    /// because the shared expert needs the original input.
+    #[allow(dead_code)]
+    effective_inplace: bool,
 }
 
 impl MoELayerWithShared {
@@ -449,6 +480,10 @@ impl MoELayerWithShared {
         let block_config =
             FusedMoEBlockConfig::auto_select(128, config.hidden_size, config.intermediate_size);
 
+        // Inplace must be disabled when shared experts exist because the
+        // shared expert reads the original input after routed experts run.
+        let effective_inplace = config.inplace && shared_expert.is_none();
+
         Ok(Self {
             router,
             experts,
@@ -456,6 +491,7 @@ impl MoELayerWithShared {
             shared_expert_gate,
             config,
             block_config,
+            effective_inplace,
         })
     }
 
@@ -577,6 +613,12 @@ impl MoELayerWithShared {
     pub fn block_config(&self) -> &FusedMoEBlockConfig {
         &self.block_config
     }
+
+    /// Whether inplace output is effectively enabled.
+    /// Always false when a shared expert is present.
+    pub fn effective_inplace(&self) -> bool {
+        self.effective_inplace
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +654,8 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
 
         let moe = MoELayer::new(config, vb).unwrap();
@@ -630,6 +674,8 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
 
         let moe = MoELayer::new(config, vb).unwrap();
@@ -656,6 +702,8 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
 
         let moe = MoELayer::new(config, vb).unwrap();
@@ -677,6 +725,8 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
 
         let moe = MoELayer::new(config, vb).unwrap();
@@ -716,6 +766,8 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
 
         let moe1 = MoELayer::new(config.clone(), vb1).unwrap();
@@ -749,6 +801,8 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
 
         let moe = MoELayer::new(config, vb).unwrap();
@@ -884,5 +938,115 @@ mod tests {
         assert!(!config.gated_shared_expert);
         assert!(!config.use_grouped_topk);
         assert!(config.shared_expert_intermediate_size.is_none());
+        assert!(!config.inplace);
+    }
+
+    // ─── Inplace Flag Tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_moe_layer_inplace_flag() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            inplace: true,
+            is_act_and_mul: true,
+        };
+
+        let moe = MoELayer::new(config, vb).unwrap();
+        assert!(moe.inplace());
+    }
+
+    #[test]
+    fn test_moe_layer_inplace_produces_same_output() {
+        let device = Device::Cpu;
+
+        let vb_a = VarBuilder::zeros(DType::F32, &device);
+        let vb_b = VarBuilder::zeros(DType::F32, &device);
+
+        let config_a = MoELayerConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+        let config_b = MoELayerConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            inplace: true,
+            is_act_and_mul: true,
+        };
+
+        let moe_a = MoELayer::new(config_a, vb_a).unwrap();
+        let moe_b = MoELayer::new(config_b, vb_b).unwrap();
+
+        let input = Tensor::randn(0f32, 1.0, (4, 16), &device).unwrap();
+        let out_a = moe_a.forward(&input).unwrap();
+        let out_b = moe_b.forward(&input).unwrap();
+
+        let diff: f32 = out_a
+            .sub(&out_b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-5, "inplace=true/false should produce same output, diff={diff}");
+    }
+
+    #[test]
+    fn test_moe_with_shared_inplace_disabled_when_shared_present() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            shared_expert_intermediate_size: Some(64),
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            inplace: true, // requested, but should be auto-disabled
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        assert!(moe.has_shared_expert());
+        // Effective inplace must be false when shared expert exists
+        assert!(!moe.effective_inplace());
+    }
+
+    #[test]
+    fn test_moe_with_shared_inplace_enabled_when_no_shared() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            shared_expert_intermediate_size: None, // no shared expert
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            inplace: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        assert!(!moe.has_shared_expert());
+        assert!(moe.effective_inplace());
     }
 }

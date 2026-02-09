@@ -62,7 +62,7 @@ pub async fn create_completion(
             .into_iter()
             .next()
             .unwrap_or(PromptInput::Text(String::new()));
-        let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
+        let (prompt, prompt_tokens) = resolve_prompt_input(&state, input, req.max_tokens)?;
 
         let include_usage = req
             .stream_options
@@ -160,7 +160,7 @@ pub async fn create_completion(
                 .is_some();
 
         for input in inputs {
-            let (prompt, prompt_tokens) = resolve_prompt_input(&state, input)?;
+            let (prompt, prompt_tokens) = resolve_prompt_input(&state, input, req.max_tokens)?;
             total_prompt_tokens += prompt_tokens;
 
             // Generate `best_of` candidates for this prompt
@@ -278,9 +278,20 @@ pub async fn create_completion(
     }
 }
 
-fn resolve_prompt_input(state: &AppState, input: PromptInput) -> Result<(String, usize), ApiError> {
+fn resolve_prompt_input(
+    state: &AppState,
+    input: PromptInput,
+    max_tokens: usize,
+) -> Result<(String, usize), ApiError> {
     match input {
         PromptInput::Text(text) => {
+            // Early-fail: reject prompts that are clearly too long before tokenizing
+            super::validation::validate_prompt_char_length(
+                text.len(),
+                max_tokens,
+                state.max_model_len,
+                state.tokenizer.max_chars_per_token(),
+            )?;
             let token_count = state
                 .tokenizer
                 .encode(&text)

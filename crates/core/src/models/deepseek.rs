@@ -245,6 +245,8 @@ impl DeepSeekDecoderLayer {
                 num_experts: n_routed,
                 top_k,
                 renormalize: true,
+                inplace: false,
+                is_act_and_mul: true,
             };
             let moe_layer = MoELayer::new(layer_cfg, vb.pp("mlp"))?;
 
@@ -495,6 +497,10 @@ impl crate::engine::ModelForward for DeepSeekForCausalLM {
     }
 }
 
+/// GLM-5 (GlmMoeDsaForCausalLM) uses the same architecture as DeepSeek V2/V3.
+/// See reference vLLM PR #34124 — the Python implementation is an empty subclass.
+pub type GlmMoeDsaForCausalLM = DeepSeekForCausalLM;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +566,17 @@ mod tests {
 
         let model = DeepSeekForCausalLM::new(&cfg, vb);
         assert!(model.is_ok());
+    }
+
+    #[test]
+    fn test_glm_moe_dsa_is_deepseek_alias() {
+        let device = Device::Cpu;
+        let cfg = test_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        // GlmMoeDsaForCausalLM is a type alias for DeepSeekForCausalLM
+        let model = GlmMoeDsaForCausalLM::new(&cfg, vb);
+        assert!(model.is_ok(), "GLM-5 alias should construct: {:?}", model.err());
     }
 
     #[test]

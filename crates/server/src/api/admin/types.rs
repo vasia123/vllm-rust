@@ -122,3 +122,26 @@ pub struct ConfigSaveResponse {
     /// Human-readable message.
     pub message: String,
 }
+
+/// Request body for POST /admin/pause.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PauseRequest {
+    /// How to handle in-flight requests. Default: "abort".
+    #[serde(default)]
+    pub mode: vllm_core::engine::PauseMode,
+}
+
+/// Response for POST /admin/pause and POST /admin/resume.
+#[derive(Debug, Clone, Serialize)]
+pub struct PauseResponse {
+    /// Whether the engine is paused.
+    pub paused: bool,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Response for GET /admin/is_paused.
+#[derive(Debug, Clone, Serialize)]
+pub struct IsPausedResponse {
+    pub paused: bool,
+}

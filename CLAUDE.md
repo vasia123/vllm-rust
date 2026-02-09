@@ -15,6 +15,9 @@ Rust-native LLM inference engine. Alternative to vLLM.
 
 vLLM source: `reference/vllm/`. Consult before implementing any component.
 
+- Baseline commit: `14d03b8` (2026-01-23) — initial version used during development
+- Current commit: `3025b3c` (2026-02-09) — latest synced version
+
 ## Principles
 
 - TDD: test first, implement second, refactor third

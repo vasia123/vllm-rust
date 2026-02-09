@@ -96,6 +96,11 @@ pub fn completion_sse_stream(
     rx: mpsc::Receiver<StreamEvent>,
     options: StreamingOptions,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Convert to Arc<str> once — subsequent per-token clones are cheap
+    // pointer bumps instead of heap allocations.
+    let id: Arc<str> = request_id.into();
+    let model: Arc<str> = model.into();
+
     let output_stream = async_stream::stream! {
         let mut completion_tokens: usize = 0;
         let mut text_offset: usize = 0;
@@ -126,10 +131,10 @@ pub fn completion_sse_stream(
                     text_offset += token_text.len();
 
                     let chunk = CompletionChunk {
-                        id: request_id.clone(),
+                        id: Arc::clone(&id),
                         object: "text_completion",
                         created: timestamp_now(),
-                        model: model.clone(),
+                        model: Arc::clone(&model),
                         system_fingerprint: system_fingerprint(),
                         choices: vec![CompletionChunkChoice {
                             text: token_text,
@@ -143,10 +148,10 @@ pub fn completion_sse_stream(
                 }
                 StreamEvent::Done { finish_reason, .. } => {
                     let chunk = CompletionChunk {
-                        id: request_id.clone(),
+                        id: Arc::clone(&id),
                         object: "text_completion",
                         created: timestamp_now(),
-                        model: model.clone(),
+                        model: Arc::clone(&model),
                         system_fingerprint: system_fingerprint(),
                         choices: vec![CompletionChunkChoice {
                             text: String::new(),
@@ -168,10 +173,10 @@ pub fn completion_sse_stream(
         // Emit usage chunk if requested via stream_options.include_usage
         if options.include_usage {
             let usage_chunk = CompletionChunk {
-                id: request_id.clone(),
+                id: Arc::clone(&id),
                 object: "text_completion",
                 created: timestamp_now(),
-                model: model.clone(),
+                model: Arc::clone(&model),
                 system_fingerprint: system_fingerprint(),
                 choices: vec![],
                 usage: Some(Usage {
@@ -195,6 +200,11 @@ pub fn chat_completion_sse_stream(
     rx: mpsc::Receiver<StreamEvent>,
     options: StreamingOptions,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Convert to Arc<str> once — subsequent per-token clones are cheap
+    // pointer bumps instead of heap allocations.
+    let id: Arc<str> = request_id.into();
+    let model: Arc<str> = model.into();
+
     let output_stream = async_stream::stream! {
         let mut first = true;
         let mut completion_tokens: usize = 0;
@@ -226,6 +236,8 @@ pub fn chat_completion_sse_stream(
                             delta: ChatDelta {
                                 role: Some("assistant".to_string()),
                                 content: Some(token_text),
+                                reasoning: None,
+                                reasoning_content: None,
                             },
                             index: 0,
                             finish_reason: None,
@@ -236,6 +248,8 @@ pub fn chat_completion_sse_stream(
                             delta: ChatDelta {
                                 role: None,
                                 content: Some(token_text),
+                                reasoning: None,
+                                reasoning_content: None,
                             },
                             index: 0,
                             finish_reason: None,
@@ -243,10 +257,10 @@ pub fn chat_completion_sse_stream(
                         }]
                     };
                     let chunk = ChatCompletionChunk {
-                        id: request_id.clone(),
+                        id: Arc::clone(&id),
                         object: "chat.completion.chunk",
                         created: timestamp_now(),
-                        model: model.clone(),
+                        model: Arc::clone(&model),
                         system_fingerprint: system_fingerprint(),
                         choices,
                         usage: None,
@@ -255,15 +269,17 @@ pub fn chat_completion_sse_stream(
                 }
                 StreamEvent::Done { finish_reason, .. } => {
                     let chunk = ChatCompletionChunk {
-                        id: request_id.clone(),
+                        id: Arc::clone(&id),
                         object: "chat.completion.chunk",
                         created: timestamp_now(),
-                        model: model.clone(),
+                        model: Arc::clone(&model),
                         system_fingerprint: system_fingerprint(),
                         choices: vec![ChatCompletionChunkChoice {
                             delta: ChatDelta {
                                 role: None,
                                 content: None,
+                                reasoning: None,
+                                reasoning_content: None,
                             },
                             index: 0,
                             finish_reason: Some(finish_reason_str(&finish_reason)),
@@ -283,10 +299,10 @@ pub fn chat_completion_sse_stream(
         // Emit usage chunk if requested via stream_options.include_usage
         if options.include_usage {
             let usage_chunk = ChatCompletionChunk {
-                id: request_id.clone(),
+                id: Arc::clone(&id),
                 object: "chat.completion.chunk",
                 created: timestamp_now(),
-                model: model.clone(),
+                model: Arc::clone(&model),
                 system_fingerprint: system_fingerprint(),
                 choices: vec![],
                 usage: Some(Usage {

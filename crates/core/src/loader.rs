@@ -124,6 +124,33 @@ pub fn quantization_info(files: &ModelFiles) -> String {
     }
 }
 
+/// Natural sort key: splits a filename into alternating text/numeric segments
+/// so that "model-2-of-10" sorts before "model-10-of-10".
+fn natural_sort_key(s: &str) -> Vec<Result<u64, String>> {
+    let basename = std::path::Path::new(s)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(s);
+    let mut parts = Vec::new();
+    let mut chars = basename.chars().peekable();
+    while chars.peek().is_some() {
+        if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            let mut num = String::new();
+            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                num.push(chars.next().unwrap());
+            }
+            parts.push(Ok(num.parse::<u64>().unwrap_or(0)));
+        } else {
+            let mut text = String::new();
+            while chars.peek().is_some_and(|c| !c.is_ascii_digit()) {
+                text.push(chars.next().unwrap());
+            }
+            parts.push(Err(text));
+        }
+    }
+    parts
+}
+
 fn load_safetensor_paths(repo: &hf_hub::api::sync::ApiRepo) -> anyhow::Result<Vec<PathBuf>> {
     // Try model.safetensors first (single file models)
     if let Ok(path) = repo.get("model.safetensors") {
@@ -142,7 +169,7 @@ fn load_safetensor_paths(repo: &hf_hub::api::sync::ApiRepo) -> anyhow::Result<Ve
         .values()
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
-    filenames.sort();
+    filenames.sort_by_key(|a| natural_sort_key(a));
     filenames.dedup();
 
     let mut paths = Vec::new();
@@ -156,6 +183,44 @@ fn load_safetensor_paths(repo: &hf_hub::api::sync::ApiRepo) -> anyhow::Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn natural_sort_orders_numerically() {
+        let mut files = vec![
+            "model-00010-of-00020.safetensors".to_string(),
+            "model-00002-of-00020.safetensors".to_string(),
+            "model-00001-of-00020.safetensors".to_string(),
+            "model-00011-of-00020.safetensors".to_string(),
+        ];
+        files.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
+        assert_eq!(
+            files,
+            vec![
+                "model-00001-of-00020.safetensors",
+                "model-00002-of-00020.safetensors",
+                "model-00010-of-00020.safetensors",
+                "model-00011-of-00020.safetensors",
+            ]
+        );
+    }
+
+    #[test]
+    fn natural_sort_handles_unpadded_numbers() {
+        let mut files = vec![
+            "shard-10.safetensors".to_string(),
+            "shard-2.safetensors".to_string(),
+            "shard-1.safetensors".to_string(),
+        ];
+        files.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
+        assert_eq!(
+            files,
+            vec![
+                "shard-1.safetensors",
+                "shard-2.safetensors",
+                "shard-10.safetensors",
+            ]
+        );
+    }
 
     #[test]
     #[ignore] // requires network + disk space

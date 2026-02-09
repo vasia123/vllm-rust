@@ -95,6 +95,19 @@ impl CacheEngine {
         &self.v_cache
     }
 
+    /// Reset cache contents to zeros without reallocating.
+    ///
+    /// This ensures consistency when restarting generation — stale KV data
+    /// from previous requests is cleared.
+    pub fn reset(&mut self) -> Result<(), CacheError> {
+        self.k_cache = self.k_cache.zeros_like()?;
+        self.v_cache = self.v_cache.zeros_like()?;
+        if let Some(ref mut scales) = self.scales {
+            scales.reset()?;
+        }
+        Ok(())
+    }
+
     /// Write K, V for new tokens into their assigned slots.
     ///
     /// k, v shape: [num_kv_heads, new_tokens, head_dim]

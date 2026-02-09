@@ -4,7 +4,8 @@ use candle_core::Tensor;
 use tracing::warn;
 
 use crate::kv_cache::{BlockTable, KVCacheManager};
-use crate::request::{RequestId, RequestStatus};
+use crate::request::{RequestId, RequestStatus, SequenceState};
+use crate::sampling;
 use crate::scheduler::SchedulerOutput;
 use crate::tokenizer::TokenizerWrapper;
 
@@ -13,6 +14,52 @@ use super::helpers::{execute_decode, execute_prefill, finish_request_with_error,
 use super::model_forward::ModelForward;
 use super::strategy::ExecutionStrategy;
 use super::types::EngineError;
+
+/// Sample a token from logits applying the request's sampling params, penalties,
+/// and optional constraint masking. Falls back to greedy argmax when the request
+/// uses greedy sampling with no penalties and no constraints.
+fn sample_speculative(
+    logits: &Tensor,
+    state: &mut SequenceState,
+    tokenizer: &TokenizerWrapper,
+) -> Result<u32, EngineError> {
+    let has_penalties = state.sampling_params.repetition_penalty != 1.0
+        || state.sampling_params.frequency_penalty != 0.0
+        || state.sampling_params.presence_penalty != 0.0
+        || state.sampling_params.logit_bias.is_some();
+    let has_constraint = state.constraint.is_some();
+
+    // Fast path: pure greedy with no penalties or constraints
+    if state.sampling_params.is_greedy() && !has_penalties && !has_constraint {
+        return greedy_sample(logits).map_err(|e| EngineError::Model(e.to_string()));
+    }
+
+    let mut logits_vec: Vec<f32> = logits
+        .squeeze(0)
+        .and_then(|t| t.squeeze(0))
+        .and_then(|t| t.to_dtype(candle_core::DType::F32))
+        .and_then(|t| t.to_vec1())
+        .map_err(|e| EngineError::Model(e.to_string()))?;
+
+    if let Some(ref mut constraint) = state.constraint {
+        let generated_text = tokenizer
+            .decode(&state.generated_token_ids)
+            .unwrap_or_default();
+        constraint
+            .mask_logits(&mut logits_vec, &generated_text)
+            .map_err(|e| EngineError::Model(format!("constraint error: {}", e)))?;
+    }
+
+    let result = sampling::sample(
+        &logits_vec,
+        &state.sampling_params,
+        &state.generated_token_ids,
+        &mut state.sampler_state,
+        None, // no logprobs during speculative decode
+    );
+
+    Ok(result.token_id)
+}
 
 /// Speculative decoding execution strategy.
 ///
@@ -156,7 +203,7 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             let logits = logits
                 .narrow(1, seq_dim - 1, 1)
                 .map_err(|e| EngineError::Model(e.to_string()))?;
-            let token = greedy_sample(&logits).map_err(|e| EngineError::Model(e.to_string()))?;
+            let token = sample_speculative(&logits, &mut req.state, tokenizer)?;
             draft_tokens.push(token);
             draft_input_token = token;
         }
@@ -189,18 +236,22 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
 
         req.state.block_table.advance(k_plus_1);
 
-        // --- Greedy verification ---
+        // --- Verification with penalties and constraints ---
+        // For each position, sample from target logits with penalties applied
+        // against the tokens generated so far (including previously accepted drafts).
         let mut accepted = 0;
-        for i in 0..k {
+        let gen_len_before = req.state.generated_token_ids.len();
+        for (i, &draft_token) in draft_tokens.iter().enumerate().take(k) {
             let pos_logits = logits
                 .narrow(1, i, 1)
                 .map_err(|e| EngineError::Model(e.to_string()))?;
-            let target_token =
-                greedy_sample(&pos_logits).map_err(|e| EngineError::Model(e.to_string()))?;
-            if target_token == draft_tokens[i] {
+            let target_token = sample_speculative(&pos_logits, &mut req.state, tokenizer)?;
+            if target_token == draft_token {
                 accepted += 1;
+                // Temporarily add accepted token so penalties apply correctly
+                // to subsequent positions.
+                req.state.generated_token_ids.push(draft_token);
             } else {
-                req.state.generated_token_ids.extend(&draft_tokens[..i]);
                 req.state.generated_token_ids.push(target_token);
                 break;
             }
@@ -210,15 +261,27 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             let bonus_logits = logits
                 .narrow(1, k, 1)
                 .map_err(|e| EngineError::Model(e.to_string()))?;
-            let bonus_token =
-                greedy_sample(&bonus_logits).map_err(|e| EngineError::Model(e.to_string()))?;
-            req.state.generated_token_ids.extend(&draft_tokens);
+            let bonus_token = sample_speculative(&bonus_logits, &mut req.state, tokenizer)?;
             req.state.generated_token_ids.push(bonus_token);
         }
 
+        // Verify generated_token_ids has correct final length.
+        // We expect gen_len_before + accepted + 1 tokens.
+        debug_assert_eq!(
+            req.state.generated_token_ids.len(),
+            gen_len_before + accepted + 1
+        );
+
         // --- Rollback: trim caches to actual accepted length ---
         let original_offset = req.state.seqlen_offset;
-        let new_tokens = accepted + 1;
+        // Guard against empty generation: new_tokens must be at least 1
+        // (the bonus token or first divergent token).
+        let new_tokens = if req.state.generated_token_ids.is_empty() {
+            warn!(request_id = req_id, "speculative decode produced no tokens");
+            0
+        } else {
+            accepted + 1
+        };
         let target_total = original_offset + new_tokens;
         let draft_total = original_offset + accepted;
 
@@ -285,14 +348,29 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
         _multi_step_count: usize,
         tokenizer: &TokenizerWrapper,
     ) {
-        // Speculative decoding doesn't use multi-step in the same way
+        // When chunked prefill is active in the same step, skip speculative
+        // decoding and fall back to single-token decode. Speculative tokens
+        // would compete for blocks and the draft model's KV cache would be
+        // out of sync with the partially-prefilled requests.
+        let has_active_prefill = !output.prefill_requests.is_empty();
+
         for &req_id in &output.decode_requests {
-            let result = self.execute_speculative_decode(
-                req_id,
-                kv_cache_mgr,
-                &mut state.requests,
-                tokenizer,
-            );
+            let result = if has_active_prefill {
+                execute_decode(
+                    req_id,
+                    &self.target_model,
+                    kv_cache_mgr,
+                    &mut state.requests,
+                    tokenizer,
+                )
+            } else {
+                self.execute_speculative_decode(
+                    req_id,
+                    kv_cache_mgr,
+                    &mut state.requests,
+                    tokenizer,
+                )
+            };
             if let Err(e) = result {
                 finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
             }

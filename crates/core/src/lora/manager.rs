@@ -55,8 +55,10 @@ pub struct LoraManager {
     adapters: HashMap<String, Arc<LoraModel>>,
     /// Map from ID to name for fast lookup.
     id_to_name: HashMap<u32, String>,
-    /// LRU order for eviction (most recently used at end).
-    lru_order: Vec<String>,
+    /// LRU generation per adapter name. Higher = more recently used.
+    lru_generation: HashMap<String, u64>,
+    /// Monotonically increasing generation counter for O(1) LRU touch.
+    generation_counter: u64,
     /// Configuration.
     config: LoraManagerConfig,
     /// Loader instance.
@@ -71,7 +73,8 @@ impl LoraManager {
         Self {
             adapters: HashMap::new(),
             id_to_name: HashMap::new(),
-            lru_order: Vec::new(),
+            lru_generation: HashMap::new(),
+            generation_counter: 0,
             config,
             loader: LoraLoader::new(device, dtype),
             next_id: 1,
@@ -123,7 +126,7 @@ impl LoraManager {
         // Store
         self.adapters.insert(name.clone(), Arc::new(model));
         self.id_to_name.insert(id, name.clone());
-        self.lru_order.push(name);
+        self.touch(&name);
 
         Ok(id)
     }
@@ -165,7 +168,7 @@ impl LoraManager {
         // Store
         self.adapters.insert(name.clone(), Arc::new(model));
         self.id_to_name.insert(id, name.clone());
-        self.lru_order.push(name);
+        self.touch(&name);
 
         // Update next_id if necessary
         if id >= self.next_id {
@@ -188,16 +191,17 @@ impl LoraManager {
             .cloned()
     }
 
-    /// Get adapter for a LoRA request.
+    /// Get adapter for a LoRA request, updating LRU state.
     pub fn get_for_request(&mut self, request: &LoraRequest) -> Option<Arc<LoraModel>> {
-        // Try by name first (most common case)
-        if let Some(model) = self.adapters.get(&request.name).cloned() {
+        // Try by name first (most common case) — single clone
+        if self.adapters.contains_key(&request.name) {
             self.touch(&request.name);
-            return Some(model);
+            return self.adapters.get(&request.name).cloned();
         }
 
-        // Try by ID
-        if let Some(name) = self.id_to_name.get(&request.id).cloned() {
+        // Try by ID — resolve name once, then single clone
+        if let Some(name) = self.id_to_name.get(&request.id) {
+            let name = name.clone();
             self.touch(&name);
             return self.adapters.get(&name).cloned();
         }
@@ -214,7 +218,7 @@ impl LoraManager {
     pub fn unload(&mut self, name: &str) -> Option<Arc<LoraModel>> {
         if let Some(model) = self.adapters.remove(name) {
             self.id_to_name.remove(&model.id);
-            self.lru_order.retain(|n| n != name);
+            self.lru_generation.remove(name);
             Some(model)
         } else {
             None
@@ -224,7 +228,7 @@ impl LoraManager {
     /// Unload an adapter by ID.
     pub fn unload_by_id(&mut self, id: u32) -> Option<Arc<LoraModel>> {
         if let Some(name) = self.id_to_name.remove(&id) {
-            self.lru_order.retain(|n| n != &name);
+            self.lru_generation.remove(&name);
             self.adapters.remove(&name)
         } else {
             None
@@ -246,23 +250,32 @@ impl LoraManager {
         self.config.max_adapters
     }
 
-    /// Mark an adapter as recently used.
+    /// Mark an adapter as recently used. O(1).
     fn touch(&mut self, name: &str) {
-        if let Some(pos) = self.lru_order.iter().position(|n| n == name) {
-            let name = self.lru_order.remove(pos);
-            self.lru_order.push(name);
+        self.generation_counter += 1;
+        // Insert for new adapters, update for existing ones.
+        if let Some(gen) = self.lru_generation.get_mut(name) {
+            *gen = self.generation_counter;
+        } else {
+            self.lru_generation
+                .insert(name.to_string(), self.generation_counter);
         }
     }
 
-    /// Evict the least recently used adapter.
+    /// Evict the least recently used adapter. O(n) in adapter count,
+    /// but eviction is rare (only when at capacity).
     fn evict_lru(&mut self) -> Result<(), LoraManagerError> {
-        if self.lru_order.is_empty() {
-            return Err(LoraManagerError::MaxAdaptersReached(
-                self.config.max_adapters,
-            ));
-        }
+        let victim = self
+            .lru_generation
+            .iter()
+            .min_by_key(|(_, &gen)| gen)
+            .map(|(name, _)| name.clone());
 
-        let name = self.lru_order.remove(0);
+        let name = victim.ok_or(LoraManagerError::MaxAdaptersReached(
+            self.config.max_adapters,
+        ))?;
+
+        self.lru_generation.remove(&name);
         if let Some(model) = self.adapters.remove(&name) {
             self.id_to_name.remove(&model.id);
         }
@@ -299,13 +312,34 @@ mod tests {
     #[test]
     fn test_lru_touch() {
         let mut manager = test_manager();
-        manager.lru_order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-
+        // Simulate three adapters loaded in order a, b, c
         manager.touch("a");
-        assert_eq!(manager.lru_order, vec!["b", "c", "a"]);
-
         manager.touch("b");
-        assert_eq!(manager.lru_order, vec!["c", "a", "b"]);
+        manager.touch("c");
+
+        // After touching "a", it should have highest generation
+        manager.touch("a");
+        assert!(manager.lru_generation["a"] > manager.lru_generation["b"]);
+        assert!(manager.lru_generation["a"] > manager.lru_generation["c"]);
+
+        // "b" should be the LRU (lowest generation)
+        let min_name = manager
+            .lru_generation
+            .iter()
+            .min_by_key(|(_, &gen)| gen)
+            .map(|(name, _)| name.as_str())
+            .unwrap();
+        assert_eq!(min_name, "b");
+
+        // After touching "b", "c" becomes LRU
+        manager.touch("b");
+        let min_name = manager
+            .lru_generation
+            .iter()
+            .min_by_key(|(_, &gen)| gen)
+            .map(|(name, _)| name.as_str())
+            .unwrap();
+        assert_eq!(min_name, "c");
     }
 
     #[test]

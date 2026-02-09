@@ -52,6 +52,14 @@ impl MLAScales {
         })
     }
 
+    /// Reset scales back to identity (1.0).
+    pub fn reset(&mut self) -> candle_core::Result<()> {
+        let device = self.kv_c_scale.device().clone();
+        self.kv_c_scale = Tensor::ones(1, DType::F32, &device)?;
+        self.k_pe_scale = Tensor::ones(1, DType::F32, &device)?;
+        Ok(())
+    }
+
     /// Update scales based on observed data.
     pub fn calibrate(&mut self, kv_c: &Tensor, k_pe: &Tensor) -> candle_core::Result<()> {
         let abs_kv_c = kv_c.abs()?.to_dtype(DType::F32)?;
@@ -288,6 +296,16 @@ impl MLACacheEngine {
         let v = kv_expanded.narrow(2, self.config.qk_nope_head_dim, self.config.v_head_dim)?;
 
         Ok((k_nope, k_pe, v))
+    }
+
+    /// Reset cache contents to zeros without reallocating.
+    pub fn reset(&mut self) -> Result<()> {
+        self.kv_c_cache = self.kv_c_cache.zeros_like()?;
+        self.k_pe_cache = self.k_pe_cache.zeros_like()?;
+        if let Some(ref mut scales) = self.scales {
+            scales.reset()?;
+        }
+        Ok(())
     }
 
     /// Get the configuration.

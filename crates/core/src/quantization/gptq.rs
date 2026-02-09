@@ -177,6 +177,7 @@ impl GptqConfig {
             is_sym: self.sym,
             scalar_type,
             use_fp32_reduce: true,
+            is_act_and_mul: true,
         })
     }
 }

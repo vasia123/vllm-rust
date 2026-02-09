@@ -86,6 +86,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_encoder_only(),
     },
     ArchitectureInfo {
+        arch_names: &["HF_ColBERT", "ColBERTModel"],
+        display_name: "ColBERT",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
         arch_names: &["CohereForCausalLM"],
         display_name: "Command R",
         capabilities: ModelCapabilities::new().with_tp(),
@@ -209,6 +214,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
+        arch_names: &["VoyageQwen3BidirectionalEmbedModel"],
+        display_name: "Voyage",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
         arch_names: &["YiForCausalLM"],
         display_name: "Yi",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
@@ -227,6 +237,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["Glm4ForCausalLM"],
         display_name: "GLM-4",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GlmMoeDsaForCausalLM"],
+        display_name: "GLM-5",
+        capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
         arch_names: &["Glm4MoeForCausalLM"],
@@ -356,6 +371,8 @@ mod tests {
             "BertForMaskedLM",
             "BertForSequenceClassification",
             "BloomForCausalLM",
+            "HF_ColBERT",
+            "ColBERTModel",
             "CohereForCausalLM",
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
@@ -381,9 +398,11 @@ mod tests {
             "Phi3ForCausalLM",
             "Olmo2ForCausalLM",
             "Starcoder2ForCausalLM",
+            "VoyageQwen3BidirectionalEmbedModel",
             "YiForCausalLM",
             "GlmForCausalLM",
             "Glm4ForCausalLM",
+            "GlmMoeDsaForCausalLM",
             "Glm4MoeForCausalLM",
             "MambaForCausalLM",
             "FalconMambaForCausalLM",

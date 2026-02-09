@@ -63,6 +63,14 @@ pub async fn create_chat_completion(
         .apply_with_tools(&messages, req.tools.as_deref(), true)
         .map_err(|e| ApiError::TemplateError(e.to_string()))?;
 
+    // Early-fail: reject prompts that are clearly too long before tokenizing
+    super::validation::validate_prompt_char_length(
+        prompt.len(),
+        req.max_tokens,
+        state.max_model_len,
+        state.tokenizer.max_chars_per_token(),
+    )?;
+
     // Determine if we should parse tool calls from the output
     let has_tools = req.tools.is_some();
 
@@ -293,6 +301,8 @@ pub async fn create_chat_completion(
                 message: ChatMessageResponse {
                     role: "assistant".to_string(),
                     content,
+                    reasoning: None,
+                    reasoning_content: None,
                     tool_calls,
                 },
                 index: i as u32,
@@ -436,7 +446,7 @@ fn build_chat_logprobs(result: &GenerationResult, tokenizer: &TokenizerWrapper) 
 }
 
 /// Create a sampling constraint from response_format.
-fn create_constraint_from_response_format(
+pub(crate) fn create_constraint_from_response_format(
     response_format: Option<&ResponseFormat>,
     tokenizer: &Arc<TokenizerWrapper>,
 ) -> Option<Box<dyn SamplingConstraint>> {

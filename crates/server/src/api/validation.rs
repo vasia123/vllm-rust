@@ -116,6 +116,36 @@ fn validate_n(n: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Early-fail check: reject prompts that are clearly too long without tokenizing.
+///
+/// Each token encodes at most `max_chars_per_token` characters, so a text of C
+/// characters produces at least `ceil(C / max_chars_per_token)` tokens. If this
+/// lower bound exceeds `max_model_len - max_tokens`, the prompt is guaranteed
+/// to be too long and we can reject immediately.
+pub fn validate_prompt_char_length(
+    prompt_chars: usize,
+    max_tokens: usize,
+    max_model_len: usize,
+    max_chars_per_token: usize,
+) -> Result<(), ApiError> {
+    if max_chars_per_token == 0 {
+        return Ok(());
+    }
+    let max_input_tokens = max_model_len.saturating_sub(max_tokens);
+    if max_input_tokens == 0 {
+        return Ok(());
+    }
+    let max_input_chars = max_input_tokens.saturating_mul(max_chars_per_token);
+    if prompt_chars > max_input_chars {
+        return Err(ApiError::InvalidRequest(format!(
+            "prompt too long: {prompt_chars} characters exceeds the maximum of \
+             {max_input_chars} characters (max_model_len={max_model_len}, \
+             max_tokens={max_tokens})"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_beam_search(
     beam_width: Option<usize>,
     response_format: Option<&ResponseFormat>,
@@ -573,6 +603,52 @@ mod tests {
         let mut req = minimal_chat_request();
         req.beam_width = Some(4);
         assert!(validate_chat_completion_request(&req).is_ok());
+    }
+
+    // ─── prompt char length (early-fail) ────────────────────────────
+
+    #[test]
+    fn prompt_char_length_within_limit_passes() {
+        // 100 chars, max_tokens=64, max_model_len=4096, max_chars_per_token=20
+        // max_input_tokens = 4096-64 = 4032, max_input_chars = 4032*20 = 80640
+        assert!(validate_prompt_char_length(100, 64, 4096, 20).is_ok());
+    }
+
+    #[test]
+    fn prompt_char_length_exceeds_limit_fails() {
+        // max_input_tokens = 100-10 = 90, max_input_chars = 90*2 = 180
+        // prompt has 200 chars > 180
+        let err = validate_prompt_char_length(200, 10, 100, 2).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("prompt too long")));
+    }
+
+    #[test]
+    fn prompt_char_length_at_exact_limit_passes() {
+        // max_input_tokens = 100-10 = 90, max_input_chars = 90*2 = 180
+        assert!(validate_prompt_char_length(180, 10, 100, 2).is_ok());
+    }
+
+    #[test]
+    fn prompt_char_length_one_over_limit_fails() {
+        // max_input_chars = 90*2 = 180, prompt is 181
+        assert!(validate_prompt_char_length(181, 10, 100, 2).is_err());
+    }
+
+    #[test]
+    fn prompt_char_length_zero_max_chars_per_token_passes() {
+        // Edge case: max_chars_per_token=0 should skip the check
+        assert!(validate_prompt_char_length(999999, 10, 100, 0).is_ok());
+    }
+
+    #[test]
+    fn prompt_char_length_zero_max_input_tokens_passes() {
+        // max_tokens >= max_model_len => max_input_tokens = 0, skip check
+        assert!(validate_prompt_char_length(100, 4096, 4096, 20).is_ok());
+    }
+
+    #[test]
+    fn prompt_char_length_empty_prompt_passes() {
+        assert!(validate_prompt_char_length(0, 64, 4096, 20).is_ok());
     }
 
     // ─── beam_width + response_format ───────────────────────────────

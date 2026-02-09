@@ -1,5 +1,46 @@
 use serde::Deserialize;
 
+/// Handles sliding_window configs that are either null, an int, or a list of
+/// ints (Mistral-style per-layer windows). Lists are collapsed to a single
+/// value after validating all non-null entries are identical.
+fn deserialize_sliding_window<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
+    match &value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .map(|v| Some(v as usize))
+            .ok_or_else(|| serde::de::Error::custom("sliding_window must be a positive integer")),
+        serde_json::Value::Array(arr) => {
+            let values: Vec<usize> = arr
+                .iter()
+                .filter(|v| !v.is_null())
+                .map(|v| {
+                    v.as_u64()
+                        .map(|n| n as usize)
+                        .ok_or_else(|| serde::de::Error::custom("sliding_window array must contain integers or null"))
+                })
+                .collect::<Result<_, _>>()?;
+            if values.is_empty() {
+                return Ok(None);
+            }
+            let first = values[0];
+            if values.iter().any(|&v| v != first) {
+                return Err(serde::de::Error::custom(
+                    "sliding_window array must contain identical non-null values",
+                ));
+            }
+            Ok(Some(first))
+        }
+        _ => Err(serde::de::Error::custom(
+            "sliding_window must be null, integer, or array",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub architectures: Vec<String>,
@@ -18,7 +59,7 @@ pub struct ModelConfig {
     pub bos_token_id: u32,
     pub eos_token_id: u32,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_sliding_window")]
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub attention_bias: Option<bool>,
@@ -367,5 +408,50 @@ mod tests {
         assert!(config.mla_dims().is_none());
         assert!(!config.is_deepseek());
         assert!(!config.is_moe());
+    }
+
+    #[test]
+    fn sliding_window_as_int() {
+        let json = r#"{
+            "architectures": ["MistralForCausalLM"],
+            "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "num_hidden_layers": 2, "intermediate_size": 128, "vocab_size": 256,
+            "max_position_embeddings": 512, "head_dim": 16, "hidden_act": "silu",
+            "rms_norm_eps": 1e-6, "rope_theta": 10000, "tie_word_embeddings": true,
+            "bos_token_id": 1, "eos_token_id": 2,
+            "sliding_window": 4096
+        }"#;
+        let config: ModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn sliding_window_as_list() {
+        let json = r#"{
+            "architectures": ["MistralForCausalLM"],
+            "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "num_hidden_layers": 2, "intermediate_size": 128, "vocab_size": 256,
+            "max_position_embeddings": 512, "head_dim": 16, "hidden_act": "silu",
+            "rms_norm_eps": 1e-6, "rope_theta": 10000, "tie_word_embeddings": true,
+            "bos_token_id": 1, "eos_token_id": 2,
+            "sliding_window": [4096, null, 4096, null]
+        }"#;
+        let config: ModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn sliding_window_all_null_list() {
+        let json = r#"{
+            "architectures": ["MistralForCausalLM"],
+            "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "num_hidden_layers": 2, "intermediate_size": 128, "vocab_size": 256,
+            "max_position_embeddings": 512, "head_dim": 16, "hidden_act": "silu",
+            "rms_norm_eps": 1e-6, "rope_theta": 10000, "tie_word_embeddings": true,
+            "bos_token_id": 1, "eos_token_id": 2,
+            "sliding_window": [null, null]
+        }"#;
+        let config: ModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sliding_window, None);
     }
 }

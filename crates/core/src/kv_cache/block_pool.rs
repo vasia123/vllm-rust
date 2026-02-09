@@ -57,6 +57,15 @@ impl BlockPool {
         self.num_blocks
     }
 
+    /// Reset pool to initial state: all blocks free.
+    ///
+    /// Used during cache reset to ensure block allocation state
+    /// is consistent with zeroed cache tensors.
+    pub fn reset(&mut self) {
+        self.free_list = (0..self.num_blocks).rev().collect();
+        self.allocated = vec![false; self.num_blocks];
+    }
+
     #[cfg(test)]
     pub fn num_used(&self) -> usize {
         self.num_blocks - self.free_list.len()

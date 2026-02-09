@@ -73,6 +73,19 @@ pub struct FusedMoEConfig {
     pub renormalize: bool,
     /// Block configuration for CUDA kernels.
     pub block_config: FusedMoEBlockConfig,
+    /// Whether to reuse the input buffer as the output buffer.
+    /// Saves one `[num_tokens, hidden_size]` allocation per forward pass.
+    /// Must be disabled when shared experts are present (they need the
+    /// original input). Currently a no-op in Candle (tensors are immutable);
+    /// will take effect once mutable-buffer CUDA kernels are implemented.
+    pub inplace: bool,
+    /// Whether the first projection uses fused activation-and-multiply
+    /// (SwiGLU: `SiLU(gate(x)) * up(x)`). When true, the w13 weight
+    /// shape is `[E, 2*intermediate_size, hidden_size]` and the
+    /// intermediate buffer is `2*intermediate_size` wide. When false,
+    /// a plain activation is applied and w13 has shape
+    /// `[E, intermediate_size, hidden_size]`.
+    pub is_act_and_mul: bool,
 }
 
 impl FusedMoEConfig {
@@ -97,12 +110,34 @@ impl FusedMoEConfig {
             intermediate_size,
             renormalize,
             block_config,
+            inplace: false,
+            is_act_and_mul: true,
         }
     }
 
     /// Get the block size used for token alignment.
     pub fn alignment_block_size(&self) -> usize {
         self.block_config.block_size_m
+    }
+
+    /// Expected first-projection (w13) N-dimension size.
+    ///
+    /// When `is_act_and_mul` is true (SwiGLU), the gate+up weights are
+    /// stacked, so N = 2 * intermediate_size. When false, N = intermediate_size.
+    pub fn w13_n_dim(&self) -> usize {
+        if self.is_act_and_mul {
+            2 * self.intermediate_size
+        } else {
+            self.intermediate_size
+        }
+    }
+
+    /// Intermediate buffer size for a given number of tokens.
+    ///
+    /// The intermediate buffer holds the output of the first projection
+    /// (gate+up or plain), before the down projection.
+    pub fn intermediate_cache_size(&self, num_tokens: usize) -> usize {
+        num_tokens * self.w13_n_dim()
     }
 }
 
@@ -124,5 +159,49 @@ mod tests {
 
         let large = FusedMoEBlockConfig::auto_select(512, 4096, 11008);
         assert_eq!(large.block_size_m, 128);
+    }
+
+    #[test]
+    fn test_fused_moe_config_inplace_default() {
+        let config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        assert!(!config.inplace, "inplace should default to false");
+    }
+
+    #[test]
+    fn test_fused_moe_config_inplace_set() {
+        let mut config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        config.inplace = true;
+        assert!(config.inplace);
+    }
+
+    #[test]
+    fn test_fused_moe_config_is_act_and_mul_default() {
+        let config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        assert!(config.is_act_and_mul, "is_act_and_mul should default to true (SwiGLU)");
+    }
+
+    #[test]
+    fn test_w13_n_dim_with_act_and_mul() {
+        let config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        assert_eq!(config.w13_n_dim(), 2 * 11008);
+    }
+
+    #[test]
+    fn test_w13_n_dim_without_act_and_mul() {
+        let mut config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        config.is_act_and_mul = false;
+        assert_eq!(config.w13_n_dim(), 11008);
+    }
+
+    #[test]
+    fn test_intermediate_cache_size() {
+        let config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        // With is_act_and_mul=true: 32 tokens * 2 * 11008
+        assert_eq!(config.intermediate_cache_size(32), 32 * 2 * 11008);
+
+        let mut config_no_mul = FusedMoEConfig::new(8, 2, 4096, 11008, true);
+        config_no_mul.is_act_and_mul = false;
+        // Without: 32 tokens * 11008
+        assert_eq!(config_no_mul.intermediate_cache_size(32), 32 * 11008);
     }
 }

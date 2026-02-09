@@ -238,6 +238,27 @@ impl KVCacheManager {
         })
     }
 
+    /// Reset all cache state: zero tensors, reset scales, free all blocks.
+    ///
+    /// Ensures consistency when restarting generation — stale KV data
+    /// from previous requests is cleared. Mirrors upstream vLLM's cache
+    /// reset logic that touches all cache types (KV, multimodal, encoder).
+    pub fn reset(&mut self) -> Result<(), CacheError> {
+        self.block_pool.reset();
+        for engine in &mut self.engines {
+            match engine {
+                CacheVariant::Standard(e) => e.reset()?,
+                CacheVariant::MLA(e) => e.reset()?,
+            }
+        }
+        if let Some(ref mut pc) = self.prefix_cache {
+            // Returned block IDs don't need to be freed: block_pool.reset() already
+            // marked all blocks as free.
+            let _ = pc.clear();
+        }
+        Ok(())
+    }
+
     /// Allocate blocks needed for `new_tokens` additional tokens.
     pub fn allocate_for_request(
         &mut self,

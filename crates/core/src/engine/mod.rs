@@ -52,7 +52,7 @@ pub use spec_decode::{
 };
 pub use types::{
     EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest, GenerationResult,
-    SpeculativeConfig, StreamEvent,
+    PauseMode, SpeculativeConfig, StreamEvent,
 };
 pub use warmup::{
     DefaultDummyInputGenerator, DummyInputGenerator, DummySequence, RandomDummyInputGenerator,
@@ -311,6 +311,15 @@ pub mod testing {
                                 let _ = response_tx.send(stats);
                             }
                         }
+                    }
+                    EngineCommand::Pause { response_tx, .. } => {
+                        let _ = response_tx.send(Ok(()));
+                    }
+                    EngineCommand::Resume { response_tx } => {
+                        let _ = response_tx.send(Ok(()));
+                    }
+                    EngineCommand::IsPaused { response_tx } => {
+                        let _ = response_tx.send(false);
                     }
                     EngineCommand::Shutdown => {
                         let (test_tx, test_rx) = oneshot::channel();
@@ -1686,5 +1695,205 @@ mod tests {
             beam_state: Some(beam_state),
         };
         assert!(super::helpers::is_beam_request(&beam_req));
+    }
+
+    // ─── Pause / Resume Tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pause_keep_mode_freezes_scheduling() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Engine should not be paused initially
+        assert!(!handle.is_paused().await.unwrap());
+
+        // Pause with Keep mode
+        handle.pause(PauseMode::Keep).await.unwrap();
+        assert!(handle.is_paused().await.unwrap());
+
+        // Stats should report paused
+        let stats = handle.get_stats().await.unwrap();
+        assert!(stats.is_paused);
+
+        // Resume
+        handle.resume().await.unwrap();
+        assert!(!handle.is_paused().await.unwrap());
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_rejects_new_requests() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        handle.pause(PauseMode::Keep).await.unwrap();
+
+        // New generate request should be rejected
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 3,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let result = handle.generate(request).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EngineError::Paused
+        ));
+
+        // Resume and try again — should succeed
+        handle.resume().await.unwrap();
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 3,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let result = handle.generate(request).await;
+        assert!(result.is_ok());
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_abort_clears_all_requests() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Submit a streaming request that will keep generating
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 1000, // Long generation
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let mut stream_rx = handle.generate_stream(request).await.unwrap();
+
+        // Give it a moment to start processing
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Pause with Abort mode
+        handle.pause(PauseMode::Abort).await.unwrap();
+        assert!(handle.is_paused().await.unwrap());
+
+        // The stream should eventually receive an error event
+        let mut got_error = false;
+        while let Some(event) = stream_rx.recv().await {
+            if matches!(event, StreamEvent::Error { .. }) {
+                got_error = true;
+                break;
+            }
+            // Token events from before the abort are OK
+            if matches!(event, StreamEvent::Done { .. }) {
+                // Request completed before abort — also acceptable
+                break;
+            }
+        }
+        // Either got an error (abort succeeded) or request completed naturally
+        assert!(got_error || stream_rx.recv().await.is_none());
+
+        // After abort, no requests should be active
+        let stats = handle.get_stats().await.unwrap();
+        assert_eq!(stats.num_running_requests, 0);
+        assert_eq!(stats.num_waiting_requests, 0);
+
+        handle.resume().await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_wait_lets_existing_requests_finish() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Submit a short request
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 3,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let gen_handle = handle.clone();
+        let gen_task = tokio::spawn(async move { gen_handle.generate(request).await });
+
+        // Give it a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Pause with Wait mode — existing request should still complete
+        handle.pause(PauseMode::Wait).await.unwrap();
+
+        // Wait for the generation to complete
+        let result = gen_task.await.unwrap();
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42, 42]);
+
+        handle.resume().await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_idempotent() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Double pause should be OK
+        handle.pause(PauseMode::Keep).await.unwrap();
+        handle.pause(PauseMode::Keep).await.unwrap();
+        assert!(handle.is_paused().await.unwrap());
+
+        // Double resume should be OK
+        handle.resume().await.unwrap();
+        handle.resume().await.unwrap();
+        assert!(!handle.is_paused().await.unwrap());
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_keep_then_resume_processes_requests() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Pause, then resume and submit a request — should work
+        handle.pause(PauseMode::Keep).await.unwrap();
+        handle.resume().await.unwrap();
+
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 2,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let result = handle.generate(request).await.unwrap();
+        assert_eq!(result.generated_token_ids, vec![42, 42]);
+
+        handle.shutdown().await.unwrap();
     }
 }

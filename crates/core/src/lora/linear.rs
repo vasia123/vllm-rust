@@ -69,7 +69,15 @@ impl LinearWithLora {
     ///
     /// If `adapter_name` is provided and the adapter exists, applies LoRA.
     /// Otherwise, returns base linear output.
+    ///
+    /// Fast path: when no adapters are registered (common case for non-LoRA
+    /// models), skips the adapter lookup entirely.
     pub fn forward_with_lora(&self, x: &Tensor, adapter_name: Option<&str>) -> Result<Tensor> {
+        // Fast path: no adapters registered — skip lookup entirely
+        if self.adapters.is_empty() {
+            return self.base.forward(x);
+        }
+
         // Base linear output
         let output = self.base.forward(x)?;
 

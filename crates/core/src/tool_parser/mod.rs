@@ -2,6 +2,7 @@
 //!
 //! This module provides parsing of tool calls from LLM output in various formats:
 //! - **Hermes**: `<tool_call>{"name": ..., "arguments": ...}</tool_call>`
+//! - **GLM-4**: `<tool_call>name\n<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
 //! - **JSON**: Raw JSON tool call arrays
 //!
 //! # Example
@@ -14,9 +15,11 @@
 //! let calls = parser.parse(output)?;
 //! ```
 
+mod glm4;
 mod hermes;
 mod json_parser;
 
+pub use glm4::Glm4ToolParser;
 pub use hermes::HermesToolParser;
 pub use json_parser::JsonToolParser;
 

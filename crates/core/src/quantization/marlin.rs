@@ -98,6 +98,11 @@ pub struct MarlinConfig {
     pub scalar_type: MarlinScalarType,
     /// Use FP32 reduction for better precision
     pub use_fp32_reduce: bool,
+    /// Whether this linear layer fuses activation-and-multiply (SwiGLU).
+    /// Affects weight repacking and intermediate buffer sizing for MoE.
+    /// True for gate+up projections, false for down projections and
+    /// non-gated architectures (e.g. Nemotron-H).
+    pub is_act_and_mul: bool,
 }
 
 impl MarlinConfig {
@@ -110,6 +115,7 @@ impl MarlinConfig {
             is_sym: true,
             scalar_type: MarlinScalarType::Uint4b8,
             use_fp32_reduce: true,
+            is_act_and_mul: true,
         }
     }
 
@@ -122,6 +128,7 @@ impl MarlinConfig {
             is_sym: true,
             scalar_type: MarlinScalarType::Uint8b128,
             use_fp32_reduce: true,
+            is_act_and_mul: true,
         }
     }
 
@@ -134,6 +141,7 @@ impl MarlinConfig {
             is_sym: false,
             scalar_type: MarlinScalarType::Uint4,
             use_fp32_reduce: true,
+            is_act_and_mul: true,
         }
     }
 
@@ -164,6 +172,11 @@ impl MarlinConfig {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        let is_act_and_mul = raw_config
+            .get("is_act_and_mul")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         Self {
             bits,
             group_size,
@@ -171,6 +184,7 @@ impl MarlinConfig {
             is_sym,
             scalar_type,
             use_fp32_reduce,
+            is_act_and_mul,
         }
     }
 
@@ -183,6 +197,12 @@ impl MarlinConfig {
     /// Set FP32 reduction for better precision.
     pub fn with_fp32_reduce(mut self, enabled: bool) -> Self {
         self.use_fp32_reduce = enabled;
+        self
+    }
+
+    /// Set whether this layer uses fused activation-and-multiply.
+    pub fn with_act_and_mul(mut self, enabled: bool) -> Self {
+        self.is_act_and_mul = enabled;
         self
     }
 
@@ -856,6 +876,34 @@ mod tests {
         assert_eq!(linear.in_features(), 4096);
         assert_eq!(linear.out_features(), 4096);
         assert!(linear.has_bias());
+    }
+
+    #[test]
+    fn test_marlin_config_is_act_and_mul_default() {
+        let config = MarlinConfig::gptq_int4(128);
+        assert!(config.is_act_and_mul, "default should be true (SwiGLU)");
+    }
+
+    #[test]
+    fn test_marlin_config_with_act_and_mul() {
+        let config = MarlinConfig::gptq_int4(128).with_act_and_mul(false);
+        assert!(!config.is_act_and_mul);
+    }
+
+    #[test]
+    fn test_marlin_config_from_detected_act_and_mul() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "is_act_and_mul".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let config = MarlinConfig::from_detected(Some(4), Some(128), None, None, &raw);
+        assert!(!config.is_act_and_mul);
+
+        // Default when not present in raw_config
+        let config_default =
+            MarlinConfig::from_detected(Some(4), Some(128), None, None, &HashMap::new());
+        assert!(config_default.is_act_and_mul);
     }
 
     #[test]

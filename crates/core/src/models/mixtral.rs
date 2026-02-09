@@ -566,6 +566,8 @@ impl MixtralTpMoE {
             num_experts: cfg.num_local_experts,
             top_k: cfg.num_experts_per_tok,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
         let moe = MoELayer::new(moe_config, vb)?;
 
@@ -595,6 +597,8 @@ impl MixtralTpMoE {
                 num_experts: cfg.num_local_experts,
                 top_k: cfg.num_experts_per_tok,
                 renormalize: true,
+                inplace: false,
+                is_act_and_mul: true,
             };
             let moe = MoELayer::new(moe_config, vb)?;
             return Ok(Self {
@@ -653,6 +657,8 @@ impl MixtralDecoderLayer {
             num_experts: cfg.num_local_experts,
             top_k: cfg.num_experts_per_tok,
             renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
         };
         let block_sparse_moe = MoELayer::new(moe_config, vb.pp("block_sparse_moe"))?;
 
