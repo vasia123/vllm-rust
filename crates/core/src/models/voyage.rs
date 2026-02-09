@@ -10,7 +10,7 @@
 //!
 //! Reference model: `voyageai/voyage-4-nano`
 
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
 use crate::config::ModelConfig;
@@ -206,6 +206,7 @@ pub struct VoyageForEmbedding {
     norm: RmsNorm,
     linear: Linear,
     embedding_size: usize,
+    #[allow(dead_code)] // used in tests for diagnostics
     hidden_size: usize,
     max_position_embeddings: usize,
     device: Device,
@@ -357,6 +358,7 @@ fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
     use crate::config::ModelConfig;
 
     fn tiny_voyage_config() -> ModelConfig {

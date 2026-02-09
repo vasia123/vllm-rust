@@ -17,7 +17,7 @@ use vllm_core::lora::LoraRequest;
 use vllm_core::request::FinishReason;
 use vllm_core::sampling::SamplingParams;
 use vllm_core::tokenizer::ChatMessage;
-use vllm_core::tool_parser::{HermesToolParser, ToolCallParser};
+use vllm_core::tool_parser::ToolCallParser;
 
 use super::admin::prometheus;
 use super::error::ApiError;
@@ -210,6 +210,7 @@ pub async fn create_response(
             &result.generated_text,
             &result.finish_reason,
             has_tools,
+            state.tool_call_parser.as_ref(),
         );
 
         let response = ResponsesResponse {
@@ -266,11 +267,11 @@ fn build_output_items(
     generated_text: &str,
     finish_reason: &FinishReason,
     has_tools: bool,
+    parser: &dyn ToolCallParser,
 ) -> Vec<ResponseOutputItem> {
     let mut items = Vec::new();
 
     if has_tools {
-        let parser = HermesToolParser::new();
         if let Ok(calls) = parser.parse(generated_text) {
             if !calls.is_empty() {
                 // Emit text content before tool calls, if any
@@ -548,7 +549,8 @@ mod tests {
 
     #[test]
     fn build_output_simple_text() {
-        let items = build_output_items("Hello, world!", &FinishReason::Eos, false);
+        let parser = vllm_core::tool_parser::HermesToolParser::new();
+        let items = build_output_items("Hello, world!", &FinishReason::Eos, false, &parser);
         assert_eq!(items.len(), 1);
         match &items[0] {
             ResponseOutputItem::Message(msg) => {
@@ -566,7 +568,8 @@ mod tests {
 
     #[test]
     fn build_output_length_truncated() {
-        let items = build_output_items("partial output", &FinishReason::Length, false);
+        let parser = vllm_core::tool_parser::HermesToolParser::new();
+        let items = build_output_items("partial output", &FinishReason::Length, false, &parser);
         assert_eq!(items.len(), 1);
         match &items[0] {
             ResponseOutputItem::Message(msg) => {
@@ -578,8 +581,9 @@ mod tests {
 
     #[test]
     fn build_output_with_tool_calls() {
+        let parser = vllm_core::tool_parser::HermesToolParser::new();
         let text = r#"Let me check. <tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
-        let items = build_output_items(text, &FinishReason::Eos, true);
+        let items = build_output_items(text, &FinishReason::Eos, true, &parser);
         // Should have: message (content before tool call) + function call
         assert_eq!(items.len(), 2);
         match &items[0] {
@@ -598,8 +602,9 @@ mod tests {
 
     #[test]
     fn build_output_no_tool_calls_when_tools_false() {
+        let parser = vllm_core::tool_parser::HermesToolParser::new();
         let text = r#"<tool_call>{"name": "test", "arguments": {}}</tool_call>"#;
-        let items = build_output_items(text, &FinishReason::Eos, false);
+        let items = build_output_items(text, &FinishReason::Eos, false, &parser);
         assert_eq!(items.len(), 1);
         match &items[0] {
             ResponseOutputItem::Message(msg) => {

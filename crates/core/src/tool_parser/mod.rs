@@ -3,10 +3,13 @@
 //! This module provides parsing of tool calls from LLM output in various formats:
 //! - **Hermes**: `<tool_call>{"name": ..., "arguments": ...}</tool_call>`
 //! - **GLM-4**: `<tool_call>name\n<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+//! - **InternLM2**: `<|action_start|><|plugin|>{"name": ..., "parameters": ...}<|action_end|>`
+//! - **Jamba**: `<tool_calls>[{"name": ..., "arguments": ...}]</tool_calls>`
 //! - **JSON**: Raw JSON tool call arrays
 //! - **Llama**: `<|python_tag|>{"name": ..., "arguments": ...}` (semicolon-separated)
 //! - **Mistral**: `[TOOL_CALLS]` with v11+ or pre-v11 formats
 //! - **DeepSeek V3**: Unicode token-delimited with ` ```json ` blocks
+//! - **Pythonic**: `[func(arg='val')]` Python function call syntax
 //!
 //! # Example
 //!
@@ -20,17 +23,25 @@
 
 mod deepseek_v3;
 mod glm4;
+mod granite;
 mod hermes;
+mod internlm2;
+mod jamba;
 mod json_parser;
 mod llama;
 mod mistral;
+mod pythonic;
 
 pub use deepseek_v3::DeepSeekV3ToolParser;
 pub use glm4::Glm4ToolParser;
+pub use granite::{Granite20bFCToolParser, GraniteToolParser};
 pub use hermes::HermesToolParser;
+pub use internlm2::InternLm2ToolParser;
+pub use jamba::JambaToolParser;
 pub use json_parser::JsonToolParser;
 pub use llama::LlamaToolParser;
 pub use mistral::MistralToolParser;
+pub use pythonic::PythonicToolParser;
 
 use serde::{Deserialize, Serialize};
 

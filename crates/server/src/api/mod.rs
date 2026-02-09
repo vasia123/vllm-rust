@@ -21,6 +21,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use vllm_core::tokenizer::{ChatTemplateEngine, TokenizerWrapper};
+use vllm_core::tool_parser::ToolCallParser;
 
 pub use admin::restart::{
     AtomicEngineHandle, EngineBuilder, EngineController, ProductionEngineBuilder,
@@ -35,6 +36,8 @@ pub struct AppState {
     pub chat_template: Option<Arc<ChatTemplateEngine>>,
     pub eos_token_id: u32,
     pub max_model_len: usize,
+    /// Tool call parser for extracting function calls from model output.
+    pub tool_call_parser: Arc<dyn ToolCallParser>,
     /// Whether the server is accepting new requests.
     accepting: Arc<AtomicBool>,
 }
@@ -47,6 +50,7 @@ impl AppState {
         chat_template: Option<Arc<ChatTemplateEngine>>,
         eos_token_id: u32,
         max_model_len: usize,
+        tool_call_parser: Arc<dyn ToolCallParser>,
         accepting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -56,12 +60,40 @@ impl AppState {
             chat_template,
             eos_token_id,
             max_model_len,
+            tool_call_parser,
             accepting,
         }
     }
 
     pub fn accepting_requests(&self) -> bool {
         self.accepting.load(Ordering::SeqCst)
+    }
+}
+
+/// Create a tool call parser by name.
+///
+/// Supported names: `hermes`, `glm4`, `json`, `llama`, `mistral`, `deepseek_v3`,
+/// `internlm2`, `jamba`, `pythonic`, `granite`, `granite-20b-fc`.
+/// Defaults to `hermes` for unknown names.
+pub fn create_tool_call_parser(name: &str) -> Arc<dyn ToolCallParser> {
+    use vllm_core::tool_parser::*;
+
+    match name {
+        "hermes" => Arc::new(HermesToolParser::new()),
+        "glm4" => Arc::new(Glm4ToolParser::new()),
+        "json" => Arc::new(JsonToolParser::new()),
+        "llama" => Arc::new(LlamaToolParser::new()),
+        "mistral" => Arc::new(MistralToolParser::new()),
+        "deepseek_v3" => Arc::new(DeepSeekV3ToolParser::new()),
+        "internlm" | "internlm2" => Arc::new(InternLm2ToolParser::new()),
+        "jamba" => Arc::new(JambaToolParser::new()),
+        "pythonic" => Arc::new(PythonicToolParser::new()),
+        "granite" => Arc::new(GraniteToolParser::new()),
+        "granite-20b-fc" => Arc::new(Granite20bFCToolParser::new()),
+        unknown => {
+            tracing::warn!("Unknown tool call parser '{unknown}', defaulting to hermes");
+            Arc::new(HermesToolParser::new())
+        }
     }
 }
 
@@ -312,6 +344,7 @@ mod tests {
             Some(Arc::new(chat_template)),
             999,
             max_model_len,
+            create_tool_call_parser("hermes"),
             accepting,
         )
     }
@@ -1462,5 +1495,40 @@ mod tests {
             .get("access-control-allow-origin")
             .expect("missing access-control-allow-origin header");
         assert_eq!(allow_origin, "http://a.com");
+    }
+
+    #[test]
+    fn create_tool_call_parser_known_names() {
+        let known = [
+            "hermes",
+            "glm4",
+            "json",
+            "llama",
+            "mistral",
+            "deepseek_v3",
+            "internlm",
+            "internlm2",
+            "jamba",
+            "pythonic",
+            "granite",
+            "granite-20b-fc",
+        ];
+        for name in &known {
+            let parser = create_tool_call_parser(name);
+            // Parser should be able to handle empty input without panicking
+            let result = parser.parse("");
+            assert!(result.is_ok(), "parser '{name}' failed on empty input");
+        }
+    }
+
+    #[test]
+    fn create_tool_call_parser_unknown_defaults_to_hermes() {
+        let parser = create_tool_call_parser("nonexistent");
+        // Should still work (defaults to hermes)
+        let result = parser.parse(
+            r#"<tool_call>{"name": "test", "arguments": {}}</tool_call>"#,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
     }
 }

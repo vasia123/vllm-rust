@@ -12,7 +12,7 @@ use vllm_core::sampling::{
     BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
 };
 use vllm_core::tokenizer::{MessageContent, TokenizerWrapper};
-use vllm_core::tool_parser::{HermesToolParser, ToolCallParser};
+use vllm_core::tool_parser::ToolCallParser;
 
 use super::admin::prometheus;
 use super::error::ApiError;
@@ -271,7 +271,7 @@ pub async fn create_chat_completion(
 
             // Parse tool calls if tools were provided
             let (content, tool_calls, finish_reason) = if has_tools {
-                let parser = HermesToolParser::new();
+                let parser = &state.tool_call_parser;
                 if let Ok(calls) = parser.parse(&result.generated_text) {
                     if !calls.is_empty() {
                         let content = parser.extract_content(&result.generated_text);
@@ -331,6 +331,7 @@ pub async fn create_chat_completion(
                 completion_tokens: total_completion_tokens,
                 total_tokens: prompt_tokens + total_completion_tokens,
             },
+            service_tier: req.service_tier.clone(),
         };
 
         // Record metrics

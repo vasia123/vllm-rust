@@ -52,6 +52,7 @@ pub mod qwen3_moe;
 pub mod qwen3_quantized;
 pub mod registry;
 pub mod starcoder2;
+pub mod step3p5;
 pub mod tp_layers;
 pub mod voyage;
 pub mod yi;
@@ -113,6 +114,7 @@ pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
 pub use starcoder2::StarCoder2ForCausalLM;
+pub use step3p5::Step3p5ForCausalLM;
 pub use voyage::VoyageForEmbedding;
 pub use yi::YiForCausalLM;
 
@@ -159,7 +161,11 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Gemma2ForCausalLM" => Ok(Box::new(Gemma2ForCausalLM::new(cfg, vb)?)),
         "Gemma3ForCausalLM" => Ok(Box::new(Gemma3ForCausalLM::new(cfg, vb)?)),
         "JambaForCausalLM" => Ok(Box::new(JambaForCausalLM::new(cfg, vb)?)),
-        "LlamaForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
+        "LlamaForCausalLM"
+        | "AquilaModel"
+        | "AquilaForCausalLM"
+        | "CwmForCausalLM"
+        | "InternLM3ForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
         "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new(cfg, vb)?)),
         "MixtralForCausalLM" => Ok(Box::new(MixtralForCausalLM::new(cfg, vb)?)),
         "Qwen2ForCausalLM" => Ok(Box::new(Qwen2ForCausalLM::new(cfg, vb)?)),
@@ -178,7 +184,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "GPTNeoXForCausalLM" => Ok(Box::new(GPTNeoXForCausalLM::new(cfg, vb)?)),
         "Starcoder2ForCausalLM" => Ok(Box::new(StarCoder2ForCausalLM::new(cfg, vb)?)),
         "BloomForCausalLM" => Ok(Box::new(BloomForCausalLM::new(cfg, vb)?)),
-        "FalconForCausalLM" => Ok(Box::new(FalconForCausalLM::new(cfg, vb)?)),
+        "FalconForCausalLM" | "RWForCausalLM" => Ok(Box::new(FalconForCausalLM::new(cfg, vb)?)),
         "PhiForCausalLM" => Ok(Box::new(PhiForCausalLM::new(cfg, vb)?)),
         "YiForCausalLM" => Ok(Box::new(YiForCausalLM::new(cfg, vb)?)),
         "MptForCausalLM" => Ok(Box::new(MptForCausalLM::new(cfg, vb)?)),
@@ -196,6 +202,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))
         }
         "HF_ColBERT" | "ColBERTModel" => Ok(Box::new(ColBERTForRetrieval::new(cfg, vb)?)),
+        "Step3p5ForCausalLM" => Ok(Box::new(Step3p5ForCausalLM::new(cfg, vb)?)),
         "VoyageQwen3BidirectionalEmbedModel" => {
             Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?))
         }
@@ -252,7 +259,11 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        "LlamaForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
+        "LlamaForCausalLM"
+        | "AquilaModel"
+        | "AquilaForCausalLM"
+        | "CwmForCausalLM"
+        | "InternLM3ForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
             cfg,
             vb,
             weight_loader.as_ref(),
@@ -453,7 +464,11 @@ pub fn from_config_with_tp(
     }
 
     match arch {
-        "LlamaForCausalLM" => Ok(Box::new(LlamaForCausalLM::new_with_tp(
+        "LlamaForCausalLM"
+        | "AquilaModel"
+        | "AquilaForCausalLM"
+        | "CwmForCausalLM"
+        | "InternLM3ForCausalLM" => Ok(Box::new(LlamaForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new_with_tp(
@@ -507,7 +522,7 @@ pub fn from_config_with_tp(
         "BloomForCausalLM" => Ok(Box::new(BloomForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "FalconForCausalLM" => Ok(Box::new(FalconForCausalLM::new_with_tp(
+        "FalconForCausalLM" | "RWForCausalLM" => Ok(Box::new(FalconForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "PhiForCausalLM" => Ok(Box::new(PhiForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),

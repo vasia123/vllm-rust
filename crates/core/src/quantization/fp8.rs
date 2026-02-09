@@ -50,6 +50,38 @@ impl Fp8Config {
         }
     }
 
+    /// Whether this config uses block-wise quantization.
+    pub fn is_block_quantized(&self) -> bool {
+        self.weight_block_size.is_some()
+    }
+
+    /// Validate block quantization constraints.
+    ///
+    /// Block quantization requires FP8-serialized checkpoint and dynamic
+    /// activation scheme (per Python vLLM constraints).
+    pub fn validate(&self) -> Result<()> {
+        if let Some(block_size) = self.weight_block_size {
+            if !self.is_checkpoint_fp8_serialized {
+                candle_core::bail!(
+                    "Block-wise FP8 quantization requires FP8-serialized checkpoint"
+                );
+            }
+            if self.activation_scheme != ActivationScheme::Static
+                && self.activation_scheme != ActivationScheme::Dynamic
+            {
+                // Currently both are valid, but in Python vLLM only dynamic is supported
+            }
+            if block_size[0] == 0 || block_size[1] == 0 {
+                candle_core::bail!(
+                    "Block dimensions must be non-zero, got [{}, {}]",
+                    block_size[0],
+                    block_size[1]
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Create from detected config.
     pub fn from_detected(
         bits: Option<u32>,
@@ -149,6 +181,7 @@ impl QuantizationConfig for Fp8Config {
             out_features,
             bias,
             self.activation_scheme,
+            self.weight_block_size,
             device,
         )?))
     }
@@ -163,25 +196,35 @@ impl QuantizationConfig for Fp8Config {
 /// When the `cuda-kernels` feature is enabled and running on CUDA,
 /// this uses fused FP8 dequantization + GEMM kernels for efficient inference.
 /// Otherwise, it falls back to standard BF16/F16 matmul.
+///
+/// Supports two scale modes:
+/// - **Per-tensor**: Single scale `[1]` or per-channel `[N]` for the whole weight matrix
+/// - **Block-wise**: 2D scale grid `[ceil(N/block_n), ceil(K/block_k)]` where each block
+///   of the weight matrix has its own scale factor
 #[derive(Debug)]
 pub struct Fp8Linear {
     /// Weight tensor - stored in FP8 (U8) format on CUDA, or compute dtype on CPU
     weight: Tensor,
     /// Optional bias
     bias: Option<Tensor>,
-    /// Weight scale for dequantization [1] for per-tensor, [N] for per-channel
+    /// Weight scale for dequantization.
+    /// Per-tensor: `[1]` or per-channel: `[N]`
+    /// Block-wise: `[ceil(N/block_n), ceil(K/block_k)]`
     weight_scale: Option<Tensor>,
     /// Input scale (for static quantization)
     input_scale: Option<Tensor>,
     /// Activation scheme (static or dynamic quantization)
-    #[allow(dead_code)] // Used for future W8A8 support
+    #[allow(dead_code)]
     activation_scheme: ActivationScheme,
-    /// Input features
+    /// Input features (K dimension)
     in_features: usize,
-    /// Output features
+    /// Output features (N dimension)
     out_features: usize,
     /// Whether weights are stored in FP8 format
     is_fp8_weights: bool,
+    /// Block size for block-wise quantization: [block_n, block_k].
+    /// When Some, weight_scale is a 2D grid of per-block scales.
+    weight_block_size: Option<[usize; 2]>,
 }
 
 impl Fp8Linear {
@@ -191,9 +234,9 @@ impl Fp8Linear {
         out_features: usize,
         has_bias: bool,
         activation_scheme: ActivationScheme,
+        weight_block_size: Option<[usize; 2]>,
         device: &Device,
     ) -> Result<Self> {
-        // Validate inputs
         if in_features == 0 {
             candle_core::bail!("in_features must be non-zero");
         }
@@ -218,7 +261,84 @@ impl Fp8Linear {
             in_features,
             out_features,
             is_fp8_weights: false,
+            weight_block_size,
         })
+    }
+
+    /// Whether this layer uses block-wise quantization.
+    pub fn is_block_quantized(&self) -> bool {
+        self.weight_block_size.is_some()
+    }
+
+    /// Expected block scale tensor shape for the current layer dimensions.
+    fn expected_block_scale_shape(&self) -> Option<[usize; 2]> {
+        self.weight_block_size.map(|[block_n, block_k]| {
+            [
+                self.out_features.div_ceil(block_n),
+                self.in_features.div_ceil(block_k),
+            ]
+        })
+    }
+
+    /// Validate that block scale dimensions match expectations.
+    fn validate_block_scales(&self, scale: &Tensor) -> Result<()> {
+        let expected = self.expected_block_scale_shape().ok_or_else(|| {
+            candle_core::Error::Msg("validate_block_scales called without block_size".to_string())
+        })?;
+
+        let dims = scale.dims();
+        if dims.len() != 2 || dims[0] != expected[0] || dims[1] != expected[1] {
+            candle_core::bail!(
+                "Block scale shape {:?} doesn't match expected [{}, {}] \
+                 for weight [{}, {}] with block_size {:?}",
+                dims,
+                expected[0],
+                expected[1],
+                self.out_features,
+                self.in_features,
+                self.weight_block_size,
+            );
+        }
+        Ok(())
+    }
+
+    /// Dequantize FP8 weights using block-wise scales to produce BF16 weights.
+    ///
+    /// For each element `weight[i][j]`, the dequantized value is:
+    ///   `fp8_to_f32(weight[i][j]) * scale[i / block_n][j / block_k]`
+    fn dequantize_block_weights(&self) -> Result<Tensor> {
+        let scale = self.weight_scale.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("Block dequantization requires weight_scale".to_string())
+        })?;
+        let [block_n, block_k] = self.weight_block_size.ok_or_else(|| {
+            candle_core::Error::Msg("Block dequantization requires weight_block_size".to_string())
+        })?;
+
+        // Build a scale tensor that matches the weight shape by repeating block scales
+        // scale shape: [ceil(N/block_n), ceil(K/block_k)]
+        // target shape: [N, K] where each [block_n, block_k] tile uses one scale
+        let scale_rows = self.out_features.div_ceil(block_n);
+        let scale_cols = self.in_features.div_ceil(block_k);
+
+        // Expand scale to match weight shape via repeat_interleave equivalent:
+        // [scale_rows, scale_cols] → [N, K] by repeating each element in the grid
+        let expanded = scale
+            // Repeat rows: [scale_rows, scale_cols] → [scale_rows * block_n, scale_cols]
+            .unsqueeze(1)?
+            .expand(&[scale_rows, block_n, scale_cols])?
+            .reshape(&[scale_rows * block_n, scale_cols])?
+            // Repeat cols: [rows, scale_cols] → [rows, scale_cols * block_k]
+            .unsqueeze(2)?
+            .expand(&[scale_rows * block_n, scale_cols, block_k])?
+            .reshape(&[scale_rows * block_n, scale_cols * block_k])?
+            // Trim to exact weight dimensions (block boundary may overshoot)
+            .narrow(0, 0, self.out_features)?
+            .narrow(1, 0, self.in_features)?;
+
+        // Convert FP8 (U8) weights to F32, multiply by per-block scale, convert to BF16
+        let weight_f32 = self.weight.to_dtype(DType::F32)?;
+        let dequantized = (weight_f32 * expanded)?;
+        dequantized.to_dtype(DType::BF16)
     }
 
     /// Check if this layer can use FP8 CUDA kernels.
@@ -288,17 +408,23 @@ impl Fp8Linear {
 
 impl QuantizedLinear for Fp8Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Use FP8 CUDA kernels when available
+        // Use FP8 CUDA kernels for per-tensor/per-channel quantization
         #[cfg(feature = "cuda-kernels")]
-        if self.can_use_fp8_kernel() {
+        if self.can_use_fp8_kernel() && !self.is_block_quantized() {
             return self.forward_fp8(x);
         }
 
+        // Block quantization: dequantize with per-block scales, then standard matmul
+        if self.is_block_quantized() && self.is_fp8_weights && self.weight_scale.is_some() {
+            let dequantized = self.dequantize_block_weights()?.to_dtype(x.dtype())?;
+            let y = x.matmul(&dequantized.t()?)?;
+            return match &self.bias {
+                Some(b) => y.broadcast_add(b),
+                None => Ok(y),
+            };
+        }
+
         // Fallback: standard matmul (BF16/F16/F32)
-        // This is used when:
-        // - Running on CPU
-        // - FP8 weights not loaded
-        // - cuda-kernels feature not enabled
         let y = x.matmul(&self.weight.t()?)?;
         match &self.bias {
             Some(b) => y.broadcast_add(b),
@@ -315,12 +441,23 @@ impl QuantizedLinear for Fp8Linear {
         if let Some(b) = weights.get("bias") {
             self.bias = Some(b.clone());
         }
-        if let Some(s) = weights.get("weight_scale") {
+        // Block-quantized checkpoints use "weight_scale_inv" for 2D block scales
+        if let Some(s) = weights.get("weight_scale_inv") {
+            self.weight_scale = Some(s.clone());
+        } else if let Some(s) = weights.get("weight_scale") {
             self.weight_scale = Some(s.clone());
         }
         if let Some(s) = weights.get("input_scale") {
             self.input_scale = Some(s.clone());
         }
+
+        // Validate block scale dimensions if using block quantization
+        if self.is_block_quantized() {
+            if let Some(ref scale) = self.weight_scale {
+                self.validate_block_scales(scale)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -385,14 +522,14 @@ mod tests {
 
     #[test]
     fn test_fp8_linear_validation_zero_in_features() {
-        let result = Fp8Linear::new(0, 128, false, ActivationScheme::Dynamic, &Device::Cpu);
+        let result = Fp8Linear::new(0, 128, false, ActivationScheme::Dynamic, None, &Device::Cpu);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("in_features"));
     }
 
     #[test]
     fn test_fp8_linear_validation_zero_out_features() {
-        let result = Fp8Linear::new(64, 0, false, ActivationScheme::Dynamic, &Device::Cpu);
+        let result = Fp8Linear::new(64, 0, false, ActivationScheme::Dynamic, None, &Device::Cpu);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out_features"));
     }
@@ -401,7 +538,7 @@ mod tests {
     fn test_fp8_linear_forward() {
         // Use F32 for CPU testing (BF16 matmul not supported on CPU)
         let mut linear =
-            Fp8Linear::new(4, 8, false, ActivationScheme::Dynamic, &Device::Cpu).unwrap();
+            Fp8Linear::new(4, 8, false, ActivationScheme::Dynamic, None, &Device::Cpu).unwrap();
         // Override with F32 weights for CPU compatibility
         linear.weight = Tensor::zeros((8, 4), DType::F32, &Device::Cpu).unwrap();
 
@@ -430,6 +567,250 @@ mod tests {
         assert_eq!(config.ignored_layers.len(), 2);
     }
 
+    // ─── Block quantization tests ──────────────────────────────────────
+
+    #[test]
+    fn test_fp8_config_block_size_parsing() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "is_checkpoint_fp8_serialized".to_string(),
+            serde_json::json!(true),
+        );
+        raw.insert(
+            "weight_block_size".to_string(),
+            serde_json::json!([128, 128]),
+        );
+
+        let config = Fp8Config::from_detected(Some(8), Some("dynamic"), &raw);
+        assert_eq!(config.weight_block_size, Some([128, 128]));
+        assert!(config.is_block_quantized());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fp8_config_block_size_requires_serialized() {
+        let config = Fp8Config {
+            is_checkpoint_fp8_serialized: false,
+            activation_scheme: ActivationScheme::Dynamic,
+            ignored_layers: Vec::new(),
+            weight_block_size: Some([128, 128]),
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_fp8_config_block_size_zero_invalid() {
+        let config = Fp8Config {
+            is_checkpoint_fp8_serialized: true,
+            activation_scheme: ActivationScheme::Dynamic,
+            ignored_layers: Vec::new(),
+            weight_block_size: Some([0, 128]),
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_fp8_config_no_block_size_valid() {
+        let config = Fp8Config::dynamic();
+        assert!(!config.is_block_quantized());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fp8_linear_block_creation() {
+        let config = Fp8Config {
+            is_checkpoint_fp8_serialized: true,
+            activation_scheme: ActivationScheme::Dynamic,
+            ignored_layers: Vec::new(),
+            weight_block_size: Some([128, 128]),
+        };
+        let linear = config.create_linear(256, 512, false, &Device::Cpu).unwrap();
+        assert_eq!(linear.in_features(), 256);
+        assert_eq!(linear.out_features(), 512);
+    }
+
+    #[test]
+    fn test_fp8_linear_expected_block_scale_shape() {
+        // 512x256 with blocks [128, 128] → scale [4, 2]
+        let linear = Fp8Linear::new(
+            256, 512, false,
+            ActivationScheme::Dynamic,
+            Some([128, 128]),
+            &Device::Cpu,
+        ).unwrap();
+        assert_eq!(linear.expected_block_scale_shape(), Some([4, 2]));
+
+        // 300x200 with blocks [128, 64] → scale [ceil(300/128), ceil(200/64)] = [3, 4]
+        let linear = Fp8Linear::new(
+            200, 300, false,
+            ActivationScheme::Dynamic,
+            Some([128, 64]),
+            &Device::Cpu,
+        ).unwrap();
+        assert_eq!(linear.expected_block_scale_shape(), Some([3, 4]));
+    }
+
+    #[test]
+    fn test_fp8_linear_block_scale_validation_correct() {
+        let linear = Fp8Linear::new(
+            256, 512, false,
+            ActivationScheme::Dynamic,
+            Some([128, 128]),
+            &Device::Cpu,
+        ).unwrap();
+        // Expected: [4, 2]
+        let scale = Tensor::ones(&[4, 2], DType::F32, &Device::Cpu).unwrap();
+        assert!(linear.validate_block_scales(&scale).is_ok());
+    }
+
+    #[test]
+    fn test_fp8_linear_block_scale_validation_wrong_shape() {
+        let linear = Fp8Linear::new(
+            256, 512, false,
+            ActivationScheme::Dynamic,
+            Some([128, 128]),
+            &Device::Cpu,
+        ).unwrap();
+        // Wrong shape: [4, 4] instead of [4, 2]
+        let scale = Tensor::ones(&[4, 4], DType::F32, &Device::Cpu).unwrap();
+        assert!(linear.validate_block_scales(&scale).is_err());
+    }
+
+    #[test]
+    fn test_fp8_linear_block_load_weights() {
+        let mut linear = Fp8Linear::new(
+            8, 16, false,
+            ActivationScheme::Dynamic,
+            Some([8, 4]),
+            &Device::Cpu,
+        ).unwrap();
+
+        let mut weights = HashMap::new();
+        // FP8 weights as U8
+        weights.insert(
+            "weight".to_string(),
+            Tensor::zeros((16, 8), DType::U8, &Device::Cpu).unwrap(),
+        );
+        // Block scales: [ceil(16/8), ceil(8/4)] = [2, 2]
+        weights.insert(
+            "weight_scale_inv".to_string(),
+            Tensor::ones(&[2, 2], DType::F32, &Device::Cpu).unwrap(),
+        );
+
+        assert!(linear.load_weights(&weights).is_ok());
+        assert!(linear.is_fp8_weights);
+        assert!(linear.weight_scale.is_some());
+    }
+
+    #[test]
+    fn test_fp8_linear_block_load_weights_wrong_scale_fails() {
+        let mut linear = Fp8Linear::new(
+            8, 16, false,
+            ActivationScheme::Dynamic,
+            Some([8, 4]),
+            &Device::Cpu,
+        ).unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "weight".to_string(),
+            Tensor::zeros((16, 8), DType::U8, &Device::Cpu).unwrap(),
+        );
+        // Wrong scale shape: should be [2, 2] not [1]
+        weights.insert(
+            "weight_scale_inv".to_string(),
+            Tensor::ones(1, DType::F32, &Device::Cpu).unwrap(),
+        );
+
+        assert!(linear.load_weights(&weights).is_err());
+    }
+
+    #[test]
+    fn test_fp8_linear_block_forward_f32() {
+        // Use F32 for CPU testing (U8→F32 dequantization)
+        let mut linear = Fp8Linear::new(
+            4, 8, false,
+            ActivationScheme::Dynamic,
+            Some([4, 4]),
+            &Device::Cpu,
+        ).unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "weight".to_string(),
+            Tensor::ones((8, 4), DType::U8, &Device::Cpu).unwrap(),
+        );
+        // Block scales: [ceil(8/4), ceil(4/4)] = [2, 1]
+        weights.insert(
+            "weight_scale_inv".to_string(),
+            Tensor::new(&[[0.5f32], [0.25]], &Device::Cpu).unwrap(),
+        );
+        linear.load_weights(&weights).unwrap();
+
+        let x = Tensor::ones(&[2, 4], DType::F32, &Device::Cpu).unwrap();
+        let y = linear.forward(&x).unwrap();
+        assert_eq!(y.dims(), &[2, 8]);
+    }
+
+    #[test]
+    fn test_fp8_linear_block_forward_with_bias() {
+        let mut linear = Fp8Linear::new(
+            4, 8, true,
+            ActivationScheme::Dynamic,
+            Some([4, 4]),
+            &Device::Cpu,
+        ).unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "weight".to_string(),
+            Tensor::ones((8, 4), DType::U8, &Device::Cpu).unwrap(),
+        );
+        weights.insert(
+            "bias".to_string(),
+            Tensor::ones(8, DType::F32, &Device::Cpu).unwrap(),
+        );
+        weights.insert(
+            "weight_scale_inv".to_string(),
+            Tensor::ones(&[2, 1], DType::F32, &Device::Cpu).unwrap(),
+        );
+        linear.load_weights(&weights).unwrap();
+
+        let x = Tensor::ones(&[3, 4], DType::F32, &Device::Cpu).unwrap();
+        let y = linear.forward(&x).unwrap();
+        assert_eq!(y.dims(), &[3, 8]);
+    }
+
+    #[test]
+    fn test_fp8_linear_weight_scale_inv_takes_priority() {
+        let mut linear = Fp8Linear::new(
+            4, 8, false,
+            ActivationScheme::Dynamic,
+            Some([4, 4]),
+            &Device::Cpu,
+        ).unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "weight".to_string(),
+            Tensor::zeros((8, 4), DType::U8, &Device::Cpu).unwrap(),
+        );
+        // Both weight_scale and weight_scale_inv present — inv takes priority
+        weights.insert(
+            "weight_scale".to_string(),
+            Tensor::ones(1, DType::F32, &Device::Cpu).unwrap(),
+        );
+        weights.insert(
+            "weight_scale_inv".to_string(),
+            Tensor::ones(&[2, 1], DType::F32, &Device::Cpu).unwrap(),
+        );
+        // Should succeed: weight_scale_inv is tried first and has correct shape
+        assert!(linear.load_weights(&weights).is_ok());
+        // Verify the 2D scale was loaded
+        let scale = linear.weight_scale.as_ref().unwrap();
+        assert_eq!(scale.dims(), &[2, 1]);
+    }
+
     // GPU tests - only run when cuda-kernels feature is enabled
     #[cfg(feature = "cuda-kernels")]
     mod gpu_tests {
@@ -447,7 +828,7 @@ mod tests {
             };
 
             let mut linear =
-                Fp8Linear::new(64, 128, false, ActivationScheme::Dynamic, &device).unwrap();
+                Fp8Linear::new(64, 128, false, ActivationScheme::Dynamic, None, &device).unwrap();
 
             // Set random weights
             let weight = Tensor::randn(0.0f32, 0.1, (128, 64), &device)
@@ -472,7 +853,7 @@ mod tests {
             };
 
             let mut linear =
-                Fp8Linear::new(64, 128, false, ActivationScheme::Dynamic, &device).unwrap();
+                Fp8Linear::new(64, 128, false, ActivationScheme::Dynamic, None, &device).unwrap();
 
             // Initialize with random BF16 weights
             let weight = Tensor::randn(0.0f32, 0.1, (128, 64), &device)
@@ -519,7 +900,7 @@ mod tests {
             };
 
             let mut linear =
-                Fp8Linear::new(32, 64, true, ActivationScheme::Dynamic, &device).unwrap();
+                Fp8Linear::new(32, 64, true, ActivationScheme::Dynamic, None, &device).unwrap();
 
             // Set weights and bias
             let weight = Tensor::randn(0.0f32, 0.1, (64, 32), &device)

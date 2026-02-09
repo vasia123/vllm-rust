@@ -256,7 +256,7 @@ fn admit_request(
             response,
             num_streamed_tokens: 0,
             streamed_text_len: 0,
-            draft_state: None,
+
             beam_state,
         },
     );

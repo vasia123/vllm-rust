@@ -11,12 +11,6 @@ use crate::scheduler::Scheduler;
 use super::cuda_graph::CudaGraphDispatcher;
 use super::types::{EngineConfig, ResponseChannel};
 
-/// Per-request state for the draft model's KV cache during speculative decoding.
-pub(crate) struct DraftState {
-    pub block_table: BlockTable,
-    pub seqlen_offset: usize,
-}
-
 /// Per-request state for beam search decoding.
 ///
 /// Each beam request internally manages `beam_width` beams. The `search` field
@@ -37,7 +31,6 @@ pub(crate) struct ActiveRequest {
     pub response: ResponseChannel,
     pub num_streamed_tokens: usize,
     pub streamed_text_len: usize,
-    pub draft_state: Option<DraftState>,
     /// Beam search state. When `Some`, this request uses beam search decoding
     /// instead of standard autoregressive sampling.
     pub beam_state: Option<BeamState>,

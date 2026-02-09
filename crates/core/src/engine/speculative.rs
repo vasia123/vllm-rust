@@ -1,17 +1,22 @@
 //! Speculative decoding execution strategy.
+//!
+//! Delegates draft token generation to a [`DraftProposer`] and handles
+//! verification with the target model. The proposer manages its own KV cache
+//! and per-request state, keeping the strategy focused on orchestration.
 
 use candle_core::Tensor;
 use tracing::warn;
 
-use crate::kv_cache::{BlockTable, KVCacheManager};
+use crate::kv_cache::KVCacheManager;
 use crate::request::{RequestId, RequestStatus, SequenceState};
 use crate::sampling;
 use crate::scheduler::SchedulerOutput;
 use crate::tokenizer::TokenizerWrapper;
 
-use super::context::{ActiveRequest, DraftState, OwnedExecutionState};
+use super::context::{ActiveRequest, OwnedExecutionState};
 use super::helpers::{execute_decode, execute_prefill, finish_request_with_error, greedy_sample};
 use super::model_forward::ModelForward;
+use super::spec_decode::DraftProposer;
 use super::strategy::ExecutionStrategy;
 use super::types::EngineError;
 
@@ -26,10 +31,16 @@ fn sample_speculative(
     let has_penalties = state.sampling_params.repetition_penalty != 1.0
         || state.sampling_params.frequency_penalty != 0.0
         || state.sampling_params.presence_penalty != 0.0
-        || state.sampling_params.logit_bias.is_some();
+        || state.sampling_params.logit_bias.is_some()
+        || state
+            .sampling_params
+            .banned_token_ids
+            .as_ref()
+            .is_some_and(|b| !b.is_empty())
+        || state.sampling_params.allowed_token_ids.is_some()
+        || (state.sampling_params.min_tokens > 0 && state.sampling_params.eos_token_id.is_some());
     let has_constraint = state.constraint.is_some();
 
-    // Fast path: pure greedy with no penalties or constraints
     if state.sampling_params.is_greedy() && !has_penalties && !has_constraint {
         return greedy_sample(logits).map_err(|e| EngineError::Model(e.to_string()));
     }
@@ -55,7 +66,7 @@ fn sample_speculative(
         &state.sampling_params,
         &state.generated_token_ids,
         &mut state.sampler_state,
-        None, // no logprobs during speculative decode
+        None,
     );
 
     Ok(result.token_id)
@@ -63,72 +74,20 @@ fn sample_speculative(
 
 /// Speculative decoding execution strategy.
 ///
-/// Uses a smaller draft model to speculatively generate tokens,
-/// then verifies them with the target model in a single forward pass.
-pub struct SpeculativeExecution<M: ModelForward, D: ModelForward> {
+/// Uses a [`DraftProposer`] to speculatively generate tokens, then verifies
+/// them with the target model in a single forward pass. The proposer owns
+/// the draft model and its KV cache; this strategy only owns the target model.
+pub struct SpeculativeExecution<M: ModelForward> {
     target_model: M,
-    draft_model: D,
-    draft_kv_cache: KVCacheManager,
-    num_speculative_tokens: usize,
+    proposer: Box<dyn DraftProposer>,
 }
 
-impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
-    pub fn new(
-        target_model: M,
-        draft_model: D,
-        draft_kv_cache: KVCacheManager,
-        num_speculative_tokens: usize,
-    ) -> Self {
+impl<M: ModelForward> SpeculativeExecution<M> {
+    pub fn new(target_model: M, proposer: Box<dyn DraftProposer>) -> Self {
         Self {
             target_model,
-            draft_model,
-            draft_kv_cache,
-            num_speculative_tokens,
+            proposer,
         }
-    }
-
-    fn execute_draft_prefill(
-        &mut self,
-        req_id: RequestId,
-        requests: &mut std::collections::HashMap<RequestId, ActiveRequest>,
-    ) -> Result<(), EngineError> {
-        let req = requests
-            .get_mut(&req_id)
-            .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
-        let prompt_len = req.state.prompt_token_ids.len();
-
-        let mut draft_block_table = BlockTable::new(self.draft_kv_cache.block_size());
-        self.draft_kv_cache
-            .allocate_for_request(&mut draft_block_table, prompt_len)
-            .map_err(|e| EngineError::Cache(e.to_string()))?;
-        let slot_mapping = draft_block_table.slot_mapping(0, prompt_len);
-
-        let input = Tensor::from_vec(
-            req.state.prompt_token_ids.clone(),
-            (1, prompt_len),
-            self.draft_model.device(),
-        )
-        .map_err(|e| EngineError::Model(e.to_string()))?;
-
-        let _logits = self
-            .draft_model
-            .forward(
-                &input,
-                0,
-                &mut self.draft_kv_cache,
-                &draft_block_table,
-                &slot_mapping,
-            )
-            .map_err(|e| EngineError::Model(e.to_string()))?;
-
-        draft_block_table.advance(prompt_len);
-
-        req.draft_state = Some(DraftState {
-            block_table: draft_block_table,
-            seqlen_offset: prompt_len,
-        });
-
-        Ok(())
     }
 
     fn execute_speculative_decode(
@@ -146,7 +105,8 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
                 .state
                 .max_new_tokens
                 .saturating_sub(req.state.num_generated());
-            self.num_speculative_tokens
+            self.proposer
+                .num_speculative_tokens()
                 .min(tokens_remaining.saturating_sub(1))
         };
 
@@ -160,56 +120,41 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             );
         }
 
-        let req = requests
-            .get_mut(&req_id)
-            .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
-        let draft_state = req
-            .draft_state
-            .as_mut()
-            .ok_or_else(|| EngineError::Model("draft state not initialized".to_string()))?;
+        // --- Draft phase: delegate to proposer ---
+        let last_target_token = {
+            let req = requests
+                .get(&req_id)
+                .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
+            *req.state.generated_token_ids.last().ok_or_else(|| {
+                EngineError::Model("no generated tokens for speculative decode".to_string())
+            })?
+        };
 
-        // --- Draft phase: generate K tokens ---
-        let mut draft_tokens = Vec::with_capacity(k);
-        let last_target_token = *req.state.generated_token_ids.last().ok_or_else(|| {
-            EngineError::Model("no generated tokens for speculative decode".to_string())
-        })?;
-        let mut draft_input_token = last_target_token;
+        let draft_tokens = {
+            let req = requests
+                .get_mut(&req_id)
+                .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
+            self.proposer
+                .propose_for_request(req_id, last_target_token, &mut req.state, tokenizer)?
+        };
+        let actual_k = draft_tokens.len().min(k);
 
-        for _ in 0..k {
-            self.draft_kv_cache
-                .allocate_for_request(&mut draft_state.block_table, 1)
-                .map_err(|e| EngineError::Cache(e.to_string()))?;
-            let slot_mapping = draft_state
-                .block_table
-                .slot_mapping(draft_state.seqlen_offset, 1);
-
-            let input = Tensor::new(&[[draft_input_token]], self.draft_model.device())
-                .map_err(|e| EngineError::Model(e.to_string()))?;
-            let logits = self
-                .draft_model
-                .forward(
-                    &input,
-                    draft_state.seqlen_offset,
-                    &mut self.draft_kv_cache,
-                    &draft_state.block_table,
-                    &slot_mapping,
-                )
-                .map_err(|e| EngineError::Model(e.to_string()))?;
-
-            draft_state.block_table.advance(1);
-            draft_state.seqlen_offset += 1;
-
-            let seq_dim = logits.dims()[1];
-            let logits = logits
-                .narrow(1, seq_dim - 1, 1)
-                .map_err(|e| EngineError::Model(e.to_string()))?;
-            let token = sample_speculative(&logits, &mut req.state, tokenizer)?;
-            draft_tokens.push(token);
-            draft_input_token = token;
+        if actual_k == 0 {
+            return execute_decode(
+                req_id,
+                &self.target_model,
+                target_kv_cache,
+                requests,
+                tokenizer,
+            );
         }
 
         // --- Verify phase: target model forward on K+1 tokens ---
-        let k_plus_1 = k + 1;
+        let req = requests
+            .get_mut(&req_id)
+            .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
+
+        let k_plus_1 = actual_k + 1;
         target_kv_cache
             .allocate_for_request(&mut req.state.block_table, k_plus_1)
             .map_err(|e| EngineError::Cache(e.to_string()))?;
@@ -219,9 +164,10 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             .slot_mapping(req.state.seqlen_offset, k_plus_1);
 
         let mut verify_input = vec![last_target_token];
-        verify_input.extend_from_slice(&draft_tokens);
-        let input = Tensor::from_vec(verify_input, (1, k_plus_1), self.target_model.device())
-            .map_err(|e| EngineError::Model(e.to_string()))?;
+        verify_input.extend_from_slice(&draft_tokens[..actual_k]);
+        let input =
+            Tensor::from_vec(verify_input, (1, k_plus_1), self.target_model.device())
+                .map_err(|e| EngineError::Model(e.to_string()))?;
 
         let logits = self
             .target_model
@@ -237,19 +183,15 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
         req.state.block_table.advance(k_plus_1);
 
         // --- Verification with penalties and constraints ---
-        // For each position, sample from target logits with penalties applied
-        // against the tokens generated so far (including previously accepted drafts).
         let mut accepted = 0;
         let gen_len_before = req.state.generated_token_ids.len();
-        for (i, &draft_token) in draft_tokens.iter().enumerate().take(k) {
+        for (i, &draft_token) in draft_tokens.iter().enumerate().take(actual_k) {
             let pos_logits = logits
                 .narrow(1, i, 1)
                 .map_err(|e| EngineError::Model(e.to_string()))?;
             let target_token = sample_speculative(&pos_logits, &mut req.state, tokenizer)?;
             if target_token == draft_token {
                 accepted += 1;
-                // Temporarily add accepted token so penalties apply correctly
-                // to subsequent positions.
                 req.state.generated_token_ids.push(draft_token);
             } else {
                 req.state.generated_token_ids.push(target_token);
@@ -257,25 +199,21 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             }
         }
 
-        if accepted == k {
+        if accepted == actual_k {
             let bonus_logits = logits
-                .narrow(1, k, 1)
+                .narrow(1, actual_k, 1)
                 .map_err(|e| EngineError::Model(e.to_string()))?;
             let bonus_token = sample_speculative(&bonus_logits, &mut req.state, tokenizer)?;
             req.state.generated_token_ids.push(bonus_token);
         }
 
-        // Verify generated_token_ids has correct final length.
-        // We expect gen_len_before + accepted + 1 tokens.
         debug_assert_eq!(
             req.state.generated_token_ids.len(),
             gen_len_before + accepted + 1
         );
 
-        // --- Rollback: trim caches to actual accepted length ---
+        // --- Rollback: trim target cache to actual accepted length ---
         let original_offset = req.state.seqlen_offset;
-        // Guard against empty generation: new_tokens must be at least 1
-        // (the bonus token or first divergent token).
         let new_tokens = if req.state.generated_token_ids.is_empty() {
             warn!(request_id = req_id, "speculative decode produced no tokens");
             0
@@ -283,7 +221,6 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
             accepted + 1
         };
         let target_total = original_offset + new_tokens;
-        let draft_total = original_offset + accepted;
 
         let target_freed = req.state.block_table.trim_to(target_total);
         if !target_freed.is_empty() {
@@ -293,22 +230,15 @@ impl<M: ModelForward, D: ModelForward> SpeculativeExecution<M, D> {
         }
         req.state.seqlen_offset = target_total;
 
-        let draft_state = req.draft_state.as_mut().ok_or_else(|| {
-            EngineError::Model("draft state not initialized for rollback".to_string())
-        })?;
-        let draft_freed = draft_state.block_table.trim_to(draft_total);
-        if !draft_freed.is_empty() {
-            self.draft_kv_cache
-                .free_blocks(&draft_freed)
-                .map_err(|e| EngineError::Cache(e.to_string()))?;
-        }
-        draft_state.seqlen_offset = draft_total;
+        // Notify proposer of verification results so it can trim its KV cache
+        self.proposer
+            .on_tokens_verified(req_id, accepted, original_offset)?;
 
         Ok(())
     }
 }
 
-impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecution<M, D> {
+impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
     fn execute_prefills(
         &mut self,
         output: &SchedulerOutput,
@@ -332,8 +262,12 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
                 continue;
             }
 
-            // Draft model prefill
-            if let Err(e) = self.execute_draft_prefill(req_id, &mut state.requests) {
+            // Draft model prefill (delegated to proposer)
+            let prompt_tokens = match state.requests.get(&req_id) {
+                Some(req) => req.state.prompt_token_ids.clone(),
+                None => continue,
+            };
+            if let Err(e) = self.proposer.init_request(req_id, &prompt_tokens) {
                 finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
                 continue;
             }
@@ -349,9 +283,7 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
         tokenizer: &TokenizerWrapper,
     ) {
         // When chunked prefill is active in the same step, skip speculative
-        // decoding and fall back to single-token decode. Speculative tokens
-        // would compete for blocks and the draft model's KV cache would be
-        // out of sync with the partially-prefilled requests.
+        // decoding and fall back to single-token decode.
         let has_active_prefill = !output.prefill_requests.is_empty();
 
         for &req_id in &output.decode_requests {
@@ -396,20 +328,14 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
                 );
             }
 
-            if let Some(ref mut ds) = req.draft_state {
-                let freed = ds.block_table.release();
-                if !freed.is_empty() {
-                    if let Err(e) = self.draft_kv_cache.free_blocks(&freed) {
-                        warn!(
-                            error = %e,
-                            request_id = req_id,
-                            blocks = ?freed,
-                            "Failed to free draft cache blocks during preemption"
-                        );
-                    }
-                }
+            // Delegate draft cache cleanup to proposer
+            if let Err(e) = self.proposer.preempt_request(req_id) {
+                warn!(
+                    error = %e,
+                    request_id = req_id,
+                    "Failed to preempt draft proposer state"
+                );
             }
-            req.draft_state = None;
 
             req.state.status = RequestStatus::Preempted;
             req.state.generated_token_ids.clear();
@@ -419,19 +345,13 @@ impl<M: ModelForward, D: ModelForward> ExecutionStrategy for SpeculativeExecutio
     }
 
     fn on_request_completed(&mut self, req_id: RequestId, state: &mut OwnedExecutionState) {
-        if let Some(req) = state.requests.get_mut(&req_id) {
-            if let Some(mut ds) = req.draft_state.take() {
-                let freed = ds.block_table.release();
-                if !freed.is_empty() {
-                    if let Err(e) = self.draft_kv_cache.free_blocks(&freed) {
-                        warn!(
-                            error = %e,
-                            request_id = req_id,
-                            blocks = ?freed,
-                            "Failed to free draft cache blocks on request completion"
-                        );
-                    }
-                }
+        if state.requests.contains_key(&req_id) {
+            if let Err(e) = self.proposer.finish_request(req_id) {
+                warn!(
+                    error = %e,
+                    request_id = req_id,
+                    "Failed to clean up draft proposer state"
+                );
             }
         }
     }

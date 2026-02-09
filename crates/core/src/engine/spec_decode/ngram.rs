@@ -11,7 +11,11 @@
 //!
 //! Reference: vLLM `vllm/v1/spec_decode/ngram_proposer.py`
 
-use super::SpeculativeProposer;
+use crate::engine::types::EngineError;
+use crate::request::{RequestId, SequenceState};
+use crate::tokenizer::TokenizerWrapper;
+
+use super::{DraftProposer, SpeculativeProposer};
 
 /// Configuration for the n-gram proposer.
 #[derive(Debug, Clone)]
@@ -75,6 +79,55 @@ impl SpeculativeProposer for NGramProposer {
             self.config.max_n,
             max_tokens.min(self.config.num_speculative_tokens),
         )
+    }
+
+    fn name(&self) -> &str {
+        "ngram"
+    }
+}
+
+impl DraftProposer for NGramProposer {
+    fn init_request(
+        &mut self,
+        _request_id: RequestId,
+        _prompt_tokens: &[u32],
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn propose_for_request(
+        &mut self,
+        _request_id: RequestId,
+        _last_token: u32,
+        state: &mut SequenceState,
+        _tokenizer: &TokenizerWrapper,
+    ) -> Result<Vec<u32>, EngineError> {
+        let mut all_tokens =
+            Vec::with_capacity(state.prompt_token_ids.len() + state.generated_token_ids.len());
+        all_tokens.extend_from_slice(&state.prompt_token_ids);
+        all_tokens.extend_from_slice(&state.generated_token_ids);
+        Ok(self.propose(&all_tokens, self.config.num_speculative_tokens))
+    }
+
+    fn on_tokens_verified(
+        &mut self,
+        _request_id: RequestId,
+        _num_accepted: usize,
+        _original_offset: usize,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn finish_request(&mut self, _request_id: RequestId) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn preempt_request(&mut self, _request_id: RequestId) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn num_speculative_tokens(&self) -> usize {
+        self.config.num_speculative_tokens
     }
 
     fn name(&self) -> &str {
@@ -311,7 +364,7 @@ mod tests {
     #[test]
     fn proposer_trait_name() {
         let proposer = NGramProposer::with_defaults();
-        assert_eq!(proposer.name(), "ngram");
+        assert_eq!(SpeculativeProposer::name(&proposer), "ngram");
     }
 
     #[test]
@@ -401,5 +454,55 @@ mod tests {
     fn vllm_test_multiple_3gram_picks_earliest() {
         let tokens = [1u32, 2, 3, 100, 1, 2, 3, 200, 1, 2, 3, 300, 1, 2, 3];
         assert_eq!(find_ngram_proposals(&tokens, 3, 3, 2), vec![100, 1]);
+    }
+
+    // ─── DraftProposer trait tests ────────────────────────────────────────
+
+    use crate::request::SequenceState;
+    use crate::tokenizer::TokenizerWrapper;
+
+    fn test_tokenizer() -> TokenizerWrapper {
+        TokenizerWrapper::for_testing(1000)
+    }
+
+    #[test]
+    fn draft_proposer_lifecycle_noop() {
+        let mut proposer = NGramProposer::with_defaults();
+        assert!(proposer.init_request(0, &[1, 2, 3]).is_ok());
+        assert!(proposer.on_tokens_verified(0, 2, 5).is_ok());
+        assert!(proposer.finish_request(0).is_ok());
+        assert!(proposer.preempt_request(0).is_ok());
+    }
+
+    #[test]
+    fn draft_proposer_name_and_tokens() {
+        let proposer = NGramProposer::with_defaults();
+        assert_eq!(DraftProposer::name(&proposer), "ngram");
+        assert_eq!(proposer.num_speculative_tokens(), 5);
+    }
+
+    #[test]
+    fn draft_proposer_propose_uses_full_sequence() {
+        let mut proposer = NGramProposer::new(NGramConfig {
+            min_n: 2,
+            max_n: 3,
+            num_speculative_tokens: 5,
+        });
+        let tokenizer = test_tokenizer();
+        let mut state = SequenceState::new(0, vec![1, 2, 3, 4], 100, 99, 16, 0);
+        // Simulate generated tokens that repeat a prompt pattern
+        state.generated_token_ids = vec![1, 2, 3];
+
+        // Full sequence: [1, 2, 3, 4, 1, 2, 3]
+        // Suffix [2, 3] matches at position 1, continuation: [4, 1, 2]
+        let result = proposer.propose_for_request(0, 3, &mut state, &tokenizer).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn draft_proposer_as_trait_object() {
+        let proposer: Box<dyn DraftProposer> = Box::new(NGramProposer::with_defaults());
+        assert_eq!(proposer.name(), "ngram");
+        assert_eq!(proposer.num_speculative_tokens(), 5);
     }
 }

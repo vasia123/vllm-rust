@@ -101,7 +101,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
-        arch_names: &["FalconForCausalLM"],
+        arch_names: &["FalconForCausalLM", "RWForCausalLM"],
         display_name: "Falcon",
         capabilities: ModelCapabilities::new().with_tp(),
     },
@@ -149,7 +149,13 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["LlamaForCausalLM"],
+        arch_names: &[
+            "LlamaForCausalLM",
+            "AquilaModel",
+            "AquilaForCausalLM",
+            "CwmForCausalLM",
+            "InternLM3ForCausalLM",
+        ],
         display_name: "Llama",
         capabilities: ModelCapabilities::new()
             .with_tp()
@@ -212,6 +218,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["Starcoder2ForCausalLM"],
         display_name: "StarCoder2",
         capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Step3p5ForCausalLM"],
+        display_name: "Step-3.5-Flash",
+        capabilities: ModelCapabilities::new().with_moe(),
     },
     ArchitectureInfo {
         arch_names: &["VoyageQwen3BidirectionalEmbedModel"],
@@ -377,6 +388,7 @@ mod tests {
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "FalconForCausalLM",
+            "RWForCausalLM",
             "GPT2LMHeadModel",
             "GPTNeoXForCausalLM",
             "GemmaForCausalLM",
@@ -387,6 +399,10 @@ mod tests {
             "LlavaForConditionalGeneration",
             "LlavaNextForConditionalGeneration",
             "LlamaForCausalLM",
+            "AquilaModel",
+            "AquilaForCausalLM",
+            "CwmForCausalLM",
+            "InternLM3ForCausalLM",
             "Mamba2ForCausalLM",
             "MistralForCausalLM",
             "MixtralForCausalLM",
@@ -407,6 +423,7 @@ mod tests {
             "MambaForCausalLM",
             "FalconMambaForCausalLM",
             "MptForCausalLM",
+            "Step3p5ForCausalLM",
             "PersimmonForCausalLM",
             "ExaoneForCausalLM",
             "DbrxForCausalLM",

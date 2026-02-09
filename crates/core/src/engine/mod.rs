@@ -47,8 +47,9 @@ pub use encoder_decoder::{EncoderOutput, ModelForEncoderDecoder};
 pub use handle::EngineHandle;
 pub use model_forward::{DecodeSequenceMetadata, ModelForward};
 pub use spec_decode::{
-    DraftModelProposer, EagleConfig, EagleProposer, MedusaHead, MedusaProposer, NGramConfig,
-    NGramProposer, SpeculationTree, SpeculativeProposer, SuffixArrayConfig, SuffixArrayProposer,
+    DraftModelDraftProposer, DraftModelProposer, DraftProposer, EagleConfig, EagleProposer,
+    MedusaHead, MedusaProposer, NGramConfig, NGramProposer, SpeculationTree, SpeculativeProposer,
+    SuffixArrayConfig, SuffixArrayProposer,
 };
 pub use types::{
     EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest, GenerationResult,
@@ -100,7 +101,7 @@ pub fn start_engine<M: ModelForward>(
     EngineHandle { cmd_tx }
 }
 
-/// Start the inference engine with speculative decoding.
+/// Start the inference engine with speculative decoding using a draft model.
 pub fn start_engine_with_draft<M: ModelForward, D: ModelForward>(
     target_model: M,
     draft_model: D,
@@ -109,21 +110,36 @@ pub fn start_engine_with_draft<M: ModelForward, D: ModelForward>(
     draft_kv_cache: KVCacheManager,
     config: EngineConfig,
 ) -> EngineHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(256);
-
     let num_speculative_tokens = config
         .speculative_config
         .as_ref()
         .map(|c| c.num_speculative_tokens)
         .unwrap_or(3);
 
-    let state = OwnedExecutionState::new(&config);
-    let strategy = SpeculativeExecution::new(
-        target_model,
+    let proposer = Box::new(DraftModelDraftProposer::new(
         draft_model,
         draft_kv_cache,
         num_speculative_tokens,
-    );
+    ));
+
+    start_engine_with_proposer(target_model, proposer, tokenizer, target_kv_cache, config)
+}
+
+/// Start the inference engine with speculative decoding using any [`DraftProposer`].
+///
+/// This is the general entry point. Use `start_engine_with_draft` as a convenience
+/// when you have a draft model and its KV cache.
+pub fn start_engine_with_proposer<M: ModelForward>(
+    target_model: M,
+    proposer: Box<dyn DraftProposer>,
+    tokenizer: TokenizerWrapper,
+    target_kv_cache: KVCacheManager,
+    config: EngineConfig,
+) -> EngineHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel(256);
+
+    let state = OwnedExecutionState::new(&config);
+    let strategy = SpeculativeExecution::new(target_model, proposer);
 
     tokio::spawn(strategy::run_engine_loop(
         strategy,
@@ -528,7 +544,7 @@ mod tests {
                         response: ResponseChannel::Complete(tx),
                         num_streamed_tokens: 0,
                         streamed_text_len: 0,
-                        draft_state: None,
+
                         beam_state: None,
                     },
                 );
@@ -991,7 +1007,7 @@ mod tests {
                         response: ResponseChannel::Complete(tx),
                         num_streamed_tokens: 0,
                         streamed_text_len: 0,
-                        draft_state: None,
+
                         beam_state: None,
                     },
                 );
@@ -1415,7 +1431,7 @@ mod tests {
                 response: ResponseChannel::Complete(tx),
                 num_streamed_tokens: 0,
                 streamed_text_len: 0,
-                draft_state: None,
+
                 beam_state: None, // Beam state is initialized during handle_command/prefill
             },
         );
@@ -1618,7 +1634,7 @@ mod tests {
             response: ResponseChannel::Complete(tx),
             num_streamed_tokens: 0,
             streamed_text_len: 0,
-            draft_state: None,
+
             beam_state: Some(beam_state),
         };
 
@@ -1652,7 +1668,7 @@ mod tests {
             response: ResponseChannel::Complete(tx),
             num_streamed_tokens: 0,
             streamed_text_len: 0,
-            draft_state: None,
+
             beam_state: Some(beam_state),
         };
 
@@ -1670,7 +1686,7 @@ mod tests {
             response: ResponseChannel::Complete(tx),
             num_streamed_tokens: 0,
             streamed_text_len: 0,
-            draft_state: None,
+
             beam_state: None,
         };
         assert!(!super::helpers::is_beam_request(&non_beam_req));
@@ -1691,7 +1707,7 @@ mod tests {
             response: ResponseChannel::Complete(tx2),
             num_streamed_tokens: 0,
             streamed_text_len: 0,
-            draft_state: None,
+
             beam_state: Some(beam_state),
         };
         assert!(super::helpers::is_beam_request(&beam_req));

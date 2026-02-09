@@ -311,6 +311,7 @@ impl QuantizedWeightLoader for Fp8WeightLoader {
             out_features,
             bias,
             self.config.activation_scheme,
+            self.config.weight_block_size,
             &self.device,
         )?;
 

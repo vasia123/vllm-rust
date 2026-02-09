@@ -8,7 +8,7 @@
 //!
 //! Reference: <https://arxiv.org/abs/2004.12832>
 
-use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
@@ -27,6 +27,7 @@ pub struct ColBERTForRetrieval {
     bert: BertForSequenceEmbedding,
     colbert_linear: Linear,
     colbert_dim: usize,
+    #[allow(dead_code)] // used in tests for diagnostics
     hidden_size: usize,
     max_position_embeddings: usize,
     device: Device,
@@ -188,6 +189,7 @@ pub fn maxsim_score(query_emb: &Tensor, doc_emb: &Tensor) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
     use crate::config::ModelConfig;
 
     fn tiny_colbert_config() -> ModelConfig {

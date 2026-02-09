@@ -96,6 +96,12 @@ enum Command {
         /// Comma-separated list of allowed CORS headers ("*" allows all)
         #[arg(long, default_value = "*")]
         allowed_headers: String,
+
+        /// Tool call parser for extracting function calls from model output.
+        /// Supported: hermes, glm4, json, llama, mistral, deepseek_v3, internlm2, jamba,
+        /// pythonic, granite, granite-20b-fc
+        #[arg(long, default_value = "hermes")]
+        tool_call_parser: String,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -154,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_origins,
             allowed_methods,
             allowed_headers,
+            tool_call_parser,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = if model == "Qwen/Qwen3-0.6B" {
@@ -457,6 +464,7 @@ async fn run_server(
         chat_template,
         eos_token_id,
         max_model_len,
+        api::create_tool_call_parser(&tool_call_parser),
         accepting.clone(),
     );
 

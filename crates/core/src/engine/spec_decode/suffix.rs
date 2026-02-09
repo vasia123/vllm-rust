@@ -15,7 +15,11 @@
 //! simpler O(n log^2 n) approach here since prompt lengths are bounded and
 //! construction cost is amortized across many proposal steps.
 
-use super::SpeculativeProposer;
+use crate::engine::types::EngineError;
+use crate::request::{RequestId, SequenceState};
+use crate::tokenizer::TokenizerWrapper;
+
+use super::{DraftProposer, SpeculativeProposer};
 
 /// Configuration for the suffix array proposer.
 #[derive(Debug, Clone)]
@@ -326,6 +330,55 @@ impl SpeculativeProposer for SuffixArrayProposer {
             self.config.context_window,
             k,
         )
+    }
+
+    fn name(&self) -> &str {
+        "suffix_array"
+    }
+}
+
+impl DraftProposer for SuffixArrayProposer {
+    fn init_request(
+        &mut self,
+        _request_id: RequestId,
+        _prompt_tokens: &[u32],
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn propose_for_request(
+        &mut self,
+        _request_id: RequestId,
+        _last_token: u32,
+        state: &mut SequenceState,
+        _tokenizer: &TokenizerWrapper,
+    ) -> Result<Vec<u32>, EngineError> {
+        let mut all_tokens =
+            Vec::with_capacity(state.prompt_token_ids.len() + state.generated_token_ids.len());
+        all_tokens.extend_from_slice(&state.prompt_token_ids);
+        all_tokens.extend_from_slice(&state.generated_token_ids);
+        Ok(self.propose(&all_tokens, self.config.max_speculation_length))
+    }
+
+    fn on_tokens_verified(
+        &mut self,
+        _request_id: RequestId,
+        _num_accepted: usize,
+        _original_offset: usize,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn finish_request(&mut self, _request_id: RequestId) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn preempt_request(&mut self, _request_id: RequestId) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn num_speculative_tokens(&self) -> usize {
+        self.config.max_speculation_length
     }
 
     fn name(&self) -> &str {
@@ -650,7 +703,7 @@ mod tests {
     #[test]
     fn proposer_trait_name() {
         let proposer = SuffixArrayProposer::with_defaults();
-        assert_eq!(proposer.name(), "suffix_array");
+        assert_eq!(SpeculativeProposer::name(&proposer), "suffix_array");
     }
 
     #[test]
@@ -811,5 +864,55 @@ mod tests {
         let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 1, 2, 3];
         let result = proposer.propose(&tokens, 5);
         assert_eq!(result, vec![4, 5]);
+    }
+
+    // ─── DraftProposer trait tests ────────────────────────────────────────
+
+    use crate::request::SequenceState;
+    use crate::tokenizer::TokenizerWrapper;
+
+    fn test_tokenizer() -> TokenizerWrapper {
+        TokenizerWrapper::for_testing(1000)
+    }
+
+    #[test]
+    fn draft_proposer_lifecycle_noop() {
+        let mut proposer = SuffixArrayProposer::with_defaults();
+        assert!(proposer.init_request(0, &[1, 2, 3, 4, 5]).is_ok());
+        assert!(proposer.on_tokens_verified(0, 2, 5).is_ok());
+        assert!(proposer.finish_request(0).is_ok());
+        assert!(proposer.preempt_request(0).is_ok());
+    }
+
+    #[test]
+    fn draft_proposer_name_and_tokens() {
+        let proposer = SuffixArrayProposer::with_defaults();
+        assert_eq!(DraftProposer::name(&proposer), "suffix_array");
+        assert_eq!(proposer.num_speculative_tokens(), 5);
+    }
+
+    #[test]
+    fn draft_proposer_propose_uses_full_sequence() {
+        let mut proposer = SuffixArrayProposer::new(SuffixArrayConfig {
+            max_speculation_length: 5,
+            min_match_length: 3,
+            context_window: 32,
+        });
+        let tokenizer = test_tokenizer();
+        let mut state = SequenceState::new(0, vec![1, 2, 3, 4, 5], 100, 99, 16, 0);
+        // Repeat a prompt pattern in generated tokens
+        state.generated_token_ids = vec![1, 2, 3];
+
+        // Full sequence: [1, 2, 3, 4, 5, 1, 2, 3]
+        // Suffix [1, 2, 3] matches at position 0, continuation: [4, 5]
+        let result = proposer.propose_for_request(0, 3, &mut state, &tokenizer).unwrap();
+        assert_eq!(result, vec![4, 5]);
+    }
+
+    #[test]
+    fn draft_proposer_as_trait_object() {
+        let proposer: Box<dyn DraftProposer> = Box::new(SuffixArrayProposer::with_defaults());
+        assert_eq!(proposer.name(), "suffix_array");
+        assert_eq!(proposer.num_speculative_tokens(), 5);
     }
 }

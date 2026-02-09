@@ -287,6 +287,12 @@ pub struct ChatCompletionRequest {
     /// If set, only these token IDs are allowed in generation.
     #[serde(default)]
     pub allowed_token_ids: Option<Vec<u32>>,
+    /// Service tier preference. Echoed back in response for OpenAI compliance.
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    /// Reasoning effort level for models supporting chain-of-thought reasoning.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,6 +304,8 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: &'static str,
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -986,6 +994,7 @@ mod tests {
                 completion_tokens: 1,
                 total_tokens: 6,
             },
+            service_tier: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["usage"]["prompt_tokens"], 5);
@@ -1429,6 +1438,7 @@ mod tests {
                 completion_tokens: 0,
                 total_tokens: 0,
             },
+            service_tier: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         let fp = json["system_fingerprint"].as_str().unwrap();
