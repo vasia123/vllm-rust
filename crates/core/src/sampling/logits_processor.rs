@@ -146,6 +146,61 @@ impl LogitsProcessor for BadWordsProcessor {
     }
 }
 
+/// Bad-words (multi-token sequence) processor.
+///
+/// Handles both single-token and multi-token bad word sequences:
+/// - Single-token words: unconditionally set to -inf (static bias)
+/// - Multi-token words: only ban the last token when preceding generated tokens
+///   match the prefix of the sequence (dynamic matching)
+pub struct NoBadWordsProcessor {
+    bad_words_ids: Vec<Vec<u32>>,
+}
+
+impl NoBadWordsProcessor {
+    pub fn new(bad_words_ids: Vec<Vec<u32>>) -> Self {
+        Self { bad_words_ids }
+    }
+}
+
+impl LogitsProcessor for NoBadWordsProcessor {
+    fn process(&self, logits: &mut [f32], generated_tokens: &[u32]) {
+        for word_ids in &self.bad_words_ids {
+            if word_ids.is_empty() {
+                continue;
+            }
+
+            if word_ids.len() == 1 {
+                // Single-token: unconditional ban
+                let idx = word_ids[0] as usize;
+                if idx < logits.len() {
+                    logits[idx] = f32::NEG_INFINITY;
+                }
+                continue;
+            }
+
+            // Multi-token: check if generated tokens end with the prefix
+            let prefix_len = word_ids.len() - 1;
+            if prefix_len > generated_tokens.len() {
+                continue;
+            }
+
+            let actual_prefix = &generated_tokens[generated_tokens.len() - prefix_len..];
+            let expected_prefix = &word_ids[..prefix_len];
+
+            if actual_prefix == expected_prefix {
+                let last_token = *word_ids.last().unwrap() as usize;
+                if last_token < logits.len() {
+                    logits[last_token] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "no_bad_words"
+    }
+}
+
 /// Allowed token IDs processor — masks all tokens except an allow-list.
 ///
 /// Sets logits of all tokens not in `allowed_ids` to `-inf`,
@@ -272,6 +327,12 @@ impl LogitsProcessorPipeline {
         if let Some(ref allowed) = params.allowed_token_ids {
             if !allowed.is_empty() {
                 pipeline.push(Box::new(AllowedTokenIdsProcessor::new(allowed.clone())));
+            }
+        }
+
+        if let Some(ref bad_words) = params.bad_words_token_ids {
+            if !bad_words.is_empty() {
+                pipeline.push(Box::new(NoBadWordsProcessor::new(bad_words.clone())));
             }
         }
 
@@ -517,5 +578,103 @@ mod tests {
         let pipeline = LogitsProcessorPipeline::from_params(&params);
         // rep_pen + freq_pres + logit_bias + banned + allowed + min_tokens = 6
         assert_eq!(pipeline.len(), 6);
+    }
+
+    #[test]
+    fn test_no_bad_words_single_token() {
+        let proc = NoBadWordsProcessor::new(vec![vec![1], vec![3]]);
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        proc.process(&mut logits, &[]);
+
+        assert!((logits[0] - 1.0).abs() < 1e-6);
+        assert!(logits[1] == f32::NEG_INFINITY);
+        assert!((logits[2] - 3.0).abs() < 1e-6);
+        assert!(logits[3] == f32::NEG_INFINITY);
+        assert!((logits[4] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_no_bad_words_multi_token_no_match() {
+        // Bad word is [10, 20] — prefix [10] must match last generated token
+        let proc = NoBadWordsProcessor::new(vec![vec![10, 20]]);
+        let mut logits = vec![1.0, 2.0, 3.0];
+        // Last generated token is 5, not 10 → no ban
+        proc.process(&mut logits, &[5]);
+        assert!((logits[0] - 1.0).abs() < 1e-6);
+        assert!((logits[1] - 2.0).abs() < 1e-6);
+        assert!((logits[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_no_bad_words_multi_token_match() {
+        // Bad word is [10, 20] — prefix [10] matches last generated token
+        let proc = NoBadWordsProcessor::new(vec![vec![10, 20]]);
+        let mut logits = vec![0.0; 30];
+        logits[20] = 5.0;
+        // Last generated token is 10 → token 20 should be banned
+        proc.process(&mut logits, &[3, 10]);
+        assert!(logits[20] == f32::NEG_INFINITY);
+        // Other tokens unchanged
+        assert!((logits[0] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_no_bad_words_three_token_sequence() {
+        // Bad word is [5, 6, 7] — prefix [5, 6] must be last 2 generated tokens
+        let proc = NoBadWordsProcessor::new(vec![vec![5, 6, 7]]);
+        let mut logits = vec![0.0; 10];
+        logits[7] = 3.0;
+
+        // Only partial prefix match → no ban
+        proc.process(&mut logits, &[5]);
+        assert!((logits[7] - 3.0).abs() < 1e-6);
+
+        // Full prefix match → ban
+        let mut logits = vec![0.0; 10];
+        logits[7] = 3.0;
+        proc.process(&mut logits, &[1, 2, 5, 6]);
+        assert!(logits[7] == f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_no_bad_words_empty_sequences_ignored() {
+        let proc = NoBadWordsProcessor::new(vec![vec![], vec![2]]);
+        let mut logits = vec![1.0, 2.0, 3.0];
+        proc.process(&mut logits, &[]);
+        // Only token 2 should be banned (empty sequence ignored)
+        assert!((logits[0] - 1.0).abs() < 1e-6);
+        assert!((logits[1] - 2.0).abs() < 1e-6);
+        assert!(logits[2] == f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_no_bad_words_not_enough_history() {
+        // Bad word [10, 20, 30] needs 2 tokens in history; only 1 exists
+        let proc = NoBadWordsProcessor::new(vec![vec![10, 20, 30]]);
+        let mut logits = vec![0.0; 40];
+        logits[30] = 5.0;
+        proc.process(&mut logits, &[20]);
+        // Not enough history → no ban
+        assert!((logits[30] - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pipeline_from_params_with_bad_words() {
+        let params = super::super::SamplingParams {
+            bad_words_token_ids: Some(vec![vec![1], vec![2, 3]]),
+            ..Default::default()
+        };
+        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        assert_eq!(pipeline.len(), 1);
+
+        let mut logits = vec![5.0; 5];
+        pipeline.process(&mut logits, &[2]);
+        // Single-token [1] → banned unconditionally
+        assert!(logits[1] == f32::NEG_INFINITY);
+        // Multi-token [2, 3] → prefix [2] matches generated → token 3 banned
+        assert!(logits[3] == f32::NEG_INFINITY);
+        // Others unchanged
+        assert!((logits[0] - 5.0).abs() < 1e-6);
+        assert!((logits[4] - 5.0).abs() < 1e-6);
     }
 }

@@ -10,6 +10,19 @@
 //! - **Mistral**: `[TOOL_CALLS]` with v11+ or pre-v11 formats
 //! - **DeepSeek V3**: Unicode token-delimited with ` ```json ` blocks
 //! - **Pythonic**: `[func(arg='val')]` Python function call syntax
+//! - **DeepSeek V3.1**: Unicode token-delimited `<｜tool▁call▁begin｜>name<｜tool▁sep｜>args<｜tool▁call▁end｜>`
+//! - **Kimi K2**: `<|tool_call_begin|>functions.name:0<|tool_call_argument_begin|>{...}<|tool_call_end|>`
+//! - **Phi-4 Mini**: `functools[{"name": ..., "arguments": ...}]`
+//! - **Longcat**: `<longcat_tool_call>{"name": ..., "arguments": ...}</longcat_tool_call>`
+//! - **xLAM**: Flexible — JSON arrays, code blocks, `[TOOL_CALLS]`, `<tool_call>` tags
+//! - **GigaChat3**: `function call{"name": ..., "arguments": ...}`
+//! - **FunctionGemma**: `<start_function_call>call:name{param:<escape>val<escape>}<end_function_call>`
+//! - **Hunyuan**: `<tool_calls>[{"name": ..., "arguments": ...}]</tool_calls>`
+//! - **ERNIE-4.5**: `<tool_call>{"name": ..., "arguments": ...}</tool_call>` with `<think>` tags
+//! - **Seed-OSS**: `<seed:tool_call><function=name><parameter=key>val</parameter></function></seed:tool_call>`
+//! - **DeepSeek V3.2**: `<｜DSML｜function_calls><｜DSML｜invoke name="...">` DSML XML format
+//! - **Step-3**: `<｜tool_calls_begin｜>` + `<steptml:invoke name="...">` XML format
+//! - **Qwen3 Coder**: `<tool_call><function=name><parameter=key>val</parameter></function></tool_call>`
 //!
 //! # Example
 //!
@@ -22,26 +35,52 @@
 //! ```
 
 mod deepseek_v3;
+mod deepseek_v31;
+mod deepseek_v32;
+mod ernie45;
+mod functiongemma;
+mod gigachat3;
 mod glm4;
 mod granite;
 mod hermes;
+mod hunyuan;
 mod internlm2;
 mod jamba;
 mod json_parser;
+mod kimi_k2;
 mod llama;
+mod longcat;
 mod mistral;
+mod phi4mini;
 mod pythonic;
+mod qwen3coder;
+mod seed_oss;
+mod step3;
+mod xlam;
 
 pub use deepseek_v3::DeepSeekV3ToolParser;
+pub use deepseek_v31::DeepSeekV31ToolParser;
+pub use deepseek_v32::DeepSeekV32ToolParser;
+pub use ernie45::Ernie45ToolParser;
+pub use functiongemma::FunctionGemmaToolParser;
+pub use gigachat3::GigaChat3ToolParser;
 pub use glm4::Glm4ToolParser;
 pub use granite::{Granite20bFCToolParser, GraniteToolParser};
 pub use hermes::HermesToolParser;
+pub use hunyuan::HunyuanToolParser;
 pub use internlm2::InternLm2ToolParser;
 pub use jamba::JambaToolParser;
 pub use json_parser::JsonToolParser;
+pub use kimi_k2::KimiK2ToolParser;
 pub use llama::LlamaToolParser;
+pub use longcat::LongcatToolParser;
 pub use mistral::MistralToolParser;
+pub use phi4mini::Phi4MiniToolParser;
 pub use pythonic::PythonicToolParser;
+pub use qwen3coder::Qwen3CoderToolParser;
+pub use seed_oss::SeedOssToolParser;
+pub use step3::Step3ToolParser;
+pub use xlam::XLamToolParser;
 
 use serde::{Deserialize, Serialize};
 

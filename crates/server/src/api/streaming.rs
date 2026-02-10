@@ -21,12 +21,16 @@ use super::types::{
 pub struct StreamingOptions {
     /// If true, emit a final chunk with usage statistics before the [DONE] sentinel.
     pub include_usage: bool,
+    /// If true, include partial usage statistics with every streaming chunk.
+    pub continuous_usage_stats: bool,
     /// Number of prompt tokens (needed for the usage chunk).
     pub prompt_tokens: usize,
     /// Whether the client requested logprobs in the streaming response.
     pub include_logprobs: bool,
     /// Tokenizer reference for decoding token IDs in logprobs to strings.
     pub tokenizer: Option<Arc<TokenizerWrapper>>,
+    /// If true, include token IDs in each streaming chunk choice.
+    pub return_token_ids: bool,
 }
 
 /// Build a single `CompletionLogProbs` entry for one streaming token.
@@ -108,7 +112,7 @@ pub fn completion_sse_stream(
 
         while let Some(event) = rx_stream.next().await {
             let sse_event = match event {
-                StreamEvent::Token { token_text, logprob, top_logprobs: top_lps, .. } => {
+                StreamEvent::Token { token_id, token_text, logprob, top_logprobs: top_lps } => {
                     completion_tokens += 1;
 
                     let chunk_logprobs = if options.include_logprobs {
@@ -130,6 +134,11 @@ pub fn completion_sse_stream(
 
                     text_offset += token_text.len();
 
+                    let usage = if options.continuous_usage_stats {
+                        Some(Usage::new(options.prompt_tokens, completion_tokens))
+                    } else {
+                        None
+                    };
                     let chunk = CompletionChunk {
                         id: Arc::clone(&id),
                         object: "text_completion",
@@ -140,13 +149,20 @@ pub fn completion_sse_stream(
                             text: token_text,
                             index: 0,
                             finish_reason: None,
+                            stop_reason: None,
                             logprobs: chunk_logprobs,
+                            token_ids: if options.return_token_ids { Some(vec![token_id]) } else { None },
                         }],
-                        usage: None,
+                        usage,
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
                 StreamEvent::Done { finish_reason, .. } => {
+                    let usage = if options.continuous_usage_stats {
+                        Some(Usage::new(options.prompt_tokens, completion_tokens))
+                    } else {
+                        None
+                    };
                     let chunk = CompletionChunk {
                         id: Arc::clone(&id),
                         object: "text_completion",
@@ -157,9 +173,11 @@ pub fn completion_sse_stream(
                             text: String::new(),
                             index: 0,
                             finish_reason: Some(finish_reason_str(&finish_reason)),
+                            stop_reason: None,
                             logprobs: None,
+                            token_ids: None,
                         }],
-                        usage: None,
+                        usage,
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
@@ -179,11 +197,7 @@ pub fn completion_sse_stream(
                 model: Arc::clone(&model),
                 system_fingerprint: system_fingerprint(),
                 choices: vec![],
-                usage: Some(Usage {
-                    prompt_tokens: options.prompt_tokens,
-                    completion_tokens,
-                    total_tokens: options.prompt_tokens + completion_tokens,
-                }),
+                usage: Some(Usage::new(options.prompt_tokens, completion_tokens)),
             };
             yield Ok(Event::default().data(serde_json::to_string(&usage_chunk).unwrap_or_default()));
         }
@@ -212,7 +226,7 @@ pub fn chat_completion_sse_stream(
 
         while let Some(event) = rx_stream.next().await {
             let sse_event = match event {
-                StreamEvent::Token { token_text, logprob, top_logprobs: top_lps, .. } => {
+                StreamEvent::Token { token_id, token_text, logprob, top_logprobs: top_lps } => {
                     completion_tokens += 1;
 
                     let chunk_logprobs = if options.include_logprobs {
@@ -230,6 +244,8 @@ pub fn chat_completion_sse_stream(
                         None
                     };
 
+                    let token_ids = if options.return_token_ids { Some(vec![token_id]) } else { None };
+
                     let choices = if first {
                         first = false;
                         vec![ChatCompletionChunkChoice {
@@ -241,7 +257,9 @@ pub fn chat_completion_sse_stream(
                             },
                             index: 0,
                             finish_reason: None,
+                            stop_reason: None,
                             logprobs: chunk_logprobs,
+                            token_ids: token_ids.clone(),
                         }]
                     } else {
                         vec![ChatCompletionChunkChoice {
@@ -253,8 +271,15 @@ pub fn chat_completion_sse_stream(
                             },
                             index: 0,
                             finish_reason: None,
+                            stop_reason: None,
                             logprobs: chunk_logprobs,
+                            token_ids,
                         }]
+                    };
+                    let usage = if options.continuous_usage_stats {
+                        Some(Usage::new(options.prompt_tokens, completion_tokens))
+                    } else {
+                        None
                     };
                     let chunk = ChatCompletionChunk {
                         id: Arc::clone(&id),
@@ -263,11 +288,16 @@ pub fn chat_completion_sse_stream(
                         model: Arc::clone(&model),
                         system_fingerprint: system_fingerprint(),
                         choices,
-                        usage: None,
+                        usage,
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
                 StreamEvent::Done { finish_reason, .. } => {
+                    let usage = if options.continuous_usage_stats {
+                        Some(Usage::new(options.prompt_tokens, completion_tokens))
+                    } else {
+                        None
+                    };
                     let chunk = ChatCompletionChunk {
                         id: Arc::clone(&id),
                         object: "chat.completion.chunk",
@@ -283,9 +313,11 @@ pub fn chat_completion_sse_stream(
                             },
                             index: 0,
                             finish_reason: Some(finish_reason_str(&finish_reason)),
+                            stop_reason: None,
                             logprobs: None,
+                            token_ids: None,
                         }],
-                        usage: None,
+                        usage,
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
@@ -305,11 +337,7 @@ pub fn chat_completion_sse_stream(
                 model: Arc::clone(&model),
                 system_fingerprint: system_fingerprint(),
                 choices: vec![],
-                usage: Some(Usage {
-                    prompt_tokens: options.prompt_tokens,
-                    completion_tokens,
-                    total_tokens: options.prompt_tokens + completion_tokens,
-                }),
+                usage: Some(Usage::new(options.prompt_tokens, completion_tokens)),
             };
             yield Ok(Event::default().data(serde_json::to_string(&usage_chunk).unwrap_or_default()));
         }
@@ -508,6 +536,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_stream_continuous_usage_stats() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(StreamEvent::Token {
+            token_id: 1,
+            token_text: "hello".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Token {
+            token_id: 2,
+            token_text: " world".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Done {
+            finish_reason: FinishReason::Eos,
+            generated_text: "hello world".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let options = StreamingOptions {
+            include_usage: true,
+            continuous_usage_stats: true,
+            prompt_tokens: 5,
+            ..Default::default()
+        };
+        let events = collect_completion_sse(rx, options).await;
+
+        // First token chunk should have usage with completion_tokens=1
+        let json0 = parse_data_json(&events[0]);
+        assert_eq!(json0["usage"]["prompt_tokens"], 5);
+        assert_eq!(json0["usage"]["completion_tokens"], 1);
+        assert_eq!(json0["usage"]["total_tokens"], 6);
+
+        // Second token chunk should have completion_tokens=2
+        let json1 = parse_data_json(&events[1]);
+        assert_eq!(json1["usage"]["completion_tokens"], 2);
+        assert_eq!(json1["usage"]["total_tokens"], 7);
+
+        // Done chunk should also have usage
+        let json2 = parse_data_json(&events[2]);
+        assert_eq!(json2["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_continuous_usage_stats() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(StreamEvent::Token {
+            token_id: 1,
+            token_text: "hi".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Done {
+            finish_reason: FinishReason::Eos,
+            generated_text: "hi".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let options = StreamingOptions {
+            include_usage: true,
+            continuous_usage_stats: true,
+            prompt_tokens: 3,
+            ..Default::default()
+        };
+        let events = collect_chat_sse(rx, options).await;
+
+        // Token chunk should have usage
+        let json0 = parse_data_json(&events[0]);
+        assert_eq!(json0["usage"]["prompt_tokens"], 3);
+        assert_eq!(json0["usage"]["completion_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn completion_stream_no_continuous_usage_has_null_usage() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(StreamEvent::Token {
+            token_id: 1,
+            token_text: "hello".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Done {
+            finish_reason: FinishReason::Eos,
+            generated_text: "hello".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let options = StreamingOptions {
+            include_usage: true,
+            continuous_usage_stats: false,
+            prompt_tokens: 5,
+            ..Default::default()
+        };
+        let events = collect_completion_sse(rx, options).await;
+
+        // Token chunk should NOT have usage
+        let json0 = parse_data_json(&events[0]);
+        assert!(json0.get("usage").is_none() || json0["usage"].is_null());
+    }
+
+    #[tokio::test]
     async fn completion_stream_text_offset_increments() {
         let tokenizer = Arc::new(TokenizerWrapper::for_testing(1000));
         let (tx, rx) = mpsc::channel(16);
@@ -549,5 +693,89 @@ mod tests {
         // Second token offset = 2 (length of "ab")
         let json1 = parse_data_json(&events[1]);
         assert_eq!(json1["choices"][0]["logprobs"]["text_offset"][0], 2);
+    }
+
+    #[tokio::test]
+    async fn completion_stream_includes_token_ids_when_requested() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(StreamEvent::Token {
+            token_id: 42,
+            token_text: "hello".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            generated_text: "hello".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let options = StreamingOptions {
+            return_token_ids: true,
+            ..Default::default()
+        };
+        let events = collect_completion_sse(rx, options).await;
+
+        let json = parse_data_json(&events[0]);
+        assert_eq!(json["choices"][0]["token_ids"][0], 42);
+    }
+
+    #[tokio::test]
+    async fn completion_stream_omits_token_ids_by_default() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(StreamEvent::Token {
+            token_id: 42,
+            token_text: "hello".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            generated_text: "hello".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let options = StreamingOptions::default();
+        let events = collect_completion_sse(rx, options).await;
+
+        let json = parse_data_json(&events[0]);
+        assert!(json["choices"][0].get("token_ids").is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_includes_token_ids_when_requested() {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(StreamEvent::Token {
+            token_id: 99,
+            token_text: "world".to_string(),
+            logprob: None,
+            top_logprobs: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            generated_text: "world".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let options = StreamingOptions {
+            return_token_ids: true,
+            ..Default::default()
+        };
+        let events = collect_chat_sse(rx, options).await;
+
+        let json = parse_data_json(&events[0]);
+        assert_eq!(json["choices"][0]["token_ids"][0], 99);
     }
 }

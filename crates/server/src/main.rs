@@ -97,9 +97,15 @@ enum Command {
         #[arg(long, default_value = "*")]
         allowed_headers: String,
 
+        /// Maximum request body size in MiB (default: 32)
+        #[arg(long, default_value_t = 32)]
+        max_body_size_mb: usize,
+
         /// Tool call parser for extracting function calls from model output.
-        /// Supported: hermes, glm4, json, llama, mistral, deepseek_v3, internlm2, jamba,
-        /// pythonic, granite, granite-20b-fc
+        /// Supported: hermes, glm4, json, llama, mistral, deepseek_v3, deepseek_v31,
+        /// internlm2, jamba, pythonic, granite, granite-20b-fc, kimi_k2, phi4mini,
+        /// longcat, xlam, gigachat3, functiongemma, hunyuan, ernie45, seed_oss,
+        /// deepseek_v32, step3, qwen3coder
         #[arg(long, default_value = "hermes")]
         tool_call_parser: String,
     },
@@ -160,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_origins,
             allowed_methods,
             allowed_headers,
+            max_body_size_mb,
             tool_call_parser,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
@@ -245,6 +252,8 @@ async fn main() -> anyhow::Result<()> {
                 enable_chunked_prefill,
                 shutdown_timeout,
                 cors_config,
+                max_body_size_mb,
+                tool_call_parser,
             )
             .await
         }
@@ -289,6 +298,8 @@ async fn run_server(
     enable_chunked_prefill: bool,
     shutdown_timeout: u64,
     cors_config: api::CorsConfig,
+    max_body_size_mb: usize,
+    tool_call_parser: String,
 ) -> anyhow::Result<()> {
     logging::init();
     prometheus::init_metrics();
@@ -498,11 +509,13 @@ async fn run_server(
     );
 
     let cors_layer = api::build_cors_layer(&cors_config);
-    let app = api::create_full_router_with_cors_and_rate_limit(
+    let max_body_size = max_body_size_mb * 1024 * 1024;
+    let app = api::create_full_router_with_options(
         state,
         admin_state,
         cors_layer,
         api::middleware::RateLimitState::unlimited(),
+        max_body_size,
     );
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -48,6 +48,11 @@ pub async fn create_completion(
             .collect::<Vec<_>>()
     });
 
+    // Tokenize bad_words strings into token ID sequences
+    let bad_words_token_ids = req.bad_words.as_ref().map(|words| {
+        super::tokenize_bad_words(words, &state.tokenizer)
+    });
+
     if req.stream {
         // Streaming only supports n=1
         if req.n > 1 {
@@ -64,10 +69,10 @@ pub async fn create_completion(
             .unwrap_or(PromptInput::Text(String::new()));
         let (prompt, prompt_tokens) = resolve_prompt_input(&state, input, req.max_tokens)?;
 
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .is_some_and(|opts| opts.include_usage);
+        let stream_opts_ref = req.stream_options.as_ref();
+        let include_usage = stream_opts_ref.is_some_and(|opts| opts.include_usage);
+        let continuous_usage_stats =
+            stream_opts_ref.is_some_and(|opts| opts.continuous_usage_stats);
 
         // Capture logprobs count before req fields are moved
         let logprobs_count = req.logprobs;
@@ -100,6 +105,7 @@ pub async fn create_completion(
                 eos_token_id: Some(state.eos_token_id),
                 banned_token_ids: req.banned_token_ids.clone(),
                 allowed_token_ids: req.allowed_token_ids.clone(),
+                bad_words_token_ids: bad_words_token_ids.clone(),
             },
             stop_strings: req.stop,
             stop_token_ids: req.stop_token_ids,
@@ -122,6 +128,7 @@ pub async fn create_completion(
         let include_logprobs = logprobs_count.is_some();
         let streaming_opts = StreamingOptions {
             include_usage,
+            continuous_usage_stats,
             prompt_tokens,
             include_logprobs,
             tokenizer: if include_logprobs {
@@ -129,6 +136,7 @@ pub async fn create_completion(
             } else {
                 None
             },
+            return_token_ids: req.return_tokens_as_token_ids.unwrap_or(false),
         };
         Ok(
             completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)
@@ -204,6 +212,7 @@ pub async fn create_completion(
                         eos_token_id: Some(state.eos_token_id),
                         banned_token_ids: req.banned_token_ids.clone(),
                         allowed_token_ids: req.allowed_token_ids.clone(),
+                        bad_words_token_ids: bad_words_token_ids.clone(),
                     },
                     stop_strings: req.stop.clone(),
                     stop_token_ids: req.stop_token_ids.clone(),
@@ -254,7 +263,9 @@ pub async fn create_completion(
                     text: result.generated_text,
                     index: choice_index,
                     finish_reason: Some(finish_reason_str(&result.finish_reason)),
+                    stop_reason: None,
                     logprobs: final_logprobs,
+                    token_ids: None,
                 });
                 choice_index += 1;
             }
@@ -267,11 +278,10 @@ pub async fn create_completion(
             model: state.model_id.clone(),
             system_fingerprint: system_fingerprint(),
             choices,
-            usage: Usage {
-                prompt_tokens: total_prompt_tokens,
-                completion_tokens: total_completion_tokens,
-                total_tokens: total_prompt_tokens + total_completion_tokens,
-            },
+            usage: Usage::new(total_prompt_tokens, total_completion_tokens),
+            service_tier: None,
+            prompt_logprobs: None,
+            prompt_token_ids: None,
         };
 
         // Record metrics
@@ -488,5 +498,57 @@ fn build_logprobs(
         token_logprobs,
         tokens,
         top_logprobs,
+    }
+}
+
+// ─── Render endpoint ────────────────────────────────────────────────
+
+/// Response type for the completions render endpoint.
+#[derive(Debug, serde::Serialize)]
+pub struct CompletionRenderResponse {
+    /// The prompt text (decoded if token IDs were provided).
+    pub prompt: String,
+    /// Token IDs after tokenization.
+    pub token_ids: Vec<u32>,
+    /// Number of prompt tokens.
+    pub num_tokens: usize,
+}
+
+/// Render a completion request: tokenize the prompt but don't generate.
+pub async fn render_completion(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let inputs = req.prompt.clone().into_inputs();
+    let input = inputs
+        .into_iter()
+        .next()
+        .unwrap_or(PromptInput::Text(String::new()));
+
+    match input {
+        PromptInput::Text(text) => {
+            let token_ids = state
+                .tokenizer
+                .encode(&text)
+                .map_err(|e| ApiError::InvalidRequest(format!("tokenization failed: {e}")))?;
+            let num_tokens = token_ids.len();
+            Ok(Json(CompletionRenderResponse {
+                prompt: text,
+                token_ids,
+                num_tokens,
+            }))
+        }
+        PromptInput::TokenIds(ids) => {
+            let text = state
+                .tokenizer
+                .decode(&ids)
+                .map_err(|e| ApiError::EngineError(format!("Failed to decode token IDs: {e}")))?;
+            let num_tokens = ids.len();
+            Ok(Json(CompletionRenderResponse {
+                prompt: text,
+                token_ids: ids,
+                num_tokens,
+            }))
+        }
     }
 }

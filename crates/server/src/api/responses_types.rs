@@ -105,6 +105,8 @@ pub enum ResponseStatus {
     InProgress,
     /// Generation failed.
     Failed,
+    /// Generation was cancelled by the user.
+    Cancelled,
 }
 
 /// `POST /v1/responses` response body.
@@ -335,6 +337,10 @@ mod tests {
             serde_json::to_string(&ResponseStatus::Failed).unwrap(),
             "\"failed\""
         );
+        assert_eq!(
+            serde_json::to_string(&ResponseStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
     }
 
     #[test]
@@ -489,11 +495,7 @@ mod tests {
 
     #[test]
     fn response_usage_from_usage() {
-        let usage = Usage {
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            total_tokens: 30,
-        };
+        let usage = Usage::new(10, 20);
         let resp_usage = ResponseUsage::from(usage);
         assert_eq!(resp_usage.input_tokens, 10);
         assert_eq!(resp_usage.output_tokens, 20);

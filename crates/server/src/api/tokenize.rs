@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use axum::extract::State;
 use axum::Json;
+use serde::Serialize;
 
 use super::error::ApiError;
 use super::types::{DetokenizeRequest, DetokenizeResponse, TokenizeRequest, TokenizeResponse};
@@ -52,4 +55,36 @@ pub async fn detokenize(
         .map_err(|e| ApiError::InternalError(format!("detokenization failed: {}", e)))?;
 
     Ok(Json(DetokenizeResponse { prompt }))
+}
+
+/// Tokenizer metadata response, equivalent to tokenizer_config.json.
+#[derive(Debug, Serialize)]
+pub struct TokenizerInfoResponse {
+    pub tokenizer_class: &'static str,
+    pub max_chars_per_token: usize,
+    pub model_max_length: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Get tokenizer configuration metadata.
+///
+/// GET /tokenizer_info
+pub async fn get_tokenizer_info(
+    State(state): State<AppState>,
+) -> Json<TokenizerInfoResponse> {
+    let chat_template = state
+        .chat_template
+        .as_ref()
+        .map(|ct| ct.raw_template().to_string());
+
+    Json(TokenizerInfoResponse {
+        tokenizer_class: "PreTrainedTokenizerFast",
+        max_chars_per_token: state.tokenizer.max_chars_per_token(),
+        model_max_length: state.max_model_len,
+        chat_template,
+        extra: HashMap::new(),
+    })
 }

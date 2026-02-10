@@ -72,7 +72,7 @@ pub struct ArchitectureInfo {
 
 static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
-        arch_names: &["BaichuanForCausalLM"],
+        arch_names: &["BaichuanForCausalLM", "BaiChuanForCausalLM"],
         display_name: "Baichuan",
         capabilities: ModelCapabilities::new().with_tp(),
     },
@@ -91,13 +91,18 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_encoder_only(),
     },
     ArchitectureInfo {
-        arch_names: &["CohereForCausalLM"],
+        arch_names: &["CohereForCausalLM", "Cohere2ForCausalLM"],
         display_name: "Command R",
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"],
-        display_name: "DeepSeek V2/V3",
+        arch_names: &[
+            "DeepseekForCausalLM",
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+        ],
+        display_name: "DeepSeek",
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
@@ -151,10 +156,15 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
         arch_names: &[
             "LlamaForCausalLM",
+            "LlamaModel",
+            "LLaMAForCausalLM",
             "AquilaModel",
             "AquilaForCausalLM",
             "CwmForCausalLM",
+            "InternLMForCausalLM",
             "InternLM3ForCausalLM",
+            "IQuestCoderForCausalLM",
+            "XverseForCausalLM",
         ],
         display_name: "Llama",
         capabilities: ModelCapabilities::new()
@@ -235,9 +245,19 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
     ArchitectureInfo {
-        arch_names: &["Olmo2ForCausalLM"],
-        display_name: "OLMo2",
+        arch_names: &["Olmo2ForCausalLM", "Olmo3ForCausalLM"],
+        display_name: "OLMo2/3",
         capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["OlmoForCausalLM"],
+        display_name: "OLMo",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["OlmoeForCausalLM"],
+        display_name: "OLMoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
     },
     ArchitectureInfo {
         arch_names: &["GlmForCausalLM"],
@@ -278,9 +298,115 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
-        arch_names: &["MptForCausalLM"],
+        arch_names: &["MptForCausalLM", "MPTForCausalLM"],
         display_name: "MPT",
         capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ChatGLMModel", "ChatGLMForConditionalGeneration"],
+        display_name: "ChatGLM",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Gemma3nForCausalLM"],
+        display_name: "Gemma 3n",
+        capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GPTBigCodeForCausalLM"],
+        display_name: "GPT-BigCode",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GPTJForCausalLM"],
+        display_name: "GPT-J",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GraniteForCausalLM"],
+        display_name: "Granite",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GraniteMoeForCausalLM"],
+        display_name: "Granite-MoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["OPTForCausalLM"],
+        display_name: "OPT",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["PhiMoEForCausalLM"],
+        display_name: "Phi-MoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "MistralModel",
+            "Gemma2Model",
+        ],
+        display_name: "Mistral/Gemma2 (base)",
+        capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen2Model"],
+        display_name: "Qwen2 (base)",
+        capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen3NextForCausalLM"],
+        display_name: "Qwen3-Next",
+        capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "StableLMEpochForCausalLM",
+            "StableLmForCausalLM",
+        ],
+        display_name: "StableLM",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["SolarForCausalLM"],
+        display_name: "Solar",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["TeleChatForCausalLM", "TeleChat2ForCausalLM"],
+        display_name: "TeleChat",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MiniCPMForCausalLM", "MiniCPM3ForCausalLM"],
+        display_name: "MiniCPM",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["NemotronForCausalLM"],
+        display_name: "Nemotron",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Glm4MoeLiteForCausalLM"],
+        display_name: "GLM-4 MoE Lite",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Llama4ForCausalLM"],
+        display_name: "Llama 4",
+        capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Exaone4ForCausalLM"],
+        display_name: "Exaone 4",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["OrionForCausalLM"],
+        display_name: "Orion",
+        capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
         arch_names: &["PersimmonForCausalLM"],
@@ -296,6 +422,210 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["DbrxForCausalLM"],
         display_name: "DBRX",
         capabilities: ModelCapabilities::new().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ArcticForCausalLM"],
+        display_name: "Arctic",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["BailingMoeForCausalLM", "BailingMoeV2ForCausalLM"],
+        display_name: "BailingMoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["BambaForCausalLM"],
+        display_name: "Bamba",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Ernie4_5ForCausalLM"],
+        display_name: "ERNIE 4.5",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Ernie4_5_MoeForCausalLM"],
+        display_name: "ERNIE 4.5 MoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ExaoneMoEForCausalLM"],
+        display_name: "Exaone MoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["FalconH1ForCausalLM"],
+        display_name: "Falcon H1",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Grok1ModelForCausalLM", "Grok1ForCausalLM"],
+        display_name: "Grok-1",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["HunYuanMoEV1ForCausalLM"],
+        display_name: "HunYuan MoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["HunYuanDenseV1ForCausalLM"],
+        display_name: "HunYuan Dense",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["JAISLMHeadModel", "Jais2ForCausalLM"],
+        display_name: "JAIS",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["KimiLinearForCausalLM"],
+        display_name: "Kimi Linear",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MistralLarge3ForCausalLM"],
+        display_name: "Mistral Large 3",
+        capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "MiniMaxForCausalLM",
+            "MiniMaxText01ForCausalLM",
+            "MiniMaxM1ForCausalLM",
+            "MiniMaxM2ForCausalLM",
+        ],
+        display_name: "MiniMax",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MiMoForCausalLM", "MiMoV2FlashForCausalLM"],
+        display_name: "MiMo",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"],
+        display_name: "Nemotron-H",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Plamo2ForCausalLM", "Plamo3ForCausalLM"],
+        display_name: "PLaMo",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["QWenLMHeadModel"],
+        display_name: "Qwen (v1)",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["SeedOssForCausalLM"],
+        display_name: "Seed-OSS",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Step1ForCausalLM", "Step3TextForCausalLM"],
+        display_name: "Step",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Lfm2ForCausalLM"],
+        display_name: "Lfm2",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Lfm2MoeForCausalLM"],
+        display_name: "Lfm2 MoE",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GraniteMoeHybridForCausalLM", "GraniteMoeSharedForCausalLM"],
+        display_name: "Granite MoE Hybrid",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Zamba2ForCausalLM"],
+        display_name: "Zamba 2",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Dots1ForCausalLM"],
+        display_name: "Dots1",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GptOssForCausalLM"],
+        display_name: "GptOSS",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "PanguEmbeddedForCausalLM",
+            "PanguProMoEV2ForCausalLM",
+            "PanguUltraMoEForCausalLM",
+        ],
+        display_name: "Pangu",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["IQuestLoopCoderForCausalLM"],
+        display_name: "IQuest LoopCoder",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Fairseq2LlamaForCausalLM"],
+        display_name: "Fairseq2 Llama",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["FlexOlmoForCausalLM"],
+        display_name: "FlexOLMo",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["LongcatFlashForCausalLM"],
+        display_name: "Longcat Flash",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["OuroForCausalLM"],
+        display_name: "Ouro",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["TeleFLMForCausalLM"],
+        display_name: "TeleFLM",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["DeciLMForCausalLM"],
+        display_name: "DeciLM",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ArceeForCausalLM"],
+        display_name: "Arcee",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["AfmoeForCausalLM"],
+        display_name: "Afmoe",
+        capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ApertusForCausalLM"],
+        display_name: "Apertus",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GritLM"],
+        display_name: "GritLM",
+        capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &["InternLM2VEForCausalLM"],
+        display_name: "InternLM2-VE",
+        capabilities: ModelCapabilities::new().with_tp(),
     },
 ];
 
@@ -333,13 +663,16 @@ mod tests {
     }
 
     #[test]
-    fn find_deepseek_v2_and_v3() {
+    fn find_deepseek_variants() {
         let v2 =
             find_architecture("DeepseekV2ForCausalLM").expect("should find DeepseekV2ForCausalLM");
         let v3 =
             find_architecture("DeepseekV3ForCausalLM").expect("should find DeepseekV3ForCausalLM");
+        let v32 =
+            find_architecture("DeepseekV32ForCausalLM").expect("should find DeepseekV32ForCausalLM");
         assert_eq!(v2.display_name, v3.display_name);
-        assert_eq!(v2.display_name, "DeepSeek V2/V3");
+        assert_eq!(v2.display_name, v32.display_name);
+        assert_eq!(v2.display_name, "DeepSeek");
     }
 
     #[test]
@@ -377,56 +710,181 @@ mod tests {
     #[test]
     fn catalog_covers_all_expected_architectures() {
         let expected = [
+            // Baichuan
             "BaichuanForCausalLM",
+            "BaiChuanForCausalLM",
+            // BERT
             "BertModel",
             "BertForMaskedLM",
             "BertForSequenceClassification",
-            "BloomForCausalLM",
+            // ColBERT
             "HF_ColBERT",
             "ColBERTModel",
+            // Cohere
             "CohereForCausalLM",
+            "Cohere2ForCausalLM",
+            // DeepSeek
+            "DeepseekForCausalLM",
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            // Falcon
             "FalconForCausalLM",
             "RWForCausalLM",
+            // BLOOM
+            "BloomForCausalLM",
+            // GPT family
             "GPT2LMHeadModel",
             "GPTNeoXForCausalLM",
+            "GPTBigCodeForCausalLM",
+            "GPTJForCausalLM",
+            // Gemma
             "GemmaForCausalLM",
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
+            "Gemma3nForCausalLM",
+            // InternLM
             "InternLM2ForCausalLM",
-            "JambaForCausalLM",
-            "LlavaForConditionalGeneration",
-            "LlavaNextForConditionalGeneration",
+            // Llama family (aliases)
             "LlamaForCausalLM",
+            "LlamaModel",
+            "LLaMAForCausalLM",
             "AquilaModel",
             "AquilaForCausalLM",
             "CwmForCausalLM",
+            "InternLMForCausalLM",
             "InternLM3ForCausalLM",
+            "IQuestCoderForCausalLM",
+            "XverseForCausalLM",
+            "Llama4ForCausalLM",
+            // LLaVA
+            "LlavaForConditionalGeneration",
+            "LlavaNextForConditionalGeneration",
+            // Mamba
+            "MambaForCausalLM",
+            "FalconMambaForCausalLM",
             "Mamba2ForCausalLM",
+            // Mistral
             "MistralForCausalLM",
             "MixtralForCausalLM",
+            // MiniCPM
+            "MiniCPMForCausalLM",
+            "MiniCPM3ForCausalLM",
+            // MPT
+            "MptForCausalLM",
+            "MPTForCausalLM",
+            // Nemotron
+            "NemotronForCausalLM",
+            // OLMo
+            "OlmoForCausalLM",
+            "Olmo2ForCausalLM",
+            "Olmo3ForCausalLM",
+            "OlmoeForCausalLM",
+            // OPT
+            "OPTForCausalLM",
+            // Orion
+            "OrionForCausalLM",
+            // Phi
             "PhiForCausalLM",
+            "Phi3ForCausalLM",
+            "PhiMoEForCausalLM",
+            // Qwen
             "Qwen2ForCausalLM",
+            "Qwen2Model",
             "Qwen2MoeForCausalLM",
             "Qwen3ForCausalLM",
             "Qwen3MoeForCausalLM",
-            "Phi3ForCausalLM",
-            "Olmo2ForCausalLM",
-            "Starcoder2ForCausalLM",
-            "VoyageQwen3BidirectionalEmbedModel",
-            "YiForCausalLM",
+            "Qwen3NextForCausalLM",
+            // GLM
             "GlmForCausalLM",
             "Glm4ForCausalLM",
             "GlmMoeDsaForCausalLM",
             "Glm4MoeForCausalLM",
-            "MambaForCausalLM",
-            "FalconMambaForCausalLM",
-            "MptForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+            "ChatGLMModel",
+            "ChatGLMForConditionalGeneration",
+            // Granite
+            "GraniteForCausalLM",
+            "GraniteMoeForCausalLM",
+            // Jamba
+            "JambaForCausalLM",
+            // StarCoder
+            "Starcoder2ForCausalLM",
+            // StableLM
+            "StableLMEpochForCausalLM",
+            "StableLmForCausalLM",
+            // Solar
+            "SolarForCausalLM",
+            // Step
             "Step3p5ForCausalLM",
-            "PersimmonForCausalLM",
+            // TeleChat
+            "TeleChatForCausalLM",
+            "TeleChat2ForCausalLM",
+            // Voyage
+            "VoyageQwen3BidirectionalEmbedModel",
+            // Yi
+            "YiForCausalLM",
+            // Exaone
             "ExaoneForCausalLM",
+            "Exaone4ForCausalLM",
+            "ExaoneMoEForCausalLM",
+            // Other
+            "PersimmonForCausalLM",
             "DbrxForCausalLM",
+            "MistralModel",
+            "Gemma2Model",
+            // New architectures (2025-02 sync)
+            "ArcticForCausalLM",
+            "BailingMoeForCausalLM",
+            "BailingMoeV2ForCausalLM",
+            "BambaForCausalLM",
+            "Ernie4_5ForCausalLM",
+            "Ernie4_5_MoeForCausalLM",
+            "FalconH1ForCausalLM",
+            "Grok1ModelForCausalLM",
+            "Grok1ForCausalLM",
+            "HunYuanMoEV1ForCausalLM",
+            "HunYuanDenseV1ForCausalLM",
+            "JAISLMHeadModel",
+            "Jais2ForCausalLM",
+            "KimiLinearForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "MiniMaxForCausalLM",
+            "MiniMaxText01ForCausalLM",
+            "MiniMaxM1ForCausalLM",
+            "MiniMaxM2ForCausalLM",
+            "MiMoForCausalLM",
+            "MiMoV2FlashForCausalLM",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Plamo2ForCausalLM",
+            "Plamo3ForCausalLM",
+            "QWenLMHeadModel",
+            "SeedOssForCausalLM",
+            "Step1ForCausalLM",
+            "Step3TextForCausalLM",
+            "Lfm2ForCausalLM",
+            "Lfm2MoeForCausalLM",
+            "GraniteMoeHybridForCausalLM",
+            "GraniteMoeSharedForCausalLM",
+            "Zamba2ForCausalLM",
+            "Dots1ForCausalLM",
+            "GptOssForCausalLM",
+            "PanguEmbeddedForCausalLM",
+            "PanguProMoEV2ForCausalLM",
+            "PanguUltraMoEForCausalLM",
+            "IQuestLoopCoderForCausalLM",
+            "Fairseq2LlamaForCausalLM",
+            "FlexOlmoForCausalLM",
+            "LongcatFlashForCausalLM",
+            "OuroForCausalLM",
+            "TeleFLMForCausalLM",
+            "DeciLMForCausalLM",
+            "ArceeForCausalLM",
+            "AfmoeForCausalLM",
+            "ApertusForCausalLM",
+            "GritLM",
+            "InternLM2VEForCausalLM",
         ];
         for arch in &expected {
             assert!(

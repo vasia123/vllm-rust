@@ -251,6 +251,11 @@ impl ChatTemplateEngine {
         })
     }
 
+    /// The raw Jinja template source string.
+    pub fn raw_template(&self) -> &str {
+        &self.template_source
+    }
+
     pub fn apply(
         &self,
         messages: &[ChatMessage],

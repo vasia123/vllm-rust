@@ -130,6 +130,49 @@ pub struct CompletionRequest {
     /// If set, only these token IDs are allowed in generation.
     #[serde(default)]
     pub allowed_token_ids: Option<Vec<u32>>,
+    /// Words/phrases to ban from generation. Each string is tokenized (with
+    /// and without a leading space) into token sequences; single-token sequences
+    /// are banned unconditionally, multi-token sequences ban the last token
+    /// only when the generated prefix matches.
+    #[serde(default)]
+    pub bad_words: Option<Vec<String>>,
+    /// Text to insert after the generated completion (used with `echo`).
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// Whether to add BOS/special tokens to the prompt.
+    #[serde(default = "default_true")]
+    pub add_special_tokens: bool,
+    /// Number of prompt token logprobs to return. None = no prompt logprobs.
+    #[serde(default)]
+    pub prompt_logprobs: Option<u32>,
+    /// Truncate the prompt to the last k tokens. -1 uses model default, None disables.
+    #[serde(default)]
+    pub truncate_prompt_tokens: Option<i32>,
+    /// If true, include raw token IDs in streaming chunks (non-standard, for tracing).
+    #[serde(default)]
+    pub return_tokens_as_token_ids: Option<bool>,
+    /// Request priority for priority-based scheduling. Higher = more urgent. Default 0.
+    #[serde(default)]
+    pub priority: i32,
+    /// Custom request ID for tracking. If not provided, server generates one.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Lower-level structured output constraints (regex, choice, grammar).
+    #[serde(default)]
+    pub structured_outputs: Option<StructuredOutputs>,
+    /// Skip reading from prefix cache for this request (auto-set when prompt_logprobs requested).
+    #[serde(default)]
+    pub skip_reading_prefix_cache: Option<bool>,
+    /// Salt for KV cache key hashing (for per-request cache isolation).
+    #[serde(default)]
+    pub cache_salt: Option<String>,
+}
+
+impl CompletionRequest {
+    /// Effective max tokens, considering both `max_tokens` field.
+    pub fn effective_max_tokens(&self) -> usize {
+        self.max_tokens
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +184,14 @@ pub struct CompletionResponse {
     pub system_fingerprint: &'static str,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Per-token logprobs for the prompt (when prompt_logprobs is requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<Vec<Option<HashMap<String, f32>>>>,
+    /// Prompt token IDs (included when return_tokens_as_token_ids is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +200,11 @@ pub struct CompletionChoice {
     pub index: u32,
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<CompletionLogProbs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 /// Log probabilities for completion tokens, following OpenAI format.
@@ -185,7 +240,11 @@ pub struct CompletionChunkChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<CompletionLogProbs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 // ─── Stream Options ───────────────────────────────────────────────────────
@@ -197,6 +256,10 @@ pub struct StreamOptions {
     /// token counts (prompt_tokens, completion_tokens, total_tokens).
     #[serde(default)]
     pub include_usage: bool,
+    /// If true, include partial usage statistics with every streaming chunk,
+    /// not just the final one. Requires `include_usage` to be true.
+    #[serde(default)]
+    pub continuous_usage_stats: bool,
 }
 
 // ─── Chat Completions ─────────────────────────────────────────────────────
@@ -287,12 +350,90 @@ pub struct ChatCompletionRequest {
     /// If set, only these token IDs are allowed in generation.
     #[serde(default)]
     pub allowed_token_ids: Option<Vec<u32>>,
+    /// Words/phrases to ban from generation (tokenized with/without leading space).
+    #[serde(default)]
+    pub bad_words: Option<Vec<String>>,
     /// Service tier preference. Echoed back in response for OpenAI compliance.
     #[serde(default)]
     pub service_tier: Option<String>,
     /// Reasoning effort level for models supporting chain-of-thought reasoning.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Maximum number of tokens to generate (newer OpenAI name).
+    /// When set, takes precedence over `max_tokens`.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
+    /// Whether to allow the model to make multiple tool calls in a single turn.
+    /// Default is true per OpenAI spec.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Whether to store the output for model distillation or evals.
+    #[serde(default)]
+    pub store: Option<bool>,
+    /// Text to insert after the generated completion.
+    #[serde(default)]
+    pub suffix: Option<String>,
+
+    // ─── Chat template control ────────────────────────────────────
+
+    /// Whether to add the generation prompt to the chat template.
+    /// Default is true. Set to false for models that don't use generation prompts.
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+    /// If true, format the chat so the final message is open-ended
+    /// (for continuation). Mutually exclusive with `add_generation_prompt`.
+    #[serde(default)]
+    pub continue_final_message: bool,
+    /// Override the model's default Jinja chat template.
+    #[serde(default)]
+    pub chat_template: Option<String>,
+    /// Additional keyword arguments for the chat template renderer.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<HashMap<String, serde_json::Value>>,
+    /// Whether to add BOS/special tokens on top of chat template output.
+    #[serde(default)]
+    pub add_special_tokens: bool,
+    /// Documents for RAG-style models (each doc has title/text keys).
+    #[serde(default)]
+    pub documents: Option<Vec<HashMap<String, String>>>,
+
+    // ─── Token output control ─────────────────────────────────────
+
+    /// Number of prompt token logprobs to return. None = no prompt logprobs.
+    #[serde(default)]
+    pub prompt_logprobs: Option<u32>,
+    /// Truncate the prompt to the last k tokens. -1 uses model default, None disables.
+    #[serde(default)]
+    pub truncate_prompt_tokens: Option<i32>,
+    /// If true, represent tokens as "token_id:{id}" strings in logprobs
+    /// (handles non-JSON-encodable tokens).
+    #[serde(default)]
+    pub return_tokens_as_token_ids: Option<bool>,
+
+    // ─── Scheduling ───────────────────────────────────────────────
+
+    /// Request priority for priority-based scheduling. Higher = more urgent. Default 0.
+    #[serde(default)]
+    pub priority: i32,
+    /// Custom request ID for tracking. If not provided, server generates one.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Lower-level structured output constraints (regex, choice, grammar).
+    #[serde(default)]
+    pub structured_outputs: Option<StructuredOutputs>,
+    /// Skip reading from prefix cache for this request (auto-set when prompt_logprobs requested).
+    #[serde(default)]
+    pub skip_reading_prefix_cache: Option<bool>,
+    /// Salt for KV cache key hashing (for per-request cache isolation).
+    #[serde(default)]
+    pub cache_salt: Option<String>,
+}
+
+impl ChatCompletionRequest {
+    /// Effective max tokens, preferring `max_completion_tokens` over `max_tokens`.
+    pub fn effective_max_tokens(&self) -> usize {
+        self.max_completion_tokens.unwrap_or(self.max_tokens)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +447,12 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// Per-token logprobs for the prompt (when prompt_logprobs is requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<Vec<Option<HashMap<String, f32>>>>,
+    /// Prompt token IDs (included when return_tokens_as_token_ids is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -314,7 +461,11 @@ pub struct ChatCompletionChoice {
     pub index: u32,
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 /// Log probabilities for chat completion tokens, following OpenAI format.
@@ -351,11 +502,49 @@ pub struct ChatTopLogProb {
     pub bytes: Option<Vec<u8>>,
 }
 
+/// Content annotation (e.g., URL citations from web searches or file references).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Annotation {
+    /// Annotation type (e.g., "url_citation", "file_citation").
+    #[serde(rename = "type")]
+    pub annotation_type: String,
+    /// Start offset in the content string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<usize>,
+    /// End offset in the content string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_index: Option<usize>,
+    /// URL for URL citations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Title for URL citations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Audio content in a chat completion response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionAudio {
+    /// Unique identifier for this audio response.
+    pub id: String,
+    /// Base64-encoded audio data.
+    pub data: String,
+    /// Transcript of the audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    /// Duration of the audio in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChatMessageResponse {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Model-generated refusal message (safety filtering).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     /// Deprecated alias for backward compatibility with clients expecting `reasoning_content`.
@@ -363,6 +552,12 @@ pub struct ChatMessageResponse {
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Content annotations (e.g., URL citations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Vec<Annotation>>,
+    /// Audio response content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<ChatCompletionAudio>,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,7 +580,11 @@ pub struct ChatCompletionChunkChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatLogProbs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,11 +638,43 @@ pub struct ModelPermission {
 
 // ─── Common ───────────────────────────────────────────────────────────────
 
+/// Breakdown of prompt token usage.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PromptTokensDetails {
+    /// Number of prompt tokens that were served from the KV cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<usize>,
+}
+
+/// Breakdown of completion token usage.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CompletionTokensDetails {
+    /// Number of tokens used for chain-of-thought reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl Usage {
+    pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }
+    }
 }
 
 fn default_max_tokens() -> usize {
@@ -464,6 +695,10 @@ fn default_repetition_penalty() -> f32 {
 
 fn default_n() -> usize {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ─── Structured Output / Response Format ─────────────────────────────────
@@ -503,6 +738,60 @@ pub struct JsonSchemaSpec {
     /// Whether to enforce strict schema validation
     #[serde(default)]
     pub strict: bool,
+}
+
+/// Lower-level structured output constraints beyond response_format.
+/// At most one field should be set. These are mutually exclusive with
+/// `response_format` json_object/json_schema.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StructuredOutputs {
+    /// JSON schema string or object to constrain output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+    /// Regular expression pattern the output must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    /// List of allowed string choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Vec<String>>,
+    /// Context-free grammar in EBNF/GBNF format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+    /// Whether to constrain output to valid JSON object (no specific schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_object: Option<bool>,
+    /// Disable fallback to unconstrained generation on errors.
+    #[serde(default)]
+    pub disable_fallback: bool,
+    /// Disable flexible whitespace matching (for xgrammar/guidance backends).
+    #[serde(default)]
+    pub disable_any_whitespace: bool,
+    /// Custom whitespace pattern for the grammar backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whitespace_pattern: Option<String>,
+}
+
+impl StructuredOutputs {
+    /// Count how many mutually-exclusive constraint fields are set.
+    pub fn active_constraint_count(&self) -> usize {
+        let mut count = 0;
+        if self.json.is_some() {
+            count += 1;
+        }
+        if self.regex.is_some() {
+            count += 1;
+        }
+        if self.choice.is_some() {
+            count += 1;
+        }
+        if self.grammar.is_some() {
+            count += 1;
+        }
+        if self.json_object == Some(true) {
+            count += 1;
+        }
+        count
+    }
 }
 
 pub fn finish_reason_str(reason: &vllm_core::request::FinishReason) -> String {
@@ -609,10 +898,12 @@ mod tests {
     fn stream_options_serialize_roundtrip() {
         let opts = StreamOptions {
             include_usage: true,
+            continuous_usage_stats: false,
         };
         let json = serde_json::to_string(&opts).unwrap();
         let parsed: StreamOptions = serde_json::from_str(&json).unwrap();
         assert!(parsed.include_usage);
+        assert!(!parsed.continuous_usage_stats);
     }
 
     // ─── ChatCompletionRequest stream_options parsing ────────────────────
@@ -756,11 +1047,7 @@ mod tests {
             model: "test-model".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
-            usage: Some(Usage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-            }),
+            usage: Some(Usage::new(10, 5)),
         };
         let json = serde_json::to_value(&chunk).unwrap();
         assert_eq!(json["usage"]["prompt_tokens"], 10);
@@ -783,7 +1070,9 @@ mod tests {
                 text: "hello".to_string(),
                 index: 0,
                 finish_reason: None,
+                stop_reason: None,
                 logprobs: None,
+                token_ids: None,
             }],
             usage: None,
         };
@@ -800,11 +1089,7 @@ mod tests {
             model: "test-model".into(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
-            usage: Some(Usage {
-                prompt_tokens: 8,
-                completion_tokens: 3,
-                total_tokens: 11,
-            }),
+            usage: Some(Usage::new(8, 3)),
         };
         let json = serde_json::to_value(&chunk).unwrap();
         assert_eq!(json["usage"]["prompt_tokens"], 8);
@@ -820,7 +1105,9 @@ mod tests {
             text: "hello".to_string(),
             index: 0,
             finish_reason: None,
+            stop_reason: None,
             logprobs: None,
+            token_ids: None,
         };
         let json = serde_json::to_value(&choice).unwrap();
         assert!(json.get("logprobs").is_none());
@@ -836,12 +1123,14 @@ mod tests {
             text: "hello".to_string(),
             index: 0,
             finish_reason: None,
+            stop_reason: None,
             logprobs: Some(CompletionLogProbs {
                 text_offset: vec![0],
                 token_logprobs: vec![Some(-0.5)],
                 tokens: vec!["hello".to_string()],
                 top_logprobs: vec![Some(top)],
             }),
+            token_ids: None,
         };
         let json = serde_json::to_value(&choice).unwrap();
         let lp = &json["logprobs"];
@@ -863,7 +1152,9 @@ mod tests {
             },
             index: 0,
             finish_reason: None,
+            stop_reason: None,
             logprobs: None,
+            token_ids: None,
         };
         let json = serde_json::to_value(&choice).unwrap();
         assert!(json.get("logprobs").is_none());
@@ -880,6 +1171,7 @@ mod tests {
             },
             index: 0,
             finish_reason: None,
+            stop_reason: None,
             logprobs: Some(ChatLogProbs {
                 content: vec![ChatLogProbToken {
                     token: "hello".to_string(),
@@ -892,6 +1184,7 @@ mod tests {
                     }]),
                 }],
             }),
+            token_ids: None,
         };
         let json = serde_json::to_value(&choice).unwrap();
         let lp = &json["logprobs"];
@@ -956,15 +1249,45 @@ mod tests {
 
     #[test]
     fn usage_serialization() {
-        let usage = Usage {
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            total_tokens: 30,
-        };
+        let usage = Usage::new(10, 20);
         let json = serde_json::to_value(&usage).unwrap();
         assert_eq!(json["prompt_tokens"], 10);
         assert_eq!(json["completion_tokens"], 20);
         assert_eq!(json["total_tokens"], 30);
+        // Details omitted when None
+        assert!(json.get("prompt_tokens_details").is_none());
+        assert!(json.get("completion_tokens_details").is_none());
+    }
+
+    #[test]
+    fn usage_with_details_serialization() {
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(80),
+            }),
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(30),
+            }),
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["prompt_tokens"], 100);
+        assert_eq!(json["completion_tokens"], 50);
+        assert_eq!(json["total_tokens"], 150);
+        assert_eq!(json["prompt_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(json["completion_tokens_details"]["reasoning_tokens"], 30);
+    }
+
+    #[test]
+    fn usage_new_constructor() {
+        let usage = Usage::new(10, 5);
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+        assert!(usage.prompt_tokens_details.is_none());
+        assert!(usage.completion_tokens_details.is_none());
     }
 
     // ─── ChatCompletionResponse format ───────────────────────────────────
@@ -981,20 +1304,23 @@ mod tests {
                 message: ChatMessageResponse {
                     role: "assistant".to_string(),
                     content: Some("Hello!".to_string()),
+                    refusal: None,
                     reasoning: None,
                     reasoning_content: None,
                     tool_calls: None,
+                    annotations: None,
+                    audio: None,
                 },
                 index: 0,
                 finish_reason: Some("stop".to_string()),
+                stop_reason: None,
                 logprobs: None,
+                token_ids: None,
             }],
-            usage: Usage {
-                prompt_tokens: 5,
-                completion_tokens: 1,
-                total_tokens: 6,
-            },
+            usage: Usage::new(5, 1),
             service_tier: None,
+            prompt_logprobs: None,
+            prompt_token_ids: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["usage"]["prompt_tokens"], 5);
@@ -1016,13 +1342,14 @@ mod tests {
                 text: "world".to_string(),
                 index: 0,
                 finish_reason: Some("length".to_string()),
+                stop_reason: None,
                 logprobs: None,
+                token_ids: None,
             }],
-            usage: Usage {
-                prompt_tokens: 3,
-                completion_tokens: 2,
-                total_tokens: 5,
-            },
+            usage: Usage::new(3, 2),
+            service_tier: None,
+            prompt_logprobs: None,
+            prompt_token_ids: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["usage"]["prompt_tokens"], 3);
@@ -1413,11 +1740,10 @@ mod tests {
             model: "m".to_string(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            },
+            usage: Usage::new(0, 0),
+            service_tier: None,
+            prompt_logprobs: None,
+            prompt_token_ids: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         let fp = json["system_fingerprint"].as_str().unwrap();
@@ -1433,12 +1759,10 @@ mod tests {
             model: "m".to_string(),
             system_fingerprint: system_fingerprint(),
             choices: vec![],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            },
+            usage: Usage::new(0, 0),
             service_tier: None,
+            prompt_logprobs: None,
+            prompt_token_ids: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         let fp = json["system_fingerprint"].as_str().unwrap();
@@ -1618,13 +1942,19 @@ mod tests {
         let msg = ChatMessageResponse {
             role: "assistant".to_string(),
             content: Some("Hello".to_string()),
+            refusal: None,
             reasoning: None,
             reasoning_content: None,
             tool_calls: None,
+            annotations: None,
+            audio: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert!(json.get("reasoning").is_none());
         assert!(json.get("reasoning_content").is_none());
+        assert!(json.get("refusal").is_none());
+        assert!(json.get("annotations").is_none());
+        assert!(json.get("audio").is_none());
     }
 
     #[test]
@@ -1632,9 +1962,12 @@ mod tests {
         let msg = ChatMessageResponse {
             role: "assistant".to_string(),
             content: Some("42".to_string()),
+            refusal: None,
             reasoning: Some("Let me think...".to_string()),
             reasoning_content: Some("Let me think...".to_string()),
             tool_calls: None,
+            annotations: None,
+            audio: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["reasoning"], "Let me think...");
@@ -1698,5 +2031,155 @@ mod tests {
             req.messages[0].reasoning.as_deref(),
             Some("I think so")
         );
+    }
+
+    // ─── New API fields (max_completion_tokens, parallel_tool_calls, etc.) ──
+
+    #[test]
+    fn chat_request_max_completion_tokens_overrides_max_tokens() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 100,
+            "max_completion_tokens": 200
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, 100);
+        assert_eq!(req.max_completion_tokens, Some(200));
+        assert_eq!(req.effective_max_tokens(), 200);
+    }
+
+    #[test]
+    fn chat_request_max_completion_tokens_absent_uses_max_tokens() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 150
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_completion_tokens, None);
+        assert_eq!(req.effective_max_tokens(), 150);
+    }
+
+    #[test]
+    fn chat_request_parallel_tool_calls() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "parallel_tool_calls": false
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn chat_request_store_field() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "store": true
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.store, Some(true));
+    }
+
+    #[test]
+    fn chat_request_new_fields_default_to_none() {
+        let json = r#"{
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.max_completion_tokens.is_none());
+        assert!(req.parallel_tool_calls.is_none());
+        assert!(req.store.is_none());
+        assert!(req.suffix.is_none());
+    }
+
+    #[test]
+    fn completion_request_suffix() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "hello",
+            "suffix": " world"
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.suffix.as_deref(), Some(" world"));
+    }
+
+    #[test]
+    fn completion_request_suffix_defaults_to_none() {
+        let json = r#"{
+            "model": "test-model",
+            "prompt": "hello"
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.suffix.is_none());
+    }
+
+    // ─── ChatMessageResponse new fields (annotations, audio, refusal) ────
+
+    #[test]
+    fn chat_message_response_with_annotations() {
+        let msg = ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: Some("See [1] for details.".to_string()),
+            refusal: None,
+            reasoning: None,
+            reasoning_content: None,
+            tool_calls: None,
+            annotations: Some(vec![Annotation {
+                annotation_type: "url_citation".to_string(),
+                start_index: Some(4),
+                end_index: Some(7),
+                url: Some("https://example.com".to_string()),
+                title: Some("Example".to_string()),
+            }]),
+            audio: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json["annotations"].is_array());
+        assert_eq!(json["annotations"][0]["type"], "url_citation");
+        assert_eq!(json["annotations"][0]["start_index"], 4);
+        assert_eq!(json["annotations"][0]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn chat_message_response_with_audio() {
+        let msg = ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: None,
+            refusal: None,
+            reasoning: None,
+            reasoning_content: None,
+            tool_calls: None,
+            annotations: None,
+            audio: Some(ChatCompletionAudio {
+                id: "audio_123".to_string(),
+                data: "base64data".to_string(),
+                transcript: Some("Hello there".to_string()),
+                expires_at: Some(1234567890),
+            }),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["audio"]["id"], "audio_123");
+        assert_eq!(json["audio"]["transcript"], "Hello there");
+    }
+
+    #[test]
+    fn chat_message_response_with_refusal() {
+        let msg = ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: None,
+            refusal: Some("I cannot help with that.".to_string()),
+            reasoning: None,
+            reasoning_content: None,
+            tool_calls: None,
+            annotations: None,
+            audio: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["refusal"], "I cannot help with that.");
+        assert!(json.get("content").is_none());
     }
 }

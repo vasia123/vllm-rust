@@ -99,6 +99,7 @@ pub async fn create_response(
                 eos_token_id: Some(state.eos_token_id),
                 banned_token_ids: None,
                 allowed_token_ids: None,
+                bad_words_token_ids: None,
             },
             stop_strings: req.stop,
             stop_token_ids: Vec::new(),
@@ -171,6 +172,7 @@ pub async fn create_response(
                 eos_token_id: Some(state.eos_token_id),
                 banned_token_ids: None,
                 allowed_token_ids: None,
+                bad_words_token_ids: None,
             },
             stop_strings: req.stop,
             stop_token_ids: Vec::new(),
@@ -236,6 +238,13 @@ pub async fn create_response(
             prometheus::observe_tps(completion_tokens as f64 / elapsed);
         }
         prometheus::inc_requests_success();
+
+        // Store completed response for retrieval via GET /v1/responses/{id}
+        state
+            .response_store
+            .write()
+            .await
+            .insert(response.id.clone(), response.clone());
 
         Ok(Json(response).into_response())
     }

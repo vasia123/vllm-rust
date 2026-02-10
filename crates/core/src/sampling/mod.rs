@@ -15,7 +15,7 @@ pub use constraint::{ChoiceConstraint, JsonSchemaConstraint, RegexConstraint, Sa
 pub use logits_processor::{
     AllowedTokenIdsProcessor, BadWordsProcessor, FrequencyPresencePenaltyProcessor,
     LogitBiasProcessor, LogitsProcessor, LogitsProcessorPipeline, MinTokensProcessor,
-    RepetitionPenaltyProcessor,
+    NoBadWordsProcessor, RepetitionPenaltyProcessor,
 };
 
 use rand::rngs::StdRng;
@@ -72,6 +72,10 @@ pub struct SamplingParams {
     /// If set, only these token IDs are allowed in generation. All other
     /// tokens will have their logits set to -inf.
     pub allowed_token_ids: Option<Vec<u32>>,
+    /// Bad words as token ID sequences. Each inner Vec is a token sequence;
+    /// single-token sequences are banned unconditionally, multi-token sequences
+    /// ban the last token only when generated tokens end with the prefix.
+    pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
 }
 
 impl Default for SamplingParams {
@@ -91,6 +95,7 @@ impl Default for SamplingParams {
             eos_token_id: None,
             banned_token_ids: None,
             allowed_token_ids: None,
+            bad_words_token_ids: None,
         }
     }
 }
@@ -206,6 +211,11 @@ pub fn sample_n(
     if let Some(ref allowed) = params.allowed_token_ids {
         if !allowed.is_empty() {
             apply_allowed_tokens(&mut logits, allowed);
+        }
+    }
+    if let Some(ref bad_words) = params.bad_words_token_ids {
+        if !bad_words.is_empty() {
+            apply_bad_words(&mut logits, bad_words, generated_tokens);
         }
     }
     if params.min_tokens > 0 {
@@ -331,6 +341,13 @@ pub fn sample(
     if let Some(ref allowed) = params.allowed_token_ids {
         if !allowed.is_empty() {
             apply_allowed_tokens(&mut logits, allowed);
+        }
+    }
+
+    // Step 1e2: Apply bad words (multi-token sequence banning)
+    if let Some(ref bad_words) = params.bad_words_token_ids {
+        if !bad_words.is_empty() {
+            apply_bad_words(&mut logits, bad_words, generated_tokens);
         }
     }
 
@@ -498,6 +515,33 @@ fn apply_allowed_tokens(logits: &mut [f32], allowed: &[u32]) {
     for (idx, logit) in logits.iter_mut().enumerate() {
         if !allowed.contains(&(idx as u32)) {
             *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn apply_bad_words(logits: &mut [f32], bad_words: &[Vec<u32>], generated_tokens: &[u32]) {
+    for word_ids in bad_words {
+        if word_ids.is_empty() {
+            continue;
+        }
+        if word_ids.len() == 1 {
+            let idx = word_ids[0] as usize;
+            if idx < logits.len() {
+                logits[idx] = f32::NEG_INFINITY;
+            }
+            continue;
+        }
+        let prefix_len = word_ids.len() - 1;
+        if prefix_len > generated_tokens.len() {
+            continue;
+        }
+        let actual_prefix = &generated_tokens[generated_tokens.len() - prefix_len..];
+        let expected_prefix = &word_ids[..prefix_len];
+        if actual_prefix == expected_prefix {
+            let last_token = *word_ids.last().unwrap() as usize;
+            if last_token < logits.len() {
+                logits[last_token] = f32::NEG_INFINITY;
+            }
         }
     }
 }
@@ -1902,5 +1946,52 @@ mod tests {
         assert_eq!(logits[0], 1.0);
         assert_eq!(logits[1], 2.0);
         assert_eq!(logits[2], 3.0);
+    }
+
+    #[test]
+    fn apply_bad_words_single_token() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        apply_bad_words(&mut logits, &[vec![1], vec![3]], &[]);
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], 3.0);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn apply_bad_words_multi_token_match() {
+        let mut logits = vec![0.0; 10];
+        logits[7] = 5.0;
+        // Bad word [5, 6, 7]: prefix [5, 6] matches tail of generated
+        apply_bad_words(&mut logits, &[vec![5, 6, 7]], &[1, 2, 5, 6]);
+        assert_eq!(logits[7], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn apply_bad_words_multi_token_no_match() {
+        let mut logits = vec![0.0; 10];
+        logits[7] = 5.0;
+        // Bad word [5, 6, 7]: prefix [5, 6] does NOT match tail of generated
+        apply_bad_words(&mut logits, &[vec![5, 6, 7]], &[1, 2, 5, 9]);
+        assert_eq!(logits[7], 5.0);
+    }
+
+    #[test]
+    fn sample_with_bad_words_token_ids() {
+        let params = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![1], vec![2, 3]]),
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(None);
+
+        // Token 1 should be unconditionally banned
+        let logits = vec![0.0, 100.0, 0.0, 0.0];
+        let result = sample(&logits, &params, &[], &mut state, None);
+        assert_ne!(result.token_id, 1);
+
+        // Token 3 should be banned when last generated token is 2
+        let logits = vec![0.0, 0.0, 0.0, 100.0];
+        let result = sample(&logits, &params, &[2], &mut state, None);
+        assert_ne!(result.token_id, 3);
     }
 }

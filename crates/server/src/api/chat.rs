@@ -12,7 +12,7 @@ use vllm_core::sampling::{
     BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
 };
 use vllm_core::tokenizer::{MessageContent, TokenizerWrapper};
-use vllm_core::tool_parser::ToolCallParser;
+
 
 use super::admin::prometheus;
 use super::error::ApiError;
@@ -64,9 +64,10 @@ pub async fn create_chat_completion(
         .map_err(|e| ApiError::TemplateError(e.to_string()))?;
 
     // Early-fail: reject prompts that are clearly too long before tokenizing
+    let max_tokens = req.effective_max_tokens();
     super::validation::validate_prompt_char_length(
         prompt.len(),
-        req.max_tokens,
+        max_tokens,
         state.max_model_len,
         state.tokenizer.max_chars_per_token(),
     )?;
@@ -95,6 +96,11 @@ pub async fn create_chat_completion(
             .collect::<Vec<_>>()
     });
 
+    // Tokenize bad_words strings into token ID sequences
+    let bad_words_token_ids = req.bad_words.as_ref().map(|words| {
+        super::tokenize_bad_words(words, &state.tokenizer)
+    });
+
     if req.stream {
         // Streaming only supports n=1
         if req.n > 1 {
@@ -108,7 +114,7 @@ pub async fn create_chat_completion(
 
         let gen_req = GenerationRequest {
             prompt: prompt.clone(),
-            max_new_tokens: req.max_tokens,
+            max_new_tokens: max_tokens,
             eos_token_id: state.eos_token_id,
             sampling_params: SamplingParams {
                 temperature: req.temperature,
@@ -125,6 +131,7 @@ pub async fn create_chat_completion(
                 eos_token_id: Some(state.eos_token_id),
                 banned_token_ids: req.banned_token_ids.clone(),
                 allowed_token_ids: req.allowed_token_ids.clone(),
+                bad_words_token_ids: bad_words_token_ids.clone(),
             },
             stop_strings: req.stop,
             stop_token_ids: req.stop_token_ids,
@@ -137,11 +144,11 @@ pub async fn create_chat_completion(
         };
 
         // Compute prompt tokens for streaming usage reporting
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .is_some_and(|opts| opts.include_usage);
-        let prompt_tokens = if include_usage {
+        let stream_opts_ref = req.stream_options.as_ref();
+        let include_usage = stream_opts_ref.is_some_and(|opts| opts.include_usage);
+        let continuous_usage_stats =
+            stream_opts_ref.is_some_and(|opts| opts.continuous_usage_stats);
+        let prompt_tokens = if include_usage || continuous_usage_stats {
             state
                 .tokenizer
                 .encode(&prompt)
@@ -165,6 +172,7 @@ pub async fn create_chat_completion(
         let include_logprobs = logprobs_count.is_some();
         let streaming_opts = StreamingOptions {
             include_usage,
+            continuous_usage_stats,
             prompt_tokens,
             include_logprobs,
             tokenizer: if include_logprobs {
@@ -172,6 +180,7 @@ pub async fn create_chat_completion(
             } else {
                 None
             },
+            return_token_ids: req.return_tokens_as_token_ids.unwrap_or(false),
         };
         Ok(
             chat_completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)
@@ -211,7 +220,7 @@ pub async fn create_chat_completion(
 
             let iter_gen_req = GenerationRequest {
                 prompt: prompt.clone(),
-                max_new_tokens: req.max_tokens,
+                max_new_tokens: max_tokens,
                 eos_token_id: state.eos_token_id,
                 sampling_params: SamplingParams {
                     temperature: req.temperature,
@@ -228,6 +237,7 @@ pub async fn create_chat_completion(
                     eos_token_id: Some(state.eos_token_id),
                     banned_token_ids: req.banned_token_ids.clone(),
                     allowed_token_ids: req.allowed_token_ids.clone(),
+                    bad_words_token_ids: bad_words_token_ids.clone(),
                 },
                 stop_strings: req.stop.clone(),
                 stop_token_ids: req.stop_token_ids.clone(),
@@ -309,13 +319,18 @@ pub async fn create_chat_completion(
                 message: ChatMessageResponse {
                     role: "assistant".to_string(),
                     content,
+                    refusal: None,
                     reasoning: None,
                     reasoning_content: None,
                     tool_calls,
+                    annotations: None,
+                    audio: None,
                 },
                 index: i as u32,
                 finish_reason: Some(finish_reason),
+                stop_reason: None,
                 logprobs,
+                token_ids: None,
             });
         }
 
@@ -326,12 +341,10 @@ pub async fn create_chat_completion(
             model: state.model_id.clone(),
             system_fingerprint: system_fingerprint(),
             choices,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens: total_completion_tokens,
-                total_tokens: prompt_tokens + total_completion_tokens,
-            },
+            usage: Usage::new(prompt_tokens, total_completion_tokens),
             service_tier: req.service_tier.clone(),
+            prompt_logprobs: None,
+            prompt_token_ids: None,
         };
 
         // Record metrics
@@ -527,6 +540,50 @@ fn parse_image_url(url: &str) -> Result<ImageData, ApiError> {
         // Regular URL - store for later fetching by the multimodal processor
         Ok(ImageData::url(url))
     }
+}
+
+// ─── Render endpoint ────────────────────────────────────────────────
+
+/// Response type for the render endpoint.
+#[derive(Debug, serde::Serialize)]
+pub struct RenderResponse {
+    /// The rendered prompt text after template application.
+    pub prompt: String,
+    /// Token IDs after tokenization.
+    pub token_ids: Vec<u32>,
+    /// Number of prompt tokens.
+    pub num_tokens: usize,
+}
+
+/// Render a chat completion request: apply the chat template and tokenize,
+/// but don't generate. Useful for debugging and validation.
+pub async fn render_chat_completion(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let chat_template = state.chat_template.as_ref().ok_or_else(|| {
+        ApiError::TemplateError("no chat template available".to_string())
+    })?;
+
+    let mut messages = req.messages.clone();
+    super::response_format::inject_json_system_prompt(&mut messages, req.response_format.as_ref());
+
+    let prompt = chat_template
+        .apply_with_tools(&messages, req.tools.as_deref(), true)
+        .map_err(|e| ApiError::TemplateError(e.to_string()))?;
+
+    let token_ids = state
+        .tokenizer
+        .encode(&prompt)
+        .map_err(|e| ApiError::InvalidRequest(format!("tokenization failed: {e}")))?;
+
+    let num_tokens = token_ids.len();
+
+    Ok(Json(RenderResponse {
+        prompt,
+        token_ids,
+        num_tokens,
+    }))
 }
 
 #[cfg(test)]

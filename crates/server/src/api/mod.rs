@@ -13,15 +13,25 @@ pub mod tokenize;
 pub mod types;
 pub mod validation;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use vllm_core::lora::LoraRequest;
 use vllm_core::tokenizer::{ChatTemplateEngine, TokenizerWrapper};
 use vllm_core::tool_parser::ToolCallParser;
+
+use responses_types::ResponsesResponse;
+
+/// Default maximum request body size: 32 MiB.
+const DEFAULT_MAX_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 pub use admin::restart::{
     AtomicEngineHandle, EngineBuilder, EngineController, ProductionEngineBuilder,
@@ -40,9 +50,18 @@ pub struct AppState {
     pub tool_call_parser: Arc<dyn ToolCallParser>,
     /// Whether the server is accepting new requests.
     accepting: Arc<AtomicBool>,
+    /// Count of in-flight GPU requests (for /load endpoint).
+    server_load: Arc<AtomicUsize>,
+    /// Registry of dynamically loaded LoRA adapters (name → request).
+    lora_adapters: Arc<RwLock<HashMap<String, LoraRequest>>>,
+    /// Monotonically increasing ID counter for LoRA adapters.
+    next_lora_id: Arc<AtomicUsize>,
+    /// In-memory store for completed Responses API objects (response_id → response).
+    pub response_store: Arc<RwLock<HashMap<String, ResponsesResponse>>>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: AtomicEngineHandle,
         model_id: String,
@@ -62,18 +81,38 @@ impl AppState {
             max_model_len,
             tool_call_parser,
             accepting,
+            server_load: Arc::new(AtomicUsize::new(0)),
+            lora_adapters: Arc::new(RwLock::new(HashMap::new())),
+            next_lora_id: Arc::new(AtomicUsize::new(1)),
+            response_store: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn accepting_requests(&self) -> bool {
         self.accepting.load(Ordering::SeqCst)
     }
+
+    /// Increment the in-flight GPU request counter.
+    pub fn increment_load(&self) {
+        self.server_load.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the in-flight GPU request counter.
+    pub fn decrement_load(&self) {
+        self.server_load.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Current number of in-flight GPU requests.
+    pub fn current_load(&self) -> usize {
+        self.server_load.load(Ordering::Relaxed)
+    }
 }
 
 /// Create a tool call parser by name.
 ///
 /// Supported names: `hermes`, `glm4`, `json`, `llama`, `mistral`, `deepseek_v3`,
-/// `internlm2`, `jamba`, `pythonic`, `granite`, `granite-20b-fc`.
+/// `deepseek_v31`, `internlm2`, `jamba`, `pythonic`, `granite`, `granite-20b-fc`,
+/// `kimi_k2`, `phi4mini`, `longcat`, `xlam`.
 /// Defaults to `hermes` for unknown names.
 pub fn create_tool_call_parser(name: &str) -> Arc<dyn ToolCallParser> {
     use vllm_core::tool_parser::*;
@@ -85,11 +124,24 @@ pub fn create_tool_call_parser(name: &str) -> Arc<dyn ToolCallParser> {
         "llama" => Arc::new(LlamaToolParser::new()),
         "mistral" => Arc::new(MistralToolParser::new()),
         "deepseek_v3" => Arc::new(DeepSeekV3ToolParser::new()),
+        "deepseek_v31" => Arc::new(DeepSeekV31ToolParser::new()),
         "internlm" | "internlm2" => Arc::new(InternLm2ToolParser::new()),
         "jamba" => Arc::new(JambaToolParser::new()),
         "pythonic" => Arc::new(PythonicToolParser::new()),
         "granite" => Arc::new(GraniteToolParser::new()),
         "granite-20b-fc" => Arc::new(Granite20bFCToolParser::new()),
+        "kimi_k2" | "kimi-k2" => Arc::new(KimiK2ToolParser::new()),
+        "phi4mini" | "phi4_mini_json" => Arc::new(Phi4MiniToolParser::new()),
+        "longcat" => Arc::new(LongcatToolParser::new()),
+        "xlam" => Arc::new(XLamToolParser::new()),
+        "gigachat3" | "gigachat" => Arc::new(GigaChat3ToolParser::new()),
+        "functiongemma" | "function_gemma" => Arc::new(FunctionGemmaToolParser::new()),
+        "hunyuan" | "hunyuan_a13b" => Arc::new(HunyuanToolParser::new()),
+        "ernie45" | "ernie_45" | "ernie-4.5" => Arc::new(Ernie45ToolParser::new()),
+        "seed_oss" | "seed-oss" => Arc::new(SeedOssToolParser::new()),
+        "deepseek_v32" => Arc::new(DeepSeekV32ToolParser::new()),
+        "step3" | "step3p5" | "step-3" | "step-3.5" => Arc::new(Step3ToolParser::new()),
+        "qwen3coder" | "qwen3_coder" => Arc::new(Qwen3CoderToolParser::new()),
         unknown => {
             tracing::warn!("Unknown tool call parser '{unknown}', defaulting to hermes");
             Arc::new(HermesToolParser::new())
@@ -186,6 +238,254 @@ pub fn build_cors_layer(config: &CorsConfig) -> CorsLayer {
     layer
 }
 
+// ─── Root-level health and version endpoints ───────────────────────────────
+
+/// Simple health check for load balancers and orchestration systems.
+/// Returns 200 if the server is accepting requests, 503 otherwise.
+async fn health_check(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> StatusCode {
+    if state.accepting_requests() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// Server version information.
+#[derive(Serialize)]
+struct VersionInfo {
+    version: &'static str,
+}
+
+async fn version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+/// GET /server_info — Server configuration and environment information.
+#[derive(Serialize)]
+struct ServerInfo {
+    version: &'static str,
+    model_id: String,
+    max_model_len: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template: Option<String>,
+    accepting_requests: bool,
+    server_load: usize,
+}
+
+async fn server_info(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<ServerInfo> {
+    let chat_template = state
+        .chat_template
+        .as_ref()
+        .map(|ct| ct.raw_template().to_string());
+
+    Json(ServerInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        model_id: state.model_id.clone(),
+        max_model_len: state.max_model_len,
+        chat_template,
+        accepting_requests: state.accepting_requests(),
+        server_load: state.current_load(),
+    })
+}
+
+/// Server load metrics (count of in-flight GPU requests).
+#[derive(Serialize)]
+struct ServerLoadMetrics {
+    server_load: usize,
+}
+
+async fn get_server_load(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<ServerLoadMetrics> {
+    Json(ServerLoadMetrics {
+        server_load: state.current_load(),
+    })
+}
+
+/// Request to load a LoRA adapter dynamically.
+#[derive(Debug, Deserialize)]
+pub struct LoadLoRAAdapterRequest {
+    pub lora_name: String,
+    pub lora_path: String,
+    #[serde(default)]
+    pub load_inplace: bool,
+}
+
+/// Request to unload a LoRA adapter.
+#[derive(Debug, Deserialize)]
+pub struct UnloadLoRAAdapterRequest {
+    pub lora_name: String,
+    #[serde(default)]
+    pub lora_int_id: Option<u32>,
+}
+
+/// POST /v1/load_lora_adapter — Load a LoRA adapter at runtime.
+async fn load_lora_adapter(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(req): Json<LoadLoRAAdapterRequest>,
+) -> Result<String, error::ApiError> {
+    if req.lora_name.is_empty() {
+        return Err(error::ApiError::InvalidRequest(
+            "lora_name is required".to_string(),
+        ));
+    }
+    if req.lora_path.is_empty() {
+        return Err(error::ApiError::InvalidRequest(
+            "lora_path is required".to_string(),
+        ));
+    }
+
+    let mut adapters = state.lora_adapters.write().await;
+    if !req.load_inplace && adapters.contains_key(&req.lora_name) {
+        return Err(error::ApiError::InvalidRequest(format!(
+            "LoRA adapter '{}' is already loaded. Use load_inplace=true to reload.",
+            req.lora_name
+        )));
+    }
+
+    let lora_id = state.next_lora_id.fetch_add(1, Ordering::Relaxed) as u32;
+    let lora_request = LoraRequest::new(req.lora_name.clone(), lora_id, req.lora_path);
+    adapters.insert(req.lora_name.clone(), lora_request);
+
+    Ok(format!(
+        "Success: LoRA adapter '{}' added successfully.",
+        req.lora_name
+    ))
+}
+
+/// POST /v1/unload_lora_adapter — Unload a LoRA adapter.
+async fn unload_lora_adapter(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(req): Json<UnloadLoRAAdapterRequest>,
+) -> Result<String, error::ApiError> {
+    if req.lora_name.is_empty() {
+        return Err(error::ApiError::InvalidRequest(
+            "lora_name is required".to_string(),
+        ));
+    }
+
+    let mut adapters = state.lora_adapters.write().await;
+    if adapters.remove(&req.lora_name).is_none() {
+        return Err(error::ApiError::InvalidRequest(format!(
+            "LoRA adapter '{}' is not loaded.",
+            req.lora_name
+        )));
+    }
+
+    Ok(format!(
+        "Success: LoRA adapter '{}' removed successfully.",
+        req.lora_name
+    ))
+}
+
+/// GET /v1/responses/{response_id} — Retrieve a stored response object.
+async fn get_response(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(response_id): axum::extract::Path<String>,
+) -> Result<Json<ResponsesResponse>, error::ApiError> {
+    let store = state.response_store.read().await;
+    match store.get(&response_id) {
+        Some(resp) => Ok(Json(resp.clone())),
+        None => Err(error::ApiError::InvalidRequest(format!(
+            "Response '{}' not found",
+            response_id,
+        ))),
+    }
+}
+
+/// POST /v1/responses/{response_id}/cancel — Cancel a response.
+///
+/// For completed/failed responses, this returns the response unchanged.
+/// For in-progress responses, this would cancel generation (currently a no-op
+/// since we store responses only after completion).
+async fn cancel_response(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(response_id): axum::extract::Path<String>,
+) -> Result<Json<ResponsesResponse>, error::ApiError> {
+    let mut store = state.response_store.write().await;
+    match store.get_mut(&response_id) {
+        Some(resp) => {
+            // Only cancel if still in progress
+            if resp.status == responses_types::ResponseStatus::InProgress {
+                resp.status = responses_types::ResponseStatus::Cancelled;
+            }
+            Ok(Json(resp.clone()))
+        }
+        None => Err(error::ApiError::InvalidRequest(format!(
+            "Response '{}' not found",
+            response_id,
+        ))),
+    }
+}
+
+/// GET /metrics — Prometheus-format metrics scraping endpoint.
+async fn prometheus_metrics() -> Result<axum::response::Response, error::ApiError> {
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::IntoResponse;
+
+    use ::prometheus::Encoder;
+    let encoder = ::prometheus::TextEncoder::new();
+    let metric_families = ::prometheus::gather();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|e| error::ApiError::InternalError(format!("Failed to encode metrics: {}", e)))?;
+
+    Ok((
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        buffer,
+    )
+        .into_response())
+}
+
+/// Tokenize bad_words strings into token ID sequences for the `NoBadWordsProcessor`.
+///
+/// Each bad word is tokenized both with and without a leading space (to handle
+/// prefix-space tokenization variants). Multi-token sequences only ban the last
+/// token when the prefix matches generated output.
+pub fn tokenize_bad_words(
+    bad_words: &[String],
+    tokenizer: &TokenizerWrapper,
+) -> Vec<Vec<u32>> {
+    let mut result: Vec<Vec<u32>> = Vec::new();
+
+    for word in bad_words {
+        let stripped = word.trim_start();
+        if stripped.is_empty() {
+            continue;
+        }
+
+        // Tokenize without prefix space
+        if let Ok(ids) = tokenizer.encode(stripped) {
+            if !ids.is_empty() {
+                result.push(ids);
+            }
+        }
+
+        // Tokenize with prefix space (captures tokenizers that use add_prefix_space)
+        let with_space = format!(" {stripped}");
+        if let Ok(ids) = tokenizer.encode(&with_space) {
+            if !ids.is_empty() {
+                // Only add if it differs from the no-space variant
+                let dominated = result.last().is_none_or(|prev| {
+                    ids[0] != prev[0] && ids.len() == prev.len()
+                });
+                if dominated {
+                    result.push(ids);
+                }
+            }
+        }
+    }
+
+    result
+}
+
 pub fn create_router(state: AppState) -> Router {
     create_router_with_cors(state, CorsLayer::very_permissive())
 }
@@ -193,13 +493,43 @@ pub fn create_router(state: AppState) -> Router {
 pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
     let accepting = state.accepting.clone();
     Router::new()
+        .route("/health", get(health_check))
+        .route("/version", get(version))
+        .route("/load", get(get_server_load))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/server_info", get(server_info))
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
+        .route(
+            "/v1/completions/render",
+            post(completions::render_completion),
+        )
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .route(
+            "/v1/chat/completions/render",
+            post(chat::render_chat_completion),
+        )
         .route("/v1/responses", post(responses::create_response))
+        .route("/v1/responses/{response_id}", get(get_response))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(cancel_response),
+        )
         .route("/v1/embeddings", post(embeddings::create_embedding))
+        .route("/score", post(embeddings::score))
+        .route("/v1/score", post(embeddings::score))
+        .route("/rerank", post(embeddings::rerank))
+        .route("/v1/rerank", post(embeddings::rerank))
+        .route("/v2/rerank", post(embeddings::rerank))
+        .route("/pooling", post(embeddings::pooling))
+        .route("/v1/pooling", post(embeddings::pooling))
+        .route("/classify", post(embeddings::classify))
+        .route("/v1/classify", post(embeddings::classify))
+        .route("/v1/load_lora_adapter", post(load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))
+        .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
         .layer(axum::middleware::from_fn_with_state(
             accepting,
             middleware::reject_during_restart,
@@ -225,14 +555,63 @@ pub fn create_full_router_with_cors_and_rate_limit(
     cors: CorsLayer,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
+    create_full_router_with_options(
+        app_state,
+        admin_state,
+        cors,
+        rate_limit_state,
+        DEFAULT_MAX_BODY_SIZE,
+    )
+}
+
+/// Create the full router with all configurable options.
+pub fn create_full_router_with_options(
+    app_state: AppState,
+    admin_state: AdminState,
+    cors: CorsLayer,
+    rate_limit_state: middleware::RateLimitState,
+    max_body_size: usize,
+) -> Router {
     let accepting = app_state.accepting.clone();
     Router::new()
+        .route("/health", get(health_check))
+        .route("/version", get(version))
+        .route("/load", get(get_server_load))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/server_info", get(server_info))
         .route("/v1/models", get(models::list_models))
         .route("/v1/completions", post(completions::create_completion))
+        .route(
+            "/v1/completions/render",
+            post(completions::render_completion),
+        )
         .route("/v1/chat/completions", post(chat::create_chat_completion))
+        .route(
+            "/v1/chat/completions/render",
+            post(chat::render_chat_completion),
+        )
+        .route("/v1/responses", post(responses::create_response))
+        .route("/v1/responses/{response_id}", get(get_response))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(cancel_response),
+        )
         .route("/v1/embeddings", post(embeddings::create_embedding))
+        .route("/score", post(embeddings::score))
+        .route("/v1/score", post(embeddings::score))
+        .route("/rerank", post(embeddings::rerank))
+        .route("/v1/rerank", post(embeddings::rerank))
+        .route("/v2/rerank", post(embeddings::rerank))
+        .route("/pooling", post(embeddings::pooling))
+        .route("/v1/pooling", post(embeddings::pooling))
+        .route("/classify", post(embeddings::classify))
+        .route("/v1/classify", post(embeddings::classify))
+        .route("/v1/load_lora_adapter", post(load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))
+        .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
+        .layer(DefaultBodyLimit::max(max_body_size))
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state,
             middleware::rate_limit,
@@ -1180,6 +1559,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tokenizer_info_returns_metadata() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let req = Request::get("/tokenizer_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["tokenizer_class"], "PreTrainedTokenizerFast");
+        assert!(json["max_chars_per_token"].as_u64().unwrap() > 0);
+        assert!(json["model_max_length"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
     async fn completions_invalid_temperature() {
         let state = test_app_state();
         let app = create_router(state);
@@ -1506,12 +1906,37 @@ mod tests {
             "llama",
             "mistral",
             "deepseek_v3",
+            "deepseek_v31",
             "internlm",
             "internlm2",
             "jamba",
             "pythonic",
             "granite",
             "granite-20b-fc",
+            "kimi_k2",
+            "kimi-k2",
+            "phi4mini",
+            "phi4_mini_json",
+            "longcat",
+            "xlam",
+            "gigachat3",
+            "gigachat",
+            "functiongemma",
+            "function_gemma",
+            "hunyuan",
+            "hunyuan_a13b",
+            "ernie45",
+            "ernie_45",
+            "ernie-4.5",
+            "seed_oss",
+            "seed-oss",
+            "deepseek_v32",
+            "step3",
+            "step3p5",
+            "step-3",
+            "step-3.5",
+            "qwen3coder",
+            "qwen3_coder",
         ];
         for name in &known {
             let parser = create_tool_call_parser(name);
@@ -1530,5 +1955,336 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    // ─── Health and version endpoints ────────────────────────────────
+
+    #[tokio::test]
+    async fn health_returns_200_when_accepting() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_returns_503_when_not_accepting() {
+        let state = test_app_state();
+        state.accepting.store(false, Ordering::SeqCst);
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn version_returns_json() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/version")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["version"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn server_info_returns_model_metadata() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["version"].as_str().is_some());
+        assert!(json["model_id"].as_str().is_some());
+        assert!(json["max_model_len"].as_u64().is_some());
+        assert_eq!(json["accepting_requests"], true);
+    }
+
+    #[tokio::test]
+    async fn load_returns_zero_initially() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/load")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["server_load"], 0);
+    }
+
+    #[tokio::test]
+    async fn server_load_increment_decrement() {
+        let state = test_app_state();
+        assert_eq!(state.current_load(), 0);
+        state.increment_load();
+        state.increment_load();
+        assert_eq!(state.current_load(), 2);
+        state.decrement_load();
+        assert_eq!(state.current_load(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_succeeds() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let body = serde_json::json!({
+            "lora_name": "my-adapter",
+            "lora_path": "/path/to/adapter"
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/load_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("my-adapter"));
+        assert!(text.contains("added successfully"));
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_rejects_duplicate() {
+        let state = test_app_state();
+        // Pre-populate an adapter
+        state
+            .lora_adapters
+            .write()
+            .await
+            .insert("existing".into(), LoraRequest::new("existing".to_string(), 1, "/p".to_string()));
+        let router = create_router(state);
+        let body = serde_json::json!({
+            "lora_name": "existing",
+            "lora_path": "/other"
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/load_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unload_lora_adapter_succeeds() {
+        let state = test_app_state();
+        state
+            .lora_adapters
+            .write()
+            .await
+            .insert("my-adapter".into(), LoraRequest::new("my-adapter".to_string(), 1, "/p".to_string()));
+        let router = create_router(state);
+        let body = serde_json::json!({ "lora_name": "my-adapter" });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/unload_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unload_lora_adapter_not_found() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let body = serde_json::json!({ "lora_name": "nonexistent" });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/unload_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_response_retrieves_stored_response() {
+        let state = test_app_state();
+        // Pre-populate the response store
+        let resp = responses_types::ResponsesResponse {
+            id: "resp_test123456789012345678".to_string(),
+            object: "response",
+            created_at: 100,
+            model: "test-model".to_string(),
+            status: responses_types::ResponseStatus::Completed,
+            output: vec![],
+            usage: Some(responses_types::ResponseUsage {
+                input_tokens: 5,
+                output_tokens: 10,
+                total_tokens: 15,
+            }),
+            incomplete_details: None,
+            metadata: None,
+        };
+        state
+            .response_store
+            .write()
+            .await
+            .insert(resp.id.clone(), resp);
+
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/v1/responses/resp_test123456789012345678")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], "resp_test123456789012345678");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["usage"]["total_tokens"], 15);
+    }
+
+    #[tokio::test]
+    async fn get_response_not_found() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/v1/responses/resp_nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancel_response_completed_stays_completed() {
+        let state = test_app_state();
+        let resp = responses_types::ResponsesResponse {
+            id: "resp_cancel_test_completed1".to_string(),
+            object: "response",
+            created_at: 100,
+            model: "test-model".to_string(),
+            status: responses_types::ResponseStatus::Completed,
+            output: vec![],
+            usage: None,
+            incomplete_details: None,
+            metadata: None,
+        };
+        state
+            .response_store
+            .write()
+            .await
+            .insert(resp.id.clone(), resp);
+
+        let router = create_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses/resp_cancel_test_completed1/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Already completed — status should remain "completed"
+        assert_eq!(json["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn cancel_response_in_progress_becomes_cancelled() {
+        let state = test_app_state();
+        let resp = responses_types::ResponsesResponse {
+            id: "resp_cancel_inprogress_01".to_string(),
+            object: "response",
+            created_at: 100,
+            model: "test-model".to_string(),
+            status: responses_types::ResponseStatus::InProgress,
+            output: vec![],
+            usage: None,
+            incomplete_details: None,
+            metadata: None,
+        };
+        state
+            .response_store
+            .write()
+            .await
+            .insert(resp.id.clone(), resp);
+
+        let router = create_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses/resp_cancel_inprogress_01/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_response_not_found() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses/resp_nonexistent/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn metrics_returns_prometheus_format() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("text/plain"));
     }
 }
