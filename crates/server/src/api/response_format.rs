@@ -35,7 +35,7 @@ pub fn inject_json_system_prompt(
     response_format: Option<&ResponseFormat>,
 ) {
     let instruction = match response_format {
-        None | Some(ResponseFormat::Text) => return,
+        None | Some(ResponseFormat::Text) | Some(ResponseFormat::StructuralTag { .. }) => return,
         Some(ResponseFormat::JsonObject) => JSON_OBJECT_SYSTEM_PROMPT.to_string(),
         Some(ResponseFormat::JsonSchema { json_schema }) => {
             let mut instruction = String::from(
@@ -97,7 +97,7 @@ pub fn validate_response_format(
     response_format: Option<&ResponseFormat>,
 ) -> Result<(), ResponseFormatError> {
     match response_format {
-        None | Some(ResponseFormat::Text) => Ok(()),
+        None | Some(ResponseFormat::Text) | Some(ResponseFormat::StructuralTag { .. }) => Ok(()),
         Some(ResponseFormat::JsonObject) => validate_json_object(generated_text),
         Some(ResponseFormat::JsonSchema { json_schema }) => {
             // First validate it's valid JSON

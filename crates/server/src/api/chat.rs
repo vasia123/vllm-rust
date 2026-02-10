@@ -473,7 +473,7 @@ pub(crate) fn create_constraint_from_response_format(
     tokenizer: &Arc<TokenizerWrapper>,
 ) -> Option<Box<dyn SamplingConstraint>> {
     match response_format {
-        None | Some(ResponseFormat::Text) => None,
+        None | Some(ResponseFormat::Text) | Some(ResponseFormat::StructuralTag { .. }) => None,
         Some(ResponseFormat::JsonObject) => {
             // Basic JSON object constraint
             let schema = serde_json::json!({"type": "object"});

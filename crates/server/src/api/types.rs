@@ -86,6 +86,9 @@ pub struct CompletionRequest {
     pub stop_token_ids: Vec<u32>,
     #[serde(default)]
     pub include_stop_str_in_output: bool,
+    /// If true, continue generating past EOS tokens.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Number of top logprobs to return per token (None = no logprobs).
     #[serde(default)]
     pub logprobs: Option<u32>,
@@ -142,6 +145,12 @@ pub struct CompletionRequest {
     /// Whether to add BOS/special tokens to the prompt.
     #[serde(default = "default_true")]
     pub add_special_tokens: bool,
+    /// If true, special tokens (BOS, EOS, etc.) are excluded from detokenized output.
+    #[serde(default = "default_true")]
+    pub skip_special_tokens: bool,
+    /// If true, spaces are inserted between special tokens during detokenization.
+    #[serde(default = "default_true")]
+    pub spaces_between_special_tokens: bool,
     /// Number of prompt token logprobs to return. None = no prompt logprobs.
     #[serde(default)]
     pub prompt_logprobs: Option<u32>,
@@ -299,6 +308,9 @@ pub struct ChatCompletionRequest {
     pub stop_token_ids: Vec<u32>,
     #[serde(default)]
     pub include_stop_str_in_output: bool,
+    /// If true, continue generating past EOS tokens.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// Token logit bias: map of token ID (as string) to bias value (-100.0 to 100.0).
     #[serde(default)]
     pub logit_bias: Option<HashMap<String, f32>>,
@@ -359,6 +371,9 @@ pub struct ChatCompletionRequest {
     /// Reasoning effort level for models supporting chain-of-thought reasoning.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Whether to include reasoning/chain-of-thought content in the response.
+    #[serde(default = "default_true")]
+    pub include_reasoning: bool,
     /// Maximum number of tokens to generate (newer OpenAI name).
     /// When set, takes precedence over `max_tokens`.
     #[serde(default)]
@@ -395,6 +410,14 @@ pub struct ChatCompletionRequest {
     /// Documents for RAG-style models (each doc has title/text keys).
     #[serde(default)]
     pub documents: Option<Vec<HashMap<String, String>>>,
+
+    // ─── Detokenization control ───────────────────────────────────
+    /// If true, special tokens (BOS, EOS, etc.) are excluded from detokenized output.
+    #[serde(default = "default_true")]
+    pub skip_special_tokens: bool,
+    /// If true, spaces are inserted between special tokens during detokenization.
+    #[serde(default = "default_true")]
+    pub spaces_between_special_tokens: bool,
 
     // ─── Token output control ─────────────────────────────────────
     /// Number of prompt token logprobs to return. None = no prompt logprobs.
@@ -718,6 +741,14 @@ pub enum ResponseFormat {
     JsonSchema {
         /// The JSON schema specification
         json_schema: JsonSchemaSpec,
+    },
+    /// Structural tag format for constrained generation with begin/end tags.
+    /// Accepts both legacy format (`structures`/`triggers`) and new format (`format`).
+    #[serde(rename = "structural_tag")]
+    StructuralTag {
+        /// Structural tag specification (opaque — passed through to engine).
+        #[serde(flatten)]
+        spec: serde_json::Value,
     },
 }
 
@@ -2175,5 +2206,103 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["refusal"], "I cannot help with that.");
         assert!(json.get("content").is_none());
+    }
+
+    // ─── New API compliance fields ───────────────────────────────
+
+    #[test]
+    fn completion_request_defaults_skip_special_tokens() {
+        let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "prompt": "hello"
+        }))
+        .unwrap();
+        assert!(req.skip_special_tokens);
+        assert!(req.spaces_between_special_tokens);
+        assert!(!req.ignore_eos);
+    }
+
+    #[test]
+    fn completion_request_override_detokenization() {
+        let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "prompt": "hello",
+            "skip_special_tokens": false,
+            "spaces_between_special_tokens": false,
+            "ignore_eos": true
+        }))
+        .unwrap();
+        assert!(!req.skip_special_tokens);
+        assert!(!req.spaces_between_special_tokens);
+        assert!(req.ignore_eos);
+    }
+
+    #[test]
+    fn chat_request_defaults_include_reasoning() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(req.include_reasoning);
+        assert!(req.skip_special_tokens);
+        assert!(req.spaces_between_special_tokens);
+        assert!(!req.ignore_eos);
+    }
+
+    #[test]
+    fn chat_request_disable_reasoning() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "include_reasoning": false,
+            "skip_special_tokens": false,
+            "ignore_eos": true
+        }))
+        .unwrap();
+        assert!(!req.include_reasoning);
+        assert!(!req.skip_special_tokens);
+        assert!(req.ignore_eos);
+    }
+
+    #[test]
+    fn response_format_structural_tag_deserialize() {
+        let fmt: ResponseFormat = serde_json::from_value(serde_json::json!({
+            "type": "structural_tag",
+            "structures": [
+                {"begin": "<tool>", "end": "</tool>", "schema": {"type": "object"}}
+            ],
+            "triggers": ["<tool>"]
+        }))
+        .unwrap();
+        match &fmt {
+            ResponseFormat::StructuralTag { spec } => {
+                assert!(spec.get("structures").is_some());
+                assert!(spec.get("triggers").is_some());
+            }
+            other => panic!("Expected StructuralTag, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_format_structural_tag_new_format() {
+        let fmt: ResponseFormat = serde_json::from_value(serde_json::json!({
+            "type": "structural_tag",
+            "format": {"key": "value"}
+        }))
+        .unwrap();
+        assert!(matches!(fmt, ResponseFormat::StructuralTag { .. }));
+    }
+
+    #[test]
+    fn response_format_structural_tag_serialize_roundtrip() {
+        let fmt: ResponseFormat = serde_json::from_value(serde_json::json!({
+            "type": "structural_tag",
+            "format": "custom"
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&fmt).unwrap();
+        assert_eq!(json["type"], "structural_tag");
+        assert_eq!(json["format"], "custom");
     }
 }

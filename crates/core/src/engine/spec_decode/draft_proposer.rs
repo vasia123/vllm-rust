@@ -52,7 +52,7 @@ impl<D: ModelForward> DraftModelDraftProposer<D> {
 /// Sample a token from logits applying the request's sampling params, penalties,
 /// and optional constraint masking. Falls back to greedy argmax when the request
 /// uses greedy sampling with no penalties and no constraints.
-fn sample_speculative(
+pub(crate) fn sample_speculative(
     logits: &Tensor,
     state: &mut SequenceState,
     tokenizer: &TokenizerWrapper,

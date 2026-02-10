@@ -7,6 +7,7 @@ pub mod cohere;
 pub mod colbert;
 pub mod dbrx;
 pub mod deepseek;
+pub mod eagle3;
 pub mod deepseek_quantized;
 pub mod exaone;
 pub mod falcon;
@@ -67,6 +68,7 @@ pub use cohere::CohereForCausalLM;
 pub use colbert::ColBERTForRetrieval;
 pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
+pub use eagle3::Eagle3LlamaForCausalLM;
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use exaone::ExaoneForCausalLM;
 pub use falcon::FalconForCausalLM;
@@ -202,6 +204,8 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))
         }
         "HF_ColBERT" | "ColBERTModel" => Ok(Box::new(ColBERTForRetrieval::new(cfg, vb)?)),
+        // Eagle3LlamaForCausalLM: loaded by speculative decode pipeline (not from_config)
+        // because its forward pass requires hidden_states from the target model.
         "Step3p5ForCausalLM" => Ok(Box::new(Step3p5ForCausalLM::new(cfg, vb)?)),
         "VoyageQwen3BidirectionalEmbedModel" => Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),

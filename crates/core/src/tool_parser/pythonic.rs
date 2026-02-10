@@ -65,7 +65,7 @@ impl ToolCallParser for PythonicToolParser {
 }
 
 /// Parse the pythonic tool call list expression.
-fn parse_pythonic_tool_calls(input: &str) -> anyhow::Result<Vec<ToolCall>> {
+pub(super) fn parse_pythonic_tool_calls(input: &str) -> anyhow::Result<Vec<ToolCall>> {
     let inner = input
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
@@ -98,7 +98,7 @@ fn parse_pythonic_tool_calls(input: &str) -> anyhow::Result<Vec<ToolCall>> {
 
 /// Split top-level function calls separated by commas.
 /// Respects parentheses, brackets, braces, and strings.
-fn split_top_level_calls(s: &str) -> Vec<&str> {
+pub(super) fn split_top_level_calls(s: &str) -> Vec<&str> {
     let mut results = Vec::new();
     let mut depth = 0i32;
     let mut in_string: Option<char> = None;
@@ -140,7 +140,7 @@ fn split_top_level_calls(s: &str) -> Vec<&str> {
 }
 
 /// Parse a single function call like `get_weather(city='NYC', metric='celsius')`.
-fn parse_single_call(s: &str) -> anyhow::Result<ToolCall> {
+pub(super) fn parse_single_call(s: &str) -> anyhow::Result<ToolCall> {
     let paren_pos = s
         .find('(')
         .ok_or_else(|| anyhow::anyhow!("missing '(' in function call"))?;

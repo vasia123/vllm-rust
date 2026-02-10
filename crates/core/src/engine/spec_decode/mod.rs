@@ -11,6 +11,7 @@
 //!
 //! `DraftProposer` implementations:
 //! - [`DraftModelDraftProposer`]: GPU-based draft model with KV cache lifecycle
+//! - [`Eagle3DraftProposer`]: Eagle-3 draft model requiring target hidden states
 //! - [`NGramProposer`]: CPU-based n-gram suffix matching (zero VRAM, stateless)
 //! - [`SuffixArrayProposer`]: CPU-based suffix array matching (zero VRAM, stateless)
 //!
@@ -24,6 +25,7 @@
 mod draft_model;
 mod draft_proposer;
 pub mod eagle;
+mod eagle3_proposer;
 pub mod medusa;
 mod ngram;
 mod suffix;
@@ -32,11 +34,16 @@ pub mod tree_attention;
 pub use draft_model::DraftModelProposer;
 pub use draft_proposer::DraftModelDraftProposer;
 pub use eagle::{EagleConfig, EagleProposer};
+pub use eagle3_proposer::Eagle3DraftProposer;
 pub use medusa::{MedusaHead, MedusaProposer};
 pub use ngram::{NGramConfig, NGramProposer};
 pub use suffix::{SuffixArrayConfig, SuffixArrayProposer};
 pub use tree_attention::SpeculationTree;
 
+// Re-export for sibling modules
+pub(crate) use draft_proposer::sample_speculative;
+
+use candle_core::Tensor;
 use crate::engine::types::EngineError;
 use crate::request::{RequestId, SequenceState};
 use crate::tokenizer::TokenizerWrapper;
@@ -97,6 +104,19 @@ pub trait DraftProposer: Send {
 
     /// Handle preemption: free all resources for the request and reset state.
     fn preempt_request(&mut self, request_id: RequestId) -> Result<(), EngineError>;
+
+    /// Provide target model hidden states for the next proposal round.
+    ///
+    /// Called by the engine before `propose_for_request` for proposers that
+    /// need target model context (e.g., Eagle3). Default is no-op for
+    /// proposers that don't use target hidden states.
+    fn set_target_hidden_states(
+        &mut self,
+        _request_id: RequestId,
+        _hidden_states: Tensor,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
 
     /// Number of speculative tokens this proposer targets per step.
     fn num_speculative_tokens(&self) -> usize;

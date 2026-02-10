@@ -81,6 +81,8 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             "BertModel",
             "BertForMaskedLM",
             "BertForSequenceClassification",
+            "BertForTokenClassification",
+            "BertSpladeSparseEmbeddingModel",
         ],
         display_name: "BERT",
         capabilities: ModelCapabilities::new().with_encoder_only(),
@@ -116,7 +118,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["GPT2LMHeadModel"],
+        arch_names: &["GPT2LMHeadModel", "GPT2ForSequenceClassification"],
         display_name: "GPT-2",
         capabilities: ModelCapabilities::new(),
     },
@@ -136,7 +138,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
     ArchitectureInfo {
-        arch_names: &["Gemma3ForCausalLM"],
+        arch_names: &["Gemma3ForCausalLM", "Gemma3TextModel"],
         display_name: "Gemma 3",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
@@ -230,6 +232,97 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
+        arch_names: &[
+            "Eagle3LlamaForCausalLM",
+            "LlamaForCausalLMEagle3",
+            "Eagle3Qwen2_5vlForCausalLM",
+            "Eagle3Qwen3vlForCausalLM",
+        ],
+        display_name: "Eagle3 Llama",
+        capabilities: ModelCapabilities::new(),
+    },
+    // ─── Speculative Decoding Draft Models ──────────────────────────────
+    ArchitectureInfo {
+        arch_names: &["EagleLlamaForCausalLM"],
+        display_name: "Eagle Llama",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["EagleLlama4ForCausalLM"],
+        display_name: "Eagle Llama 4",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["EagleMiniCPMForCausalLM"],
+        display_name: "Eagle MiniCPM",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["EagleMistralLarge3ForCausalLM"],
+        display_name: "Eagle Mistral Large 3",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["EagleDeepSeekMTPModel"],
+        display_name: "Eagle DeepSeek MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["DeepSeekMTPModel"],
+        display_name: "DeepSeek MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ErnieMTPModel"],
+        display_name: "ERNIE MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ExaoneMoeMTP"],
+        display_name: "Exaone MoE MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Glm4MoeMTPModel", "Glm4MoeLiteMTPModel"],
+        display_name: "GLM-4 MoE MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GlmOcrMTPModel"],
+        display_name: "GLM OCR MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["LongCatFlashMTPModel"],
+        display_name: "LongCat Flash MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MedusaModel"],
+        display_name: "Medusa",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MiMoMTPModel"],
+        display_name: "MiMo MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["OpenPanguMTPModel"],
+        display_name: "OpenPangu MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen3NextMTP"],
+        display_name: "Qwen3 Next MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Step3p5MTP"],
+        display_name: "Step-3.5 MTP",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
         arch_names: &["Step3p5ForCausalLM"],
         display_name: "Step-3.5-Flash",
         capabilities: ModelCapabilities::new().with_moe(),
@@ -283,7 +376,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             .with_moe(),
     },
     ArchitectureInfo {
-        arch_names: &["JambaForCausalLM"],
+        arch_names: &["JambaForCausalLM", "JambaForSequenceClassification"],
         display_name: "Jamba",
         capabilities: ModelCapabilities::new().with_moe(),
     },
@@ -621,6 +714,104 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         display_name: "InternLM2-VE",
         capabilities: ModelCapabilities::new().with_tp(),
     },
+    // ─── Embedding / Cross-Encoder / Reward Models ──────────────────────────
+    ArchitectureInfo {
+        arch_names: &[
+            "RobertaForMaskedLM",
+            "RobertaModel",
+            "XLMRobertaModel",
+            "RobertaForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+        ],
+        display_name: "RoBERTa",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &["BgeM3EmbeddingModel"],
+        display_name: "BGE-M3",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "ModernBertModel",
+            "ModernBertForSequenceClassification",
+            "ModernBertForTokenClassification",
+        ],
+        display_name: "ModernBERT",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "GteModel",
+            "GteNewModel",
+            "NomicBertModel",
+            "GteNewForSequenceClassification",
+        ],
+        display_name: "GTE/Nomic",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "LlamaBidirectionalModel",
+            "LlamaBidirectionalForSequenceClassification",
+        ],
+        display_name: "Llama Bidirectional",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &["InternLM2ForRewardModel"],
+        display_name: "InternLM2 Reward",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen2ForRewardModel", "Qwen2ForProcessRewardModel"],
+        display_name: "Qwen2 Reward",
+        capabilities: ModelCapabilities::new().with_encoder_only(),
+    },
+    ArchitectureInfo {
+        arch_names: &["HCXVisionForCausalLM"],
+        display_name: "HyperCLOVA X",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    // ─── Multimodal Embedding / Cross-Encoder ───────────────────────────────
+    ArchitectureInfo {
+        arch_names: &["CLIPModel"],
+        display_name: "CLIP",
+        capabilities: ModelCapabilities::new()
+            .with_encoder_only()
+            .with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["SiglipModel"],
+        display_name: "SigLIP",
+        capabilities: ModelCapabilities::new()
+            .with_encoder_only()
+            .with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Phi3VForCausalLM"],
+        display_name: "Phi-3 Vision",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen2VLForConditionalGeneration"],
+        display_name: "Qwen2-VL",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["JinaVLForRanking"],
+        display_name: "Jina VL",
+        capabilities: ModelCapabilities::new()
+            .with_encoder_only()
+            .with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["PrithviGeoSpatialMAE", "Terratorch"],
+        display_name: "Terratorch",
+        capabilities: ModelCapabilities::new()
+            .with_encoder_only()
+            .with_multimodal(),
+    },
 ];
 
 /// Returns the full catalog of supported architectures.
@@ -711,6 +902,8 @@ mod tests {
             "BertModel",
             "BertForMaskedLM",
             "BertForSequenceClassification",
+            "BertForTokenClassification",
+            "BertSpladeSparseEmbeddingModel",
             // ColBERT
             "HF_ColBERT",
             "ColBERTModel",
@@ -729,6 +922,7 @@ mod tests {
             "BloomForCausalLM",
             // GPT family
             "GPT2LMHeadModel",
+            "GPT2ForSequenceClassification",
             "GPTNeoXForCausalLM",
             "GPTBigCodeForCausalLM",
             "GPTJForCausalLM",
@@ -736,6 +930,7 @@ mod tests {
             "GemmaForCausalLM",
             "Gemma2ForCausalLM",
             "Gemma3ForCausalLM",
+            "Gemma3TextModel",
             "Gemma3nForCausalLM",
             // InternLM
             "InternLM2ForCausalLM",
@@ -802,6 +997,7 @@ mod tests {
             "GraniteMoeForCausalLM",
             // Jamba
             "JambaForCausalLM",
+            "JambaForSequenceClassification",
             // StarCoder
             "Starcoder2ForCausalLM",
             // StableLM
@@ -809,6 +1005,29 @@ mod tests {
             "StableLmForCausalLM",
             // Solar
             "SolarForCausalLM",
+            // Eagle3
+            "Eagle3LlamaForCausalLM",
+            "LlamaForCausalLMEagle3",
+            "Eagle3Qwen2_5vlForCausalLM",
+            "Eagle3Qwen3vlForCausalLM",
+            // Speculative decoding draft models
+            "EagleLlamaForCausalLM",
+            "EagleLlama4ForCausalLM",
+            "EagleMiniCPMForCausalLM",
+            "EagleMistralLarge3ForCausalLM",
+            "EagleDeepSeekMTPModel",
+            "DeepSeekMTPModel",
+            "ErnieMTPModel",
+            "ExaoneMoeMTP",
+            "Glm4MoeMTPModel",
+            "Glm4MoeLiteMTPModel",
+            "GlmOcrMTPModel",
+            "LongCatFlashMTPModel",
+            "MedusaModel",
+            "MiMoMTPModel",
+            "OpenPanguMTPModel",
+            "Qwen3NextMTP",
+            "Step3p5MTP",
             // Step
             "Step3p5ForCausalLM",
             // TeleChat
@@ -879,6 +1098,34 @@ mod tests {
             "ApertusForCausalLM",
             "GritLM",
             "InternLM2VEForCausalLM",
+            // Embedding / Cross-Encoder / Reward models
+            "RobertaForMaskedLM",
+            "RobertaModel",
+            "XLMRobertaModel",
+            "RobertaForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+            "BgeM3EmbeddingModel",
+            "ModernBertModel",
+            "ModernBertForSequenceClassification",
+            "ModernBertForTokenClassification",
+            "GteModel",
+            "GteNewModel",
+            "NomicBertModel",
+            "GteNewForSequenceClassification",
+            "LlamaBidirectionalModel",
+            "LlamaBidirectionalForSequenceClassification",
+            "InternLM2ForRewardModel",
+            "Qwen2ForRewardModel",
+            "Qwen2ForProcessRewardModel",
+            "HCXVisionForCausalLM",
+            // Multimodal embedding / cross-encoder
+            "CLIPModel",
+            "SiglipModel",
+            "Phi3VForCausalLM",
+            "Qwen2VLForConditionalGeneration",
+            "JinaVLForRanking",
+            "PrithviGeoSpatialMAE",
+            "Terratorch",
         ];
         for arch in &expected {
             assert!(
@@ -910,5 +1157,108 @@ mod tests {
         assert!(caps.is_moe);
         assert!(!caps.supports_multimodal);
         assert!(!caps.is_encoder_only);
+    }
+
+    #[test]
+    fn find_roberta_variants() {
+        let names = [
+            "RobertaForMaskedLM",
+            "RobertaModel",
+            "XLMRobertaModel",
+            "RobertaForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+        ];
+        for name in &names {
+            let info = find_architecture(name).unwrap_or_else(|| panic!("should find {name}"));
+            assert_eq!(info.display_name, "RoBERTa");
+            assert!(info.capabilities.is_encoder_only);
+        }
+    }
+
+    #[test]
+    fn find_modernbert_family() {
+        let names = [
+            "ModernBertModel",
+            "ModernBertForSequenceClassification",
+            "ModernBertForTokenClassification",
+        ];
+        for name in &names {
+            let info = find_architecture(name).unwrap_or_else(|| panic!("should find {name}"));
+            assert_eq!(info.display_name, "ModernBERT");
+            assert!(info.capabilities.is_encoder_only);
+        }
+    }
+
+    #[test]
+    fn find_reward_models() {
+        let info =
+            find_architecture("InternLM2ForRewardModel").expect("should find InternLM2 reward");
+        assert_eq!(info.display_name, "InternLM2 Reward");
+        assert!(info.capabilities.is_encoder_only);
+
+        let q1 = find_architecture("Qwen2ForRewardModel").expect("should find Qwen2 reward");
+        let q2 = find_architecture("Qwen2ForProcessRewardModel")
+            .expect("should find Qwen2 process reward");
+        assert_eq!(q1.display_name, "Qwen2 Reward");
+        assert_eq!(q1.display_name, q2.display_name);
+        assert!(q1.capabilities.is_encoder_only);
+    }
+
+    #[test]
+    fn find_speculative_decoding_models() {
+        let spec_decode_archs = [
+            "Eagle3LlamaForCausalLM",
+            "LlamaForCausalLMEagle3",
+            "Eagle3Qwen2_5vlForCausalLM",
+            "EagleLlamaForCausalLM",
+            "EagleMistralLarge3ForCausalLM",
+            "DeepSeekMTPModel",
+            "MedusaModel",
+            "MiMoMTPModel",
+            "Step3p5MTP",
+        ];
+        for name in &spec_decode_archs {
+            assert!(
+                is_supported(name),
+                "speculative decoding model {name} should be in registry"
+            );
+        }
+    }
+
+    #[test]
+    fn eagle3_aliases_resolve_to_same_entry() {
+        let e3 = find_architecture("Eagle3LlamaForCausalLM").unwrap();
+        let alias1 = find_architecture("LlamaForCausalLMEagle3").unwrap();
+        let alias2 = find_architecture("Eagle3Qwen2_5vlForCausalLM").unwrap();
+        assert_eq!(e3.display_name, alias1.display_name);
+        assert_eq!(e3.display_name, alias2.display_name);
+    }
+
+    #[test]
+    fn embedding_models_are_encoder_only() {
+        let encoder_only_archs = [
+            "BertModel",
+            "BertForMaskedLM",
+            "BertSpladeSparseEmbeddingModel",
+            "HF_ColBERT",
+            "VoyageQwen3BidirectionalEmbedModel",
+            "RobertaForMaskedLM",
+            "XLMRobertaModel",
+            "BgeM3EmbeddingModel",
+            "ModernBertModel",
+            "GteModel",
+            "GteNewModel",
+            "NomicBertModel",
+            "LlamaBidirectionalModel",
+            "InternLM2ForRewardModel",
+            "Qwen2ForRewardModel",
+        ];
+        for name in &encoder_only_archs {
+            let info = find_architecture(name).unwrap_or_else(|| panic!("should find {name}"));
+            assert!(
+                info.capabilities.is_encoder_only,
+                "{name} should be encoder_only"
+            );
+        }
     }
 }

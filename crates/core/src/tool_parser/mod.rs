@@ -23,6 +23,10 @@
 //! - **DeepSeek V3.2**: `<｜DSML｜function_calls><｜DSML｜invoke name="...">` DSML XML format
 //! - **Step-3**: `<｜tool_calls_begin｜>` + `<steptml:invoke name="...">` XML format
 //! - **Qwen3 Coder**: `<tool_call><function=name><parameter=key>val</parameter></function></tool_call>`
+//! - **Olmo3**: `<function_calls>func(args)</function_calls>` newline-separated pythonic
+//! - **Llama4 Pythonic**: `<|python_start|>[func(args)]<|python_end|>` pythonic with tags
+//! - **MiniMax**: `<tool_calls>{"name": ..., "arguments": ...}</tool_calls>` JSON with `<think>` stripping
+//! - **MiniMax M2**: `<minimax:tool_call><invoke name="..."><parameter name="...">val</parameter></invoke></minimax:tool_call>`
 //!
 //! # Example
 //!
@@ -49,10 +53,14 @@ mod jamba;
 mod json_parser;
 mod kimi_k2;
 mod llama;
+mod llama4_pythonic;
 mod longcat;
+mod minimax;
+mod minimax_m2;
 mod mistral;
+mod olmo3;
 mod phi4mini;
-mod pythonic;
+pub(super) mod pythonic;
 mod qwen3coder;
 mod seed_oss;
 mod step3;
@@ -73,8 +81,12 @@ pub use jamba::JambaToolParser;
 pub use json_parser::JsonToolParser;
 pub use kimi_k2::KimiK2ToolParser;
 pub use llama::LlamaToolParser;
+pub use llama4_pythonic::Llama4PythonicToolParser;
 pub use longcat::LongcatToolParser;
+pub use minimax::MinimaxToolParser;
+pub use minimax_m2::MinimaxM2ToolParser;
 pub use mistral::MistralToolParser;
+pub use olmo3::Olmo3PythonicToolParser;
 pub use phi4mini::Phi4MiniToolParser;
 pub use pythonic::PythonicToolParser;
 pub use qwen3coder::Qwen3CoderToolParser;

@@ -220,7 +220,7 @@ fn validate_structured_outputs(
     if count > 0 {
         if let Some(fmt) = response_format {
             match fmt {
-                ResponseFormat::Text => {}
+                ResponseFormat::Text | ResponseFormat::StructuralTag { .. } => {}
                 ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. } => {
                     return Err(ApiError::InvalidRequest(
                         "structured_outputs cannot be combined with response_format json constraints".to_string(),
@@ -310,7 +310,7 @@ fn validate_beam_search(
     // Beam search is incompatible with structured output constraints
     if let Some(fmt) = response_format {
         match fmt {
-            ResponseFormat::Text => {}
+            ResponseFormat::Text | ResponseFormat::StructuralTag { .. } => {}
             ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. } => {
                 return Err(ApiError::InvalidRequest(
                     "beam_search is not compatible with response_format json constraints"
@@ -1197,6 +1197,29 @@ mod tests {
         assert!(
             matches!(err, ApiError::InvalidRequest(msg) if msg.contains("choice must not be empty"))
         );
+    }
+
+    #[test]
+    fn structural_tag_with_structured_outputs_allowed() {
+        let mut req = minimal_completion_request();
+        req.response_format = Some(ResponseFormat::StructuralTag {
+            spec: serde_json::json!({"format": "custom"}),
+        });
+        req.structured_outputs = Some(StructuredOutputs {
+            regex: Some("^[a-z]+$".to_string()),
+            ..Default::default()
+        });
+        assert!(validate_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn structural_tag_with_beam_search_allowed() {
+        let mut req = minimal_completion_request();
+        req.response_format = Some(ResponseFormat::StructuralTag {
+            spec: serde_json::json!({}),
+        });
+        req.beam_width = Some(4);
+        assert!(validate_completion_request(&req).is_ok());
     }
 
     #[test]
