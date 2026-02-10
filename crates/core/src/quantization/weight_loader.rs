@@ -14,6 +14,7 @@ use super::bitsandbytes::{BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType};
 use super::config::{QuantizationConfig, QuantizedLinear};
 use super::fp8::{Fp8Config, Fp8Linear};
 use super::gptq::{GptqConfig, GptqLinear};
+use super::mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 use super::{create_config_from_directory, DetectedQuantConfig, QuantizationMethod};
 
 /// Trait for loading quantized weights from safetensors.
@@ -561,6 +562,102 @@ impl QuantizedWeightLoader for BitsAndBytesWeightLoader {
     }
 }
 
+/// Weight loader for MXFP8 (ModelOpt) quantized models.
+pub struct MxFp8WeightLoader {
+    vb: VarBuilder<'static>,
+    config: MxFp8Config,
+    device: Device,
+    dtype: DType,
+}
+
+impl MxFp8WeightLoader {
+    /// Create a new MXFP8 weight loader.
+    pub fn new(vb: VarBuilder<'static>, config: MxFp8Config) -> Self {
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        Self {
+            vb,
+            config,
+            device,
+            dtype,
+        }
+    }
+}
+
+impl QuantizedWeightLoader for MxFp8WeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        // Skip quantization for ignored layers
+        if self.config.is_layer_skipped(prefix) {
+            let vb = self.vb.pp(prefix);
+            let weight = vb.get((out_features, in_features), "weight")?;
+            let bias_tensor = if bias {
+                Some(vb.get(out_features, "bias")?)
+            } else {
+                None
+            };
+            return Ok(Box::new(LoadedUnquantizedLinear {
+                weight,
+                bias: bias_tensor,
+                in_features,
+                out_features,
+            }));
+        }
+
+        // Validate K divisibility by block size
+        if !in_features.is_multiple_of(MXFP8_BLOCK_SIZE) {
+            candle_core::bail!(
+                "MXFP8 requires in_features ({}) divisible by block_size ({})",
+                in_features,
+                MXFP8_BLOCK_SIZE,
+            );
+        }
+
+        let vb = self.vb.pp(prefix);
+        let mut linear = MxFp8Linear::new(in_features, out_features, bias, &self.device)?;
+
+        let mut weights = HashMap::new();
+
+        // MXFP8 weights: U8 (FP8 E4M3), shape [out_features, in_features]
+        if let Ok(weight) = vb.get((out_features, in_features), "weight") {
+            weights.insert("weight".to_string(), weight);
+        }
+
+        // E8M0 block scales: U8, shape [out_features, in_features / 32]
+        let num_blocks = in_features / MXFP8_BLOCK_SIZE;
+        if let Ok(scale) = vb.get((out_features, num_blocks), "weight_scale") {
+            weights.insert("weight_scale".to_string(), scale);
+        }
+
+        // Optional bias
+        if bias {
+            if let Ok(b) = vb.get(out_features, "bias") {
+                weights.insert("bias".to_string(), b);
+            }
+        }
+
+        linear.load_weights(&weights)?;
+        Ok(Box::new(linear))
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::ModelOpt
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
 /// Create an appropriate weight loader for a model directory.
 ///
 /// This function detects the quantization method from the model config
@@ -605,6 +702,10 @@ pub fn create_weight_loader_from_config(
             let bnb_config = BitsAndBytesConfig::default();
             Box::new(BitsAndBytesWeightLoader::new(vb, bnb_config))
         }
+        QuantizationMethod::ModelOpt => {
+            let mxfp8_config = MxFp8Config::default();
+            Box::new(MxFp8WeightLoader::new(vb, mxfp8_config))
+        }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }
 }
@@ -640,6 +741,10 @@ pub fn create_weight_loader_with_params(
         QuantizationMethod::BitsAndBytes => {
             let bnb_config = BitsAndBytesConfig::from_detected(&detected.raw_config);
             Box::new(BitsAndBytesWeightLoader::new(vb, bnb_config))
+        }
+        QuantizationMethod::ModelOpt => {
+            let mxfp8_config = MxFp8Config::from_detected(&detected.raw_config);
+            Box::new(MxFp8WeightLoader::new(vb, mxfp8_config))
         }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }
@@ -778,5 +883,30 @@ mod tests {
 
         assert_eq!(y.dims(), &[2, 8]);
         assert!(linear.has_bias());
+    }
+
+    #[test]
+    fn test_mxfp8_loader_method() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let config = MxFp8Config::default();
+        let loader = MxFp8WeightLoader::new(vb, config);
+        assert_eq!(loader.method(), QuantizationMethod::ModelOpt);
+    }
+
+    #[test]
+    fn test_create_weight_loader_mxfp8() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::ModelOpt,
+            bits: None,
+            group_size: None,
+            desc_act: None,
+            activation_scheme: None,
+            raw_config: HashMap::new(),
+        };
+        let loader = create_weight_loader_with_params(vb, &detected);
+        assert_eq!(loader.method(), QuantizationMethod::ModelOpt);
     }
 }

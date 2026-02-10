@@ -125,6 +125,17 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("squeezellm") => QuantizationMethod::SqueezeLlm,
         Some("compressed-tensors") => QuantizationMethod::CompressedTensors,
         Some("torchao") => QuantizationMethod::Torchao,
+        Some("modelopt") => {
+            let quant_algo = quant_config
+                .get("quantization")
+                .and_then(|q| q.get("quant_algo"))
+                .and_then(|v| v.as_str());
+            if quant_algo == Some("MXFP8") {
+                QuantizationMethod::ModelOpt
+            } else {
+                return None;
+            }
+        }
         _ => return None,
     };
 
@@ -206,6 +217,17 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "squeezellm" => QuantizationMethod::SqueezeLlm,
                 "compressed-tensors" => QuantizationMethod::CompressedTensors,
                 "torchao" => QuantizationMethod::Torchao,
+                "modelopt" => {
+                    let quant_algo = quant_config
+                        .get("quantization")
+                        .and_then(|q| q.get("quant_algo"))
+                        .and_then(|v| v.as_str());
+                    if quant_algo == Some("MXFP8") {
+                        QuantizationMethod::ModelOpt
+                    } else {
+                        QuantizationMethod::None
+                    }
+                }
                 _ => QuantizationMethod::None,
             };
 
@@ -310,5 +332,48 @@ mod tests {
         assert_eq!(config.method, QuantizationMethod::None);
         assert!(config.bits.is_none());
         assert!(config.group_size.is_none());
+    }
+
+    #[test]
+    fn test_detect_modelopt_mxfp8_from_json() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quantization": {
+                    "quant_algo": "MXFP8",
+                    "kv_cache_quant_algo": "FP8"
+                }
+            }
+        });
+
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::ModelOpt);
+    }
+
+    #[test]
+    fn test_detect_modelopt_unknown_algo() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quantization": {
+                    "quant_algo": "INT8_SQ"
+                }
+            }
+        });
+
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::None);
+    }
+
+    #[test]
+    fn test_detect_modelopt_missing_quantization() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt"
+            }
+        });
+
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::None);
     }
 }

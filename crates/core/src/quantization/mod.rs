@@ -40,6 +40,7 @@ pub mod gptq_cuda;
 pub mod marlin;
 #[cfg(feature = "marlin")]
 pub mod marlin_cuda;
+pub mod mxfp8;
 pub mod weight_loader;
 
 // Re-export public types
@@ -72,10 +73,11 @@ pub use marlin::{
 };
 #[cfg(feature = "marlin")]
 pub use marlin_cuda::marlin_gemm;
+pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
     AwqWeightLoader, BitsAndBytesWeightLoader, Fp8WeightLoader, GptqWeightLoader,
-    QuantizedWeightLoader, UnquantizedWeightLoader,
+    MxFp8WeightLoader, QuantizedWeightLoader, UnquantizedWeightLoader,
 };
 
 use std::path::Path;
@@ -123,6 +125,7 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
         QuantizationMethod::BitsAndBytes => {
             Box::new(BitsAndBytesConfig::from_detected(&detected.raw_config))
         }
+        QuantizationMethod::ModelOpt => Box::new(MxFp8Config::from_detected(&detected.raw_config)),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -161,6 +164,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::Marlin => 80,            // Ampere
         QuantizationMethod::CompressedTensors => 70, // Volta
         QuantizationMethod::Torchao => 70,           // Volta
+        QuantizationMethod::ModelOpt => 0,           // Emulation on any GPU
     };
     capability >= min_cap
 }
@@ -255,5 +259,29 @@ mod tests {
         assert!(is_supported(0, QuantizationMethod::Gguf));
         assert!(is_supported(70, QuantizationMethod::Gguf));
         assert!(is_supported(90, QuantizationMethod::Gguf));
+    }
+
+    #[test]
+    fn test_create_config_modelopt() {
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::ModelOpt,
+            bits: None,
+            group_size: None,
+            desc_act: None,
+            activation_scheme: None,
+            raw_config: Default::default(),
+        };
+
+        let config = create_config(&detected);
+        assert_eq!(config.method(), QuantizationMethod::ModelOpt);
+        assert_eq!(config.min_capability(), 0);
+    }
+
+    #[test]
+    fn test_is_supported_modelopt() {
+        // MXFP8 emulation works on any GPU
+        assert!(is_supported(0, QuantizationMethod::ModelOpt));
+        assert!(is_supported(70, QuantizationMethod::ModelOpt));
+        assert!(is_supported(90, QuantizationMethod::ModelOpt));
     }
 }

@@ -34,6 +34,8 @@ pub enum QuantizationMethod {
     CompressedTensors,
     /// TorchAO quantization (PyTorch native)
     Torchao,
+    /// ModelOpt quantization (NVIDIA MXFP8)
+    ModelOpt,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -49,6 +51,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::Marlin => write!(f, "marlin"),
             Self::CompressedTensors => write!(f, "compressed-tensors"),
             Self::Torchao => write!(f, "torchao"),
+            Self::ModelOpt => write!(f, "modelopt"),
         }
     }
 }
