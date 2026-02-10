@@ -18,7 +18,7 @@ pub use block_metrics::{BlockEvictionEvent, BlockMetricsCollector, BlockMetricsS
 pub use block_pool::BlockId;
 pub use block_table::BlockTable;
 pub use cache_engine::CacheEngine;
-pub use config::CacheConfig;
+pub use config::{CacheConfig, KVCacheLayout};
 pub use error::CacheError;
 pub use free_block_queue::FreeBlockQueue;
 pub use metrics::{KVCacheMetrics, MetricsSnapshot};
@@ -153,6 +153,8 @@ pub struct KVCacheManager {
     prefix_cache: Option<PrefixCache>,
     /// Optional CPU offload manager for storing evicted blocks in host memory
     cpu_offload: Option<CpuOffloadManager>,
+    /// Memory layout of standard KV cache tensors
+    layout: KVCacheLayout,
 }
 
 impl KVCacheManager {
@@ -161,14 +163,33 @@ impl KVCacheManager {
         Self::with_metrics(config, Arc::new(KVCacheMetrics::new()))
     }
 
+    /// Create a KVCacheManager with explicit cache layout.
+    pub fn with_layout(
+        config: &CacheConfig,
+        layout: KVCacheLayout,
+    ) -> Result<Self, CacheError> {
+        Self::with_metrics_and_layout(config, Arc::new(KVCacheMetrics::new()), layout)
+    }
+
     /// Create a KVCacheManager with custom metrics instance.
     pub fn with_metrics(
         config: &CacheConfig,
         metrics: Arc<KVCacheMetrics>,
     ) -> Result<Self, CacheError> {
+        Self::with_metrics_and_layout(config, metrics, KVCacheLayout::NHD)
+    }
+
+    /// Create a KVCacheManager with custom metrics and explicit layout.
+    pub fn with_metrics_and_layout(
+        config: &CacheConfig,
+        metrics: Arc<KVCacheMetrics>,
+        layout: KVCacheLayout,
+    ) -> Result<Self, CacheError> {
         let mut engines = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            engines.push(CacheVariant::Standard(CacheEngine::new(config)?));
+            engines.push(CacheVariant::Standard(CacheEngine::with_layout(
+                config, layout,
+            )?));
         }
 
         let cpu_offload = Self::init_cpu_offload(config)?;
@@ -180,6 +201,7 @@ impl KVCacheManager {
             metrics,
             prefix_cache: None,
             cpu_offload,
+            layout,
         })
     }
 
@@ -188,7 +210,16 @@ impl KVCacheManager {
         config: &CacheConfig,
         metrics: Arc<KVCacheMetrics>,
     ) -> Result<Self, CacheError> {
-        let mut mgr = Self::with_metrics(config, Arc::clone(&metrics))?;
+        Self::with_prefix_cache_and_layout(config, metrics, KVCacheLayout::NHD)
+    }
+
+    /// Create a KVCacheManager with prefix caching and explicit layout.
+    pub fn with_prefix_cache_and_layout(
+        config: &CacheConfig,
+        metrics: Arc<KVCacheMetrics>,
+        layout: KVCacheLayout,
+    ) -> Result<Self, CacheError> {
+        let mut mgr = Self::with_metrics_and_layout(config, Arc::clone(&metrics), layout)?;
         mgr.prefix_cache = Some(PrefixCache::with_metrics(config.block_size, metrics));
         Ok(mgr)
     }
@@ -235,6 +266,8 @@ impl KVCacheManager {
             metrics,
             prefix_cache: None,
             cpu_offload: None,
+            // MLA uses its own layout, this field is only for standard cache
+            layout: KVCacheLayout::NHD,
         })
     }
 
@@ -321,6 +354,11 @@ impl KVCacheManager {
     /// Check if this manager uses MLA compressed cache.
     pub fn is_mla(&self) -> bool {
         self.engines.first().map(|e| e.is_mla()).unwrap_or(false)
+    }
+
+    /// Get the memory layout of the standard KV cache.
+    pub fn layout(&self) -> KVCacheLayout {
+        self.layout
     }
 
     pub fn block_size(&self) -> usize {
@@ -1160,6 +1198,18 @@ mod tests {
         let mgr = KVCacheManager::new(&config).unwrap();
 
         assert!(!mgr.is_mla());
+        assert_eq!(mgr.layout(), KVCacheLayout::NHD);
+    }
+
+    #[test]
+    fn kv_cache_manager_with_hnd_layout() {
+        let config = test_config();
+        let mgr = KVCacheManager::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        assert_eq!(mgr.layout(), KVCacheLayout::HND);
+        // HND engine allocates [num_blocks, kv_heads, block_size, head_dim]
+        assert_eq!(mgr.engine(0).k_cache().dims(), &[16, 2, 4, 8]);
+        assert_eq!(mgr.engine(0).layout(), KVCacheLayout::HND);
     }
 
     #[test]

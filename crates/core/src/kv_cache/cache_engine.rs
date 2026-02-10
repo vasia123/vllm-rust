@@ -1,7 +1,7 @@
 use candle_core::{DType, Tensor};
 
 use super::block_pool::BlockId;
-use super::config::CacheConfig;
+use super::config::{CacheConfig, KVCacheLayout};
 use super::error::CacheError;
 use super::quantization::{
     compute_int8_scale, dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype,
@@ -30,15 +30,29 @@ pub struct CacheEngine {
     compute_dtype: DType,
     /// Scales for quantized mode (None if Auto/unquantized)
     scales: Option<KVScales>,
+    /// Memory layout (NHD or HND)
+    layout: KVCacheLayout,
 }
 
 impl CacheEngine {
-    /// Pre-allocate cache tensors, filled with zeros.
+    /// Pre-allocate cache tensors with NHD layout, filled with zeros.
     ///
     /// When `kv_cache_dtype` is FP8 or INT8, allocates U8 tensors and
     /// initializes scales.
     pub fn new(config: &CacheConfig) -> Result<Self, CacheError> {
-        let shape = (
+        Self::with_layout(config, KVCacheLayout::NHD)
+    }
+
+    /// Pre-allocate cache tensors with explicit layout, filled with zeros.
+    ///
+    /// The layout determines tensor shape:
+    /// - NHD: `[num_blocks, block_size, num_kv_heads, head_dim]`
+    /// - HND: `[num_blocks, num_kv_heads, block_size, head_dim]`
+    pub fn with_layout(
+        config: &CacheConfig,
+        layout: KVCacheLayout,
+    ) -> Result<Self, CacheError> {
+        let shape = layout.cache_shape(
             config.num_blocks,
             config.block_size,
             config.num_kv_heads,
@@ -67,6 +81,7 @@ impl CacheEngine {
             kv_cache_dtype: config.kv_cache_dtype,
             compute_dtype: config.dtype,
             scales,
+            layout,
         })
     }
 
@@ -85,14 +100,204 @@ impl CacheEngine {
         self.scales.as_ref().map(|s| &s.v_scale)
     }
 
-    /// Raw K cache tensor: [num_blocks, block_size, num_kv_heads, head_dim].
+    /// Raw K cache tensor (shape depends on layout).
     pub fn k_cache(&self) -> &Tensor {
         &self.k_cache
     }
 
-    /// Raw V cache tensor: [num_blocks, block_size, num_kv_heads, head_dim].
+    /// Raw V cache tensor (shape depends on layout).
     pub fn v_cache(&self) -> &Tensor {
         &self.v_cache
+    }
+
+    /// Get the memory layout of this cache engine.
+    pub fn layout(&self) -> KVCacheLayout {
+        self.layout
+    }
+
+    /// Build scatter indices for write operations.
+    ///
+    /// Expands slot indices from [new_tokens] to [new_tokens, kv_heads, head_dim]
+    /// for use with scatter_set on dim 0.
+    fn build_scatter_indices(
+        slot_mapping: &[usize],
+        new_tokens: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        device: &candle_core::Device,
+    ) -> Result<Tensor, CacheError> {
+        let indices = Tensor::from_vec(
+            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
+            (new_tokens,),
+            device,
+        )?;
+        let indices = indices
+            .reshape((new_tokens, 1, 1))?
+            .expand((new_tokens, num_kv_heads, head_dim))?
+            .contiguous()?;
+        Ok(indices)
+    }
+
+    /// Quantize write data based on kv_cache_dtype setting.
+    ///
+    /// Input and output are in [new_tokens, kv_heads, head_dim] layout.
+    /// `k_orig` and `v_orig` are the original (pre-transposed) tensors for calibration.
+    fn quantize_write_data(
+        &mut self,
+        k_prepared: &Tensor,
+        v_prepared: &Tensor,
+        k_orig: &Tensor,
+        v_orig: &Tensor,
+        new_tokens: usize,
+    ) -> Result<(Tensor, Tensor), CacheError> {
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => Ok((k_prepared.clone(), v_prepared.clone())),
+            KVCacheDtype::Fp8E4m3 => {
+                let scales = self.scales.as_mut().ok_or_else(|| {
+                    candle_core::Error::Msg("FP8 mode requires scales".to_string())
+                })?;
+                scales.calibrate(k_orig, v_orig)?;
+
+                let k_2d = k_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+                let v_2d = v_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+
+                let k_quant = quantize_fp8(&k_2d, &scales.k_scale)?;
+                let v_quant = quantize_fp8(&v_2d, &scales.v_scale)?;
+
+                Ok((
+                    k_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?,
+                    v_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?,
+                ))
+            }
+            KVCacheDtype::Int8 => {
+                let scales = self.scales.as_mut().ok_or_else(|| {
+                    candle_core::Error::Msg("INT8 mode requires scales".to_string())
+                })?;
+
+                scales.k_scale = compute_int8_scale(k_orig)?;
+                scales.v_scale = compute_int8_scale(v_orig)?;
+
+                let k_2d = k_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+                let v_2d = v_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+
+                let k_quant = quantize_int8(&k_2d, &scales.k_scale)?;
+                let v_quant = quantize_int8(&v_2d, &scales.v_scale)?;
+
+                Ok((
+                    k_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?,
+                    v_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?,
+                ))
+            }
+        }
+    }
+
+    /// Scatter data into the cache, handling NHD/HND layout differences.
+    ///
+    /// For NHD: reshape is a zero-copy view, scatter modifies cache in-place.
+    /// For HND: requires transpose→scatter→transpose round-trip (copies entire cache).
+    /// TODO: Replace HND path with CUDA kernel for zero-copy scatter.
+    fn scatter_into_cache(
+        &mut self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        indices: &Tensor,
+        total_slots: usize,
+    ) -> Result<(), CacheError> {
+        let flat_shape = (total_slots, self.num_kv_heads, self.head_dim);
+
+        match self.layout {
+            KVCacheLayout::NHD => {
+                // NHD [num_blocks, block_size, kv_heads, head_dim]
+                // reshape to [total_slots, kv_heads, head_dim] is a view (no copy)
+                let k_flat = self.k_cache.reshape(flat_shape)?;
+                let v_flat = self.v_cache.reshape(flat_shape)?;
+                k_flat.scatter_set(indices, k_src, 0)?;
+                v_flat.scatter_set(indices, v_src, 0)?;
+            }
+            KVCacheLayout::HND => {
+                // HND [num_blocks, kv_heads, block_size, head_dim]
+                // Must transpose to NHD, scatter, then transpose back.
+                let k_nhd = self.k_cache.transpose(1, 2)?.contiguous()?;
+                let v_nhd = self.v_cache.transpose(1, 2)?.contiguous()?;
+                let k_flat = k_nhd.reshape(flat_shape)?;
+                let v_flat = v_nhd.reshape(flat_shape)?;
+                k_flat.scatter_set(indices, k_src, 0)?;
+                v_flat.scatter_set(indices, v_src, 0)?;
+                // Reshape back to 4D NHD then transpose to HND
+                let nhd_4d = (self.num_blocks, self.block_size, self.num_kv_heads, self.head_dim);
+                self.k_cache = k_flat.reshape(nhd_4d)?.transpose(1, 2)?.contiguous()?;
+                self.v_cache = v_flat.reshape(nhd_4d)?.transpose(1, 2)?.contiguous()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Flatten selected blocks to [total_capacity, kv_heads, head_dim], handling layout.
+    ///
+    /// For NHD: direct reshape (no copy).
+    /// For HND: transpose dims 1↔2 then reshape (requires copy).
+    fn flatten_read_blocks(
+        &self,
+        k_raw: &Tensor,
+        v_raw: &Tensor,
+        _num_blocks_used: usize,
+        total_capacity: usize,
+    ) -> Result<(Tensor, Tensor), CacheError> {
+        let flat_shape = (total_capacity, self.num_kv_heads, self.head_dim);
+
+        match self.layout {
+            KVCacheLayout::NHD => {
+                // NHD: [B, block_size, kv_heads, head_dim] → reshape
+                Ok((k_raw.reshape(flat_shape)?, v_raw.reshape(flat_shape)?))
+            }
+            KVCacheLayout::HND => {
+                // HND: [B, kv_heads, block_size, head_dim] → transpose to NHD → reshape
+                let k_nhd = k_raw.transpose(1, 2)?.contiguous()?;
+                let v_nhd = v_raw.transpose(1, 2)?.contiguous()?;
+                Ok((k_nhd.reshape(flat_shape)?, v_nhd.reshape(flat_shape)?))
+            }
+        }
+    }
+
+    /// Dequantize read data based on kv_cache_dtype.
+    ///
+    /// Input and output are in [total_capacity, kv_heads, head_dim] layout.
+    fn dequantize_read_data(
+        &self,
+        k_flat: &Tensor,
+        v_flat: &Tensor,
+        total_capacity: usize,
+    ) -> Result<(Tensor, Tensor), CacheError> {
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => Ok((k_flat.clone(), v_flat.clone())),
+            KVCacheDtype::Fp8E4m3 => {
+                let scales = self.scales.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("FP8 mode requires scales".to_string())
+                })?;
+                let k_2d = k_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
+                let v_2d = v_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
+                let k_dq = dequantize_fp8(&k_2d, &scales.k_scale, self.compute_dtype)?;
+                let v_dq = dequantize_fp8(&v_2d, &scales.v_scale, self.compute_dtype)?;
+                Ok((
+                    k_dq.reshape((total_capacity, self.num_kv_heads, self.head_dim))?,
+                    v_dq.reshape((total_capacity, self.num_kv_heads, self.head_dim))?,
+                ))
+            }
+            KVCacheDtype::Int8 => {
+                let scales = self.scales.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("INT8 mode requires scales".to_string())
+                })?;
+                let k_2d = k_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
+                let v_2d = v_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
+                let k_dq = dequantize_int8(&k_2d, &scales.k_scale, self.compute_dtype)?;
+                let v_dq = dequantize_int8(&v_2d, &scales.v_scale, self.compute_dtype)?;
+                Ok((
+                    k_dq.reshape((total_capacity, self.num_kv_heads, self.head_dim))?,
+                    v_dq.reshape((total_capacity, self.num_kv_heads, self.head_dim))?,
+                ))
+            }
+        }
     }
 
     /// Reset cache contents to zeros without reallocating.
@@ -124,76 +329,30 @@ impl CacheEngine {
         let new_tokens = slot_mapping.len();
         let total_slots = self.num_blocks * self.block_size;
 
-        // Cache [num_blocks, block_size, kv_heads, head_dim] → [total_slots, kv_heads, head_dim]
-        let k_cache_flat = self
-            .k_cache
-            .reshape((total_slots, self.num_kv_heads, self.head_dim))?;
-        let v_cache_flat = self
-            .v_cache
-            .reshape((total_slots, self.num_kv_heads, self.head_dim))?;
-
         // Input [kv_heads, new_tokens, head_dim] → [new_tokens, kv_heads, head_dim]
         let k_transposed = k.transpose(0, 1)?.contiguous()?;
         let v_transposed = v.transpose(0, 1)?.contiguous()?;
 
         // Apply quantization if enabled
-        let (k_src, v_src) = match self.kv_cache_dtype {
-            KVCacheDtype::Auto => (k_transposed, v_transposed),
-            KVCacheDtype::Fp8E4m3 => {
-                // Update scales based on new data and quantize
-                let scales = self.scales.as_mut().ok_or_else(|| {
-                    candle_core::Error::Msg("FP8 mode requires scales".to_string())
-                })?;
-                scales.calibrate(k, v)?;
-
-                // Reshape to 2D for quantization: [new_tokens * kv_heads, head_dim]
-                let k_2d = k_transposed.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-                let v_2d = v_transposed.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-
-                let k_quant = quantize_fp8(&k_2d, &scales.k_scale)?;
-                let v_quant = quantize_fp8(&v_2d, &scales.v_scale)?;
-
-                // Reshape back to [new_tokens, kv_heads, head_dim]
-                let k_quant = k_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-                let v_quant = v_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-
-                (k_quant, v_quant)
-            }
-            KVCacheDtype::Int8 => {
-                let scales = self.scales.as_mut().ok_or_else(|| {
-                    candle_core::Error::Msg("INT8 mode requires scales".to_string())
-                })?;
-
-                // Compute INT8 scales
-                scales.k_scale = compute_int8_scale(k)?;
-                scales.v_scale = compute_int8_scale(v)?;
-
-                let k_2d = k_transposed.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-                let v_2d = v_transposed.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-
-                let k_quant = quantize_int8(&k_2d, &scales.k_scale)?;
-                let v_quant = quantize_int8(&v_2d, &scales.v_scale)?;
-
-                let k_quant = k_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-                let v_quant = v_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-
-                (k_quant, v_quant)
-            }
-        };
-
-        // Index: [new_tokens] → expand to [new_tokens, kv_heads, head_dim]
-        let indices = Tensor::from_vec(
-            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
-            (new_tokens,),
-            k_cache_flat.device(),
+        let (k_src, v_src) = self.quantize_write_data(
+            &k_transposed,
+            &v_transposed,
+            k,
+            v,
+            new_tokens,
         )?;
-        let indices = indices
-            .reshape((new_tokens, 1, 1))?
-            .expand((new_tokens, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
 
-        k_cache_flat.scatter_set(&indices, &k_src, 0)?;
-        v_cache_flat.scatter_set(&indices, &v_src, 0)?;
+        // Build scatter indices: [new_tokens] → expand to [new_tokens, kv_heads, head_dim]
+        let indices = Self::build_scatter_indices(
+            slot_mapping,
+            new_tokens,
+            self.num_kv_heads,
+            self.head_dim,
+            self.k_cache.device(),
+        )?;
+
+        // Scatter into cache (layout-aware)
+        self.scatter_into_cache(&k_src, &v_src, &indices, total_slots)?;
 
         Ok(())
     }
@@ -209,70 +368,28 @@ impl CacheEngine {
         let new_tokens = slot_mapping.len();
         let total_slots = self.num_blocks * self.block_size;
 
-        let k_cache_flat = self
-            .k_cache
-            .reshape((total_slots, self.num_kv_heads, self.head_dim))?;
-        let v_cache_flat = self
-            .v_cache
-            .reshape((total_slots, self.num_kv_heads, self.head_dim))?;
-
         // Input already in [new_tokens, kv_heads, head_dim]
         let k_contiguous = k.contiguous()?;
         let v_contiguous = v.contiguous()?;
 
         // Apply quantization if enabled
-        let (k_src, v_src) = match self.kv_cache_dtype {
-            KVCacheDtype::Auto => (k_contiguous, v_contiguous),
-            KVCacheDtype::Fp8E4m3 => {
-                let scales = self.scales.as_mut().ok_or_else(|| {
-                    candle_core::Error::Msg("FP8 mode requires scales".to_string())
-                })?;
-                scales.calibrate(k, v)?;
-
-                let k_2d = k_contiguous.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-                let v_2d = v_contiguous.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-
-                let k_quant = quantize_fp8(&k_2d, &scales.k_scale)?;
-                let v_quant = quantize_fp8(&v_2d, &scales.v_scale)?;
-
-                let k_quant = k_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-                let v_quant = v_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-
-                (k_quant, v_quant)
-            }
-            KVCacheDtype::Int8 => {
-                let scales = self.scales.as_mut().ok_or_else(|| {
-                    candle_core::Error::Msg("INT8 mode requires scales".to_string())
-                })?;
-
-                scales.k_scale = compute_int8_scale(k)?;
-                scales.v_scale = compute_int8_scale(v)?;
-
-                let k_2d = k_contiguous.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-                let v_2d = v_contiguous.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-
-                let k_quant = quantize_int8(&k_2d, &scales.k_scale)?;
-                let v_quant = quantize_int8(&v_2d, &scales.v_scale)?;
-
-                let k_quant = k_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-                let v_quant = v_quant.reshape((new_tokens, self.num_kv_heads, self.head_dim))?;
-
-                (k_quant, v_quant)
-            }
-        };
-
-        let indices = Tensor::from_vec(
-            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
-            (new_tokens,),
-            k_cache_flat.device(),
+        let (k_src, v_src) = self.quantize_write_data(
+            &k_contiguous,
+            &v_contiguous,
+            k,
+            v,
+            new_tokens,
         )?;
-        let indices = indices
-            .reshape((new_tokens, 1, 1))?
-            .expand((new_tokens, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
 
-        k_cache_flat.scatter_set(&indices, &k_src, 0)?;
-        v_cache_flat.scatter_set(&indices, &v_src, 0)?;
+        let indices = Self::build_scatter_indices(
+            slot_mapping,
+            new_tokens,
+            self.num_kv_heads,
+            self.head_dim,
+            self.k_cache.device(),
+        )?;
+
+        self.scatter_into_cache(&k_src, &v_src, &indices, total_slots)?;
 
         Ok(())
     }
@@ -299,57 +416,17 @@ impl CacheEngine {
                 self.k_cache.device(),
             )?;
 
+            // index_select on dim 0: selects blocks
             let k_raw = self.k_cache.index_select(&indices, 0)?;
             let v_raw = self.v_cache.index_select(&indices, 0)?;
 
+            // Flatten to [total_capacity, kv_heads, head_dim] (layout-aware)
             let total_capacity = num_blocks_used * self.block_size;
-            let k_flat = k_raw.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-            let v_flat = v_raw.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
+            let (k_flat, v_flat) =
+                self.flatten_read_blocks(&k_raw, &v_raw, num_blocks_used, total_capacity)?;
 
-            // Apply dequantization if enabled
-            let (k, v) = match self.kv_cache_dtype {
-                KVCacheDtype::Auto => (k_flat, v_flat),
-                KVCacheDtype::Fp8E4m3 => {
-                    let scales = self.scales.as_ref().ok_or_else(|| {
-                        candle_core::Error::Msg("FP8 mode requires scales".to_string())
-                    })?;
-
-                    let k_2d =
-                        k_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-                    let v_2d =
-                        v_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-
-                    let k_dequant = dequantize_fp8(&k_2d, &scales.k_scale, self.compute_dtype)?;
-                    let v_dequant = dequantize_fp8(&v_2d, &scales.v_scale, self.compute_dtype)?;
-
-                    let k_dequant =
-                        k_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-                    let v_dequant =
-                        v_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-
-                    (k_dequant, v_dequant)
-                }
-                KVCacheDtype::Int8 => {
-                    let scales = self.scales.as_ref().ok_or_else(|| {
-                        candle_core::Error::Msg("INT8 mode requires scales".to_string())
-                    })?;
-
-                    let k_2d =
-                        k_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-                    let v_2d =
-                        v_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-
-                    let k_dequant = dequantize_int8(&k_2d, &scales.k_scale, self.compute_dtype)?;
-                    let v_dequant = dequantize_int8(&v_2d, &scales.v_scale, self.compute_dtype)?;
-
-                    let k_dequant =
-                        k_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-                    let v_dequant =
-                        v_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-
-                    (k_dequant, v_dequant)
-                }
-            };
+            // Apply dequantization
+            let (k, v) = self.dequantize_read_data(&k_flat, &v_flat, total_capacity)?;
 
             let k = k.narrow(0, 0, num_tokens)?;
             let v = v.narrow(0, 0, num_tokens)?;
@@ -383,56 +460,17 @@ impl CacheEngine {
             self.k_cache.device(),
         )?;
 
-        // index_select on dim 0: [num_blocks_used, block_size, kv_heads, head_dim]
+        // index_select on dim 0: selects blocks
         let k_raw = self.k_cache.index_select(&indices, 0)?;
         let v_raw = self.v_cache.index_select(&indices, 0)?;
 
-        // Reshape to merge blocks: [num_blocks_used * block_size, kv_heads, head_dim]
+        // Flatten to [total_capacity, kv_heads, head_dim] (layout-aware)
         let total_capacity = num_blocks_used * self.block_size;
-        let k_flat = k_raw.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-        let v_flat = v_raw.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
+        let (k_flat, v_flat) =
+            self.flatten_read_blocks(&k_raw, &v_raw, num_blocks_used, total_capacity)?;
 
-        // Apply dequantization if enabled
-        let (k, v) = match self.kv_cache_dtype {
-            KVCacheDtype::Auto => (k_flat, v_flat),
-            KVCacheDtype::Fp8E4m3 => {
-                let scales = self.scales.as_ref().ok_or_else(|| {
-                    candle_core::Error::Msg("FP8 mode requires scales".to_string())
-                })?;
-
-                // Reshape to 2D for dequantization
-                let k_2d = k_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-                let v_2d = v_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-
-                let k_dequant = dequantize_fp8(&k_2d, &scales.k_scale, self.compute_dtype)?;
-                let v_dequant = dequantize_fp8(&v_2d, &scales.v_scale, self.compute_dtype)?;
-
-                let k_dequant =
-                    k_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-                let v_dequant =
-                    v_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-
-                (k_dequant, v_dequant)
-            }
-            KVCacheDtype::Int8 => {
-                let scales = self.scales.as_ref().ok_or_else(|| {
-                    candle_core::Error::Msg("INT8 mode requires scales".to_string())
-                })?;
-
-                let k_2d = k_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-                let v_2d = v_flat.reshape((total_capacity * self.num_kv_heads, self.head_dim))?;
-
-                let k_dequant = dequantize_int8(&k_2d, &scales.k_scale, self.compute_dtype)?;
-                let v_dequant = dequantize_int8(&v_2d, &scales.v_scale, self.compute_dtype)?;
-
-                let k_dequant =
-                    k_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-                let v_dequant =
-                    v_dequant.reshape((total_capacity, self.num_kv_heads, self.head_dim))?;
-
-                (k_dequant, v_dequant)
-            }
-        };
+        // Apply dequantization
+        let (k, v) = self.dequantize_read_data(&k_flat, &v_flat, total_capacity)?;
 
         // Narrow to actual tokens, transpose to [kv_heads, num_tokens, head_dim]
         let k = k.narrow(0, 0, num_tokens)?;
@@ -450,6 +488,7 @@ impl CacheEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::config::KVCacheLayout;
     use candle_core::{DType, Device, Tensor};
 
     fn test_config(num_blocks: usize) -> CacheConfig {
@@ -498,10 +537,21 @@ mod tests {
     fn new_allocates_correct_shape() {
         let config = test_config(8);
         let engine = CacheEngine::new(&config).unwrap();
-        // Layout: [num_blocks, block_size, kv_heads, head_dim]
+        // NHD layout: [num_blocks, block_size, kv_heads, head_dim]
         assert_eq!(engine.k_cache.dims(), &[8, 4, 2, 8]);
         assert_eq!(engine.v_cache.dims(), &[8, 4, 2, 8]);
+        assert_eq!(engine.layout(), KVCacheLayout::NHD);
         assert!(!engine.is_quantized());
+    }
+
+    #[test]
+    fn new_with_hnd_layout_allocates_correct_shape() {
+        let config = test_config(8);
+        let engine = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+        // HND layout: [num_blocks, kv_heads, block_size, head_dim]
+        assert_eq!(engine.k_cache.dims(), &[8, 2, 4, 8]);
+        assert_eq!(engine.v_cache.dims(), &[8, 2, 4, 8]);
+        assert_eq!(engine.layout(), KVCacheLayout::HND);
     }
 
     #[test]
@@ -867,5 +917,129 @@ mod tests {
                 read
             );
         }
+    }
+
+    // ─── HND layout tests ───────────────────────────────────────────────────
+
+    fn test_config_hnd(num_blocks: usize) -> CacheConfig {
+        CacheConfig {
+            block_size: 4,
+            num_blocks,
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        }
+    }
+
+    #[test]
+    fn hnd_write_read_roundtrip() {
+        let config = test_config_hnd(8);
+        let mut engine = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+        assert_eq!(engine.layout(), KVCacheLayout::HND);
+        assert_eq!(engine.k_cache.dims(), &[8, 2, 4, 8]); // [blocks, heads, block_size, head_dim]
+
+        // Write 3 tokens to block 2 (slots 8, 9, 10)
+        let k_data: Vec<f32> = (0..2 * 3 * 8).map(|i| i as f32).collect();
+        let k = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data, (2, 3, 8), &Device::Cpu).unwrap();
+        let slot_mapping = vec![8, 9, 10];
+
+        engine.write(&k, &v, &slot_mapping).unwrap();
+
+        // Cache should still be HND after write
+        assert_eq!(engine.k_cache.dims(), &[8, 2, 4, 8]);
+
+        let (k_out, _v_out) = engine.read(&[2], 3).unwrap();
+        assert_eq!(k_out.dims(), &[1, 2, 3, 8]);
+
+        let k_read_flat: Vec<f32> = k_out.flatten_all().unwrap().to_vec1().unwrap();
+        let k_orig_flat: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(k_read_flat, k_orig_flat);
+    }
+
+    #[test]
+    fn hnd_write_batch_roundtrip() {
+        let config = test_config_hnd(8);
+        let mut engine = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        // write_batch: [new_tokens, kv_heads, head_dim]
+        let k_data: Vec<f32> = (0..3 * 2 * 8).map(|i| (i + 1) as f32).collect();
+        let k = Tensor::from_vec(k_data.clone(), (3, 2, 8), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data, (3, 2, 8), &Device::Cpu).unwrap();
+
+        engine.write_batch(&k, &v, &[0, 1, 2]).unwrap();
+
+        let (k_out, _) = engine.read(&[0], 3).unwrap();
+        assert_eq!(k_out.dims(), &[1, 2, 3, 8]);
+    }
+
+    #[test]
+    fn hnd_write_non_contiguous_slots() {
+        let config = test_config_hnd(8);
+        let mut engine = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        // Write 2 tokens: slot 1 (block 0, offset 1) and slot 12 (block 3, offset 0)
+        let k_data: Vec<f32> = (0..2 * 2 * 8).map(|i| (i + 1) as f32).collect();
+        let k = Tensor::from_vec(k_data.clone(), (2, 2, 8), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data, (2, 2, 8), &Device::Cpu).unwrap();
+
+        engine.write(&k, &v, &[1, 12]).unwrap();
+
+        // Read block 0 (2 tokens): slot 0 = zeros, slot 1 = first token
+        let (k_out, _) = engine.read(&[0], 2).unwrap();
+        assert_eq!(k_out.dims(), &[1, 2, 2, 8]);
+
+        let k_flat: Vec<f32> = k_out.flatten_all().unwrap().to_vec1().unwrap();
+        // head 0, token 0: positions 0..8 should be zeros
+        assert!(k_flat[0..8].iter().all(|&x| x == 0.0));
+        // head 1, token 0: positions 16..24 should be zeros
+        assert!(k_flat[16..24].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn hnd_read_multi_block_partial() {
+        let config = test_config_hnd(8);
+        let mut engine = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        // Write 6 tokens: 4 in block 1 + 2 in block 5
+        let k_data: Vec<f32> = (0..2 * 6 * 8).map(|i| i as f32).collect();
+        let k = Tensor::from_vec(k_data.clone(), (2, 6, 8), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data, (2, 6, 8), &Device::Cpu).unwrap();
+        let slot_mapping = vec![4, 5, 6, 7, 20, 21];
+
+        engine.write(&k, &v, &slot_mapping).unwrap();
+
+        let (k_out, _) = engine.read(&[1, 5], 6).unwrap();
+        assert_eq!(k_out.dims(), &[1, 2, 6, 8]);
+
+        let k_read_flat: Vec<f32> = k_out.flatten_all().unwrap().to_vec1().unwrap();
+        let k_orig_flat: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(k_read_flat, k_orig_flat);
+    }
+
+    #[test]
+    fn hnd_read_contiguous_multi() {
+        let config = test_config_hnd(8);
+        let mut engine = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        // Write data into blocks 0 and 2
+        let k1_data: Vec<f32> = (0..2 * 3 * 8).map(|i| i as f32).collect();
+        let k1 = Tensor::from_vec(k1_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
+        let v1 = Tensor::from_vec(k1_data, (2, 3, 8), &Device::Cpu).unwrap();
+        engine.write(&k1, &v1, &[0, 1, 2]).unwrap();
+
+        let k2_data: Vec<f32> = (100..100 + 2 * 2 * 8).map(|i| i as f32).collect();
+        let k2 = Tensor::from_vec(k2_data.clone(), (2, 2, 8), &Device::Cpu).unwrap();
+        let v2 = Tensor::from_vec(k2_data, (2, 2, 8), &Device::Cpu).unwrap();
+        engine.write(&k2, &v2, &[8, 9]).unwrap();
+
+        let (k_out, _) = engine
+            .read_contiguous_multi(&[(&[0usize], 3), (&[2], 2)])
+            .unwrap();
+        assert_eq!(k_out.dims(), &[5, 2, 8]); // 3 + 2 tokens
     }
 }

@@ -1,7 +1,50 @@
 use candle_core::{DType, Device};
+use std::fmt;
 
 use super::offload::CpuOffloadConfig;
 use super::quantization::KVCacheDtype;
+
+/// Memory layout of the paged KV cache tensor.
+///
+/// Determines how the 4D cache tensor dimensions are arranged:
+/// - NHD: `[num_blocks, block_size, num_kv_heads, head_dim]` — slot-major
+/// - HND: `[num_blocks, num_kv_heads, block_size, head_dim]` — head-major
+///
+/// NHD allows direct reshape to `[total_slots, kv_heads, head_dim]` for scatter/gather.
+/// HND is preferred by FlashInfer on newer GPUs for better memory access patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum KVCacheLayout {
+    /// Slot-major: `[num_blocks, block_size, num_kv_heads, head_dim]`
+    #[default]
+    NHD,
+    /// Head-major: `[num_blocks, num_kv_heads, block_size, head_dim]`
+    HND,
+}
+
+impl KVCacheLayout {
+    /// Returns the 4D tensor shape for cache allocation.
+    pub fn cache_shape(
+        &self,
+        num_blocks: usize,
+        block_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> (usize, usize, usize, usize) {
+        match self {
+            Self::NHD => (num_blocks, block_size, num_kv_heads, head_dim),
+            Self::HND => (num_blocks, num_kv_heads, block_size, head_dim),
+        }
+    }
+}
+
+impl fmt::Display for KVCacheLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NHD => write!(f, "NHD"),
+            Self::HND => write!(f, "HND"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
@@ -310,5 +353,37 @@ mod tests {
         };
         // 256 bytes per block * 10 blocks = 2560 bytes
         assert_eq!(config.total_memory_bytes(), 2560);
+    }
+
+    // ─── KVCacheLayout tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn kv_cache_layout_default_is_nhd() {
+        assert_eq!(KVCacheLayout::default(), KVCacheLayout::NHD);
+    }
+
+    #[test]
+    fn kv_cache_layout_nhd_shape() {
+        let shape = KVCacheLayout::NHD.cache_shape(10, 16, 8, 128);
+        assert_eq!(shape, (10, 16, 8, 128));
+    }
+
+    #[test]
+    fn kv_cache_layout_hnd_shape() {
+        let shape = KVCacheLayout::HND.cache_shape(10, 16, 8, 128);
+        assert_eq!(shape, (10, 8, 16, 128));
+    }
+
+    #[test]
+    fn kv_cache_layout_display() {
+        assert_eq!(format!("{}", KVCacheLayout::NHD), "NHD");
+        assert_eq!(format!("{}", KVCacheLayout::HND), "HND");
+    }
+
+    #[test]
+    fn kv_cache_layout_equality() {
+        assert_eq!(KVCacheLayout::NHD, KVCacheLayout::NHD);
+        assert_eq!(KVCacheLayout::HND, KVCacheLayout::HND);
+        assert_ne!(KVCacheLayout::NHD, KVCacheLayout::HND);
     }
 }
