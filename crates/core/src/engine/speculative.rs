@@ -68,6 +68,7 @@ fn sample_speculative(
         &state.generated_token_ids,
         &mut state.sampler_state,
         None,
+        &state.stop_token_ids,
     );
 
     Ok(result.token_id)
@@ -138,6 +139,7 @@ fn compute_target_probs(
             sampling::apply_min_tokens_suppression(
                 &mut logits_vec,
                 eos_id,
+                &state.stop_token_ids,
                 state.sampling_params.min_tokens,
                 state.generated_token_ids.len(),
             );

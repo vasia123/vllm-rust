@@ -163,6 +163,7 @@ pub fn sample_n(
     sampler_state: &mut SamplerState,
     num_top_logprobs: Option<usize>,
     n: usize,
+    stop_token_ids: &[u32],
 ) -> Vec<SamplingResult> {
     if n == 0 {
         return Vec::new();
@@ -174,6 +175,7 @@ pub fn sample_n(
             generated_tokens,
             sampler_state,
             num_top_logprobs,
+            stop_token_ids,
         )];
     }
 
@@ -185,6 +187,7 @@ pub fn sample_n(
             generated_tokens,
             sampler_state,
             num_top_logprobs,
+            stop_token_ids,
         );
         return vec![result; n];
     }
@@ -228,6 +231,7 @@ pub fn sample_n(
             apply_min_tokens_suppression(
                 &mut logits,
                 eos_id,
+                stop_token_ids,
                 params.min_tokens,
                 generated_tokens.len(),
             );
@@ -311,6 +315,7 @@ pub fn sample(
     generated_tokens: &[u32],
     sampler_state: &mut SamplerState,
     num_top_logprobs: Option<usize>,
+    stop_token_ids: &[u32],
 ) -> SamplingResult {
     let vocab_size = logits.len();
     let mut logits = logits.to_vec();
@@ -356,12 +361,13 @@ pub fn sample(
         }
     }
 
-    // Step 1f: Suppress EOS until min_tokens generated
+    // Step 1f: Suppress EOS and stop tokens until min_tokens generated
     if params.min_tokens > 0 {
         if let Some(eos_id) = params.eos_token_id {
             apply_min_tokens_suppression(
                 &mut logits,
                 eos_id,
+                stop_token_ids,
                 params.min_tokens,
                 generated_tokens.len(),
             );
@@ -554,13 +560,20 @@ pub(crate) fn apply_bad_words(logits: &mut [f32], bad_words: &[Vec<u32>], genera
 pub(crate) fn apply_min_tokens_suppression(
     logits: &mut [f32],
     eos_id: u32,
+    stop_token_ids: &[u32],
     min_tokens: usize,
     generated_len: usize,
 ) {
     if generated_len < min_tokens {
-        let idx = eos_id as usize;
-        if idx < logits.len() {
-            logits[idx] = f32::NEG_INFINITY;
+        let eos_idx = eos_id as usize;
+        if eos_idx < logits.len() {
+            logits[eos_idx] = f32::NEG_INFINITY;
+        }
+        for &stop_id in stop_token_ids {
+            let idx = stop_id as usize;
+            if idx < logits.len() {
+                logits[idx] = f32::NEG_INFINITY;
+            }
         }
     }
 }
@@ -679,7 +692,7 @@ mod tests {
         let logits = vec![1.0, 5.0, 3.0, 2.0];
         let params = SamplingParams::greedy();
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(result.token_id, 1); // index of max value (5.0)
     }
 
@@ -691,7 +704,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(result.token_id, 2); // index of 10.0
     }
 
@@ -706,8 +719,8 @@ mod tests {
         let mut state1 = SamplerState::new(Some(123));
         let mut state2 = SamplerState::new(Some(123));
 
-        let result1 = sample(&logits, &params, &[], &mut state1, None);
-        let result2 = sample(&logits, &params, &[], &mut state2, None);
+        let result1 = sample(&logits, &params, &[], &mut state1, None, &[]);
+        let result2 = sample(&logits, &params, &[], &mut state2, None, &[]);
         assert_eq!(result1.token_id, result2.token_id);
     }
 
@@ -722,7 +735,7 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // Token 0 was already generated, should be penalized
-        let result = sample(&logits, &params, &[0], &mut state, None);
+        let result = sample(&logits, &params, &[0], &mut state, None, &[]);
         assert_ne!(result.token_id, 0); // penalized token should not be selected
     }
 
@@ -736,7 +749,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(result.token_id, 1); // only top-1 survives
     }
 
@@ -750,7 +763,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(result.token_id, 0); // 10.0 dominates
     }
 
@@ -764,7 +777,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert!(result.token_id <= 1); // only first two tokens should be candidates
     }
 
@@ -804,7 +817,7 @@ mod tests {
         let mut counts = [0u32; 10];
         let mut state = SamplerState::new(Some(0));
         for _ in 0..1000 {
-            let result = sample(&logits, &params, &[], &mut state, None);
+            let result = sample(&logits, &params, &[], &mut state, None, &[]);
             counts[result.token_id as usize] += 1;
         }
 
@@ -824,7 +837,7 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // Token 2 (the only positive one) was generated, penalize it
-        let result = sample(&logits, &params, &[2], &mut state, None);
+        let result = sample(&logits, &params, &[2], &mut state, None, &[]);
         // 5.0 / 2.0 = 2.5, still higher than -1.0, so token 2 still wins
         assert_eq!(result.token_id, 2);
 
@@ -834,7 +847,7 @@ mod tests {
             repetition_penalty: 10.0,
             ..Default::default()
         };
-        let result2 = sample(&logits, &params2, &[2], &mut state, None);
+        let result2 = sample(&logits, &params2, &[2], &mut state, None, &[]);
         // 5.0 / 10.0 = 0.5, -1.0 * 10.0 = -10.0 for the rest → token 2 still wins
         assert_eq!(result2.token_id, 2);
     }
@@ -861,7 +874,7 @@ mod tests {
         let logits = vec![1.0, 5.0, 3.0, 2.0];
         let params = SamplingParams::greedy();
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, Some(3));
+        let result = sample(&logits, &params, &[], &mut state, Some(3), &[]);
 
         // Token 1 has the highest logit (5.0)
         assert_eq!(result.token_id, 1);
@@ -888,7 +901,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, Some(5));
+        let result = sample(&logits, &params, &[], &mut state, Some(5), &[]);
 
         // Logprob should be for the sampled token
         assert!(result.logprob.is_finite());
@@ -910,7 +923,7 @@ mod tests {
         let logits = vec![1.0, 5.0, 3.0];
         let params = SamplingParams::greedy();
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
 
         assert!(result.top_logprobs.is_none());
         // Logprob will be NEG_INFINITY when not computed
@@ -1187,13 +1200,13 @@ mod tests {
 
         let mut state = SamplerState::new(Some(42));
         for _ in 0..1000 {
-            let r = sample(&logits, &params_low_temp, &[], &mut state, None);
+            let r = sample(&logits, &params_low_temp, &[], &mut state, None, &[]);
             counts_low[r.token_id as usize] += 1;
         }
 
         let mut state = SamplerState::new(Some(42));
         for _ in 0..1000 {
-            let r = sample(&logits, &params_high_temp, &[], &mut state, None);
+            let r = sample(&logits, &params_high_temp, &[], &mut state, None, &[]);
             counts_high[r.token_id as usize] += 1;
         }
 
@@ -1224,10 +1237,10 @@ mod tests {
 
         // Sample many times and collect results
         let results1: Vec<u32> = (0..100)
-            .map(|_| sample(&logits, &params, &[], &mut state1, None).token_id)
+            .map(|_| sample(&logits, &params, &[], &mut state1, None, &[]).token_id)
             .collect();
         let results2: Vec<u32> = (0..100)
-            .map(|_| sample(&logits, &params, &[], &mut state2, None).token_id)
+            .map(|_| sample(&logits, &params, &[], &mut state2, None, &[]).token_id)
             .collect();
 
         // With high probability, these should differ (entropy initialization)
@@ -1253,7 +1266,7 @@ mod tests {
         let mut sampled_tokens = std::collections::HashSet::new();
 
         for _ in 0..1000 {
-            let r = sample(&logits, &params, &[], &mut state, None);
+            let r = sample(&logits, &params, &[], &mut state, None, &[]);
             sampled_tokens.insert(r.token_id);
         }
 
@@ -1277,7 +1290,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(
             result.token_id, 2,
             "Positive bias should boost token 2 to top"
@@ -1294,7 +1307,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_ne!(
             result.token_id, 0,
             "Negative bias should prevent token 0 from being selected"
@@ -1314,7 +1327,7 @@ mod tests {
 
         // Sample many times; token 0 should never appear
         for _ in 0..1000 {
-            let result = sample(&logits, &params, &[], &mut state, None);
+            let result = sample(&logits, &params, &[], &mut state, None, &[]);
             assert_ne!(
                 result.token_id, 0,
                 "Token 0 should be effectively banned with -100 bias"
@@ -1335,8 +1348,8 @@ mod tests {
         let mut state1 = SamplerState::new(Some(42));
         let mut state2 = SamplerState::new(Some(42));
 
-        let r1 = sample(&logits, &params_no_bias, &[], &mut state1, None);
-        let r2 = sample(&logits, &params_default, &[], &mut state2, None);
+        let r1 = sample(&logits, &params_no_bias, &[], &mut state1, None, &[]);
+        let r2 = sample(&logits, &params_default, &[], &mut state2, None, &[]);
         assert_eq!(
             r1.token_id, r2.token_id,
             "None logit_bias should behave identically to default"
@@ -1522,7 +1535,7 @@ mod tests {
 
         // Token 0 appeared 3 times -> penalized by 2.0 * 3 = 6.0 -> logit becomes -1.0
         // Token 1 appeared 0 times -> stays at 4.9
-        let result = sample(&logits, &params, &[0, 0, 0], &mut state, None);
+        let result = sample(&logits, &params, &[0, 0, 0], &mut state, None, &[]);
         assert_eq!(
             result.token_id, 1,
             "Heavily penalized token 0 should lose to token 1"
@@ -1552,7 +1565,7 @@ mod tests {
         let logits = vec![1.0, 5.0, 3.0];
         let params = SamplingParams::default();
         let mut state = SamplerState::new(Some(42));
-        let results = sample_n(&logits, &params, &[], &mut state, None, 0);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 0, &[]);
         assert!(results.is_empty());
     }
 
@@ -1567,8 +1580,8 @@ mod tests {
         let mut state1 = SamplerState::new(Some(42));
         let mut state2 = SamplerState::new(Some(42));
 
-        let single = sample(&logits, &params, &[], &mut state1, None);
-        let multi = sample_n(&logits, &params, &[], &mut state2, None, 1);
+        let single = sample(&logits, &params, &[], &mut state1, None, &[]);
+        let multi = sample_n(&logits, &params, &[], &mut state2, None, 1, &[]);
 
         assert_eq!(multi.len(), 1);
         assert_eq!(multi[0].token_id, single.token_id);
@@ -1580,7 +1593,7 @@ mod tests {
         let params = SamplingParams::greedy();
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, None, 5);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 5, &[]);
 
         assert_eq!(results.len(), 5);
         // All should be the argmax (token 1)
@@ -1601,7 +1614,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, None, 10);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 10, &[]);
         assert_eq!(results.len(), 10);
     }
 
@@ -1615,7 +1628,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, None, 100);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 100, &[]);
         let unique: std::collections::HashSet<u32> = results.iter().map(|r| r.token_id).collect();
 
         assert!(
@@ -1635,8 +1648,8 @@ mod tests {
         let mut state1 = SamplerState::new(Some(123));
         let mut state2 = SamplerState::new(Some(123));
 
-        let results1 = sample_n(&logits, &params, &[], &mut state1, None, 10);
-        let results2 = sample_n(&logits, &params, &[], &mut state2, None, 10);
+        let results1 = sample_n(&logits, &params, &[], &mut state1, None, 10, &[]);
+        let results2 = sample_n(&logits, &params, &[], &mut state2, None, 10, &[]);
 
         let ids1: Vec<u32> = results1.iter().map(|r| r.token_id).collect();
         let ids2: Vec<u32> = results2.iter().map(|r| r.token_id).collect();
@@ -1649,7 +1662,7 @@ mod tests {
         let params = SamplingParams::greedy();
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, Some(3), 3);
+        let results = sample_n(&logits, &params, &[], &mut state, Some(3), 3, &[]);
 
         assert_eq!(results.len(), 3);
         for r in &results {
@@ -1669,7 +1682,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, Some(2), 3);
+        let results = sample_n(&logits, &params, &[], &mut state, Some(2), 3, &[]);
 
         // Top logprobs should be the same for all samples (computed once from same distribution)
         let top0 = results[0].top_logprobs.as_ref().unwrap();
@@ -1701,7 +1714,7 @@ mod tests {
 
         // Token 0 was already generated, should be penalized: 5.0 / 2.0 = 2.5
         // Token 1 should now be argmax at 4.9
-        let results = sample_n(&logits, &params, &[0], &mut state, None, 3);
+        let results = sample_n(&logits, &params, &[0], &mut state, None, 3, &[]);
         for r in &results {
             assert_eq!(
                 r.token_id, 1,
@@ -1721,7 +1734,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, None, 10);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 10, &[]);
         for r in &results {
             assert_eq!(r.token_id, 1, "top_k=1 should only allow the argmax");
         }
@@ -1741,7 +1754,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         // Token 1 banned → next best is token 2 (3.0)
         assert_eq!(result.token_id, 2, "Banned token should not be selected");
     }
@@ -1755,7 +1768,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         // Tokens 1, 2 banned → next best is token 3 (3.0)
         assert_eq!(result.token_id, 3);
     }
@@ -1769,7 +1782,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(result.token_id, 1);
     }
 
@@ -1783,7 +1796,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         // Only tokens 0 (1.0) and 3 (3.0) allowed → greedy picks 3
         assert_eq!(result.token_id, 3);
     }
@@ -1798,7 +1811,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
         for _ in 0..100 {
-            let result = sample(&logits, &params, &[], &mut state, None);
+            let result = sample(&logits, &params, &[], &mut state, None, &[]);
             assert_eq!(result.token_id, 2, "Only token 2 should be allowed");
         }
     }
@@ -1816,7 +1829,7 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // Only 2 tokens generated so far (< min_tokens=5) → EOS suppressed
-        let result = sample(&logits, &params, &[10, 20], &mut state, None);
+        let result = sample(&logits, &params, &[10, 20], &mut state, None, &[]);
         assert_ne!(
             result.token_id, 1,
             "EOS should be suppressed before min_tokens"
@@ -1837,7 +1850,7 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // 3 tokens already generated (= min_tokens) → EOS allowed
-        let result = sample(&logits, &params, &[10, 20, 30], &mut state, None);
+        let result = sample(&logits, &params, &[10, 20, 30], &mut state, None, &[]);
         assert_eq!(
             result.token_id, 1,
             "EOS should be allowed once min_tokens reached"
@@ -1854,7 +1867,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = SamplerState::new(Some(42));
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_eq!(
             result.token_id, 1,
             "Without eos_token_id, min_tokens has no effect"
@@ -1871,7 +1884,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, None, 50);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 50, &[]);
         for r in &results {
             assert_ne!(
                 r.token_id, 1,
@@ -1890,7 +1903,7 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
 
-        let results = sample_n(&logits, &params, &[], &mut state, None, 50);
+        let results = sample_n(&logits, &params, &[], &mut state, None, 50, &[]);
         for r in &results {
             assert!(
                 r.token_id == 0 || r.token_id == 2,
@@ -1913,7 +1926,7 @@ mod tests {
         let mut state = SamplerState::new(Some(42));
 
         // Only 1 token generated → EOS suppressed
-        let results = sample_n(&logits, &params, &[10], &mut state, None, 3);
+        let results = sample_n(&logits, &params, &[10], &mut state, None, 3, &[]);
         for r in &results {
             assert_ne!(r.token_id, 1, "EOS should be suppressed in sample_n too");
         }
@@ -1950,7 +1963,7 @@ mod tests {
     #[test]
     fn apply_min_tokens_suppression_helper() {
         let mut logits = vec![1.0, 2.0, 3.0];
-        apply_min_tokens_suppression(&mut logits, 1, 5, 3); // 3 < 5 → suppress
+        apply_min_tokens_suppression(&mut logits, 1, &[], 5, 3); // 3 < 5 → suppress
         assert_eq!(logits[0], 1.0);
         assert_eq!(logits[1], f32::NEG_INFINITY);
         assert_eq!(logits[2], 3.0);
@@ -1959,10 +1972,34 @@ mod tests {
     #[test]
     fn apply_min_tokens_suppression_allows_after_threshold() {
         let mut logits = vec![1.0, 2.0, 3.0];
-        apply_min_tokens_suppression(&mut logits, 1, 5, 5); // 5 >= 5 → no suppression
+        apply_min_tokens_suppression(&mut logits, 1, &[], 5, 5); // 5 >= 5 → no suppression
         assert_eq!(logits[0], 1.0);
         assert_eq!(logits[1], 2.0);
         assert_eq!(logits[2], 3.0);
+    }
+
+    #[test]
+    fn apply_min_tokens_suppression_with_stop_token_ids() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        // EOS=1, stop_token_ids=[3, 4], min_tokens=5, generated=2 → suppress all
+        apply_min_tokens_suppression(&mut logits, 1, &[3, 4], 5, 2);
+        assert_eq!(logits[0], 1.0); // not a stop token
+        assert_eq!(logits[1], f32::NEG_INFINITY); // EOS
+        assert_eq!(logits[2], 3.0); // not a stop token
+        assert_eq!(logits[3], f32::NEG_INFINITY); // stop token
+        assert_eq!(logits[4], f32::NEG_INFINITY); // stop token
+    }
+
+    #[test]
+    fn apply_min_tokens_suppression_stop_tokens_allowed_after_threshold() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        // EOS=1, stop_token_ids=[3, 4], min_tokens=3, generated=3 → no suppression
+        apply_min_tokens_suppression(&mut logits, 1, &[3, 4], 3, 3);
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[1], 2.0); // EOS not suppressed
+        assert_eq!(logits[2], 3.0);
+        assert_eq!(logits[3], 4.0); // stop token not suppressed
+        assert_eq!(logits[4], 5.0); // stop token not suppressed
     }
 
     #[test]
@@ -2003,12 +2040,12 @@ mod tests {
 
         // Token 1 should be unconditionally banned
         let logits = vec![0.0, 100.0, 0.0, 0.0];
-        let result = sample(&logits, &params, &[], &mut state, None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
         assert_ne!(result.token_id, 1);
 
         // Token 3 should be banned when last generated token is 2
         let logits = vec![0.0, 0.0, 0.0, 100.0];
-        let result = sample(&logits, &params, &[2], &mut state, None);
+        let result = sample(&logits, &params, &[2], &mut state, None, &[]);
         assert_ne!(result.token_id, 3);
     }
 }

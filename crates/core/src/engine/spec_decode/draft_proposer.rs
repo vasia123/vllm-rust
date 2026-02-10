@@ -96,6 +96,7 @@ pub(crate) fn sample_speculative(
         &state.generated_token_ids,
         &mut state.sampler_state,
         None,
+        &state.stop_token_ids,
     );
 
     Ok(result.token_id)

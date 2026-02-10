@@ -723,6 +723,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 &req.state.generated_token_ids,
                 &mut req.state.sampler_state,
                 req.state.num_top_logprobs,
+                &req.state.stop_token_ids,
             );
             req.state.block_table.advance(1);
             req.state.seqlen_offset += 1;
@@ -847,6 +848,7 @@ pub(crate) fn sample_token(
         &state.generated_token_ids,
         &mut state.sampler_state,
         state.num_top_logprobs,
+        &state.stop_token_ids,
     );
 
     if state.num_top_logprobs.is_some() {

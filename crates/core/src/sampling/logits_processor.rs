@@ -230,17 +230,19 @@ impl LogitsProcessor for AllowedTokenIdsProcessor {
     }
 }
 
-/// Min-tokens processor — prevents EOS token until min_tokens generated.
+/// Min-tokens processor — prevents EOS and stop tokens until min_tokens generated.
 pub struct MinTokensProcessor {
     min_tokens: usize,
     eos_token_id: u32,
+    stop_token_ids: Vec<u32>,
 }
 
 impl MinTokensProcessor {
-    pub fn new(min_tokens: usize, eos_token_id: u32) -> Self {
+    pub fn new(min_tokens: usize, eos_token_id: u32, stop_token_ids: Vec<u32>) -> Self {
         Self {
             min_tokens,
             eos_token_id,
+            stop_token_ids,
         }
     }
 }
@@ -248,9 +250,15 @@ impl MinTokensProcessor {
 impl LogitsProcessor for MinTokensProcessor {
     fn process(&self, logits: &mut [f32], generated_tokens: &[u32]) {
         if generated_tokens.len() < self.min_tokens {
-            let idx = self.eos_token_id as usize;
-            if idx < logits.len() {
-                logits[idx] = f32::NEG_INFINITY;
+            let eos_idx = self.eos_token_id as usize;
+            if eos_idx < logits.len() {
+                logits[eos_idx] = f32::NEG_INFINITY;
+            }
+            for &stop_id in &self.stop_token_ids {
+                let idx = stop_id as usize;
+                if idx < logits.len() {
+                    logits[idx] = f32::NEG_INFINITY;
+                }
             }
         }
     }
@@ -295,8 +303,8 @@ impl LogitsProcessorPipeline {
         self.processors.len()
     }
 
-    /// Build a pipeline from SamplingParams.
-    pub fn from_params(params: &super::SamplingParams) -> Self {
+    /// Build a pipeline from SamplingParams and stop token IDs.
+    pub fn from_params(params: &super::SamplingParams, stop_token_ids: &[u32]) -> Self {
         let mut pipeline = Self::new();
 
         if params.repetition_penalty != 1.0 {
@@ -338,7 +346,7 @@ impl LogitsProcessorPipeline {
 
         if params.min_tokens > 0 {
             if let Some(eos_id) = params.eos_token_id {
-                pipeline.push(Box::new(MinTokensProcessor::new(params.min_tokens, eos_id)));
+                pipeline.push(Box::new(MinTokensProcessor::new(params.min_tokens, eos_id, stop_token_ids.to_vec())));
             }
         }
 
@@ -405,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_min_tokens_processor() {
-        let proc = MinTokensProcessor::new(3, 2);
+        let proc = MinTokensProcessor::new(3, 2, vec![]);
 
         // Not enough tokens generated — EOS (token 2) should be -inf
         let mut logits = vec![1.0, 2.0, 3.0, 4.0];
@@ -416,6 +424,27 @@ mod tests {
         let mut logits = vec![1.0, 2.0, 3.0, 4.0];
         proc.process(&mut logits, &[5, 6, 7]);
         assert!((logits[2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_min_tokens_processor_suppresses_stop_tokens() {
+        // EOS=2, stop_token_ids=[1, 3]
+        let proc = MinTokensProcessor::new(3, 2, vec![1, 3]);
+
+        // Not enough tokens — EOS and stop tokens should all be -inf
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        proc.process(&mut logits, &[5, 6]);
+        assert!((logits[0] - 1.0).abs() < 1e-6, "non-stop token unchanged");
+        assert!(logits[1] == f32::NEG_INFINITY, "stop token 1 suppressed");
+        assert!(logits[2] == f32::NEG_INFINITY, "eos token 2 suppressed");
+        assert!(logits[3] == f32::NEG_INFINITY, "stop token 3 suppressed");
+
+        // Enough tokens — nothing suppressed
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        proc.process(&mut logits, &[5, 6, 7]);
+        assert!((logits[1] - 2.0).abs() < 1e-6, "stop token 1 not suppressed after min_tokens");
+        assert!((logits[2] - 3.0).abs() < 1e-6, "eos not suppressed after min_tokens");
+        assert!((logits[3] - 4.0).abs() < 1e-6, "stop token 3 not suppressed after min_tokens");
     }
 
     #[test]
@@ -439,14 +468,14 @@ mod tests {
             ..Default::default()
         };
 
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert_eq!(pipeline.len(), 3);
     }
 
     #[test]
     fn test_pipeline_default_empty() {
         let params = super::super::SamplingParams::default();
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert!(pipeline.is_empty());
     }
 
@@ -496,7 +525,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert_eq!(pipeline.len(), 1);
 
         let mut logits = vec![5.0, 5.0, 5.0, 5.0];
@@ -513,7 +542,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert_eq!(pipeline.len(), 1);
 
         let mut logits = vec![5.0, 5.0, 5.0, 5.0];
@@ -532,7 +561,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert_eq!(pipeline.len(), 1);
 
         // Not enough tokens generated — EOS blocked
@@ -555,7 +584,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert!(pipeline.is_empty());
     }
 
@@ -572,7 +601,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         // rep_pen + freq_pres + logit_bias + banned + allowed + min_tokens = 6
         assert_eq!(pipeline.len(), 6);
     }
@@ -661,7 +690,7 @@ mod tests {
             bad_words_token_ids: Some(vec![vec![1], vec![2, 3]]),
             ..Default::default()
         };
-        let pipeline = LogitsProcessorPipeline::from_params(&params);
+        let pipeline = LogitsProcessorPipeline::from_params(&params, &[]);
         assert_eq!(pipeline.len(), 1);
 
         let mut logits = vec![5.0; 5];
