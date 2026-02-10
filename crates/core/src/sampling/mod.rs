@@ -141,6 +141,11 @@ impl SamplerState {
         };
         Self { rng }
     }
+
+    /// Access the underlying RNG for use in rejection sampling.
+    pub fn rng_mut(&mut self) -> &mut StdRng {
+        &mut self.rng
+    }
 }
 
 /// Draw N independent samples from the same logit distribution.
@@ -453,7 +458,7 @@ pub fn sample(
     }
 }
 
-fn apply_repetition_penalty(logits: &mut [f32], generated_tokens: &[u32], penalty: f32) {
+pub(crate) fn apply_repetition_penalty(logits: &mut [f32], generated_tokens: &[u32], penalty: f32) {
     for &token_id in generated_tokens {
         let idx = token_id as usize;
         if idx < logits.len() {
@@ -472,7 +477,7 @@ fn apply_repetition_penalty(logits: &mut [f32], generated_tokens: &[u32], penalt
 ///   logits[token_id] -= frequency_penalty * count + presence_penalty * 1.0
 ///
 /// Where `count` is the number of times the token appears in `generated_tokens`.
-fn apply_frequency_presence_penalty(
+pub(crate) fn apply_frequency_presence_penalty(
     logits: &mut [f32],
     generated_tokens: &[u32],
     frequency_penalty: f32,
@@ -493,7 +498,7 @@ fn apply_frequency_presence_penalty(
     }
 }
 
-fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
+pub(crate) fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
     for &(token_id, bias_value) in bias {
         let idx = token_id as usize;
         if idx < logits.len() {
@@ -502,7 +507,7 @@ fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
     }
 }
 
-fn apply_banned_tokens(logits: &mut [f32], banned: &[u32]) {
+pub(crate) fn apply_banned_tokens(logits: &mut [f32], banned: &[u32]) {
     for &token_id in banned {
         let idx = token_id as usize;
         if idx < logits.len() {
@@ -511,7 +516,7 @@ fn apply_banned_tokens(logits: &mut [f32], banned: &[u32]) {
     }
 }
 
-fn apply_allowed_tokens(logits: &mut [f32], allowed: &[u32]) {
+pub(crate) fn apply_allowed_tokens(logits: &mut [f32], allowed: &[u32]) {
     for (idx, logit) in logits.iter_mut().enumerate() {
         if !allowed.contains(&(idx as u32)) {
             *logit = f32::NEG_INFINITY;
@@ -519,7 +524,7 @@ fn apply_allowed_tokens(logits: &mut [f32], allowed: &[u32]) {
     }
 }
 
-fn apply_bad_words(logits: &mut [f32], bad_words: &[Vec<u32>], generated_tokens: &[u32]) {
+pub(crate) fn apply_bad_words(logits: &mut [f32], bad_words: &[Vec<u32>], generated_tokens: &[u32]) {
     for word_ids in bad_words {
         if word_ids.is_empty() {
             continue;
@@ -546,7 +551,7 @@ fn apply_bad_words(logits: &mut [f32], bad_words: &[Vec<u32>], generated_tokens:
     }
 }
 
-fn apply_min_tokens_suppression(
+pub(crate) fn apply_min_tokens_suppression(
     logits: &mut [f32],
     eos_id: u32,
     min_tokens: usize,
@@ -603,7 +608,7 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
     }
 }
 
-fn softmax(logits: &[f32]) -> Vec<f32> {
+pub(crate) fn softmax(logits: &[f32]) -> Vec<f32> {
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
     let sum: f32 = probs.iter().sum();
