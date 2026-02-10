@@ -23,7 +23,9 @@
 mod attention;
 mod communicator;
 mod error;
+#[cfg(feature = "cuda")]
 mod launcher;
+#[cfg(feature = "cuda")]
 mod nccl;
 mod parallel_layers;
 mod pipeline;
@@ -32,7 +34,9 @@ mod process_group;
 pub use attention::{TensorParallelAttention, TensorParallelMLP};
 pub use communicator::{DeviceCommunicator, MockCommunicator, ReduceOp};
 pub use error::DistributedError;
+#[cfg(feature = "cuda")]
 pub use launcher::{DistributedConfig, NcclProcessGroup};
+#[cfg(feature = "cuda")]
 pub use nccl::{
     is_nccl_available, NcclCommunicator, NcclDataType, NcclDeviceCommunicator, NcclLibrary,
     NcclUniqueId,

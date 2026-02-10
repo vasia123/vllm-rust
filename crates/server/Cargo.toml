@@ -4,7 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-cuda-kernels = ["vllm-core/cuda-kernels"]
+cuda = ["vllm-core/cuda", "candle-core/cuda"]
+cuda-kernels = ["cuda", "vllm-core/cuda-kernels"]
 
 [dependencies]
 vllm-core = { path = "../core" }

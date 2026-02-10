@@ -5,9 +5,10 @@ edition.workspace = true
 
 [features]
 test-utils = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 flash-attn = ["dep:candle-flash-attn"]
 flashinfer = ["dep:flashinfer-rs"]
-cuda-kernels = []
+cuda-kernels = ["cuda"]
 cuda-fused-activations = ["cuda-kernels"]
 cuda-layernorm = ["cuda-kernels"]
 cuda-moe = ["cuda-kernels"]

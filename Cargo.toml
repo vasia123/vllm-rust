@@ -8,12 +8,15 @@ publish = false
 members = ["crates/*"]
 resolver = "2"
 
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "vllm-core/cuda", "vllm-server/cuda"]
+
 [dev-dependencies]
 vllm-core = { path = "crates/core", features = ["test-utils"] }
 vllm-server = { path = "crates/server" }
 tokio = { version = "1", features = ["full"] }
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
+candle-core = "0.9"
+candle-nn = "0.9"
 serde = { workspace = true }
 serde_json = "1"
 tempfile = "3"
@@ -27,8 +30,8 @@ thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
+candle-core = "0.9"
+candle-nn = "0.9"
 candle-flash-attn = "0.9"
 hf-hub = "0.4"
 tokenizers = "0.22"
