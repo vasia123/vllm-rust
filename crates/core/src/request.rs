@@ -12,11 +12,16 @@ pub enum RequestStatus {
     Preempted,
     FinishedEos,
     FinishedLength,
+    /// Finished due to a stop token or stop string match.
+    FinishedStopped,
 }
 
 impl RequestStatus {
     pub fn is_finished(self) -> bool {
-        matches!(self, Self::FinishedEos | Self::FinishedLength)
+        matches!(
+            self,
+            Self::FinishedEos | Self::FinishedLength | Self::FinishedStopped
+        )
     }
 
     pub fn is_running(self) -> bool {
@@ -46,6 +51,8 @@ pub struct SequenceState {
     pub stop_token_ids: Vec<u32>,
     pub stop_strings: Vec<String>,
     pub include_stop_str_in_output: bool,
+    /// When true, EOS token does not trigger generation stop.
+    pub ignore_eos: bool,
     /// Number of prompt tokens already processed (for chunked prefill).
     pub num_computed_tokens: usize,
     /// Number of top logprobs to return (None = no logprobs).
@@ -88,6 +95,7 @@ impl SequenceState {
             stop_token_ids: Vec::new(),
             stop_strings: Vec::new(),
             include_stop_str_in_output: false,
+            ignore_eos: false,
             num_computed_tokens: 0,
             num_top_logprobs: None,
             token_logprobs: Vec::new(),
@@ -138,6 +146,7 @@ mod tests {
         assert!(!RequestStatus::Preempted.is_finished());
         assert!(RequestStatus::FinishedEos.is_finished());
         assert!(RequestStatus::FinishedLength.is_finished());
+        assert!(RequestStatus::FinishedStopped.is_finished());
     }
 
     #[test]
@@ -148,6 +157,7 @@ mod tests {
         assert!(!RequestStatus::Preempted.is_running());
         assert!(!RequestStatus::FinishedEos.is_running());
         assert!(!RequestStatus::FinishedLength.is_running());
+        assert!(!RequestStatus::FinishedStopped.is_running());
     }
 
     #[test]

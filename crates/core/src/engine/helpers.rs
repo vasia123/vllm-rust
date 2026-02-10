@@ -25,6 +25,8 @@ use crate::lora::LoraContext;
 pub(crate) struct FinishCheck {
     pub reason: FinishReason,
     pub trim_bytes: usize,
+    /// For stop token matches: the specific token ID that triggered the stop.
+    pub stop_reason: Option<u32>,
 }
 
 /// Handle an incoming command. Returns true if shutdown was requested.
@@ -213,6 +215,7 @@ fn admit_request(
     state.stop_token_ids = request.stop_token_ids;
     state.stop_strings = request.stop_strings;
     state.include_stop_str_in_output = request.include_stop_str_in_output;
+    state.ignore_eos = request.ignore_eos;
     state.num_top_logprobs = request.logprobs.map(|n| n as usize);
     state.echo = request.echo;
     state.lora_request = request.lora_request;
@@ -741,10 +744,25 @@ pub(crate) fn check_finished(
 ) -> Option<FinishCheck> {
     let last_token = *state.generated_token_ids.last()?;
 
-    if last_token == state.eos_token_id {
+    // min_tokens guard: don't stop before minimum generated tokens.
+    // Length limit still overrides min_tokens.
+    if state.generated_token_ids.len() < state.sampling_params.min_tokens {
+        if state.num_generated() >= state.max_new_tokens {
+            return Some(FinishCheck {
+                reason: FinishReason::Length,
+                trim_bytes: 0,
+                stop_reason: None,
+            });
+        }
+        return None;
+    }
+
+    // EOS check — respect ignore_eos
+    if !state.ignore_eos && last_token == state.eos_token_id {
         return Some(FinishCheck {
             reason: FinishReason::Eos,
             trim_bytes: 0,
+            stop_reason: None,
         });
     }
 
@@ -752,6 +770,7 @@ pub(crate) fn check_finished(
         return Some(FinishCheck {
             reason: FinishReason::Stop,
             trim_bytes: 0,
+            stop_reason: Some(last_token),
         });
     }
 
@@ -767,6 +786,7 @@ pub(crate) fn check_finished(
                     return Some(FinishCheck {
                         reason: FinishReason::Stop,
                         trim_bytes: trim,
+                        stop_reason: None,
                     });
                 }
             }
@@ -780,6 +800,7 @@ pub(crate) fn check_finished(
                 return Some(FinishCheck {
                     reason: FinishReason::Stop,
                     trim_bytes: 0,
+                    stop_reason: None,
                 });
             }
         }
@@ -789,6 +810,7 @@ pub(crate) fn check_finished(
         return Some(FinishCheck {
             reason: FinishReason::Length,
             trim_bytes: 0,
+            stop_reason: None,
         });
     }
 
@@ -900,6 +922,7 @@ pub(crate) fn build_generation_result(
     generated_text: String,
     state: &mut SequenceState,
     finish_reason: FinishReason,
+    stop_reason: Option<u32>,
 ) -> GenerationResult {
     let has_logprobs = state.num_top_logprobs.is_some();
 
@@ -932,6 +955,7 @@ pub(crate) fn build_generation_result(
         generated_text,
         generated_token_ids: std::mem::take(&mut state.generated_token_ids),
         finish_reason,
+        stop_reason,
         token_logprobs,
         top_logprobs,
         prompt_token_ids,
@@ -1109,6 +1133,7 @@ pub(crate) fn check_beam_finished(req: &ActiveRequest) -> Option<FinishCheck> {
         return Some(FinishCheck {
             reason: FinishReason::Eos,
             trim_bytes: 0,
+            stop_reason: None,
         });
     }
 
@@ -1125,6 +1150,7 @@ pub(crate) fn check_beam_finished(req: &ActiveRequest) -> Option<FinishCheck> {
         return Some(FinishCheck {
             reason: FinishReason::Length,
             trim_bytes: 0,
+            stop_reason: None,
         });
     }
 
@@ -1179,4 +1205,130 @@ pub(crate) fn finalize_beam_request(
 /// Returns `true` if the given request is a beam search request.
 pub(crate) fn is_beam_request(req: &ActiveRequest) -> bool {
     req.beam_state.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state(eos: u32, max_new: usize) -> SequenceState {
+        SequenceState::new(0, vec![1, 2, 3], max_new, eos, 16, 0)
+    }
+
+    fn dummy_tokenizer() -> TokenizerWrapper {
+        TokenizerWrapper::for_testing(100)
+    }
+
+    #[test]
+    fn test_check_finished_eos() {
+        let mut state = make_state(99, 100);
+        state.generated_token_ids.push(99);
+        let tok = dummy_tokenizer();
+        let check = check_finished(&state, &tok).unwrap();
+        assert_eq!(check.reason, FinishReason::Eos);
+        assert!(check.stop_reason.is_none());
+    }
+
+    #[test]
+    fn test_check_finished_ignore_eos() {
+        let mut state = make_state(99, 100);
+        state.ignore_eos = true;
+        state.generated_token_ids.push(99);
+        let tok = dummy_tokenizer();
+        // EOS should be ignored
+        assert!(check_finished(&state, &tok).is_none());
+    }
+
+    #[test]
+    fn test_check_finished_stop_token_with_reason() {
+        let mut state = make_state(99, 100);
+        state.stop_token_ids = vec![42, 55];
+        state.generated_token_ids.push(42);
+        let tok = dummy_tokenizer();
+        let check = check_finished(&state, &tok).unwrap();
+        assert_eq!(check.reason, FinishReason::Stop);
+        assert_eq!(check.stop_reason, Some(42));
+    }
+
+    #[test]
+    fn test_check_finished_length_limit() {
+        let mut state = make_state(99, 2);
+        state.generated_token_ids.push(10);
+        state.generated_token_ids.push(20);
+        let tok = dummy_tokenizer();
+        let check = check_finished(&state, &tok).unwrap();
+        assert_eq!(check.reason, FinishReason::Length);
+        assert!(check.stop_reason.is_none());
+    }
+
+    #[test]
+    fn test_check_finished_min_tokens_blocks_eos() {
+        let mut state = make_state(99, 100);
+        state.sampling_params.min_tokens = 5;
+        // Only 1 token generated, below min_tokens
+        state.generated_token_ids.push(99);
+        let tok = dummy_tokenizer();
+        // EOS should NOT trigger stop because min_tokens not reached
+        assert!(check_finished(&state, &tok).is_none());
+    }
+
+    #[test]
+    fn test_check_finished_min_tokens_blocks_stop_token() {
+        let mut state = make_state(99, 100);
+        state.sampling_params.min_tokens = 3;
+        state.stop_token_ids = vec![42];
+        state.generated_token_ids.push(42);
+        let tok = dummy_tokenizer();
+        // Stop token should NOT trigger because min_tokens not reached
+        assert!(check_finished(&state, &tok).is_none());
+    }
+
+    #[test]
+    fn test_check_finished_min_tokens_allows_length_limit() {
+        let mut state = make_state(99, 1);
+        state.sampling_params.min_tokens = 10;
+        // 1 token generated, hits max_new_tokens (1) even though < min_tokens
+        state.generated_token_ids.push(99);
+        let tok = dummy_tokenizer();
+        let check = check_finished(&state, &tok).unwrap();
+        assert_eq!(check.reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn test_check_finished_min_tokens_met_allows_eos() {
+        let mut state = make_state(99, 100);
+        state.sampling_params.min_tokens = 2;
+        state.generated_token_ids.push(10);
+        state.generated_token_ids.push(99); // EOS at position 2, min_tokens=2 met
+        let tok = dummy_tokenizer();
+        let check = check_finished(&state, &tok).unwrap();
+        assert_eq!(check.reason, FinishReason::Eos);
+    }
+
+    #[test]
+    fn test_check_finished_no_tokens() {
+        let state = make_state(99, 100);
+        let tok = dummy_tokenizer();
+        assert!(check_finished(&state, &tok).is_none());
+    }
+
+    #[test]
+    fn test_check_finished_non_stop_token() {
+        let mut state = make_state(99, 100);
+        state.generated_token_ids.push(50);
+        let tok = dummy_tokenizer();
+        assert!(check_finished(&state, &tok).is_none());
+    }
+
+    #[test]
+    fn test_check_finished_ignore_eos_still_respects_stop_tokens() {
+        let mut state = make_state(99, 100);
+        state.ignore_eos = true;
+        state.stop_token_ids = vec![42];
+        state.generated_token_ids.push(42);
+        let tok = dummy_tokenizer();
+        let check = check_finished(&state, &tok).unwrap();
+        assert_eq!(check.reason, FinishReason::Stop);
+        assert_eq!(check.stop_reason, Some(42));
+    }
 }

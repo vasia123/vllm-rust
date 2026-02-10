@@ -25,6 +25,8 @@ pub enum StreamEvent {
     Done {
         finish_reason: FinishReason,
         generated_text: String,
+        /// For stop token matches: the specific token ID that triggered the stop.
+        stop_reason: Option<u32>,
     },
     Error {
         error: String,
@@ -57,6 +59,8 @@ pub struct GenerationRequest {
     pub stop_token_ids: Vec<u32>,
     pub stop_strings: Vec<String>,
     pub include_stop_str_in_output: bool,
+    /// When true, EOS token does not trigger generation stop.
+    pub ignore_eos: bool,
     pub logprobs: Option<u32>,
     pub echo: bool,
     /// LoRA adapter to use for this request (None = no adapter).
@@ -78,6 +82,7 @@ impl Default for GenerationRequest {
             stop_token_ids: Vec::new(),
             stop_strings: Vec::new(),
             include_stop_str_in_output: false,
+            ignore_eos: false,
             logprobs: None,
             echo: false,
             lora_request: None,
@@ -93,6 +98,8 @@ pub struct GenerationResult {
     pub generated_text: String,
     pub generated_token_ids: Vec<u32>,
     pub finish_reason: FinishReason,
+    /// For stop token matches: the specific token ID that triggered the stop.
+    pub stop_reason: Option<u32>,
     pub token_logprobs: Option<Vec<f32>>,
     pub top_logprobs: Option<Vec<Vec<(u32, f32)>>>,
     pub prompt_token_ids: Option<Vec<u32>>,

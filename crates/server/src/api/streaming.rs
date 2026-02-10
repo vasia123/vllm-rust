@@ -157,7 +157,7 @@ pub fn completion_sse_stream(
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
-                StreamEvent::Done { finish_reason, .. } => {
+                StreamEvent::Done { finish_reason, stop_reason, .. } => {
                     let usage = if options.continuous_usage_stats {
                         Some(Usage::new(options.prompt_tokens, completion_tokens))
                     } else {
@@ -173,7 +173,7 @@ pub fn completion_sse_stream(
                             text: String::new(),
                             index: 0,
                             finish_reason: Some(finish_reason_str(&finish_reason)),
-                            stop_reason: None,
+                            stop_reason: stop_reason.map(serde_json::Value::from),
                             logprobs: None,
                             token_ids: None,
                         }],
@@ -292,7 +292,7 @@ pub fn chat_completion_sse_stream(
                     };
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
-                StreamEvent::Done { finish_reason, .. } => {
+                StreamEvent::Done { finish_reason, stop_reason, .. } => {
                     let usage = if options.continuous_usage_stats {
                         Some(Usage::new(options.prompt_tokens, completion_tokens))
                     } else {
@@ -313,7 +313,7 @@ pub fn chat_completion_sse_stream(
                             },
                             index: 0,
                             finish_reason: Some(finish_reason_str(&finish_reason)),
-                            stop_reason: None,
+                            stop_reason: stop_reason.map(serde_json::Value::from),
                             logprobs: None,
                             token_ids: None,
                         }],
@@ -412,6 +412,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "hello".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -444,6 +445,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "hello".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -479,6 +481,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "hi".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -507,6 +510,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "world".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -557,6 +561,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "hello world".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -600,6 +605,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "hi".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -633,6 +639,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Eos,
             generated_text: "hello".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -674,6 +681,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Length,
             generated_text: "abcde".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -709,6 +717,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Stop,
             generated_text: "hello".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -738,6 +747,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Stop,
             generated_text: "hello".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -764,6 +774,7 @@ mod tests {
         tx.send(StreamEvent::Done {
             finish_reason: FinishReason::Stop,
             generated_text: "world".to_string(),
+            stop_reason: None,
         })
         .await
         .unwrap();

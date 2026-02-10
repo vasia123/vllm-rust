@@ -289,16 +289,23 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                 }
             }
 
+            let stop_reason = check.stop_reason;
             match req.response {
                 ResponseChannel::Complete(tx) => {
-                    let result =
-                        build_generation_result(req_id, text, &mut req.state, finish_reason);
+                    let result = build_generation_result(
+                        req_id,
+                        text,
+                        &mut req.state,
+                        finish_reason,
+                        stop_reason,
+                    );
                     let _ = tx.send(Ok(result));
                 }
                 ResponseChannel::Stream(tx) => {
                     let _ = tx.try_send(super::types::StreamEvent::Done {
                         finish_reason,
                         generated_text: text,
+                        stop_reason,
                     });
                 }
             }
