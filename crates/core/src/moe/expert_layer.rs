@@ -14,6 +14,7 @@ use candle_core::{DType, IndexOp, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use super::fused::FusedMoEBlockConfig;
+use super::lora::{expert_forward_with_lora, MoELoraWeights};
 use super::router::{MoERouter, RouterConfig, TopKRouter};
 
 /// Configuration for a single MoE expert.
@@ -29,9 +30,9 @@ pub struct MoEExpertConfig {
 ///
 /// Uses SwiGLU activation: output = down_proj(silu(gate_proj(x)) * up_proj(x))
 pub struct MoEExpert {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    pub(crate) gate_proj: Linear,
+    pub(crate) up_proj: Linear,
+    pub(crate) down_proj: Linear,
 }
 
 impl MoEExpert {
@@ -345,6 +346,105 @@ impl MoELayer {
     pub fn inplace(&self) -> bool {
         self.inplace
     }
+
+    /// Forward pass with optional LoRA adapters.
+    ///
+    /// If `lora_weights` is `None`, delegates to the standard `forward`.
+    /// Otherwise uses the fused path with per-expert LoRA applied.
+    pub fn forward_with_lora(
+        &self,
+        hidden_states: &Tensor,
+        lora_weights: Option<&MoELoraWeights>,
+    ) -> Result<Tensor> {
+        match lora_weights {
+            None => self.forward(hidden_states),
+            Some(lora) => self.forward_fused_with_lora(hidden_states, lora),
+        }
+    }
+
+    /// Fused forward pass with per-expert LoRA applied on permuted tokens.
+    ///
+    /// Tokens are grouped by expert assignment, then each expert batch gets
+    /// LoRA-augmented gate/up/down projections. The existing scatter-back
+    /// (unpermute) step restores original token order.
+    ///
+    /// This is "unpermute-aware" because LoRA is applied within the grouped
+    /// execution loop rather than as a separate pass, avoiding redundant
+    /// permutation/unpermutation.
+    pub fn forward_fused_with_lora(
+        &self,
+        hidden_states: &Tensor,
+        lora_weights: &MoELoraWeights,
+    ) -> Result<Tensor> {
+        let orig_shape = hidden_states.dims().to_vec();
+        let hidden_size = *orig_shape.last().ok_or_else(|| {
+            candle_core::Error::Msg("Tensor must have at least 1 dimension".to_string())
+        })?;
+
+        let num_tokens: usize = orig_shape.iter().take(orig_shape.len() - 1).product();
+        let flat_hidden = hidden_states.reshape((num_tokens, hidden_size))?;
+
+        let (routing_weights, expert_indices) = self.router.route(&flat_hidden)?;
+
+        let device = hidden_states.device();
+        let dtype = hidden_states.dtype();
+        let mut output = Tensor::zeros((num_tokens, hidden_size), dtype, device)?;
+
+        let expert_indices_vec: Vec<u32> = expert_indices.flatten_all()?.to_vec1()?;
+        let routing_weights_vec: Vec<f32> = routing_weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1()?;
+
+        // Group tokens by expert
+        let mut expert_tokens: Vec<Vec<(usize, usize, f32)>> =
+            vec![Vec::new(); self.config.num_experts];
+
+        for token_idx in 0..num_tokens {
+            for k in 0..self.config.top_k {
+                let flat_idx = token_idx * self.config.top_k + k;
+                let expert_id = expert_indices_vec[flat_idx] as usize;
+                let weight = routing_weights_vec[flat_idx];
+                if expert_id < self.config.num_experts {
+                    expert_tokens[expert_id].push((token_idx, k, weight));
+                }
+            }
+        }
+
+        // Process each expert's tokens with LoRA
+        for (expert_id, tokens) in expert_tokens.iter().enumerate() {
+            if tokens.is_empty() {
+                continue;
+            }
+
+            let expert = &self.experts[expert_id];
+            let batch_size = tokens.len();
+
+            // Gather input tokens for this expert
+            let mut input_rows = Vec::with_capacity(batch_size);
+            for &(token_idx, _, _) in tokens {
+                input_rows.push(flat_hidden.i(token_idx)?.unsqueeze(0)?);
+            }
+            let batch_input = Tensor::cat(&input_rows, 0)?;
+
+            // Expert forward with LoRA
+            let expert_output =
+                expert_forward_with_lora(&batch_input, expert, expert_id, lora_weights)?;
+
+            // Apply routing weights and scatter back
+            let weights_vec: Vec<f32> = tokens.iter().map(|(_, _, w)| *w).collect();
+            let weights_tensor =
+                Tensor::from_vec(weights_vec, batch_size, device)?.to_dtype(dtype)?;
+            let weights_expanded = weights_tensor.reshape((batch_size, 1))?;
+            let weighted_output = expert_output.broadcast_mul(&weights_expanded)?;
+
+            let indices: Vec<u32> = tokens.iter().map(|(idx, _, _)| *idx as u32).collect();
+            let index_tensor = Tensor::from_vec(indices, batch_size, device)?;
+            output = output.index_add(&index_tensor, &weighted_output, 0)?;
+        }
+
+        output.reshape(orig_shape)
+    }
 }
 
 // ─── MoE Layer with Shared Expert ───────────────────────────────────────────
@@ -618,6 +718,109 @@ impl MoELayerWithShared {
     /// Always false when a shared expert is present.
     pub fn effective_inplace(&self) -> bool {
         self.effective_inplace
+    }
+
+    /// Forward pass with optional LoRA adapters.
+    ///
+    /// LoRA is applied only to routed experts; the shared expert (if present)
+    /// runs without LoRA modification.
+    pub fn forward_with_lora(
+        &self,
+        hidden_states: &Tensor,
+        lora_weights: Option<&MoELoraWeights>,
+    ) -> Result<Tensor> {
+        let lora = match lora_weights {
+            None => return self.forward(hidden_states),
+            Some(lora) => lora,
+        };
+
+        let orig_shape = hidden_states.dims().to_vec();
+        let hidden_size = *orig_shape.last().ok_or_else(|| {
+            candle_core::Error::Msg("Tensor must have at least 1 dimension".to_string())
+        })?;
+
+        let num_tokens: usize = orig_shape.iter().take(orig_shape.len() - 1).product();
+        let flat_hidden = hidden_states.reshape((num_tokens, hidden_size))?;
+
+        let (routing_weights, expert_indices) = self.router.route(&flat_hidden)?;
+
+        let device = hidden_states.device();
+        let dtype = hidden_states.dtype();
+        let mut output = Tensor::zeros((num_tokens, hidden_size), dtype, device)?;
+
+        // Process routed experts with LoRA
+        let expert_indices_vec: Vec<u32> = expert_indices.flatten_all()?.to_vec1()?;
+        let routing_weights_vec: Vec<f32> = routing_weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1()?;
+
+        let mut expert_tokens: Vec<Vec<(usize, usize, f32)>> =
+            vec![Vec::new(); self.config.num_experts];
+
+        for token_idx in 0..num_tokens {
+            for k in 0..self.config.top_k {
+                let flat_idx = token_idx * self.config.top_k + k;
+                let expert_id = expert_indices_vec[flat_idx] as usize;
+                let weight = routing_weights_vec[flat_idx];
+                if expert_id < self.config.num_experts {
+                    expert_tokens[expert_id].push((token_idx, k, weight));
+                }
+            }
+        }
+
+        for (expert_id, tokens) in expert_tokens.iter().enumerate() {
+            if tokens.is_empty() {
+                continue;
+            }
+
+            let expert = &self.experts[expert_id];
+            let batch_size = tokens.len();
+
+            let mut input_rows = Vec::with_capacity(batch_size);
+            for &(token_idx, _, _) in tokens {
+                input_rows.push(flat_hidden.i(token_idx)?.unsqueeze(0)?);
+            }
+            let batch_input = Tensor::cat(&input_rows, 0)?;
+
+            // Expert forward with LoRA
+            let expert_output =
+                expert_forward_with_lora(&batch_input, expert, expert_id, lora)?;
+
+            let weights_vec: Vec<f32> = tokens.iter().map(|(_, _, w)| *w).collect();
+            let weights_tensor =
+                Tensor::from_vec(weights_vec, batch_size, device)?.to_dtype(dtype)?;
+            let weights_expanded = weights_tensor.reshape((batch_size, 1))?;
+            let weighted_output = expert_output.broadcast_mul(&weights_expanded)?;
+
+            let indices: Vec<u32> = tokens.iter().map(|(idx, _, _)| *idx as u32).collect();
+            let index_tensor = Tensor::from_vec(indices, batch_size, device)?;
+            output = output.index_add(&index_tensor, &weighted_output, 0)?;
+        }
+
+        // Apply routed scaling factor
+        if (self.config.routed_scaling_factor - 1.0).abs() > 1e-9 {
+            let scale = Tensor::new(&[self.config.routed_scaling_factor as f32], device)?
+                .to_dtype(dtype)?;
+            output = output.broadcast_mul(&scale)?;
+        }
+
+        // Add shared expert output (without LoRA)
+        if let Some(ref shared_expert) = self.shared_expert {
+            let shared_output = shared_expert.forward(&flat_hidden)?;
+
+            let shared_output = if let Some(ref gate) = self.shared_expert_gate {
+                let gate_output = gate.forward(&flat_hidden)?;
+                let gate_weight = candle_nn::ops::sigmoid(&gate_output)?;
+                shared_output.broadcast_mul(&gate_weight)?
+            } else {
+                shared_output
+            };
+
+            output = output.add(&shared_output)?;
+        }
+
+        output.reshape(orig_shape)
     }
 }
 
@@ -1051,5 +1254,446 @@ mod tests {
         let moe = MoELayerWithShared::new(config, vb).unwrap();
         assert!(!moe.has_shared_expert());
         assert!(moe.effective_inplace());
+    }
+
+    // ─── MoE LoRA Tests ─────────────────────────────────────────────────────────
+
+    fn make_lora_adapter(
+        rank: usize,
+        in_dim: usize,
+        out_dim: usize,
+        device: &Device,
+    ) -> crate::lora::LoraAdapter {
+        let lora_a = Tensor::randn(0f32, 0.1, (rank, in_dim), device).unwrap();
+        let lora_b = Tensor::randn(0f32, 0.1, (out_dim, rank), device).unwrap();
+        crate::lora::LoraAdapter::new(lora_a, lora_b, rank, 16.0)
+    }
+
+    fn make_zero_lora(
+        num_experts: usize,
+        rank: usize,
+        hidden: usize,
+        intermediate: usize,
+        device: &Device,
+    ) -> MoELoraWeights {
+        MoELoraWeights::from_tensors(
+            Tensor::zeros((num_experts, rank, hidden), DType::F32, device).unwrap(),
+            Tensor::zeros((num_experts, intermediate, rank), DType::F32, device).unwrap(),
+            Tensor::zeros((num_experts, rank, intermediate), DType::F32, device).unwrap(),
+            Tensor::zeros((num_experts, hidden, rank), DType::F32, device).unwrap(),
+            Tensor::zeros((num_experts, rank, hidden), DType::F32, device).unwrap(),
+            Tensor::zeros((num_experts, intermediate, rank), DType::F32, device).unwrap(),
+            2.0,
+            rank,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_moe_forward_with_lora_none_equals_base() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+
+        let moe = MoELayer::new(config, vb).unwrap();
+        let input = Tensor::randn(0f32, 1.0, (4, 16), &device).unwrap();
+
+        let out_base = moe.forward(&input).unwrap();
+        let out_lora_none = moe.forward_with_lora(&input, None).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora_none)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-6, "None LoRA should match base, diff={}", diff);
+    }
+
+    #[test]
+    fn test_moe_forward_with_lora_zero_weights_equals_base() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+
+        let moe = MoELayer::new(config, vb).unwrap();
+        let zero_lora = make_zero_lora(num_experts, rank, hidden, intermediate, &device);
+
+        let input = Tensor::randn(0f32, 1.0, (4, hidden), &device).unwrap();
+
+        let out_base = moe.forward_fused(&input).unwrap();
+        let out_lora = moe.forward_fused_with_lora(&input, &zero_lora).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "Zero LoRA should match base fused, diff={}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_moe_forward_with_lora_modifies_output() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+
+        let moe = MoELayer::new(config, vb).unwrap();
+
+        let gate: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, hidden, intermediate, &device))
+            .collect();
+        let down: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, intermediate, hidden, &device))
+            .collect();
+        let up: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, hidden, intermediate, &device))
+            .collect();
+        let lora = MoELoraWeights::from_adapters(&gate, &down, &up).unwrap();
+
+        let input = Tensor::randn(0f32, 1.0, (8, hidden), &device).unwrap();
+
+        let out_base = moe.forward_fused(&input).unwrap();
+        let out_lora = moe.forward_fused_with_lora(&input, &lora).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff > 0.0, "Non-zero LoRA should modify output");
+    }
+
+    #[test]
+    fn test_moe_forward_with_lora_preserves_shape() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+
+        let moe = MoELayer::new(config, vb).unwrap();
+        let lora = make_zero_lora(num_experts, rank, hidden, intermediate, &device);
+
+        // 2D input
+        let input_2d = Tensor::randn(0f32, 1.0, (8, hidden), &device).unwrap();
+        let out = moe.forward_fused_with_lora(&input_2d, &lora).unwrap();
+        assert_eq!(out.dims(), &[8, hidden]);
+
+        // 3D input
+        let input_3d = Tensor::randn(0f32, 1.0, (2, 4, hidden), &device).unwrap();
+        let out = moe.forward_fused_with_lora(&input_3d, &lora).unwrap();
+        assert_eq!(out.dims(), &[2, 4, hidden]);
+    }
+
+    #[test]
+    fn test_moe_forward_with_lora_various_batch_sizes() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+
+        let moe = MoELayer::new(config, vb).unwrap();
+
+        let gate: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, hidden, intermediate, &device))
+            .collect();
+        let down: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, intermediate, hidden, &device))
+            .collect();
+        let up: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, hidden, intermediate, &device))
+            .collect();
+        let lora = MoELoraWeights::from_adapters(&gate, &down, &up).unwrap();
+
+        for batch_size in [1, 3, 8, 16, 32] {
+            let input = Tensor::randn(0f32, 1.0, (batch_size, hidden), &device).unwrap();
+            let output = moe.forward_fused_with_lora(&input, &lora).unwrap();
+            assert_eq!(
+                output.dims(),
+                &[batch_size, hidden],
+                "Failed for batch_size={}",
+                batch_size
+            );
+        }
+    }
+
+    // ─── MoELayerWithShared LoRA Tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_moe_with_shared_lora_none_equals_base() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            shared_expert_intermediate_size: Some(64),
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        let input = Tensor::randn(0f32, 1.0, (5, 16), &device).unwrap();
+
+        let out_base = moe.forward(&input).unwrap();
+        let out_lora_none = moe.forward_with_lora(&input, None).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora_none)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff < 1e-6, "None LoRA should match base, diff={}", diff);
+    }
+
+    #[test]
+    fn test_moe_with_shared_lora_zero_weights_equals_base() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            shared_expert_intermediate_size: Some(64),
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        let zero_lora = make_zero_lora(num_experts, rank, hidden, intermediate, &device);
+
+        let input = Tensor::randn(0f32, 1.0, (5, hidden), &device).unwrap();
+
+        let out_base = moe.forward(&input).unwrap();
+        let out_lora = moe.forward_with_lora(&input, Some(&zero_lora)).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "Zero LoRA should match base with shared, diff={}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_moe_with_shared_lora_modifies_routed_output() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            shared_expert_intermediate_size: Some(64),
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+
+        let gate: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, hidden, intermediate, &device))
+            .collect();
+        let down: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, intermediate, hidden, &device))
+            .collect();
+        let up: Vec<_> = (0..num_experts)
+            .map(|_| make_lora_adapter(rank, hidden, intermediate, &device))
+            .collect();
+        let lora = MoELoraWeights::from_adapters(&gate, &down, &up).unwrap();
+
+        let input = Tensor::randn(0f32, 1.0, (5, hidden), &device).unwrap();
+
+        let out_base = moe.forward(&input).unwrap();
+        let out_lora = moe.forward_with_lora(&input, Some(&lora)).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(diff > 0.0, "Non-zero LoRA should modify output");
+    }
+
+    #[test]
+    fn test_moe_with_shared_lora_preserves_shape() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            shared_expert_intermediate_size: Some(64),
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            gated_shared_expert: true,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        let lora = make_zero_lora(num_experts, rank, hidden, intermediate, &device);
+
+        // 2D
+        let input_2d = Tensor::randn(0f32, 1.0, (6, hidden), &device).unwrap();
+        let out = moe.forward_with_lora(&input_2d, Some(&lora)).unwrap();
+        assert_eq!(out.dims(), &[6, hidden]);
+
+        // 3D
+        let input_3d = Tensor::randn(0f32, 1.0, (2, 3, hidden), &device).unwrap();
+        let out = moe.forward_with_lora(&input_3d, Some(&lora)).unwrap();
+        assert_eq!(out.dims(), &[2, 3, hidden]);
+    }
+
+    #[test]
+    fn test_moe_with_shared_lora_scaling_factor() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let hidden = 16;
+        let intermediate = 32;
+        let num_experts = 4;
+        let rank = 4;
+
+        let config = MoELayerWithSharedConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            shared_expert_intermediate_size: Some(64),
+            num_experts,
+            top_k: 2,
+            renormalize: true,
+            routed_scaling_factor: 0.5,
+            ..Default::default()
+        };
+
+        let moe = MoELayerWithShared::new(config, vb).unwrap();
+        let zero_lora = make_zero_lora(num_experts, rank, hidden, intermediate, &device);
+
+        let input = Tensor::randn(0f32, 1.0, (4, hidden), &device).unwrap();
+
+        // Should produce same result as base with scaling
+        let out_base = moe.forward(&input).unwrap();
+        let out_lora = moe.forward_with_lora(&input, Some(&zero_lora)).unwrap();
+
+        let diff: f32 = out_base
+            .sub(&out_lora)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "Scaling factor should be preserved, diff={}",
+            diff
+        );
     }
 }

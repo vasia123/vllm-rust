@@ -22,6 +22,7 @@ mod ep_layer;
 mod expert_layer;
 mod expert_map;
 pub mod fused;
+mod lora;
 mod router;
 mod token_dispatch;
 pub mod topk_softmax;
@@ -33,6 +34,7 @@ pub use expert_layer::{
 };
 pub use expert_map::{ExpertMap, ExpertPlacement};
 pub use fused::{FusedMoEBlockConfig, FusedMoEConfig};
+pub use lora::MoELoraWeights;
 pub use router::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 pub use token_dispatch::{DispatchMetadata, TokenDispatcher};
 pub use topk_softmax::{topk_softmax, TopKSoftmaxConfig};
