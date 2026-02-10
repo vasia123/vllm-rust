@@ -12,7 +12,7 @@ use crate::tokenizer::TokenizerWrapper;
 
 use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
-use super::types::{EngineCommand, EngineConfig};
+use super::types::{EngineCommand, EngineConfig, SpecDecodingStats};
 use super::warmup::{WarmupConfig, WarmupStats};
 
 /// Trait defining execution strategy for different inference modes.
@@ -54,6 +54,11 @@ pub(crate) trait ExecutionStrategy: Send {
     fn on_request_completed(&mut self, req_id: RequestId, state: &mut OwnedExecutionState) {
         // Default: no-op. Override in strategies that own additional resources.
         let _ = (req_id, state);
+    }
+
+    /// Returns accumulated speculative decoding statistics, if applicable.
+    fn spec_decode_stats(&self) -> Option<SpecDecodingStats> {
+        None
     }
 
     /// Perform warmup for this execution strategy.
@@ -118,6 +123,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut kv_cache_mgr,
                         &mut paused,
                         &mut frozen,
+                        strategy.spec_decode_stats(),
                     ) {
                         return; // shutdown
                     }
@@ -142,6 +148,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut kv_cache_mgr,
                         &mut paused,
                         &mut frozen,
+                        strategy.spec_decode_stats(),
                     ) {
                         return;
                     }
@@ -165,6 +172,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &mut kv_cache_mgr,
                         &mut paused,
                         &mut frozen,
+                        strategy.spec_decode_stats(),
                     ) {
                         return;
                     }

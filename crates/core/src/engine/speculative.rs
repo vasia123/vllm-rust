@@ -18,7 +18,7 @@ use super::helpers::{execute_decode, execute_prefill, finish_request_with_error,
 use super::model_forward::ModelForward;
 use super::spec_decode::DraftProposer;
 use super::strategy::ExecutionStrategy;
-use super::types::EngineError;
+use super::types::{EngineError, SpecDecodingStats};
 
 /// Sample a token from logits applying the request's sampling params, penalties,
 /// and optional constraint masking. Falls back to greedy argmax when the request
@@ -80,13 +80,16 @@ fn sample_speculative(
 pub struct SpeculativeExecution<M: ModelForward> {
     target_model: M,
     proposer: Box<dyn DraftProposer>,
+    stats: SpecDecodingStats,
 }
 
 impl<M: ModelForward> SpeculativeExecution<M> {
     pub fn new(target_model: M, proposer: Box<dyn DraftProposer>) -> Self {
+        let k = proposer.num_speculative_tokens();
         Self {
             target_model,
             proposer,
+            stats: SpecDecodingStats::new(k),
         }
     }
 
@@ -237,6 +240,9 @@ impl<M: ModelForward> SpeculativeExecution<M> {
         self.proposer
             .on_tokens_verified(req_id, accepted, original_offset)?;
 
+        // Record spec decode statistics
+        self.stats.observe_draft(actual_k, accepted);
+
         Ok(())
     }
 }
@@ -345,6 +351,10 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
             req.state.num_computed_tokens = 0;
             req.state.seqlen_offset = 0;
         }
+    }
+
+    fn spec_decode_stats(&self) -> Option<SpecDecodingStats> {
+        Some(self.stats.clone())
     }
 
     fn on_request_completed(&mut self, req_id: RequestId, state: &mut OwnedExecutionState) {

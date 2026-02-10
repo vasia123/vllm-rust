@@ -454,6 +454,7 @@ mod tests {
                             prefix_cache_stats: None,
                             prefix_cache_detailed_stats: None,
                             prefix_cache_recent_stats: None,
+                            spec_decode_stats: None,
                         };
                         let _ = response_tx.send(stats);
                     }

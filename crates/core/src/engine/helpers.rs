@@ -45,6 +45,7 @@ pub(crate) fn handle_command(
     kv_cache_mgr: &mut KVCacheManager,
     paused: &mut bool,
     frozen: &mut bool,
+    spec_decode_stats: Option<super::types::SpecDecodingStats>,
 ) -> bool {
     match cmd {
         EngineCommand::Generate {
@@ -108,6 +109,7 @@ pub(crate) fn handle_command(
                 prefix_cache_stats: kv_cache_mgr.prefix_cache_stats(),
                 prefix_cache_detailed_stats,
                 prefix_cache_recent_stats,
+                spec_decode_stats,
             };
             let _ = response_tx.send(stats);
             false

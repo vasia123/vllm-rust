@@ -141,6 +141,76 @@ pub enum PauseMode {
     Keep,
 }
 
+// ─── Speculative Decoding Stats ───────────────────────────────────────────
+
+/// Accumulated speculative decoding statistics.
+///
+/// Tracks draft proposal counts, acceptance rates, and per-position
+/// acceptance to measure speculative decoding efficiency.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpecDecodingStats {
+    /// Maximum number of draft tokens per proposal (K).
+    pub num_spec_tokens: usize,
+    /// Number of draft rounds (one per request that went through spec decode).
+    pub num_drafts: u64,
+    /// Total draft tokens generated.
+    pub num_draft_tokens: u64,
+    /// Total draft tokens accepted by the target model.
+    pub num_accepted_tokens: u64,
+    /// Per-position acceptance counts, length = num_spec_tokens.
+    /// Position i counts how many drafts had at least i+1 tokens accepted.
+    pub num_accepted_tokens_per_pos: Vec<u64>,
+}
+
+impl SpecDecodingStats {
+    pub fn new(num_spec_tokens: usize) -> Self {
+        Self {
+            num_spec_tokens,
+            num_drafts: 0,
+            num_draft_tokens: 0,
+            num_accepted_tokens: 0,
+            num_accepted_tokens_per_pos: vec![0; num_spec_tokens],
+        }
+    }
+
+    /// Record a single draft proposal's verification results.
+    pub fn observe_draft(&mut self, num_draft_tokens: usize, num_accepted_tokens: usize) {
+        self.num_drafts += 1;
+        self.num_draft_tokens += num_draft_tokens as u64;
+        self.num_accepted_tokens += num_accepted_tokens as u64;
+        for pos in self.num_accepted_tokens_per_pos.iter_mut().take(num_accepted_tokens) {
+            *pos += 1;
+        }
+    }
+
+    /// Overall draft acceptance rate (0.0–1.0).
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.num_draft_tokens == 0 {
+            return 0.0;
+        }
+        self.num_accepted_tokens as f64 / self.num_draft_tokens as f64
+    }
+
+    /// Mean number of tokens accepted per draft round (includes bonus token).
+    pub fn mean_acceptance_length(&self) -> f64 {
+        if self.num_drafts == 0 {
+            return 0.0;
+        }
+        1.0 + self.num_accepted_tokens as f64 / self.num_drafts as f64
+    }
+
+    /// Per-position acceptance rates (monotonically decreasing).
+    pub fn per_position_acceptance_rates(&self) -> Vec<f64> {
+        if self.num_drafts == 0 {
+            return vec![0.0; self.num_spec_tokens];
+        }
+        self.num_accepted_tokens_per_pos
+            .iter()
+            .map(|&count| count as f64 / self.num_drafts as f64)
+            .collect()
+    }
+}
+
 // ─── Engine Stats ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,6 +231,9 @@ pub struct EngineStats {
     /// Sliding window prefix cache statistics (recent hit rate).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_recent_stats: Option<SlidingWindowSnapshot>,
+    /// Speculative decoding statistics (present only when spec decode is active).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_decode_stats: Option<SpecDecodingStats>,
 }
 
 // ─── Internal command types ───────────────────────────────────────────────
@@ -260,6 +333,125 @@ mod tests {
     }
 
     #[test]
+    fn spec_decoding_stats_new() {
+        let stats = SpecDecodingStats::new(5);
+        assert_eq!(stats.num_spec_tokens, 5);
+        assert_eq!(stats.num_drafts, 0);
+        assert_eq!(stats.num_draft_tokens, 0);
+        assert_eq!(stats.num_accepted_tokens, 0);
+        assert_eq!(stats.num_accepted_tokens_per_pos, vec![0; 5]);
+        assert_eq!(stats.acceptance_rate(), 0.0);
+        assert_eq!(stats.mean_acceptance_length(), 0.0);
+    }
+
+    #[test]
+    fn spec_decoding_stats_observe_draft() {
+        let mut stats = SpecDecodingStats::new(5);
+
+        // Draft 1: proposed 5 tokens, 3 accepted
+        stats.observe_draft(5, 3);
+        assert_eq!(stats.num_drafts, 1);
+        assert_eq!(stats.num_draft_tokens, 5);
+        assert_eq!(stats.num_accepted_tokens, 3);
+        assert_eq!(stats.num_accepted_tokens_per_pos, vec![1, 1, 1, 0, 0]);
+
+        // Draft 2: proposed 4 tokens, all 4 accepted
+        stats.observe_draft(4, 4);
+        assert_eq!(stats.num_drafts, 2);
+        assert_eq!(stats.num_draft_tokens, 9);
+        assert_eq!(stats.num_accepted_tokens, 7);
+        assert_eq!(stats.num_accepted_tokens_per_pos, vec![2, 2, 2, 1, 0]);
+    }
+
+    #[test]
+    fn spec_decoding_stats_acceptance_rate() {
+        let mut stats = SpecDecodingStats::new(3);
+        stats.observe_draft(3, 2);
+        stats.observe_draft(3, 1);
+        // Total: 6 drafted, 3 accepted
+        assert!((stats.acceptance_rate() - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn spec_decoding_stats_mean_acceptance_length() {
+        let mut stats = SpecDecodingStats::new(3);
+        stats.observe_draft(3, 2);
+        stats.observe_draft(3, 0);
+        // 2 drafts, 2 total accepted → mean = 1 + 2/2 = 2.0
+        assert!((stats.mean_acceptance_length() - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn spec_decoding_stats_per_position_rates() {
+        let mut stats = SpecDecodingStats::new(3);
+        // Draft 1: 3 accepted → [1,1,1]
+        stats.observe_draft(3, 3);
+        // Draft 2: 1 accepted → [2,1,1]
+        stats.observe_draft(3, 1);
+        // Draft 3: 0 accepted → [2,1,1]
+        stats.observe_draft(3, 0);
+        // 3 drafts: rates = [2/3, 1/3, 1/3]
+        let rates = stats.per_position_acceptance_rates();
+        assert!((rates[0] - 2.0 / 3.0).abs() < 1e-10);
+        assert!((rates[1] - 1.0 / 3.0).abs() < 1e-10);
+        assert!((rates[2] - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn spec_decoding_stats_serializes() {
+        let mut stats = SpecDecodingStats::new(2);
+        stats.observe_draft(2, 1);
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["num_spec_tokens"], 2);
+        assert_eq!(json["num_drafts"], 1);
+        assert_eq!(json["num_draft_tokens"], 2);
+        assert_eq!(json["num_accepted_tokens"], 1);
+        assert_eq!(json["num_accepted_tokens_per_pos"], serde_json::json!([1, 0]));
+    }
+
+    #[test]
+    fn engine_stats_omits_spec_decode_when_none() {
+        let stats = EngineStats {
+            num_running_requests: 0,
+            num_waiting_requests: 0,
+            num_free_blocks: 10,
+            num_total_blocks: 10,
+            block_size: 16,
+            is_paused: false,
+            kv_cache_metrics: Default::default(),
+            prefix_cache_stats: None,
+            prefix_cache_detailed_stats: None,
+            prefix_cache_recent_stats: None,
+            spec_decode_stats: None,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(json.get("spec_decode_stats").is_none());
+    }
+
+    #[test]
+    fn engine_stats_includes_spec_decode_when_present() {
+        let mut sd_stats = SpecDecodingStats::new(3);
+        sd_stats.observe_draft(3, 2);
+        let stats = EngineStats {
+            num_running_requests: 1,
+            num_waiting_requests: 0,
+            num_free_blocks: 8,
+            num_total_blocks: 10,
+            block_size: 16,
+            is_paused: false,
+            kv_cache_metrics: Default::default(),
+            prefix_cache_stats: None,
+            prefix_cache_detailed_stats: None,
+            prefix_cache_recent_stats: None,
+            spec_decode_stats: Some(sd_stats),
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        let sd = json.get("spec_decode_stats").unwrap();
+        assert_eq!(sd["num_drafts"], 1);
+        assert_eq!(sd["num_accepted_tokens"], 2);
+    }
+
+    #[test]
     fn engine_stats_includes_is_paused() {
         let stats = EngineStats {
             num_running_requests: 0,
@@ -272,6 +464,7 @@ mod tests {
             prefix_cache_stats: None,
             prefix_cache_detailed_stats: None,
             prefix_cache_recent_stats: None,
+            spec_decode_stats: None,
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["is_paused"], true);

@@ -53,7 +53,7 @@ pub use spec_decode::{
 };
 pub use types::{
     EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest, GenerationResult,
-    PauseMode, SpeculativeConfig, StreamEvent,
+    PauseMode, SpecDecodingStats, SpeculativeConfig, StreamEvent,
 };
 pub use warmup::{
     DefaultDummyInputGenerator, DummyInputGenerator, DummySequence, RandomDummyInputGenerator,
