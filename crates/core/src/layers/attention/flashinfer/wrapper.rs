@@ -8,6 +8,7 @@ use candle_core::{Device, Result, Tensor};
 #[cfg(feature = "flashinfer")]
 use super::tensor_bridge;
 use super::workspace::WorkspaceBuffer;
+use crate::kv_cache::KVCacheLayout;
 
 /// Configuration for FlashInfer attention operations.
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct FlashInferConfig {
     pub soft_cap: f32,
     /// Sliding window size (0 = disabled)
     pub window_left: i32,
+    /// KV cache memory layout (NHD or HND)
+    pub kv_layout: KVCacheLayout,
 }
 
 impl FlashInferConfig {
@@ -39,6 +42,7 @@ impl FlashInferConfig {
             causal: true,
             soft_cap: 0.0,
             window_left: -1,
+            kv_layout: KVCacheLayout::NHD,
         }
     }
 
@@ -52,6 +56,21 @@ impl FlashInferConfig {
     pub fn with_window(mut self, window: i32) -> Self {
         self.window_left = window;
         self
+    }
+
+    /// Set KV cache layout.
+    pub fn with_kv_layout(mut self, layout: KVCacheLayout) -> Self {
+        self.kv_layout = layout;
+        self
+    }
+
+    /// Convert our KVCacheLayout to the flashinfer-rs FFI KVLayout.
+    #[cfg(feature = "flashinfer")]
+    fn ffi_kv_layout(&self) -> flashinfer_rs::ffi::KVLayout {
+        match self.kv_layout {
+            KVCacheLayout::NHD => flashinfer_rs::ffi::KVLayout::NHD,
+            KVCacheLayout::HND => flashinfer_rs::ffi::KVLayout::HND,
+        }
     }
 }
 
@@ -187,7 +206,7 @@ impl PrefillWrapper {
                 qo_indptr_ptr,
                 output_ptr,
                 std::ptr::null_mut(), // lse
-                flashinfer_rs::ffi::KVLayout::NHD,
+                self.config.ffi_kv_layout(),
                 stream_ptr,
             )
             .map_err(|e| {
@@ -322,7 +341,7 @@ impl DecodeWrapper {
                 kv_last_page_len_ptr,
                 output_ptr,
                 std::ptr::null_mut(), // lse
-                flashinfer_rs::ffi::KVLayout::NHD,
+                self.config.ffi_kv_layout(),
                 stream_ptr,
             )
             .map_err(|e| {
@@ -445,12 +464,19 @@ mod tests {
         assert_eq!(config.page_size, 16);
         assert!(config.causal);
         assert_eq!(config.soft_cap, 0.0);
+        assert_eq!(config.kv_layout, KVCacheLayout::NHD);
     }
 
     #[test]
     fn test_config_with_soft_cap() {
         let config = FlashInferConfig::new(32, 8, 128, 16).with_soft_cap(50.0);
         assert_eq!(config.soft_cap, 50.0);
+    }
+
+    #[test]
+    fn test_config_with_kv_layout() {
+        let config = FlashInferConfig::new(32, 8, 128, 16).with_kv_layout(KVCacheLayout::HND);
+        assert_eq!(config.kv_layout, KVCacheLayout::HND);
     }
 
     #[test]

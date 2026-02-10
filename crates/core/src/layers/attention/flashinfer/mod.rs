@@ -128,13 +128,14 @@ impl FlashInferBackend {
         let qo_indptr_data: Vec<i32> = vec![0, total_tokens as i32];
         let qo_indptr = tensor_bridge::alloc_gpu_i32(&qo_indptr_data, device)?;
 
-        // Create wrapper and run
+        // Create wrapper and run (pass cache layout for correct KV access pattern)
         let config = FlashInferConfig::new(
             num_heads as u32,
             num_kv_heads as u32,
             head_dim as u32,
             self.block_size as u32,
-        );
+        )
+        .with_kv_layout(cache_engine.layout());
         let wrapper = PrefillWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
@@ -195,13 +196,14 @@ impl FlashInferBackend {
         let kv_indices = fi_metadata.paged_kv_indices.to_dtype(DType::U32)?;
         let kv_last_page_len = fi_metadata.paged_kv_last_page_len.to_dtype(DType::U32)?;
 
-        // Create wrapper and run
+        // Create wrapper and run (pass cache layout for correct KV access pattern)
         let config = FlashInferConfig::new(
             num_heads as u32,
             num_kv_heads as u32,
             head_dim as u32,
             self.block_size as u32,
-        );
+        )
+        .with_kv_layout(cache_engine.layout());
         let wrapper = DecodeWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
