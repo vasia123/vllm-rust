@@ -114,7 +114,7 @@ impl GptNeoXAttention {
         let head_dim = cfg.hidden_size / num_heads;
         let world_size = pg.world_size();
 
-        if world_size > 1 && num_heads % world_size != 0 {
+        if world_size > 1 && !num_heads.is_multiple_of(world_size) {
             return Err(candle_core::Error::Msg(format!(
                 "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
             )));

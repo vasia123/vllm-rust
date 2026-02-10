@@ -49,12 +49,12 @@ impl GlmAttention {
 
         // For TP: num_heads and num_kv_heads must be divisible by world_size
         if world_size > 1 {
-            if num_heads % world_size != 0 {
+            if !num_heads.is_multiple_of(world_size) {
                 return Err(candle_core::Error::Msg(format!(
                     "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
                 )));
             }
-            if num_kv_heads % world_size != 0 {
+            if !num_kv_heads.is_multiple_of(world_size) {
                 return Err(candle_core::Error::Msg(format!(
                     "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
                 )));

@@ -120,10 +120,11 @@ pub struct EngineConfig {
 ///
 /// Mirrors vLLM's `PauseMode` (PR #32351) for reinforcement learning
 /// workflows where model weights are updated between batches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseMode {
     /// Abort all in-flight requests immediately. Default.
+    #[default]
     Abort,
     /// Wait for in-flight requests to complete, then pause.
     /// New generation requests are rejected while draining.
@@ -131,12 +132,6 @@ pub enum PauseMode {
     /// Freeze requests in the scheduler queue; they resume on `resume()`.
     /// No scheduling occurs while frozen.
     Keep,
-}
-
-impl Default for PauseMode {
-    fn default() -> Self {
-        Self::Abort
-    }
 }
 
 // ─── Engine Stats ─────────────────────────────────────────────────────────

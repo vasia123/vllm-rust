@@ -72,7 +72,7 @@ impl ColumnParallelLinear {
 
         // Each GPU gets out_features/tp_size columns
         let out_per_gpu = out_features / tp_size;
-        if out_features % tp_size != 0 {
+        if !out_features.is_multiple_of(tp_size) {
             return Err(candle_core::Error::Msg(format!(
                 "out_features ({}) must be divisible by tp_size ({})",
                 out_features, tp_size
@@ -218,7 +218,7 @@ impl RowParallelLinear {
 
         // Each GPU gets in_features/tp_size columns
         let in_per_gpu = in_features / tp_size;
-        if in_features % tp_size != 0 {
+        if !in_features.is_multiple_of(tp_size) {
             return Err(candle_core::Error::Msg(format!(
                 "in_features ({}) must be divisible by tp_size ({})",
                 in_features, tp_size

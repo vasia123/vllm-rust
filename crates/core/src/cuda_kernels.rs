@@ -1602,7 +1602,7 @@ impl CustomOp1 for GeluAndMulOp {
             candle_core::bail!("gelu_and_mul: input must have at least 1 dimension");
         }
         let last_dim = dims[dims.len() - 1];
-        if last_dim % 2 != 0 {
+        if !last_dim.is_multiple_of(2) {
             candle_core::bail!("gelu_and_mul: last dimension must be even, got {last_dim}");
         }
         let d = last_dim / 2;

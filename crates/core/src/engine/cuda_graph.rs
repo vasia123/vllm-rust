@@ -31,20 +31,15 @@ use candle_core::cuda::cudarc::driver::sys::{
 };
 
 /// Runtime execution mode for CUDA graphs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum RuntimeMode {
     /// No CUDA graph - standard eager execution
+    #[default]
     None,
     /// Full model forward captured in single graph
     Full,
     /// Per-layer graphs for more flexibility
     Piecewise,
-}
-
-impl Default for RuntimeMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Describes a batch shape for CUDA graph dispatch.

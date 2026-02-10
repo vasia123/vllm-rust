@@ -841,8 +841,8 @@ mod tests {
 
         // Create tensor with negative values
         let k_data: Vec<f32> = (0..2 * 3 * 8)
-            .map(|i| {
-                if i % 2 == 0 {
+            .map(|i: usize| {
+                if i.is_multiple_of(2) {
                     i as f32 * 0.1
                 } else {
                     -(i as f32) * 0.1

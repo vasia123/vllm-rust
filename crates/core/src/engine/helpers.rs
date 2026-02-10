@@ -373,7 +373,7 @@ pub(crate) fn execute_prefill<M: ModelForward>(
             .narrow(1, seq_dim - 1, 1)
             .map_err(|e| EngineError::Model(e.to_string()))?;
 
-        if req.beam_state.is_some() {
+        if let Some(beam_state) = req.beam_state.as_mut() {
             // Beam search: compute log_softmax over full vocab and run initial beam step
             let logits_vec: Vec<f32> = logits
                 .squeeze(0)
@@ -383,8 +383,6 @@ pub(crate) fn execute_prefill<M: ModelForward>(
                 .map_err(|e| EngineError::Model(e.to_string()))?;
 
             let log_probs = sampling::log_softmax(&logits_vec);
-
-            let beam_state = req.beam_state.as_mut().expect("checked above");
             let beam_width = beam_state.search.config.beam_width;
 
             // Initial step: all beams see the same log_probs (from the single prompt)

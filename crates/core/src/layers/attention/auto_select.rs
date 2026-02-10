@@ -312,7 +312,7 @@ impl AttentionBackendSelector {
     ///
     /// FlashAttention-2 requires head_dim % 8 == 0 and head_dim <= 256.
     fn is_valid_flash_attn_head_dim(head_dim: usize) -> bool {
-        head_dim > 0 && head_dim % 8 == 0 && head_dim <= 256
+        head_dim > 0 && head_dim.is_multiple_of(8) && head_dim <= 256
     }
 
     /// Check if head_dim is valid for FlashInfer.

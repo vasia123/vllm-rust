@@ -206,7 +206,7 @@ impl QuantizedGemma2Attention {
             .and_then(|v| v.as_f64());
 
         // Even layers use sliding window, odd layers use global
-        let sliding_window = if layer_idx % 2 == 0 {
+        let sliding_window = if layer_idx.is_multiple_of(2) {
             cfg.sliding_window
         } else {
             None

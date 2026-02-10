@@ -311,7 +311,7 @@ pub fn check_marlin_supports_shape(
     group_size: i32,
 ) -> Result<()> {
     // Validate output size (N dimension)
-    if output_size % GPTQ_MARLIN_MIN_THREAD_N != 0 {
+    if !output_size.is_multiple_of(GPTQ_MARLIN_MIN_THREAD_N) {
         candle_core::bail!(
             "Marlin requires output_size ({}) to be divisible by {} (GPTQ_MARLIN_MIN_THREAD_N)",
             output_size,
@@ -320,7 +320,7 @@ pub fn check_marlin_supports_shape(
     }
 
     // Validate input size (K dimension)
-    if input_size % GPTQ_MARLIN_MIN_THREAD_K != 0 {
+    if !input_size.is_multiple_of(GPTQ_MARLIN_MIN_THREAD_K) {
         candle_core::bail!(
             "Marlin requires input_size ({}) to be divisible by {} (GPTQ_MARLIN_MIN_THREAD_K)",
             input_size,
