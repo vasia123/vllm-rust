@@ -83,7 +83,7 @@ fn reference_data_dir() -> PathBuf {
 }
 
 fn load_reference(model_name: &str) -> Option<ReferenceFile> {
-    let sanitized = model_name.replace('/', "_").replace('\\', "_");
+    let sanitized = model_name.replace(['/', '\\'], "_");
     let path = reference_data_dir().join(format!("{sanitized}.json"));
     if !path.exists() {
         eprintln!(
