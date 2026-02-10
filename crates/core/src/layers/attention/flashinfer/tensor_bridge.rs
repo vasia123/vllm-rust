@@ -1,30 +1,80 @@
 //! Tensor conversion between candle and FlashInfer.
 //!
-//! Provides utilities for converting candle Tensors to raw pointers
-//! and managing CUDA stream synchronization.
+//! Provides utilities for converting candle Tensors to raw CUDA pointers
+//! for passing to FlashInfer's FFI layer.
 
 use candle_core::{Device, Result, Tensor};
 
 #[cfg(feature = "flashinfer")]
 use candle_core::DType;
 
-/// Extract raw CUDA device pointer from a candle Tensor.
+/// Extract raw CUDA device pointer from a candle Tensor as `*const c_void`.
+///
+/// The returned pointer is the raw GPU memory address suitable for FFI.
 ///
 /// # Safety
 /// The returned pointer is only valid as long as the Tensor is alive.
 /// Caller must ensure proper synchronization with CUDA operations.
 #[cfg(feature = "flashinfer")]
-pub fn tensor_to_cuda_ptr<T: candle_core::cuda_backend::WrapErr>(
-    tensor: &Tensor,
-) -> Result<*const T> {
-    use candle_core::cuda_backend::CudaStorageSlice;
+pub fn tensor_to_device_ptr(tensor: &Tensor) -> Result<*const std::ffi::c_void> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::Storage;
 
-    let storage = tensor.storage_and_layout().0;
+    let (storage, layout) = tensor.storage_and_layout();
+    let offset = layout.start_offset();
     match &*storage {
         Storage::Cuda(cuda_storage) => {
-            let slice = cuda_storage.as_cuda_slice::<T>()?;
-            Ok(slice.device_ptr() as *const T)
+            // Get the raw CUdeviceptr from the underlying storage.
+            // We match on the dtype to extract the appropriately-typed CudaSlice,
+            // then read its cu_device_ptr field via the stream-based API.
+            let cuda_device = match tensor.device() {
+                Device::Cuda(d) => d,
+                _ => unreachable!(),
+            };
+            let stream = cuda_device.cuda_stream();
+
+            let base_ptr = match tensor.dtype() {
+                DType::F16 => {
+                    let slice = cuda_storage.as_cuda_slice::<half::f16>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+                DType::BF16 => {
+                    let slice = cuda_storage.as_cuda_slice::<half::bf16>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+                DType::F32 => {
+                    let slice = cuda_storage.as_cuda_slice::<f32>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+                DType::U8 => {
+                    let slice = cuda_storage.as_cuda_slice::<u8>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+                DType::U32 => {
+                    let slice = cuda_storage.as_cuda_slice::<u32>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+                DType::I64 => {
+                    let slice = cuda_storage.as_cuda_slice::<i64>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+                DType::F64 => {
+                    let slice = cuda_storage.as_cuda_slice::<f64>()?;
+                    let (ptr, _guard) = slice.device_ptr(&stream);
+                    ptr as *const std::ffi::c_void
+                }
+            };
+
+            // Add byte offset for non-zero start offsets
+            let elem_size = tensor.dtype().size_in_bytes();
+            let ptr = unsafe { (base_ptr as *const u8).add(offset * elem_size) };
+            Ok(ptr as *const std::ffi::c_void)
         }
         _ => Err(candle_core::Error::Msg(
             "Tensor must be on CUDA device".to_string(),
@@ -32,61 +82,45 @@ pub fn tensor_to_cuda_ptr<T: candle_core::cuda_backend::WrapErr>(
     }
 }
 
-/// Extract mutable raw CUDA device pointer from a candle Tensor.
+/// Extract raw CUDA stream handle from a candle CUDA device.
+///
+/// Returns the raw `CUstream` pointer suitable for passing to FlashInfer FFI
+/// as `*mut c_void`.
 #[cfg(feature = "flashinfer")]
-pub fn tensor_to_cuda_ptr_mut<T: candle_core::cuda_backend::WrapErr>(
-    tensor: &mut Tensor,
-) -> Result<*mut T> {
-    tensor_to_cuda_ptr::<T>(tensor).map(|p| p as *mut T)
-}
-
-/// Trait for types that can be used with FlashInfer operations.
-#[cfg(feature = "flashinfer")]
-pub trait FlashInferDtype: Sized {
-    /// The candle DType corresponding to this type.
-    fn candle_dtype() -> DType;
-
-    /// Check if a tensor has the correct dtype for this operation.
-    fn check_dtype(tensor: &Tensor) -> Result<()> {
-        if tensor.dtype() != Self::candle_dtype() {
-            return Err(candle_core::Error::Msg(format!(
-                "Expected dtype {:?}, got {:?}",
-                Self::candle_dtype(),
-                tensor.dtype()
-            )));
+pub fn get_cuda_stream_ptr(device: &Device) -> Result<*mut std::ffi::c_void> {
+    match device {
+        Device::Cuda(cuda_device) => {
+            let stream = cuda_device.cuda_stream();
+            Ok(stream.cu_stream() as *mut std::ffi::c_void)
         }
-        Ok(())
+        _ => Err(candle_core::Error::Msg(
+            "Device must be CUDA for FlashInfer".to_string(),
+        )),
     }
 }
 
+/// Allocate a GPU tensor of i32 data and return its raw pointer for FFI use.
+///
+/// Since candle doesn't support i32 tensors (no WithDType impl for i32),
+/// we store the data as i64 and provide the raw pointer.
+/// For FFI calls that expect i32*, use `tensor_to_device_ptr` directly
+/// with the i64 tensor and cast at the call site.
+///
+/// Alternatively, for actual i32 GPU buffers needed by FlashInfer FFI,
+/// use `alloc_gpu_i32_raw` which allocates via cudarc directly.
 #[cfg(feature = "flashinfer")]
-impl FlashInferDtype for half::f16 {
-    fn candle_dtype() -> DType {
-        DType::F16
-    }
+pub fn alloc_gpu_i32(data: &[i32], device: &Device) -> Result<Tensor> {
+    let data_i64: Vec<i64> = data.iter().map(|&x| x as i64).collect();
+    Tensor::from_vec(data_i64, (data.len(),), device)
 }
 
+/// Convert candle DType to flashinfer-rs FFI DType.
 #[cfg(feature = "flashinfer")]
-impl FlashInferDtype for half::bf16 {
-    fn candle_dtype() -> DType {
-        DType::BF16
-    }
-}
-
-#[cfg(feature = "flashinfer")]
-impl FlashInferDtype for f32 {
-    fn candle_dtype() -> DType {
-        DType::F32
-    }
-}
-
-/// Convert candle DType to flashinfer-rs DType equivalent.
-#[cfg(feature = "flashinfer")]
-pub fn candle_to_flashinfer_dtype(dtype: DType) -> Result<flashinfer_rs::DType> {
+pub fn candle_to_ffi_dtype(dtype: DType) -> Result<flashinfer_rs::ffi::DType> {
     match dtype {
-        DType::F16 => Ok(flashinfer_rs::DType::Float16),
-        DType::BF16 => Ok(flashinfer_rs::DType::BFloat16),
-        DType::F32 => Ok(flashinfer_rs::DType::Float32),
+        DType::F16 => Ok(flashinfer_rs::ffi::DType::Float16),
+        DType::BF16 => Ok(flashinfer_rs::ffi::DType::BFloat16),
+        DType::F32 => Ok(flashinfer_rs::ffi::DType::Float32),
         _ => Err(candle_core::Error::Msg(format!(
             "Unsupported dtype for FlashInfer: {:?}",
             dtype
@@ -97,15 +131,6 @@ pub fn candle_to_flashinfer_dtype(dtype: DType) -> Result<flashinfer_rs::DType> 
 /// Check if a device is CUDA and suitable for FlashInfer.
 pub fn is_cuda_available(device: &Device) -> bool {
     device.is_cuda()
-}
-
-/// Get CUDA device ordinal from candle Device.
-#[cfg(feature = "flashinfer")]
-pub fn get_cuda_device_ordinal(device: &Device) -> Result<i32> {
-    match device {
-        Device::Cuda(cuda_device) => Ok(cuda_device.ordinal() as i32),
-        _ => Err(candle_core::Error::Msg("Device must be CUDA".to_string())),
-    }
 }
 
 /// Ensure a tensor is contiguous for FlashInfer operations.

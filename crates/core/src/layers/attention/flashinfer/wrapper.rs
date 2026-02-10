@@ -1,16 +1,12 @@
-//! High-level wrappers for FlashInfer operations.
+//! High-level wrappers for FlashInfer attention operations.
 //!
-//! Provides PrefillWrapper and DecodeWrapper that encapsulate
-//! BatchPrefillHandler and BatchDecodeHandler from flashinfer-rs.
+//! Provides PrefillWrapper and DecodeWrapper that call flashinfer-rs
+//! FFI functions directly using raw CUDA pointers extracted from Candle tensors.
 
-use std::sync::Arc;
+use candle_core::{Device, Result, Tensor};
 
-use candle_core::{DType, Result, Tensor};
-
-#[allow(unused_imports)]
-use candle_core::Device;
-
-use super::metadata::FlashInferMetadata;
+#[cfg(feature = "flashinfer")]
+use super::tensor_bridge;
 use super::workspace::WorkspaceBuffer;
 
 /// Configuration for FlashInfer attention operations.
@@ -26,10 +22,10 @@ pub struct FlashInferConfig {
     pub page_size: u32,
     /// Use causal mask
     pub causal: bool,
-    /// Rotary embedding mode (0 = none, 1 = interleaved, 2 = half)
-    pub rotary_mode: u32,
     /// Soft-capping value (0.0 = disabled)
     pub soft_cap: f32,
+    /// Sliding window size (0 = disabled)
+    pub window_left: i32,
 }
 
 impl FlashInferConfig {
@@ -41,8 +37,8 @@ impl FlashInferConfig {
             head_dim,
             page_size,
             causal: true,
-            rotary_mode: 0,
             soft_cap: 0.0,
+            window_left: -1,
         }
     }
 
@@ -52,255 +48,355 @@ impl FlashInferConfig {
         self
     }
 
-    /// Set rotary mode.
-    pub fn with_rotary_mode(mut self, mode: u32) -> Self {
-        self.rotary_mode = mode;
+    /// Set sliding window size.
+    pub fn with_window(mut self, window: i32) -> Self {
+        self.window_left = window;
         self
     }
 }
 
-/// Wrapper for FlashInfer BatchPrefillHandler.
+/// Wrapper for FlashInfer batch prefill attention via direct FFI calls.
 ///
 /// Handles prefill attention where we have multiple query tokens
-/// attending to cached KV and new KV.
+/// attending to paged KV cache. Uses flashinfer-rs FFI layer directly,
+/// bypassing the cudarc-dependent handler layer.
 #[cfg(feature = "flashinfer")]
 pub struct PrefillWrapper {
-    handler: flashinfer_rs::BatchPrefillHandler,
-    workspace: Arc<WorkspaceBuffer>,
     config: FlashInferConfig,
-    planned: bool,
+    device: Device,
 }
 
 #[cfg(feature = "flashinfer")]
 impl PrefillWrapper {
     /// Create a new prefill wrapper.
-    pub fn new(workspace: Arc<WorkspaceBuffer>, config: FlashInferConfig) -> Result<Self> {
-        let device = workspace.device();
+    pub fn new(config: FlashInferConfig, device: &Device) -> Result<Self> {
         if !device.is_cuda() {
             return Err(candle_core::Error::Msg(
                 "PrefillWrapper requires CUDA device".to_string(),
             ));
         }
 
-        let fi_config = flashinfer_rs::AttentionConfig::new(
-            config.num_qo_heads,
-            config.num_kv_heads,
-            config.head_dim,
-        )
-        .with_page_size(config.page_size as usize)
-        .with_causal(config.causal);
-
-        let handler = flashinfer_rs::BatchPrefillHandler::new(device.ordinal()?, fi_config)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer init failed: {}", e)))?;
-
         Ok(Self {
-            handler,
-            workspace,
             config,
-            planned: false,
+            device: device.clone(),
         })
     }
 
-    /// Plan the prefill operation for given batch configuration.
-    ///
-    /// Must be called before `run()` when batch shape changes.
-    pub fn plan<T: half::GpuFloat>(
-        &mut self,
-        metadata: &FlashInferMetadata,
-        q_lens: &[usize],
-        dtype: DType,
-    ) -> Result<()> {
-        // Convert metadata tensors to raw slices
-        let indptr: Vec<i32> = metadata.paged_kv_indptr.to_vec1()?;
-        let indices: Vec<i32> = metadata.paged_kv_indices.to_vec1()?;
-        let last_page_lens: Vec<i32> = metadata.paged_kv_last_page_len.to_vec1()?;
-
-        self.handler
-            .plan::<T>(
-                q_lens,
-                &indptr.iter().map(|&x| x as usize).collect::<Vec<_>>(),
-                &indices.iter().map(|&x| x as usize).collect::<Vec<_>>(),
-                &last_page_lens
-                    .iter()
-                    .map(|&x| x as usize)
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer plan failed: {}", e)))?;
-
-        self.planned = true;
-        Ok(())
-    }
-
-    /// Run prefill attention.
+    /// Run prefill attention via FlashInfer FFI.
     ///
     /// # Arguments
     /// * `q` - Query tensor [total_tokens, num_qo_heads, head_dim]
     /// * `k_cache` - Key cache [num_pages, page_size, num_kv_heads, head_dim]
     /// * `v_cache` - Value cache [num_pages, page_size, num_kv_heads, head_dim]
+    /// * `workspace` - Workspace buffer for FlashInfer temporaries
+    /// * `qo_indptr` - Cumulative query lengths [batch_size + 1], i32 GPU tensor
+    /// * `kv_indptr` - Cumulative block counts [batch_size + 1], i32 GPU tensor
+    /// * `kv_indices` - Flattened block IDs [total_blocks], i32 GPU tensor
+    /// * `kv_last_page_len` - Valid tokens in last page [batch_size], i32 GPU tensor
+    /// * `kv_lengths` - KV lengths (host, for workspace sizing)
     ///
     /// # Returns
     /// Output tensor [total_tokens, num_qo_heads, head_dim]
-    pub fn run<T: half::GpuFloat>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
         &self,
         q: &Tensor,
         k_cache: &Tensor,
         v_cache: &Tensor,
+        workspace: &mut WorkspaceBuffer,
+        qo_indptr: &Tensor,
+        kv_indptr: &Tensor,
+        kv_indices: &Tensor,
+        kv_last_page_len: &Tensor,
+        batch_size: usize,
+        total_tokens: usize,
     ) -> Result<Tensor> {
-        if !self.planned {
-            return Err(candle_core::Error::Msg(
-                "Must call plan() before run()".to_string(),
-            ));
-        }
+        let q = tensor_bridge::ensure_contiguous(q)?;
+
+        // Ensure workspace is large enough
+        let required_size = estimate_prefill_workspace(
+            batch_size,
+            total_tokens,
+            self.config.num_qo_heads as usize,
+            self.config.head_dim as usize,
+        );
+        workspace.ensure_size(required_size)?;
+
+        // Get raw pointers from tensors
+        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
+        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
+        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
+        let qo_indptr_ptr = tensor_bridge::tensor_to_device_ptr(qo_indptr)? as *const i32;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(kv_indices)? as *const i32;
+        let kv_last_page_len_ptr =
+            tensor_bridge::tensor_to_device_ptr(kv_last_page_len)? as *const i32;
+        let workspace_ptr = workspace.as_ptr()?;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
 
         // Allocate output
-        let output = Tensor::zeros_like(q)?;
+        let output = Tensor::zeros_like(&q)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
 
-        // Get raw pointers and call handler
-        // Note: This requires flashinfer-rs to expose a tensor-based API
-        // or we need to use the raw FFI layer
-        self.handler
-            .forward_with_tensors::<T>(q, k_cache, v_cache, &output)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer prefill failed: {}", e)))?;
+        let dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
+
+        // Create FFI plan
+        // Workspace is split: first half for float, second half for int
+        let ws_size = workspace.size();
+        let float_ws_size = ws_size / 2;
+        let int_ws_size = ws_size - float_ws_size;
+        let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
+        let int_ws_ptr =
+            unsafe { (workspace_ptr as *mut u8).add(float_ws_size) } as *mut std::ffi::c_void;
+
+        let plan = unsafe {
+            flashinfer_rs::ffi::BatchPrefillPlan::new(
+                float_ws_ptr,
+                float_ws_size,
+                int_ws_ptr,
+                int_ws_size,
+                std::ptr::null_mut(), // page_locked_workspace
+                0,                    // page_locked_size
+                qo_indptr_ptr,
+                kv_indptr_ptr,
+                batch_size as i32,
+                self.config.num_qo_heads as i32,
+                self.config.num_kv_heads as i32,
+                self.config.head_dim as i32,
+                self.config.page_size as i32,
+                dtype,
+                flashinfer_rs::ffi::PosEncoding::None,
+                self.config.soft_cap,
+                self.config.window_left,
+                self.config.causal,
+                false, // enable_cuda_graph
+                stream_ptr,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer prefill plan failed: {e}")))?
+        };
+
+        // Run the kernel
+        unsafe {
+            plan.run(
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                kv_indptr_ptr,
+                kv_indices_ptr,
+                kv_last_page_len_ptr,
+                qo_indptr_ptr,
+                output_ptr,
+                std::ptr::null_mut(), // lse
+                flashinfer_rs::ffi::KVLayout::NHD,
+                stream_ptr,
+            )
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("FlashInfer prefill forward failed: {e}"))
+            })?;
+        }
 
         Ok(output)
     }
 }
 
-/// Wrapper for FlashInfer BatchDecodeHandler.
+/// Wrapper for FlashInfer batch decode attention via direct FFI calls.
 ///
 /// Handles decode attention where we have a single query token per sequence
 /// attending to the entire cached KV history.
 #[cfg(feature = "flashinfer")]
 pub struct DecodeWrapper {
-    handler: flashinfer_rs::BatchDecodeHandler,
-    workspace: Arc<WorkspaceBuffer>,
     config: FlashInferConfig,
-    planned: bool,
+    device: Device,
 }
 
 #[cfg(feature = "flashinfer")]
 impl DecodeWrapper {
     /// Create a new decode wrapper.
-    pub fn new(workspace: Arc<WorkspaceBuffer>, config: FlashInferConfig) -> Result<Self> {
-        let device = workspace.device();
+    pub fn new(config: FlashInferConfig, device: &Device) -> Result<Self> {
         if !device.is_cuda() {
             return Err(candle_core::Error::Msg(
                 "DecodeWrapper requires CUDA device".to_string(),
             ));
         }
 
-        let fi_config = flashinfer_rs::AttentionConfig::new(
-            config.num_qo_heads,
-            config.num_kv_heads,
-            config.head_dim,
-        )
-        .with_page_size(config.page_size as usize)
-        .with_causal(config.causal);
-
-        let handler = flashinfer_rs::BatchDecodeHandler::new(device.ordinal()?, fi_config)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer init failed: {}", e)))?;
-
         Ok(Self {
-            handler,
-            workspace,
             config,
-            planned: false,
+            device: device.clone(),
         })
     }
 
-    /// Plan the decode operation for given batch configuration.
-    ///
-    /// Must be called before `run()` when batch shape changes.
-    pub fn plan<T: half::GpuFloat>(
-        &mut self,
-        metadata: &FlashInferMetadata,
-        kv_lengths: &[usize],
-    ) -> Result<()> {
-        let indptr: Vec<i32> = metadata.paged_kv_indptr.to_vec1()?;
-        let indices: Vec<i32> = metadata.paged_kv_indices.to_vec1()?;
-        let last_page_lens: Vec<i32> = metadata.paged_kv_last_page_len.to_vec1()?;
-
-        self.handler
-            .plan::<T>(
-                kv_lengths,
-                &indptr.iter().map(|&x| x as usize).collect::<Vec<_>>(),
-                &indices.iter().map(|&x| x as usize).collect::<Vec<_>>(),
-                &last_page_lens
-                    .iter()
-                    .map(|&x| x as usize)
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer plan failed: {}", e)))?;
-
-        self.planned = true;
-        Ok(())
-    }
-
-    /// Run decode attention.
+    /// Run batch decode attention via FlashInfer FFI.
     ///
     /// # Arguments
     /// * `q` - Query tensor [batch_size, num_qo_heads, head_dim]
     /// * `k_cache` - Key cache [num_pages, page_size, num_kv_heads, head_dim]
     /// * `v_cache` - Value cache [num_pages, page_size, num_kv_heads, head_dim]
+    /// * `workspace` - Workspace buffer for FlashInfer temporaries
+    /// * `kv_indptr` - Cumulative block counts [batch_size + 1], i32 GPU tensor
+    /// * `kv_indices` - Flattened block IDs [total_blocks], i32 GPU tensor
+    /// * `kv_last_page_len` - Valid tokens in last page [batch_size], i32 GPU tensor
+    /// * `batch_size` - Number of sequences
     ///
     /// # Returns
     /// Output tensor [batch_size, num_qo_heads, head_dim]
-    pub fn run<T: half::GpuFloat>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
         &self,
         q: &Tensor,
         k_cache: &Tensor,
         v_cache: &Tensor,
+        workspace: &mut WorkspaceBuffer,
+        kv_indptr: &Tensor,
+        kv_indices: &Tensor,
+        kv_last_page_len: &Tensor,
+        batch_size: usize,
     ) -> Result<Tensor> {
-        if !self.planned {
-            return Err(candle_core::Error::Msg(
-                "Must call plan() before run()".to_string(),
-            ));
+        let q = tensor_bridge::ensure_contiguous(q)?;
+
+        // Ensure workspace is large enough
+        let required_size = estimate_decode_workspace(
+            batch_size,
+            self.config.num_qo_heads as usize,
+            self.config.head_dim as usize,
+        );
+        workspace.ensure_size(required_size)?;
+
+        // Get raw pointers
+        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
+        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
+        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(kv_indices)? as *const i32;
+        let kv_last_page_len_ptr =
+            tensor_bridge::tensor_to_device_ptr(kv_last_page_len)? as *const i32;
+        let workspace_ptr = workspace.as_ptr()?;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+
+        // Allocate output
+        let output = Tensor::zeros_like(&q)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
+
+        let dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
+
+        // Split workspace
+        let ws_size = workspace.size();
+        let float_ws_size = ws_size / 2;
+        let int_ws_size = ws_size - float_ws_size;
+        let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
+        let int_ws_ptr =
+            unsafe { (workspace_ptr as *mut u8).add(float_ws_size) } as *mut std::ffi::c_void;
+
+        // Create FFI plan
+        let plan = unsafe {
+            flashinfer_rs::ffi::BatchDecodePlan::new(
+                float_ws_ptr,
+                float_ws_size,
+                int_ws_ptr,
+                int_ws_size,
+                std::ptr::null_mut(), // page_locked_workspace
+                0,                    // page_locked_size
+                kv_indptr_ptr,
+                batch_size as i32,
+                self.config.num_qo_heads as i32,
+                self.config.num_kv_heads as i32,
+                self.config.head_dim as i32,
+                self.config.page_size as i32,
+                dtype,
+                flashinfer_rs::ffi::PosEncoding::None,
+                self.config.soft_cap,
+                self.config.window_left,
+                false, // enable_cuda_graph
+                stream_ptr,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode plan failed: {e}")))?
+        };
+
+        // Run the kernel
+        unsafe {
+            plan.run(
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                kv_indptr_ptr,
+                kv_indices_ptr,
+                kv_last_page_len_ptr,
+                output_ptr,
+                std::ptr::null_mut(), // lse
+                flashinfer_rs::ffi::KVLayout::NHD,
+                stream_ptr,
+            )
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("FlashInfer decode forward failed: {e}"))
+            })?;
         }
-
-        let output = Tensor::zeros_like(q)?;
-
-        self.handler
-            .forward_with_tensors::<T>(q, k_cache, v_cache, &output)
-            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode failed: {}", e)))?;
 
         Ok(output)
     }
+}
 
-    /// Check if handler is ready (plan has been called).
-    pub fn is_planned(&self) -> bool {
-        self.planned
-    }
+/// Estimate workspace size for prefill operations.
+#[cfg(feature = "flashinfer")]
+fn estimate_prefill_workspace(
+    batch_size: usize,
+    total_tokens: usize,
+    num_qo_heads: usize,
+    head_dim: usize,
+) -> usize {
+    // Float workspace: temporary output for split-K
+    let tmp_size = total_tokens * num_qo_heads * head_dim * 4; // f32
+    // Int workspace: request and tile info
+    let request_info_size = batch_size * 4 * 4; // i32
+    let tile_info_size = total_tokens * 4; // i32
+    // Total with generous padding
+    let total = tmp_size + request_info_size + tile_info_size + 16384;
+    // Ensure at least 16 MB
+    total.max(16 * 1024 * 1024)
+}
+
+/// Estimate workspace size for decode operations.
+#[cfg(feature = "flashinfer")]
+fn estimate_decode_workspace(
+    batch_size: usize,
+    num_qo_heads: usize,
+    head_dim: usize,
+) -> usize {
+    // Float workspace: tmp_v for split-K, tmp_s for softmax
+    let tmp_v_size = batch_size * num_qo_heads * head_dim * 4; // f32
+    let tmp_s_size = batch_size * num_qo_heads * 4; // f32
+    // Int workspace: partition info
+    let partition_info_size = batch_size * num_qo_heads * 2 * 4; // i32
+    // Total with generous padding
+    let total = tmp_v_size + tmp_s_size + partition_info_size + 16384;
+    // Ensure at least 16 MB
+    total.max(16 * 1024 * 1024)
 }
 
 /// Stub implementations when flashinfer feature is disabled.
 #[cfg(not(feature = "flashinfer"))]
 pub struct PrefillWrapper {
-    _workspace: Arc<WorkspaceBuffer>,
-    #[allow(dead_code)]
-    config: FlashInferConfig,
+    _config: FlashInferConfig,
 }
 
 #[cfg(not(feature = "flashinfer"))]
 impl PrefillWrapper {
-    pub fn new(workspace: Arc<WorkspaceBuffer>, config: FlashInferConfig) -> Result<Self> {
-        Ok(Self {
-            _workspace: workspace,
-            config,
-        })
+    pub fn new(config: FlashInferConfig, _device: &Device) -> Result<Self> {
+        Ok(Self { _config: config })
     }
 
-    pub fn plan(
-        &mut self,
-        _metadata: &FlashInferMetadata,
-        _q_lens: &[usize],
-        _dtype: DType,
-    ) -> Result<()> {
-        Err(candle_core::Error::Msg(
-            "FlashInfer not available - enable 'flashinfer' feature".to_string(),
-        ))
-    }
-
-    pub fn run(&self, _q: &Tensor, _k_cache: &Tensor, _v_cache: &Tensor) -> Result<Tensor> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        _q: &Tensor,
+        _k_cache: &Tensor,
+        _v_cache: &Tensor,
+        _workspace: &mut WorkspaceBuffer,
+        _qo_indptr: &Tensor,
+        _kv_indptr: &Tensor,
+        _kv_indices: &Tensor,
+        _kv_last_page_len: &Tensor,
+        _batch_size: usize,
+        _total_tokens: usize,
+    ) -> Result<Tensor> {
         Err(candle_core::Error::Msg(
             "FlashInfer not available - enable 'flashinfer' feature".to_string(),
         ))
@@ -309,34 +405,30 @@ impl PrefillWrapper {
 
 #[cfg(not(feature = "flashinfer"))]
 pub struct DecodeWrapper {
-    _workspace: Arc<WorkspaceBuffer>,
-    #[allow(dead_code)]
-    config: FlashInferConfig,
+    _config: FlashInferConfig,
 }
 
 #[cfg(not(feature = "flashinfer"))]
 impl DecodeWrapper {
-    pub fn new(workspace: Arc<WorkspaceBuffer>, config: FlashInferConfig) -> Result<Self> {
-        Ok(Self {
-            _workspace: workspace,
-            config,
-        })
+    pub fn new(config: FlashInferConfig, _device: &Device) -> Result<Self> {
+        Ok(Self { _config: config })
     }
 
-    pub fn plan(&mut self, _metadata: &FlashInferMetadata, _kv_lengths: &[usize]) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        _q: &Tensor,
+        _k_cache: &Tensor,
+        _v_cache: &Tensor,
+        _workspace: &mut WorkspaceBuffer,
+        _kv_indptr: &Tensor,
+        _kv_indices: &Tensor,
+        _kv_last_page_len: &Tensor,
+        _batch_size: usize,
+    ) -> Result<Tensor> {
         Err(candle_core::Error::Msg(
             "FlashInfer not available - enable 'flashinfer' feature".to_string(),
         ))
-    }
-
-    pub fn run(&self, _q: &Tensor, _k_cache: &Tensor, _v_cache: &Tensor) -> Result<Tensor> {
-        Err(candle_core::Error::Msg(
-            "FlashInfer not available - enable 'flashinfer' feature".to_string(),
-        ))
-    }
-
-    pub fn is_planned(&self) -> bool {
-        false
     }
 }
 
@@ -359,5 +451,22 @@ mod tests {
     fn test_config_with_soft_cap() {
         let config = FlashInferConfig::new(32, 8, 128, 16).with_soft_cap(50.0);
         assert_eq!(config.soft_cap, 50.0);
+    }
+
+    #[test]
+    #[cfg(feature = "flashinfer")]
+    fn test_estimate_prefill_workspace() {
+        let size = estimate_prefill_workspace(4, 1024, 32, 128);
+        // Should be at least 16 MB
+        assert!(size >= 16 * 1024 * 1024);
+        // Should be large enough for the actual computation
+        assert!(size >= 1024 * 32 * 128 * 4);
+    }
+
+    #[test]
+    #[cfg(feature = "flashinfer")]
+    fn test_estimate_decode_workspace() {
+        let size = estimate_decode_workspace(4, 32, 128);
+        assert!(size >= 16 * 1024 * 1024);
     }
 }

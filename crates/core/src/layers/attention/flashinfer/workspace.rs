@@ -61,17 +61,25 @@ impl WorkspaceBuffer {
     /// is alive and not modified.
     #[cfg(feature = "flashinfer")]
     pub fn as_ptr(&self) -> Result<*mut u8> {
-        use candle_core::cuda_backend::CudaStorageSlice;
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
         use candle_core::Storage;
+
+        let cuda_device = match self.buffer.device() {
+            Device::Cuda(d) => d,
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "WorkspaceBuffer must be on CUDA device".to_string(),
+                ))
+            }
+        };
+        let stream = cuda_device.cuda_stream();
 
         let storage = self.buffer.storage_and_layout().0;
         match &*storage {
             Storage::Cuda(cuda_storage) => {
-                // Get the CUDA device pointer
-                match cuda_storage.as_cuda_slice::<u8>() {
-                    Ok(slice) => Ok(slice.device_ptr() as *mut u8),
-                    Err(e) => Err(e),
-                }
+                let slice = cuda_storage.as_cuda_slice::<u8>()?;
+                let (ptr, _guard) = slice.device_ptr(&stream);
+                Ok(ptr as *mut u8)
             }
             _ => Err(candle_core::Error::Msg(
                 "WorkspaceBuffer must be on CUDA device".to_string(),

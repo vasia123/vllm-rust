@@ -7,7 +7,7 @@ edition.workspace = true
 test-utils = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 flash-attn = ["dep:candle-flash-attn"]
-flashinfer = ["dep:flashinfer-rs"]
+flashinfer = ["dep:flashinfer-rs", "flashinfer-rs/cuda", "cuda"]
 cuda-kernels = ["cuda"]
 cuda-fused-activations = ["cuda-kernels"]
 cuda-layernorm = ["cuda-kernels"]
@@ -36,7 +36,7 @@ minijinja.workspace = true
 minijinja-contrib.workspace = true
 ahash.workspace = true
 candle-flash-attn = { workspace = true, optional = true }
-flashinfer-rs = { git = "https://github.com/vasia123/flashinfer-rs", optional = true }
+flashinfer-rs = { path = "../../../flashinfer-rs", optional = true }
 image = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }

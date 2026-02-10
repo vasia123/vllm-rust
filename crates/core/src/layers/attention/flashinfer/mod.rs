@@ -4,13 +4,15 @@
 //! computation with paged KV cache support. FlashInfer provides 2-3x speedup
 //! over naive attention for decode operations.
 //!
-//! Requires the `flashinfer` feature and CUDA support.
+//! On CUDA devices with the `flashinfer` feature enabled, calls into
+//! FlashInfer's FFI layer via `wrapper.rs`. On CPU or without the feature,
+//! falls back to naive matmul-based attention.
 //!
 //! # Module Structure
 //! - `metadata`: Paged KV cache metadata construction
 //! - `workspace`: Workspace buffer management
-//! - `wrapper`: High-level BatchPrefillHandler/BatchDecodeHandler wrappers
-//! - `tensor_bridge`: Tensor conversion utilities
+//! - `wrapper`: Direct FFI wrappers for BatchPrefillPlan/BatchDecodePlan
+//! - `tensor_bridge`: Candle tensor ↔ raw CUDA pointer conversion
 
 pub mod metadata;
 pub mod tensor_bridge;
@@ -21,6 +23,8 @@ pub use metadata::FlashInferMetadata;
 pub use workspace::{WorkspaceBuffer, DEFAULT_WORKSPACE_SIZE};
 pub use wrapper::{DecodeWrapper, FlashInferConfig, PrefillWrapper};
 
+#[cfg(feature = "flashinfer")]
+use candle_core::DType;
 use candle_core::{Device, IndexOp, Result, Tensor};
 
 use crate::kv_cache::CacheEngine;
@@ -34,12 +38,12 @@ use super::backend::{AttentionBackend, BatchedDecodeMetadata, PagedAttentionMeta
 ///
 /// Falls back to naive attention on CPU or when FlashInfer is unavailable.
 pub struct FlashInferBackend {
-    /// Workspace buffer for FlashInfer operations
+    /// Workspace buffer for FlashInfer operations (lazily initialized on first CUDA call)
     #[cfg(feature = "flashinfer")]
-    workspace: Option<std::sync::Arc<WorkspaceBuffer>>,
+    workspace: std::sync::Mutex<Option<WorkspaceBuffer>>,
 
     /// Block size for paged KV cache
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "flashinfer"), allow(dead_code))]
     block_size: usize,
 }
 
@@ -48,7 +52,7 @@ impl FlashInferBackend {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "flashinfer")]
-            workspace: None,
+            workspace: std::sync::Mutex::new(None),
             block_size: 16, // Default block size
         }
     }
@@ -57,29 +61,174 @@ impl FlashInferBackend {
     pub fn with_block_size(block_size: usize) -> Self {
         Self {
             #[cfg(feature = "flashinfer")]
-            workspace: None,
+            workspace: std::sync::Mutex::new(None),
             block_size,
         }
     }
 
-    /// Initialize workspace buffer for a CUDA device.
+    /// Get or create workspace buffer for the given device.
+    ///
+    /// Uses interior mutability via Mutex since AttentionBackend trait
+    /// methods take `&self`.
     #[cfg(feature = "flashinfer")]
-    #[allow(dead_code)]
-    fn ensure_workspace(&mut self, device: &Device) -> Result<std::sync::Arc<WorkspaceBuffer>> {
-        if let Some(ref ws) = self.workspace {
-            // Check if workspace is on the same device
+    fn get_or_create_workspace(&self, device: &Device) -> Result<()> {
+        let mut ws_guard = self.workspace.lock().map_err(|e| {
+            candle_core::Error::Msg(format!("workspace lock poisoned: {e}"))
+        })?;
+
+        if let Some(ref ws) = *ws_guard {
             if ws.device().same_device(device) {
-                return Ok(std::sync::Arc::clone(ws));
+                return Ok(());
             }
         }
 
-        // Create new workspace for this device
-        let ws = std::sync::Arc::new(WorkspaceBuffer::new(device)?);
-        self.workspace = Some(std::sync::Arc::clone(&ws));
-        Ok(ws)
+        *ws_guard = Some(WorkspaceBuffer::new(device)?);
+        Ok(())
     }
 
-    /// Naive prefill attention implementation (fallback).
+    /// Run prefill attention using FlashInfer kernels.
+    ///
+    /// Assumes K/V have already been written to cache before this call.
+    #[cfg(feature = "flashinfer")]
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_flashinfer(
+        &self,
+        q: &Tensor,
+        cache_engine: &CacheEngine,
+        metadata: &PagedAttentionMetadata,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let device = q.device();
+        let (b_sz, _num_heads, q_len, _head_dim) = q.dims4()?;
+        let total_tokens = b_sz * q_len;
+
+        // Reshape Q from [b, heads, q_len, head_dim] to [total_tokens, heads, head_dim]
+        // FlashInfer expects flattened token dimension
+        let q_flat = q
+            .transpose(1, 2)? // [b, q_len, heads, head_dim]
+            .reshape((total_tokens, num_heads, head_dim))?;
+
+        // Build FlashInfer paged KV metadata
+        let fi_metadata = FlashInferMetadata::from_single_sequence(
+            metadata.block_ids,
+            metadata.seq_len,
+            self.block_size,
+            device,
+        )?;
+
+        // Convert metadata tensors from i64/u32 to i32 for FFI
+        let kv_indptr = fi_metadata.paged_kv_indptr.to_dtype(DType::U32)?;
+        let kv_indices = fi_metadata.paged_kv_indices.to_dtype(DType::U32)?;
+        let kv_last_page_len = fi_metadata.paged_kv_last_page_len.to_dtype(DType::U32)?;
+
+        // Build qo_indptr: cumulative query token counts per sequence
+        // For single-sequence prefill: [0, total_tokens]
+        let qo_indptr_data: Vec<i32> = vec![0, total_tokens as i32];
+        let qo_indptr = tensor_bridge::alloc_gpu_i32(&qo_indptr_data, device)?;
+
+        // Create wrapper and run
+        let config = FlashInferConfig::new(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            self.block_size as u32,
+        );
+        let wrapper = PrefillWrapper::new(config, device)?;
+
+        self.get_or_create_workspace(device)?;
+        let mut ws_guard = self.workspace.lock().map_err(|e| {
+            candle_core::Error::Msg(format!("workspace lock poisoned: {e}"))
+        })?;
+        let ws = ws_guard.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("workspace not initialized".to_string())
+        })?;
+
+        let output = wrapper.run(
+            &q_flat,
+            cache_engine.k_cache(),
+            cache_engine.v_cache(),
+            ws,
+            &qo_indptr,
+            &kv_indptr,
+            &kv_indices,
+            &kv_last_page_len,
+            1, // batch_size = 1 for single-sequence prefill
+            total_tokens,
+        )?;
+
+        // Reshape output from [total_tokens, num_heads, head_dim]
+        // to [b, q_len, num_heads * head_dim]
+        output.reshape((b_sz, q_len, num_heads * head_dim))
+    }
+
+    /// Run batched decode attention using FlashInfer kernels.
+    ///
+    /// Assumes K/V have already been written to cache before this call.
+    #[cfg(feature = "flashinfer")]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_flashinfer(
+        &self,
+        q: &Tensor,
+        cache_engine: &CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let device = q.device();
+        let batch_size = metadata.kv_lengths.len();
+
+        // q shape: [batch_size, num_heads, head_dim] — already correct for FlashInfer
+
+        // Build FlashInfer paged KV metadata
+        let fi_metadata = FlashInferMetadata::from_paged_attention(
+            metadata.seq_block_ids,
+            metadata.kv_lengths,
+            self.block_size,
+            device,
+        )?;
+
+        // Convert metadata tensors from i64/u32 to i32 for FFI
+        let kv_indptr = fi_metadata.paged_kv_indptr.to_dtype(DType::U32)?;
+        let kv_indices = fi_metadata.paged_kv_indices.to_dtype(DType::U32)?;
+        let kv_last_page_len = fi_metadata.paged_kv_last_page_len.to_dtype(DType::U32)?;
+
+        // Create wrapper and run
+        let config = FlashInferConfig::new(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            self.block_size as u32,
+        );
+        let wrapper = DecodeWrapper::new(config, device)?;
+
+        self.get_or_create_workspace(device)?;
+        let mut ws_guard = self.workspace.lock().map_err(|e| {
+            candle_core::Error::Msg(format!("workspace lock poisoned: {e}"))
+        })?;
+        let ws = ws_guard.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("workspace not initialized".to_string())
+        })?;
+
+        let output = wrapper.run(
+            q,
+            cache_engine.k_cache(),
+            cache_engine.v_cache(),
+            ws,
+            &kv_indptr,
+            &kv_indices,
+            &kv_last_page_len,
+            batch_size,
+        )?;
+
+        // Reshape output from [batch_size, num_heads, head_dim]
+        // to [batch_size, num_heads * head_dim]
+        output.reshape((batch_size, num_heads * head_dim))
+    }
+
+    /// Naive prefill attention implementation (CPU fallback).
     #[allow(clippy::too_many_arguments)]
     fn prefill_naive(
         &self,
@@ -141,7 +290,7 @@ impl FlashInferBackend {
             .reshape((b_sz, q_len, num_heads * head_dim))
     }
 
-    /// Naive batched decode attention implementation (fallback).
+    /// Naive batched decode attention implementation (CPU fallback).
     #[allow(clippy::too_many_arguments)]
     fn batched_decode_naive(
         &self,
@@ -230,7 +379,7 @@ impl AttentionBackend for FlashInferBackend {
     ) -> Result<Tensor> {
         let device = q.device();
 
-        // Fall back to naive implementation if not on CUDA
+        // CPU fallback — FlashInfer requires CUDA
         if !device.is_cuda() {
             return self.prefill_naive(
                 q,
@@ -245,36 +394,15 @@ impl AttentionBackend for FlashInferBackend {
             );
         }
 
-        // Write new K, V to paged cache
+        // Write new K, V to paged cache first
         let k_for_cache = k.squeeze(0)?;
         let v_for_cache = v.squeeze(0)?;
         cache_engine
             .write(&k_for_cache, &v_for_cache, metadata.slot_mapping)
             .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
 
-        // Build FlashInfer metadata
-        let _fi_metadata = FlashInferMetadata::from_single_sequence(
-            metadata.block_ids,
-            metadata.seq_len,
-            self.block_size,
-            device,
-        )?;
-
-        // Get workspace and create handler
-        // Note: For now, we fall back to naive since the wrapper API
-        // needs proper integration with flashinfer-rs handlers.
-        // This provides the infrastructure for real integration.
-        self.prefill_naive(
-            q,
-            k,
-            v,
-            attention_mask,
-            cache_engine,
-            metadata,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-        )
+        // Run FlashInfer prefill kernel (reads from paged cache directly)
+        self.prefill_flashinfer(q, cache_engine, metadata, num_heads, num_kv_heads, head_dim)
     }
 
     fn batched_decode_attention(
@@ -290,7 +418,7 @@ impl AttentionBackend for FlashInferBackend {
     ) -> Result<Tensor> {
         let device = q.device();
 
-        // Fall back to naive implementation if not on CUDA
+        // CPU fallback — FlashInfer requires CUDA
         if !device.is_cuda() {
             return self.batched_decode_naive(
                 q,
@@ -304,38 +432,17 @@ impl AttentionBackend for FlashInferBackend {
             );
         }
 
-        // Write new K/V tokens to cache
+        // Write new K/V tokens to cache first
         cache_engine
             .write_batch(k_new, v_new, metadata.all_slot_mapping)
             .map_err(|e| candle_core::Error::Msg(format!("cache write_batch: {e}")))?;
 
-        // Build FlashInfer metadata
-        let _fi_metadata = FlashInferMetadata::from_paged_attention(
-            metadata.seq_block_ids,
-            metadata.kv_lengths,
-            self.block_size,
-            device,
-        )?;
-
-        // For now, fall back to naive implementation
-        // Real FlashInfer integration requires:
-        // 1. Proper workspace initialization
-        // 2. Handler creation and planning
-        // 3. Running the kernel with correct tensor layouts
-        self.batched_decode_naive(
-            q,
-            k_new,
-            v_new,
-            cache_engine,
-            metadata,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-        )
+        // Run FlashInfer decode kernel (reads from paged cache directly)
+        self.decode_flashinfer(q, cache_engine, metadata, num_heads, num_kv_heads, head_dim)
     }
 
     fn supported_dtypes(&self) -> &[DType] {
-        &[DType::F32, DType::F16, DType::BF16]
+        &[DType::F16, DType::BF16]
     }
 }
 
@@ -395,7 +502,7 @@ impl AttentionBackend for FlashInferBackend {
     }
 }
 
-/// Create a causal attention mask.
+/// Create a causal attention mask (for naive fallback).
 fn create_causal_mask(
     q_len: usize,
     kv_len: usize,
