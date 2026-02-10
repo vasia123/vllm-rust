@@ -51,7 +51,7 @@ temp/
 
 # Frontend build artifacts (if any)
 node_modules/
-dist/
+frontend/node_modules/
 *.lock
 !Cargo.lock
 

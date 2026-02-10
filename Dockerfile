@@ -25,7 +25,8 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Create app directory
 WORKDIR /app
 
-# Copy only dependency files first for better caching
+# Copy toolchain config and dependency files first for better caching
+COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/
 COPY crates/server/Cargo.toml crates/server/
@@ -36,6 +37,9 @@ RUN mkdir -p crates/core/src crates/server/src && \
     echo "pub fn dummy() {}" > crates/core/src/lib.rs && \
     echo "pub fn dummy() {}" > crates/server/src/lib.rs
 
+# Copy frontend dist (needed by RustEmbed at compile time)
+COPY frontend/dist/ frontend/dist/
+
 # Build dependencies (this layer will be cached)
 RUN cargo build --release -p vllm-server 2>/dev/null || true
 
@@ -44,8 +48,6 @@ RUN rm -rf crates/core/src crates/server/src
 
 # Copy actual source code
 COPY crates/ crates/
-COPY kernels/ kernels/
-COPY build.rs ./
 
 # Touch source files to invalidate the cache
 RUN touch crates/core/src/lib.rs crates/server/src/main.rs
