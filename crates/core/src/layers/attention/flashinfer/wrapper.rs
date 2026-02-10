@@ -159,14 +159,17 @@ impl PrefillWrapper {
 
         let dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
 
-        // Create FFI plan
-        // Workspace is split: first half for float, second half for int
+        // Split workspace: first half for float, second half for int
         let ws_size = workspace.size();
         let float_ws_size = ws_size / 2;
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
         let int_ws_ptr =
-            unsafe { (workspace_ptr as *mut u8).add(float_ws_size) } as *mut std::ffi::c_void;
+            unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
+
+        // PrefillPlan writes plan metadata to page-locked host memory, then
+        // copies it to device via cudaMemcpyAsync. Must match int workspace size.
+        let mut page_locked_buf: Vec<u8> = vec![0u8; int_ws_size];
 
         let plan = unsafe {
             flashinfer_rs::ffi::BatchPrefillPlan::new(
@@ -174,8 +177,8 @@ impl PrefillWrapper {
                 float_ws_size,
                 int_ws_ptr,
                 int_ws_size,
-                std::ptr::null_mut(), // page_locked_workspace
-                0,                    // page_locked_size
+                page_locked_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                int_ws_size,
                 qo_indptr_ptr,
                 kv_indptr_ptr,
                 batch_size as i32,
@@ -280,7 +283,7 @@ impl DecodeWrapper {
         );
         workspace.ensure_size(required_size)?;
 
-        // Get raw pointers
+        // Get raw DEVICE pointers
         let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
         let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
         let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
@@ -291,30 +294,43 @@ impl DecodeWrapper {
         let workspace_ptr = workspace.as_ptr()?;
         let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
 
+        // Copy kv_indptr to HOST for plan creation.
+        // FlashInfer's DecodePlan reads indptr on the CPU for work estimation
+        // (the C++ parameter is named `indptr_h` — the `_h` suffix = host).
+        let kv_indptr_host_u32: Vec<u32> = kv_indptr.to_vec1::<u32>()?;
+        let kv_indptr_host: Vec<i32> = kv_indptr_host_u32
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+
         // Allocate output
         let output = Tensor::zeros_like(&q)?;
         let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
 
         let dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
 
-        // Split workspace
+        // Split workspace: first half for float, second half for int
         let ws_size = workspace.size();
         let float_ws_size = ws_size / 2;
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
         let int_ws_ptr =
-            unsafe { (workspace_ptr as *mut u8).add(float_ws_size) } as *mut std::ffi::c_void;
+            unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
 
-        // Create FFI plan
+        // DecodePlan writes plan metadata to page-locked host memory, then
+        // copies it to device via cudaMemcpyAsync. Must match int workspace size.
+        let mut page_locked_buf: Vec<u8> = vec![0u8; int_ws_size];
+
+        // Create FFI plan (uses HOST kv_indptr for CPU-side work estimation)
         let plan = unsafe {
             flashinfer_rs::ffi::BatchDecodePlan::new(
                 float_ws_ptr,
                 float_ws_size,
                 int_ws_ptr,
                 int_ws_size,
-                std::ptr::null_mut(), // page_locked_workspace
-                0,                    // page_locked_size
-                kv_indptr_ptr,
+                page_locked_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                int_ws_size,
+                kv_indptr_host.as_ptr(),
                 batch_size as i32,
                 self.config.num_qo_heads as i32,
                 self.config.num_kv_heads as i32,
@@ -330,7 +346,7 @@ impl DecodeWrapper {
             .map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode plan failed: {e}")))?
         };
 
-        // Run the kernel
+        // Run the kernel (uses DEVICE pointers for GPU execution)
         unsafe {
             plan.run(
                 q_ptr,
@@ -481,21 +497,29 @@ impl MlaWrapper {
         );
         workspace.ensure_size(required_size)?;
 
-        // Get raw pointers
+        // Get raw pointers for tensors that stay on GPU (queries, caches, indices)
         let qn_ptr = tensor_bridge::tensor_to_device_ptr(&q_nope)?;
         let qp_ptr = tensor_bridge::tensor_to_device_ptr(&q_pe)?;
         let ckv_ptr = tensor_bridge::tensor_to_device_ptr(ckv_cache)?;
         let kpe_ptr = tensor_bridge::tensor_to_device_ptr(kpe_cache)?;
-        let qo_indptr_ptr = tensor_bridge::tensor_to_device_ptr(qo_indptr)? as *const i32;
-        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(kv_indptr)? as *const i32;
         let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(kv_indices)? as *const i32;
         let workspace_ptr = workspace.as_ptr()?;
         let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
 
-        // kv_lengths as i32 on GPU for plan
-        let kv_len_i32: Vec<i32> = kv_lengths.iter().map(|&l| l as i32).collect();
-        let kv_len_gpu = tensor_bridge::alloc_gpu_i32(&kv_len_i32, &self.device)?;
-        let kv_len_ptr = tensor_bridge::tensor_to_device_ptr(&kv_len_gpu)? as *const i32;
+        // Copy indptr arrays to HOST for plan creation.
+        // FlashInfer's MLAPlan reads qo_indptr_h, kv_indptr_h, kv_len_arr_h on the CPU
+        // (the C++ parameter names use `_h` suffix = host).
+        let qo_indptr_host: Vec<i32> = qo_indptr
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+        let kv_indptr_host: Vec<i32> = kv_indptr
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+        let kv_len_host: Vec<i32> = kv_lengths.iter().map(|&l| l as i32).collect();
 
         // Allocate output: same shape as q_nope [nnz, num_heads, head_dim_ckv]
         let output = Tensor::zeros_like(&q_nope)?;
@@ -509,20 +533,23 @@ impl MlaWrapper {
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
         let int_ws_ptr =
-            unsafe { (workspace_ptr as *mut u8).add(float_ws_size) } as *mut std::ffi::c_void;
+            unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
 
-        // Create MLA plan
+        // MLA plan writes metadata to page-locked host memory, then copies to device.
+        let mut page_locked_buf: Vec<u8> = vec![0u8; int_ws_size];
+
+        // Create MLA plan (all indptr/len arrays must be HOST pointers)
         let plan = unsafe {
             flashinfer_rs::ffi::MLAPlan::new(
                 float_ws_ptr,
                 float_ws_size,
                 int_ws_ptr,
                 int_ws_size,
-                std::ptr::null_mut(), // page_locked_workspace
-                0,                    // page_locked_size
-                qo_indptr_ptr,
-                kv_indptr_ptr,
-                kv_len_ptr,
+                page_locked_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                int_ws_size,
+                qo_indptr_host.as_ptr(),
+                kv_indptr_host.as_ptr(),
+                kv_len_host.as_ptr(),
                 batch_size as i32,
                 self.config.num_heads as i32,
                 self.config.head_dim_ckv as i32,

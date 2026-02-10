@@ -1391,7 +1391,7 @@ impl<P: ProcessGroup + Send + Sync> DeviceCommunicator for NcclDeviceCommunicato
         let world_size = self.process_group.world_size();
         let dims = tensor.dims();
 
-        if dims[scatter_dim] % world_size != 0 {
+        if !dims[scatter_dim].is_multiple_of(world_size) {
             return Err(DistributedError::ShapeMismatch {
                 expected: vec![dims[scatter_dim] / world_size],
                 actual: vec![dims[scatter_dim]],
@@ -1529,7 +1529,7 @@ impl<P: ProcessGroup + Send + Sync> DeviceCommunicator for NcclDeviceCommunicato
         let rank = self.process_group.rank();
         let dims = tensor.dims();
 
-        if dims.is_empty() || dims[0] % world_size != 0 {
+        if dims.is_empty() || !dims[0].is_multiple_of(world_size) {
             return Err(DistributedError::ShapeMismatch {
                 expected: vec![world_size],
                 actual: dims.to_vec(),

@@ -447,6 +447,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[cfg(not(any(feature = "flashinfer", feature = "flash-attn")))]
     fn test_select_fallback_to_naive_no_features() {
         // Standard LLaMA-like config
         let req = AttentionRequirements::new(32, 8, 128);
