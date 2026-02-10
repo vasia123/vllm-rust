@@ -1,6 +1,6 @@
 //! Eagle-3 DraftProposer implementation.
 //!
-//! Wraps [`Eagle3LlamaForCausalLM`] with full lifecycle management. Unlike
+//! Wraps any [`Eagle3DraftModel`] with full lifecycle management. Unlike
 //! [`DraftModelDraftProposer`], this proposer requires target model hidden
 //! states via [`set_target_hidden_states`] before each proposal round.
 //!
@@ -22,7 +22,7 @@ use tracing::warn;
 
 use crate::engine::types::EngineError;
 use crate::kv_cache::{BlockTable, KVCacheManager};
-use crate::models::Eagle3LlamaForCausalLM;
+use crate::models::Eagle3DraftModel;
 use crate::request::{RequestId, SequenceState};
 use crate::tokenizer::TokenizerWrapper;
 
@@ -42,14 +42,14 @@ struct Eagle3RequestState {
 
 /// [`DraftProposer`] backed by an Eagle-3 speculative decoding model.
 ///
-/// Eagle-3 generates draft tokens by combining target model hidden states
-/// with token embeddings. Layer 0 concatenates embeddings and hidden states;
-/// subsequent layers follow standard transformer flow.
+/// Works with any model implementing [`Eagle3DraftModel`], including:
+/// - [`Eagle3LlamaForCausalLM`](crate::models::Eagle3LlamaForCausalLM): Llama-based (layer-0 concatenation)
+/// - [`Eagle3MistralLarge3ForCausalLM`](crate::models::Eagle3MistralLarge3ForCausalLM): DeepSeek-based (fc projection)
 ///
 /// The engine must call [`set_target_hidden_states`] before each
 /// `propose_for_request` call to provide the target model's context.
 pub struct Eagle3DraftProposer {
-    model: Eagle3LlamaForCausalLM,
+    model: Box<dyn Eagle3DraftModel>,
     kv_cache: KVCacheManager,
     num_speculative_tokens: usize,
     requests: HashMap<RequestId, Eagle3RequestState>,
@@ -57,7 +57,7 @@ pub struct Eagle3DraftProposer {
 
 impl Eagle3DraftProposer {
     pub fn new(
-        model: Eagle3LlamaForCausalLM,
+        model: Box<dyn Eagle3DraftModel>,
         kv_cache: KVCacheManager,
         num_speculative_tokens: usize,
     ) -> Self {
@@ -301,6 +301,7 @@ mod tests {
     use crate::config::ModelConfig;
     use crate::kv_cache::config::CacheConfig;
     use crate::kv_cache::KVCacheDtype;
+    use crate::models::Eagle3LlamaForCausalLM;
     use crate::request::SequenceState;
     use crate::tokenizer::TokenizerWrapper;
     use candle_core::{DType, Device};
@@ -360,7 +361,7 @@ mod tests {
         let model = Eagle3LlamaForCausalLM::new(&cfg, vb).expect("build model");
         let cache_cfg = eagle3_cache_config(&cfg);
         let kv_cache = KVCacheManager::new(&cache_cfg).expect("cache creation");
-        Eagle3DraftProposer::new(model, kv_cache, num_spec_tokens)
+        Eagle3DraftProposer::new(Box::new(model), kv_cache, num_spec_tokens)
     }
 
     fn make_state(prompt: &[u32]) -> SequenceState {
@@ -615,7 +616,7 @@ mod tests {
         let model = Eagle3LlamaForCausalLM::new(&cfg, vb).expect("build model");
         let cache_cfg = eagle3_cache_config(&cfg);
         let kv_cache = KVCacheManager::new(&cache_cfg).expect("cache creation");
-        let mut proposer = Eagle3DraftProposer::new(model, kv_cache, 2);
+        let mut proposer = Eagle3DraftProposer::new(Box::new(model), kv_cache, 2);
 
         proposer.init_request(0, &[1, 2, 3]).unwrap();
 

@@ -619,6 +619,85 @@ impl Eagle3LlamaForCausalLM {
     }
 }
 
+// ─── Eagle3 Draft Model Trait ──────────────────────────────────────────────
+
+/// Trait for Eagle3-family draft models that require target hidden states.
+///
+/// Both [`Eagle3LlamaForCausalLM`] and
+/// [`Eagle3MistralLarge3ForCausalLM`](super::Eagle3MistralLarge3ForCausalLM)
+/// implement this trait, allowing the [`Eagle3DraftProposer`](crate::engine::spec_decode::Eagle3DraftProposer)
+/// to be generic over the underlying architecture.
+pub trait Eagle3DraftModel: Send {
+    /// Forward pass taking input_ids and target hidden states.
+    ///
+    /// Returns `(hidden_states, hidden_prenorm)`:
+    /// - Llama variant: hidden_states (post-norm) and hidden_prenorm (pre-norm) differ
+    /// - MistralLarge3 variant: both are the same tensor
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        hidden_states: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<(Tensor, Tensor)>;
+
+    /// Compute logits from hidden states.
+    fn compute_logits(&self, hidden_states: &Tensor) -> Result<Tensor>;
+
+    /// Project auxiliary hidden states from target model.
+    ///
+    /// For models with `use_aux_hidden_state() == true`, this projects
+    /// 3×target_hidden_size → hidden_size. Otherwise returns a clone.
+    fn combine_hidden_states(&self, hidden_states: &Tensor) -> Result<Tensor>;
+
+    /// Whether this model uses auxiliary hidden state combination.
+    fn use_aux_hidden_state(&self) -> bool;
+
+    /// Device this model resides on.
+    fn device(&self) -> &Device;
+}
+
+impl Eagle3DraftModel for Eagle3LlamaForCausalLM {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        hidden_states: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        Eagle3LlamaForCausalLM::forward(
+            self,
+            input_ids,
+            hidden_states,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn compute_logits(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        Eagle3LlamaForCausalLM::compute_logits(self, hidden_states)
+    }
+
+    fn combine_hidden_states(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        Eagle3LlamaForCausalLM::combine_hidden_states(self, hidden_states)
+    }
+
+    fn use_aux_hidden_state(&self) -> bool {
+        Eagle3LlamaForCausalLM::use_aux_hidden_state(self)
+    }
+
+    fn device(&self) -> &Device {
+        Eagle3LlamaForCausalLM::device(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

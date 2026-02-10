@@ -68,7 +68,7 @@ impl Module for DeepSeekMLP {
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
 /// DeepSeek decoder layer using MLA attention with compressed KV cache.
-struct DeepSeekDecoderLayer {
+pub(crate) struct DeepSeekDecoderLayer {
     self_attn: MLAAttention,
     mlp: Option<DeepSeekMLP>,
     moe: Option<MoELayer>,
@@ -79,7 +79,7 @@ struct DeepSeekDecoderLayer {
 }
 
 impl DeepSeekDecoderLayer {
-    fn new(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
         let vb_attn = vb.pp("self_attn");
         let num_heads = cfg.num_attention_heads;
 
@@ -278,7 +278,7 @@ impl DeepSeekDecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -319,7 +319,7 @@ impl DeepSeekDecoderLayer {
         residual + x
     }
 
-    fn forward_decode(
+    pub(crate) fn forward_decode(
         &self,
         x: &Tensor,
         seqlen_offset: usize,

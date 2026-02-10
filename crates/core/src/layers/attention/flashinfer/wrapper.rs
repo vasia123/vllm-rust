@@ -468,7 +468,7 @@ impl MlaWrapper {
         kv_indices: &Tensor,
         kv_lengths: &[usize],
         batch_size: usize,
-        total_tokens: usize,
+        _total_tokens: usize,
     ) -> Result<Tensor> {
         let q_nope = tensor_bridge::ensure_contiguous(q_nope)?;
         let q_pe = tensor_bridge::ensure_contiguous(q_pe)?;
