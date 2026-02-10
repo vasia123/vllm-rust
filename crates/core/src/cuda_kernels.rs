@@ -1792,6 +1792,303 @@ pub fn gelu_cuda_available(_tensor: &Tensor) -> bool {
     false
 }
 
+// ============================================================================
+// reshape_and_cache CUDA Kernels
+// ============================================================================
+
+#[cfg(feature = "cuda-kernels")]
+const CACHE_OPS_PTX: &str = include_str!("../kernels/cache_ops.ptx");
+
+/// Cache layout for CUDA kernel dispatch.
+#[cfg(feature = "cuda-kernels")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaCacheLayout {
+    /// `[num_blocks, block_size, num_kv_heads, head_dim]`
+    NHD,
+    /// `[num_blocks, num_kv_heads, block_size, head_dim]`
+    HND,
+}
+
+/// Write K/V from model output into paged KV cache using a CUDA kernel.
+///
+/// This replaces the Candle scatter path with a direct kernel launch,
+/// avoiding intermediate tensor allocations for index expansion.
+///
+/// # Arguments
+/// - `key`: Input key tensor `[num_tokens, num_kv_heads, head_dim]`, contiguous
+/// - `value`: Input value tensor `[num_tokens, num_kv_heads, head_dim]`, contiguous
+/// - `key_cache`: KV cache key tensor (modified in-place)
+/// - `value_cache`: KV cache value tensor (modified in-place)
+/// - `slot_mapping`: Physical slot per token `[num_tokens]` (i32, on CUDA)
+/// - `num_kv_heads`: Number of KV heads
+/// - `head_dim`: Head dimension
+/// - `block_size`: Cache block size
+/// - `layout`: Cache layout (NHD or HND)
+#[cfg(feature = "cuda-kernels")]
+#[allow(clippy::too_many_arguments)]
+pub fn reshape_and_cache_cuda(
+    key: &Tensor,
+    value: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    slot_mapping: &Tensor,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    layout: CudaCacheLayout,
+) -> Result<()> {
+    use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let num_tokens = key.dim(0)?;
+    if num_tokens == 0 {
+        return Ok(());
+    }
+
+    let (key_guard, _) = key.storage_and_layout();
+    let (value_guard, _) = value.storage_and_layout();
+    let (kc_guard, _) = key_cache.storage_and_layout();
+    let (vc_guard, _) = value_cache.storage_and_layout();
+    let (sm_guard, _) = slot_mapping.storage_and_layout();
+
+    let dev = match &*key_guard {
+        Storage::Cuda(cs) => &cs.device,
+        _ => candle_core::bail!("reshape_and_cache: key must be on CUDA"),
+    };
+
+    let sm_slice = match &*sm_guard {
+        Storage::Cuda(cs) => match &cs.slice {
+            CudaStorageSlice::I64(_) => {
+                candle_core::bail!("reshape_and_cache: slot_mapping must be U32, got I64")
+            }
+            CudaStorageSlice::U32(s) => s,
+            _ => candle_core::bail!("reshape_and_cache: slot_mapping must be U32"),
+        },
+        _ => candle_core::bail!("reshape_and_cache: slot_mapping must be on CUDA"),
+    };
+
+    let num_kv_heads_i32 = num_kv_heads as i32;
+    let head_dim_i32 = head_dim as i32;
+    let block_size_i32 = block_size as i32;
+
+    // Select kernel name and grid based on layout and dtype
+    match layout {
+        CudaCacheLayout::NHD => {
+            let kv_stride = num_kv_heads * head_dim;
+            let block_dim = std::cmp::min(kv_stride, 1024) as u32;
+
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            match &key_guard {
+                Storage::Cuda(key_cs) => match (&key_cs.slice, &value_guard) {
+                    (CudaStorageSlice::BF16(k_slice), Storage::Cuda(v_cs)) => {
+                        let v_slice = match &v_cs.slice {
+                            CudaStorageSlice::BF16(s) => s,
+                            _ => candle_core::bail!("reshape_and_cache: value dtype mismatch"),
+                        };
+                        let kc_slice = match &*kc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::BF16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
+                        };
+                        let vc_slice = match &*vc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::BF16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
+                        };
+
+                        let func = dev.get_or_load_custom_func(
+                            "reshape_and_cache_bf16",
+                            "cache_ops",
+                            CACHE_OPS_PTX,
+                        )?;
+
+                        let mut builder = func.builder();
+                        builder.arg(k_slice);
+                        builder.arg(v_slice);
+                        builder.arg(kc_slice);
+                        builder.arg(vc_slice);
+                        builder.arg(sm_slice);
+                        builder.arg(&num_kv_heads_i32);
+                        builder.arg(&head_dim_i32);
+                        builder.arg(&block_size_i32);
+
+                        // SAFETY: all pointers validated, contiguous, same device
+                        unsafe { builder.launch(cfg) }.map_err(|e| {
+                            candle_core::Error::Msg(format!("reshape_and_cache NHD launch: {e}"))
+                        })?;
+                    }
+                    (CudaStorageSlice::F16(k_slice), Storage::Cuda(v_cs)) => {
+                        let v_slice = match &v_cs.slice {
+                            CudaStorageSlice::F16(s) => s,
+                            _ => candle_core::bail!("reshape_and_cache: value dtype mismatch"),
+                        };
+                        let kc_slice = match &*kc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::F16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
+                        };
+                        let vc_slice = match &*vc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::F16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
+                        };
+
+                        let func = dev.get_or_load_custom_func(
+                            "reshape_and_cache_fp16",
+                            "cache_ops",
+                            CACHE_OPS_PTX,
+                        )?;
+
+                        let mut builder = func.builder();
+                        builder.arg(k_slice);
+                        builder.arg(v_slice);
+                        builder.arg(kc_slice);
+                        builder.arg(vc_slice);
+                        builder.arg(sm_slice);
+                        builder.arg(&num_kv_heads_i32);
+                        builder.arg(&head_dim_i32);
+                        builder.arg(&block_size_i32);
+
+                        unsafe { builder.launch(cfg) }.map_err(|e| {
+                            candle_core::Error::Msg(format!("reshape_and_cache NHD launch: {e}"))
+                        })?;
+                    }
+                    _ => candle_core::bail!("reshape_and_cache: unsupported dtype, expected BF16 or F16"),
+                },
+                _ => candle_core::bail!("reshape_and_cache: key not on CUDA"),
+            }
+        }
+        CudaCacheLayout::HND => {
+            let block_dim = std::cmp::min(head_dim, 1024) as u32;
+
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, num_kv_heads as u32, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            match &key_guard {
+                Storage::Cuda(key_cs) => match (&key_cs.slice, &value_guard) {
+                    (CudaStorageSlice::BF16(k_slice), Storage::Cuda(v_cs)) => {
+                        let v_slice = match &v_cs.slice {
+                            CudaStorageSlice::BF16(s) => s,
+                            _ => candle_core::bail!("reshape_and_cache: value dtype mismatch"),
+                        };
+                        let kc_slice = match &*kc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::BF16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
+                        };
+                        let vc_slice = match &*vc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::BF16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
+                        };
+
+                        let func = dev.get_or_load_custom_func(
+                            "reshape_and_cache_hnd_bf16",
+                            "cache_ops",
+                            CACHE_OPS_PTX,
+                        )?;
+
+                        let mut builder = func.builder();
+                        builder.arg(k_slice);
+                        builder.arg(v_slice);
+                        builder.arg(kc_slice);
+                        builder.arg(vc_slice);
+                        builder.arg(sm_slice);
+                        builder.arg(&num_kv_heads_i32);
+                        builder.arg(&head_dim_i32);
+                        builder.arg(&block_size_i32);
+
+                        // SAFETY: all pointers validated, contiguous, same device
+                        unsafe { builder.launch(cfg) }.map_err(|e| {
+                            candle_core::Error::Msg(format!("reshape_and_cache HND launch: {e}"))
+                        })?;
+                    }
+                    (CudaStorageSlice::F16(k_slice), Storage::Cuda(v_cs)) => {
+                        let v_slice = match &v_cs.slice {
+                            CudaStorageSlice::F16(s) => s,
+                            _ => candle_core::bail!("reshape_and_cache: value dtype mismatch"),
+                        };
+                        let kc_slice = match &*kc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::F16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
+                        };
+                        let vc_slice = match &*vc_guard {
+                            Storage::Cuda(cs) => match &cs.slice {
+                                CudaStorageSlice::F16(s) => s,
+                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                            },
+                            _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
+                        };
+
+                        let func = dev.get_or_load_custom_func(
+                            "reshape_and_cache_hnd_fp16",
+                            "cache_ops",
+                            CACHE_OPS_PTX,
+                        )?;
+
+                        let mut builder = func.builder();
+                        builder.arg(k_slice);
+                        builder.arg(v_slice);
+                        builder.arg(kc_slice);
+                        builder.arg(vc_slice);
+                        builder.arg(sm_slice);
+                        builder.arg(&num_kv_heads_i32);
+                        builder.arg(&head_dim_i32);
+                        builder.arg(&block_size_i32);
+
+                        unsafe { builder.launch(cfg) }.map_err(|e| {
+                            candle_core::Error::Msg(format!("reshape_and_cache HND launch: {e}"))
+                        })?;
+                    }
+                    _ => candle_core::bail!("reshape_and_cache: unsupported dtype, expected BF16 or F16"),
+                },
+                _ => candle_core::bail!("reshape_and_cache: key not on CUDA"),
+            }
+        }
+    }
+
+    drop(key_guard);
+    drop(value_guard);
+    drop(kc_guard);
+    drop(vc_guard);
+    drop(sm_guard);
+
+    Ok(())
+}
+
+/// Check if reshape_and_cache CUDA kernel is available.
+#[cfg(feature = "cuda-kernels")]
+pub fn reshape_and_cache_cuda_available(tensor: &Tensor) -> bool {
+    tensor.device().is_cuda()
+}
+
+#[cfg(not(feature = "cuda-kernels"))]
+pub fn reshape_and_cache_cuda_available(_tensor: &Tensor) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

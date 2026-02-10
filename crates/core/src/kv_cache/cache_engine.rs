@@ -115,29 +115,6 @@ impl CacheEngine {
         self.layout
     }
 
-    /// Build scatter indices for write operations.
-    ///
-    /// Expands slot indices from [new_tokens] to [new_tokens, kv_heads, head_dim]
-    /// for use with scatter_set on dim 0.
-    fn build_scatter_indices(
-        slot_mapping: &[usize],
-        new_tokens: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        device: &candle_core::Device,
-    ) -> Result<Tensor, CacheError> {
-        let indices = Tensor::from_vec(
-            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
-            (new_tokens,),
-            device,
-        )?;
-        let indices = indices
-            .reshape((new_tokens, 1, 1))?
-            .expand((new_tokens, num_kv_heads, head_dim))?
-            .contiguous()?;
-        Ok(indices)
-    }
-
     /// Quantize write data based on kv_cache_dtype setting.
     ///
     /// Input and output are in [new_tokens, kv_heads, head_dim] layout.
@@ -193,40 +170,141 @@ impl CacheEngine {
 
     /// Scatter data into the cache, handling NHD/HND layout differences.
     ///
-    /// For NHD: reshape is a zero-copy view, scatter modifies cache in-place.
-    /// For HND: requires transpose→scatter→transpose round-trip (copies entire cache).
-    /// TODO: Replace HND path with CUDA kernel for zero-copy scatter.
+    /// `k_src`, `v_src`: [new_tokens, kv_heads, head_dim]
+    /// `slot_mapping`: physical slot per token (length = new_tokens)
+    ///
+    /// GPU fast path (cuda-kernels feature, BF16/F16 only): uses CUDA kernel directly.
+    /// CPU / quantized fallback:
+    /// - NHD: reshape cache to [total_slots, H, D] (zero-copy view), scatter on dim 0.
+    /// - HND: reshape cache to [total_rows, D], build HND-native indices, scatter on dim 0.
     fn scatter_into_cache(
         &mut self,
         k_src: &Tensor,
         v_src: &Tensor,
-        indices: &Tensor,
-        total_slots: usize,
+        slot_mapping: &[usize],
     ) -> Result<(), CacheError> {
-        let flat_shape = (total_slots, self.num_kv_heads, self.head_dim);
+        // GPU fast path: CUDA kernel for unquantized BF16/F16
+        #[cfg(feature = "cuda-kernels")]
+        if self.k_cache.device().is_cuda() && !self.is_quantized() {
+            return self.scatter_into_cache_cuda(k_src, v_src, slot_mapping);
+        }
+
+        self.scatter_into_cache_candle(k_src, v_src, slot_mapping)
+    }
+
+    /// CUDA kernel fast path for scatter.
+    #[cfg(feature = "cuda-kernels")]
+    fn scatter_into_cache_cuda(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        slot_mapping: &[usize],
+    ) -> Result<(), CacheError> {
+        use crate::cuda_kernels::{reshape_and_cache_cuda, CudaCacheLayout};
+
+        let new_tokens = slot_mapping.len();
+        let device = self.k_cache.device().clone();
+
+        // Build slot_mapping as U32 tensor on CUDA
+        let slot_tensor = Tensor::from_vec(
+            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
+            (new_tokens,),
+            &device,
+        )?;
+
+        let cuda_layout = match self.layout {
+            KVCacheLayout::NHD => CudaCacheLayout::NHD,
+            KVCacheLayout::HND => CudaCacheLayout::HND,
+        };
+
+        reshape_and_cache_cuda(
+            &k_src.contiguous()?,
+            &v_src.contiguous()?,
+            &self.k_cache,
+            &self.v_cache,
+            &slot_tensor,
+            self.num_kv_heads,
+            self.head_dim,
+            self.block_size,
+            cuda_layout,
+        )?;
+
+        Ok(())
+    }
+
+    /// Candle-based scatter fallback (CPU + quantized GPU).
+    fn scatter_into_cache_candle(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        slot_mapping: &[usize],
+    ) -> Result<(), CacheError> {
+        let new_tokens = slot_mapping.len();
+        let device = self.k_cache.device().clone();
 
         match self.layout {
             KVCacheLayout::NHD => {
                 // NHD [num_blocks, block_size, kv_heads, head_dim]
                 // reshape to [total_slots, kv_heads, head_dim] is a view (no copy)
+                let total_slots = self.num_blocks * self.block_size;
+                let flat_shape = (total_slots, self.num_kv_heads, self.head_dim);
                 let k_flat = self.k_cache.reshape(flat_shape)?;
                 let v_flat = self.v_cache.reshape(flat_shape)?;
-                k_flat.scatter_set(indices, k_src, 0)?;
-                v_flat.scatter_set(indices, v_src, 0)?;
+
+                // Build NHD indices: [new_tokens] → expand to [new_tokens, H, D]
+                let indices = Tensor::from_vec(
+                    slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
+                    (new_tokens,),
+                    &device,
+                )?;
+                let indices = indices
+                    .reshape((new_tokens, 1, 1))?
+                    .expand((new_tokens, self.num_kv_heads, self.head_dim))?
+                    .contiguous()?;
+
+                k_flat.scatter_set(&indices, k_src, 0)?;
+                v_flat.scatter_set(&indices, v_src, 0)?;
             }
             KVCacheLayout::HND => {
                 // HND [num_blocks, kv_heads, block_size, head_dim]
-                // Must transpose to NHD, scatter, then transpose back.
-                let k_nhd = self.k_cache.transpose(1, 2)?.contiguous()?;
-                let v_nhd = self.v_cache.transpose(1, 2)?.contiguous()?;
-                let k_flat = k_nhd.reshape(flat_shape)?;
-                let v_flat = v_nhd.reshape(flat_shape)?;
-                k_flat.scatter_set(indices, k_src, 0)?;
-                v_flat.scatter_set(indices, v_src, 0)?;
-                // Reshape back to 4D NHD then transpose to HND
-                let nhd_4d = (self.num_blocks, self.block_size, self.num_kv_heads, self.head_dim);
-                self.k_cache = k_flat.reshape(nhd_4d)?.transpose(1, 2)?.contiguous()?;
-                self.v_cache = v_flat.reshape(nhd_4d)?.transpose(1, 2)?.contiguous()?;
+                // Flatten to [num_blocks * kv_heads * block_size, head_dim] and
+                // build HND-native row indices. Each (token, head) pair maps to
+                // a unique row without transposing the cache.
+                let total_rows = self.num_blocks * self.num_kv_heads * self.block_size;
+                let k_flat = self.k_cache.reshape((total_rows, self.head_dim))?;
+                let v_flat = self.v_cache.reshape((total_rows, self.head_dim))?;
+
+                // Build HND indices: for slot s, head h:
+                //   block = s / block_size, offset = s % block_size
+                //   row = block * (H * block_size) + h * block_size + offset
+                let head_block_stride = self.num_kv_heads * self.block_size;
+                let mut idx_data =
+                    Vec::with_capacity(new_tokens * self.num_kv_heads * self.head_dim);
+                for &slot in slot_mapping {
+                    let block = slot / self.block_size;
+                    let offset = slot % self.block_size;
+                    let block_base = block * head_block_stride;
+                    for h in 0..self.num_kv_heads {
+                        let row = block_base + h * self.block_size + offset;
+                        for _d in 0..self.head_dim {
+                            idx_data.push(row as u32);
+                        }
+                    }
+                }
+                let hnd_indices = Tensor::from_vec(
+                    idx_data,
+                    (new_tokens * self.num_kv_heads, self.head_dim),
+                    &device,
+                )?;
+
+                // Reshape src from [new_tokens, H, D] to [new_tokens * H, D]
+                let k_2d =
+                    k_src.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+                let v_2d =
+                    v_src.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+
+                k_flat.scatter_set(&hnd_indices, &k_2d, 0)?;
+                v_flat.scatter_set(&hnd_indices, &v_2d, 0)?;
             }
         }
 
@@ -327,7 +405,6 @@ impl CacheEngine {
         slot_mapping: &[usize],
     ) -> Result<(), CacheError> {
         let new_tokens = slot_mapping.len();
-        let total_slots = self.num_blocks * self.block_size;
 
         // Input [kv_heads, new_tokens, head_dim] → [new_tokens, kv_heads, head_dim]
         let k_transposed = k.transpose(0, 1)?.contiguous()?;
@@ -342,17 +419,8 @@ impl CacheEngine {
             new_tokens,
         )?;
 
-        // Build scatter indices: [new_tokens] → expand to [new_tokens, kv_heads, head_dim]
-        let indices = Self::build_scatter_indices(
-            slot_mapping,
-            new_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-            self.k_cache.device(),
-        )?;
-
         // Scatter into cache (layout-aware)
-        self.scatter_into_cache(&k_src, &v_src, &indices, total_slots)?;
+        self.scatter_into_cache(&k_src, &v_src, slot_mapping)?;
 
         Ok(())
     }
@@ -366,7 +434,6 @@ impl CacheEngine {
         slot_mapping: &[usize],
     ) -> Result<(), CacheError> {
         let new_tokens = slot_mapping.len();
-        let total_slots = self.num_blocks * self.block_size;
 
         // Input already in [new_tokens, kv_heads, head_dim]
         let k_contiguous = k.contiguous()?;
@@ -381,15 +448,7 @@ impl CacheEngine {
             new_tokens,
         )?;
 
-        let indices = Self::build_scatter_indices(
-            slot_mapping,
-            new_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-            self.k_cache.device(),
-        )?;
-
-        self.scatter_into_cache(&k_src, &v_src, &indices, total_slots)?;
+        self.scatter_into_cache(&k_src, &v_src, slot_mapping)?;
 
         Ok(())
     }
@@ -1041,5 +1100,76 @@ mod tests {
             .read_contiguous_multi(&[(&[0usize], 3), (&[2], 2)])
             .unwrap();
         assert_eq!(k_out.dims(), &[5, 2, 8]); // 3 + 2 tokens
+    }
+
+    // ─── NHD vs HND equivalence ─────────────────────────────────────────────
+
+    #[test]
+    fn nhd_hnd_equivalence_write_read() {
+        // Write identical data into NHD and HND engines, read back, verify same result
+        let config = test_config(8);
+        let mut nhd = CacheEngine::new(&config).unwrap();
+        let mut hnd = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        let k_data: Vec<f32> = (0..2 * 6 * 8).map(|i| (i as f32) * 0.1).collect();
+        let k = Tensor::from_vec(k_data.clone(), (2, 6, 8), &Device::Cpu).unwrap();
+        let v_data: Vec<f32> = (0..2 * 6 * 8).map(|i| (i as f32) * -0.05 + 1.0).collect();
+        let v = Tensor::from_vec(v_data.clone(), (2, 6, 8), &Device::Cpu).unwrap();
+
+        // Non-contiguous slots across multiple blocks
+        let slot_mapping = vec![4, 5, 6, 7, 20, 21];
+
+        nhd.write(&k, &v, &slot_mapping).unwrap();
+        hnd.write(&k, &v, &slot_mapping).unwrap();
+
+        // Read back from both
+        let (k_nhd, v_nhd) = nhd.read(&[1, 5], 6).unwrap();
+        let (k_hnd, v_hnd) = hnd.read(&[1, 5], 6).unwrap();
+
+        let k_nhd_flat: Vec<f32> = k_nhd.flatten_all().unwrap().to_vec1().unwrap();
+        let k_hnd_flat: Vec<f32> = k_hnd.flatten_all().unwrap().to_vec1().unwrap();
+        let v_nhd_flat: Vec<f32> = v_nhd.flatten_all().unwrap().to_vec1().unwrap();
+        let v_hnd_flat: Vec<f32> = v_hnd.flatten_all().unwrap().to_vec1().unwrap();
+
+        assert_eq!(k_nhd_flat, k_hnd_flat, "K values must match between NHD and HND");
+        assert_eq!(v_nhd_flat, v_hnd_flat, "V values must match between NHD and HND");
+    }
+
+    #[test]
+    fn nhd_hnd_equivalence_write_batch() {
+        let config = test_config(8);
+        let mut nhd = CacheEngine::new(&config).unwrap();
+        let mut hnd = CacheEngine::with_layout(&config, KVCacheLayout::HND).unwrap();
+
+        // write_batch input: [new_tokens, kv_heads, head_dim]
+        let k_data: Vec<f32> = (0..4 * 2 * 8).map(|i| (i as f32) * 0.3 - 5.0).collect();
+        let k = Tensor::from_vec(k_data.clone(), (4, 2, 8), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data, (4, 2, 8), &Device::Cpu).unwrap();
+
+        // Scatter across blocks
+        let slot_mapping = vec![1, 5, 10, 25];
+
+        nhd.write_batch(&k, &v, &slot_mapping).unwrap();
+        hnd.write_batch(&k, &v, &slot_mapping).unwrap();
+
+        // Read individual blocks and compare
+        for block_id in [0usize, 1, 2, 6] {
+            let (k_nhd, v_nhd) = nhd.read(&[block_id], 4).unwrap();
+            let (k_hnd, v_hnd) = hnd.read(&[block_id], 4).unwrap();
+
+            let k_nhd_flat: Vec<f32> = k_nhd.flatten_all().unwrap().to_vec1().unwrap();
+            let k_hnd_flat: Vec<f32> = k_hnd.flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(
+                k_nhd_flat, k_hnd_flat,
+                "K mismatch in block {block_id}"
+            );
+
+            let v_nhd_flat: Vec<f32> = v_nhd.flatten_all().unwrap().to_vec1().unwrap();
+            let v_hnd_flat: Vec<f32> = v_hnd.flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(
+                v_nhd_flat, v_hnd_flat,
+                "V mismatch in block {block_id}"
+            );
+        }
     }
 }

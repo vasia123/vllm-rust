@@ -95,6 +95,82 @@ extern "C" __global__ void reshape_and_cache_fp16(
 }
 
 // ==========================================================================
+// reshape_and_cache HND — BF16
+// ==========================================================================
+//
+// HND variant: cache layout is [num_blocks, num_kv_heads, block_size, head_dim].
+// Each thread block writes one head of one token into the cache.
+//
+// Grid: (num_tokens, num_kv_heads)
+// Block: (min(head_dim, 1024),)
+extern "C" __global__ void reshape_and_cache_hnd_bf16(
+    const __nv_bfloat16* __restrict__ key,        // [num_tokens, num_kv_heads, head_dim]
+    const __nv_bfloat16* __restrict__ value,      // [num_tokens, num_kv_heads, head_dim]
+    __nv_bfloat16* __restrict__ key_cache,        // [num_blocks, num_kv_heads, block_size, head_dim]
+    __nv_bfloat16* __restrict__ value_cache,      // [num_blocks, num_kv_heads, block_size, head_dim]
+    const int* __restrict__ slot_mapping,          // [num_tokens]
+    const int num_kv_heads,
+    const int head_dim,
+    const int block_size
+) {
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int slot = slot_mapping[token_idx];
+
+    if (slot < 0) return;
+
+    const int block_idx = slot / block_size;
+    const int offset_in_block = slot % block_size;
+
+    // Input: [num_tokens, num_kv_heads, head_dim]
+    const int src_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim;
+
+    // HND cache: [num_blocks, num_kv_heads, block_size, head_dim]
+    const int head_stride = block_size * head_dim;
+    const int block_stride = num_kv_heads * head_stride;
+    const int dst_offset = block_idx * block_stride + head_idx * head_stride + offset_in_block * head_dim;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        key_cache[dst_offset + d] = key[src_offset + d];
+        value_cache[dst_offset + d] = value[src_offset + d];
+    }
+}
+
+// ==========================================================================
+// reshape_and_cache HND — FP16
+// ==========================================================================
+extern "C" __global__ void reshape_and_cache_hnd_fp16(
+    const __half* __restrict__ key,
+    const __half* __restrict__ value,
+    __half* __restrict__ key_cache,
+    __half* __restrict__ value_cache,
+    const int* __restrict__ slot_mapping,
+    const int num_kv_heads,
+    const int head_dim,
+    const int block_size
+) {
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int slot = slot_mapping[token_idx];
+
+    if (slot < 0) return;
+
+    const int block_idx = slot / block_size;
+    const int offset_in_block = slot % block_size;
+
+    const int src_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim;
+
+    const int head_stride = block_size * head_dim;
+    const int block_stride = num_kv_heads * head_stride;
+    const int dst_offset = block_idx * block_stride + head_idx * head_stride + offset_in_block * head_dim;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        key_cache[dst_offset + d] = key[src_offset + d];
+        value_cache[dst_offset + d] = value[src_offset + d];
+    }
+}
+
+// ==========================================================================
 // copy_blocks — BF16
 // ==========================================================================
 // Copy cache blocks between physical locations (used for COW / preemption).
