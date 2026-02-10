@@ -30,7 +30,10 @@ pub fn validate_completion_request(req: &CompletionRequest) -> Result<(), ApiErr
     }
 
     validate_truncate_prompt_tokens(req.truncate_prompt_tokens)?;
-    validate_structured_outputs(req.structured_outputs.as_ref(), req.response_format.as_ref())?;
+    validate_structured_outputs(
+        req.structured_outputs.as_ref(),
+        req.response_format.as_ref(),
+    )?;
 
     Ok(())
 }
@@ -66,7 +69,10 @@ pub fn validate_chat_completion_request(req: &ChatCompletionRequest) -> Result<(
     }
 
     validate_truncate_prompt_tokens(req.truncate_prompt_tokens)?;
-    validate_structured_outputs(req.structured_outputs.as_ref(), req.response_format.as_ref())?;
+    validate_structured_outputs(
+        req.structured_outputs.as_ref(),
+        req.response_format.as_ref(),
+    )?;
 
     if req.add_generation_prompt && req.continue_final_message {
         return Err(ApiError::InvalidRequest(
@@ -185,7 +191,10 @@ fn validate_stop_strings(stop: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_stream_options(stream: bool, stream_options: Option<&StreamOptions>) -> Result<(), ApiError> {
+fn validate_stream_options(
+    stream: bool,
+    stream_options: Option<&StreamOptions>,
+) -> Result<(), ApiError> {
     if stream_options.is_some() && !stream {
         return Err(ApiError::InvalidRequest(
             "stream_options can only be set when stream is true".to_string(),
@@ -900,9 +909,7 @@ mod tests {
         req.max_tokens = 1000;
         req.min_tokens = 20;
         let err = validate_chat_completion_request(&req).unwrap_err();
-        assert!(
-            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("min_tokens"))
-        );
+        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("min_tokens")));
     }
 
     // ─── logit_bias ──────────────────────────────────────────────────
@@ -1056,7 +1063,9 @@ mod tests {
         let mut req = minimal_completion_request();
         req.truncate_prompt_tokens = Some(0);
         let err = validate_completion_request(&req).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("truncate_prompt_tokens")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("truncate_prompt_tokens"))
+        );
     }
 
     #[test]
@@ -1064,7 +1073,9 @@ mod tests {
         let mut req = minimal_chat_request();
         req.truncate_prompt_tokens = Some(-2);
         let err = validate_chat_completion_request(&req).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("truncate_prompt_tokens")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("truncate_prompt_tokens"))
+        );
     }
 
     // ─── add_generation_prompt / continue_final_message ─────────────
@@ -1183,7 +1194,9 @@ mod tests {
             ..Default::default()
         });
         let err = validate_completion_request(&req).unwrap_err();
-        assert!(matches!(err, ApiError::InvalidRequest(msg) if msg.contains("choice must not be empty")));
+        assert!(
+            matches!(err, ApiError::InvalidRequest(msg) if msg.contains("choice must not be empty"))
+        );
     }
 
     #[test]

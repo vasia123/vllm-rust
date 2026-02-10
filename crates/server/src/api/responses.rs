@@ -184,15 +184,10 @@ pub async fn create_response(
             image_inputs: Vec::new(),
         };
 
-        let result = state
-            .engine
-            .get()
-            .generate(gen_req)
-            .await
-            .map_err(|e| {
-                prometheus::inc_requests_error();
-                ApiError::EngineError(e.to_string())
-            })?;
+        let result = state.engine.get().generate(gen_req).await.map_err(|e| {
+            prometheus::inc_requests_error();
+            ApiError::EngineError(e.to_string())
+        })?;
 
         let completion_tokens = result.generated_token_ids.len();
 

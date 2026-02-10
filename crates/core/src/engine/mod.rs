@@ -1762,10 +1762,7 @@ mod tests {
         };
         let result = handle.generate(request).await;
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            EngineError::Paused
-        ));
+        assert!(matches!(result.unwrap_err(), EngineError::Paused));
 
         // Resume and try again — should succeed
         handle.resume().await.unwrap();

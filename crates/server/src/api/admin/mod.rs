@@ -204,9 +204,7 @@ async fn pause_engine(
         vllm_core::engine::PauseMode::Wait => {
             "Engine paused: draining in-flight requests".to_string()
         }
-        vllm_core::engine::PauseMode::Keep => {
-            "Engine paused: requests frozen in queue".to_string()
-        }
+        vllm_core::engine::PauseMode::Keep => "Engine paused: requests frozen in queue".to_string(),
     };
 
     Ok(Json(PauseResponse {
@@ -216,9 +214,7 @@ async fn pause_engine(
 }
 
 /// POST /admin/resume - Resume a paused engine.
-async fn resume_engine(
-    State(state): State<AdminState>,
-) -> Result<impl IntoResponse, ApiError> {
+async fn resume_engine(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
     state
         .engine
         .get()
@@ -233,9 +229,7 @@ async fn resume_engine(
 }
 
 /// GET /admin/is_paused - Check if engine is paused.
-async fn is_engine_paused(
-    State(state): State<AdminState>,
-) -> Result<impl IntoResponse, ApiError> {
+async fn is_engine_paused(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
     let paused = state
         .engine
         .get()

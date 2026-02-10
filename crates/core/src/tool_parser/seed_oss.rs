@@ -141,8 +141,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
@@ -153,8 +152,7 @@ mod tests {
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "rust lang");
         assert_eq!(args["limit"], 10);
     }
@@ -213,7 +211,8 @@ mod tests {
     #[test]
     fn extract_content_with_prefix() {
         let parser = SeedOssToolParser::new();
-        let output = "Let me check. <seed:tool_call>\n<function=test>\n</function>\n</seed:tool_call>";
+        let output =
+            "Let me check. <seed:tool_call>\n<function=test>\n</function>\n</seed:tool_call>";
 
         let content = parser.extract_content(output).unwrap();
         assert_eq!(content, "Let me check.");
@@ -235,8 +234,7 @@ mod tests {
         let output = "<seed:tool_call>\n<function=search>\n<parameter=query>hello world test</parameter>\n</function>\n</seed:tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "hello world test");
     }
 }

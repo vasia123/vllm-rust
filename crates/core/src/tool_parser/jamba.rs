@@ -61,9 +61,7 @@ impl ToolCallParser for JambaToolParser {
                     for tc in tool_call_arr {
                         let arguments = match &tc.arguments {
                             serde_json::Value::Null => "{}".to_string(),
-                            serde_json::Value::Object(_) => {
-                                serde_json::to_string(&tc.arguments)?
-                            }
+                            serde_json::Value::Object(_) => serde_json::to_string(&tc.arguments)?,
                             other => other.to_string(),
                         };
 
@@ -97,11 +95,7 @@ impl ToolCallParser for JambaToolParser {
         }
 
         // Content is everything before the first <tool_calls> tag
-        let content = output
-            .split(TOOL_CALLS_START)
-            .next()
-            .unwrap_or("")
-            .trim();
+        let content = output.split(TOOL_CALLS_START).next().unwrap_or("").trim();
 
         if content.is_empty() {
             None
@@ -124,8 +118,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
@@ -166,8 +159,7 @@ mod tests {
     #[test]
     fn extract_content_only_tool_calls() {
         let parser = JambaToolParser::new();
-        let output =
-            r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
+        let output = r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
 
         let content = parser.extract_content(output);
         assert!(content.is_none());
@@ -176,8 +168,7 @@ mod tests {
     #[test]
     fn parse_empty_arguments() {
         let parser = JambaToolParser::new();
-        let output =
-            r#"<tool_calls>[{"name": "get_time"}]</tool_calls>"#;
+        let output = r#"<tool_calls>[{"name": "get_time"}]</tool_calls>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -193,8 +184,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "test");
         assert_eq!(args["limit"], 10);
         assert_eq!(args["filters"]["type"], "article");
@@ -222,8 +212,7 @@ mod tests {
     #[test]
     fn tool_call_id_format() {
         let parser = JambaToolParser::new();
-        let output =
-            r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
+        let output = r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
 
         let calls = parser.parse(output).unwrap();
         assert!(calls[0].id.starts_with("call_"));
@@ -233,9 +222,8 @@ mod tests {
     #[test]
     fn has_tool_calls_detection() {
         let parser = JambaToolParser::new();
-        assert!(parser.has_tool_calls(
-            r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#
-        ));
+        assert!(parser
+            .has_tool_calls(r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#));
         assert!(!parser.has_tool_calls("no tool calls here"));
     }
 

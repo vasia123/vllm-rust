@@ -221,8 +221,7 @@ mod tests {
     #[test]
     fn granite_parse_single_tool_call_special_token() {
         let parser = GraniteToolParser::new();
-        let output =
-            r#"<|tool_call|>[{"name": "get_weather", "arguments": {"city": "NYC"}}]"#;
+        let output = r#"<|tool_call|>[{"name": "get_weather", "arguments": {"city": "NYC"}}]"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -232,8 +231,7 @@ mod tests {
     #[test]
     fn granite_parse_single_tool_call_text_token() {
         let parser = GraniteToolParser::new();
-        let output =
-            r#"<tool_call>[{"name": "get_weather", "arguments": {"city": "NYC"}}]"#;
+        let output = r#"<tool_call>[{"name": "get_weather", "arguments": {"city": "NYC"}}]"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -355,8 +353,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "test");
         assert_eq!(args["filters"]["type"], "article");
     }

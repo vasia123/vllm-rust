@@ -184,10 +184,7 @@ impl Step3p5Config {
     }
 
     fn use_rope(&self, layer_idx: usize) -> bool {
-        self.use_rope_layers
-            .get(layer_idx)
-            .copied()
-            .unwrap_or(true)
+        self.use_rope_layers.get(layer_idx).copied().unwrap_or(true)
     }
 
     fn is_moe_layer(&self, layer_idx: usize) -> bool {
@@ -725,8 +722,7 @@ impl Step3p5MoEBlock {
         let (routing_weights, selected_experts) = self.router.route(&xs_2d)?;
 
         // Routed expert computation
-        let mut routed_output =
-            Tensor::zeros((num_tokens, hidden_dim), xs.dtype(), xs.device())?;
+        let mut routed_output = Tensor::zeros((num_tokens, hidden_dim), xs.dtype(), xs.device())?;
 
         for token_idx in 0..num_tokens {
             let token_input = xs_2d.narrow(0, token_idx, 1)?;
@@ -796,7 +792,13 @@ impl Step3p5DecoderLayer {
             Step3p5Attention::new_with_tp(cfg, step_cfg, layer_idx, vb.pp("self_attn"), pg)?;
 
         let ffn = if step_cfg.is_moe_layer(layer_idx) {
-            FfnVariant::MoE(Step3p5MoEBlock::new(cfg, step_cfg, layer_idx, vb.pp("moe"), pg)?)
+            FfnVariant::MoE(Step3p5MoEBlock::new(
+                cfg,
+                step_cfg,
+                layer_idx,
+                vb.pp("moe"),
+                pg,
+            )?)
         } else {
             // Dense MLP with optional SwiGLU clamping for shared expert
             FfnVariant::Dense(TpSwiGluMlp::new(
@@ -912,7 +914,11 @@ impl Step3p5ForCausalLM {
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(Step3p5DecoderLayer::new_with_tp(
-                cfg, &step_cfg, i, vb_l.pp(i), pg,
+                cfg,
+                &step_cfg,
+                i,
+                vb_l.pp(i),
+                pg,
             )?);
         }
 
@@ -1249,10 +1255,8 @@ mod tests {
         let pg = LocalProcessGroup::new();
 
         // Layer 0: full rotation, layer 1: half rotation
-        let attn0 =
-            Step3p5Attention::new_with_tp(&cfg, &step_cfg, 0, vb.pp("attn0"), &pg).unwrap();
-        let attn1 =
-            Step3p5Attention::new_with_tp(&cfg, &step_cfg, 1, vb.pp("attn1"), &pg).unwrap();
+        let attn0 = Step3p5Attention::new_with_tp(&cfg, &step_cfg, 0, vb.pp("attn0"), &pg).unwrap();
+        let attn1 = Step3p5Attention::new_with_tp(&cfg, &step_cfg, 1, vb.pp("attn1"), &pg).unwrap();
 
         // Both should construct successfully
         assert!(attn0.use_rope);
@@ -1380,8 +1384,7 @@ mod tests {
 
         let moe = Step3p5MoEBlock::new(&cfg, &step_cfg, 1, vb.pp("moe"), &pg).unwrap();
 
-        let input =
-            Tensor::zeros((2, 3, cfg.hidden_size), DType::F32, &device).expect("input");
+        let input = Tensor::zeros((2, 3, cfg.hidden_size), DType::F32, &device).expect("input");
         let output = moe.forward(&input, &tp_ctx);
         assert!(output.is_ok(), "MoE forward: {:?}", output.err());
         assert_eq!(output.unwrap().dims(), &[2, 3, cfg.hidden_size]);
@@ -1394,8 +1397,7 @@ mod tests {
         let pg = LocalProcessGroup::new();
         let tp_ctx = TpContext::single_gpu();
 
-        let mlp =
-            Step3p5MLP::new_with_tp(64, 128, Some(7.0), vb.pp("mlp"), &pg).unwrap();
+        let mlp = Step3p5MLP::new_with_tp(64, 128, Some(7.0), vb.pp("mlp"), &pg).unwrap();
 
         let input = Tensor::zeros((2, 64), DType::F32, &device).expect("input");
         let output = mlp.forward(&input, &tp_ctx);

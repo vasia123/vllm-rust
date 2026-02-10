@@ -1812,7 +1812,10 @@ mod tests {
 
         // Only 2 tokens generated so far (< min_tokens=5) → EOS suppressed
         let result = sample(&logits, &params, &[10, 20], &mut state, None);
-        assert_ne!(result.token_id, 1, "EOS should be suppressed before min_tokens");
+        assert_ne!(
+            result.token_id, 1,
+            "EOS should be suppressed before min_tokens"
+        );
         assert_eq!(result.token_id, 2, "Next best after suppressed EOS");
     }
 
@@ -1830,7 +1833,10 @@ mod tests {
 
         // 3 tokens already generated (= min_tokens) → EOS allowed
         let result = sample(&logits, &params, &[10, 20, 30], &mut state, None);
-        assert_eq!(result.token_id, 1, "EOS should be allowed once min_tokens reached");
+        assert_eq!(
+            result.token_id, 1,
+            "EOS should be allowed once min_tokens reached"
+        );
     }
 
     #[test]
@@ -1844,7 +1850,10 @@ mod tests {
         };
         let mut state = SamplerState::new(Some(42));
         let result = sample(&logits, &params, &[], &mut state, None);
-        assert_eq!(result.token_id, 1, "Without eos_token_id, min_tokens has no effect");
+        assert_eq!(
+            result.token_id, 1,
+            "Without eos_token_id, min_tokens has no effect"
+        );
     }
 
     #[test]
@@ -1859,7 +1868,10 @@ mod tests {
 
         let results = sample_n(&logits, &params, &[], &mut state, None, 50);
         for r in &results {
-            assert_ne!(r.token_id, 1, "Banned token should never appear in sample_n");
+            assert_ne!(
+                r.token_id, 1,
+                "Banned token should never appear in sample_n"
+            );
         }
     }
 

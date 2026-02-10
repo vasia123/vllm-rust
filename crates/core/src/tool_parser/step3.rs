@@ -32,8 +32,10 @@ static STEPTML_INVOKE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Regex to extract parameters: `<steptml:parameter name="KEY">VALUE</steptml:parameter>`.
 static STEPTML_PARAM_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)<steptml:parameter\s+name="(?P<key>[^"]+)">(?P<val>[^<]*)</steptml:parameter>"#)
-        .expect("STEPTML_PARAM_REGEX pattern is invalid")
+    Regex::new(
+        r#"(?s)<steptml:parameter\s+name="(?P<key>[^"]+)">(?P<val>[^<]*)</steptml:parameter>"#,
+    )
+    .expect("STEPTML_PARAM_REGEX pattern is invalid")
 });
 
 /// Parser for Step-3 and Step-3.5 tool calls.
@@ -77,10 +79,7 @@ impl Step3ToolParser {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(val) {
                     params.insert(key.to_string(), v);
                 } else {
-                    params.insert(
-                        key.to_string(),
-                        serde_json::Value::String(val.to_string()),
-                    );
+                    params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
                 }
             }
         }
@@ -177,8 +176,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
@@ -222,8 +220,7 @@ mod tests {
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "rust lang");
         assert_eq!(args["limit"], 10);
     }

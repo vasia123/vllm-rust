@@ -893,10 +893,7 @@ mod tests {
     #[test]
     fn test_marlin_config_from_detected_act_and_mul() {
         let mut raw = HashMap::new();
-        raw.insert(
-            "is_act_and_mul".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        raw.insert("is_act_and_mul".to_string(), serde_json::Value::Bool(false));
         let config = MarlinConfig::from_detected(Some(4), Some(128), None, None, &raw);
         assert!(!config.is_act_and_mul);
 

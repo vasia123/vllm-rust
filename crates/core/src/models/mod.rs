@@ -3,8 +3,8 @@ mod macros;
 pub mod baichuan;
 pub mod bert;
 pub mod bloom;
-pub mod colbert;
 pub mod cohere;
+pub mod colbert;
 pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_quantized;
@@ -63,8 +63,8 @@ pub use tp_layers::{TpContext, TpEmbedding, TpGeGluMlp, TpGeluMlp, TpLinear, TpS
 pub use baichuan::BaichuanForCausalLM;
 pub use bert::BertForSequenceEmbedding;
 pub use bloom::BloomForCausalLM;
-pub use colbert::ColBERTForRetrieval;
 pub use cohere::CohereForCausalLM;
+pub use colbert::ColBERTForRetrieval;
 pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
@@ -203,9 +203,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "HF_ColBERT" | "ColBERTModel" => Ok(Box::new(ColBERTForRetrieval::new(cfg, vb)?)),
         "Step3p5ForCausalLM" => Ok(Box::new(Step3p5ForCausalLM::new(cfg, vb)?)),
-        "VoyageQwen3BidirectionalEmbedModel" => {
-            Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?))
-        }
+        "VoyageQwen3BidirectionalEmbedModel" => Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
@@ -303,13 +301,9 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" | "GlmMoeDsaForCausalLM" => Ok(
-            Box::new(QuantizedDeepSeekForCausalLM::new(
-                cfg,
-                vb,
-                weight_loader.as_ref(),
-            )?),
-        ),
+        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" | "GlmMoeDsaForCausalLM" => Ok(Box::new(
+            QuantizedDeepSeekForCausalLM::new(cfg, vb, weight_loader.as_ref())?,
+        )),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

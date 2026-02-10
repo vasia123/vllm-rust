@@ -120,9 +120,11 @@ impl VoyageBidirectionalAttention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // [batch, heads, seq, head_dim] → [batch, seq, hidden]
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            b_sz,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
 
         self.o_proj.forward(&attn_output)
     }
@@ -347,10 +349,7 @@ impl ModelForEmbedding for VoyageForEmbedding {
 
 /// L2-normalize along the last dimension.
 fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
-    let norm = tensor
-        .sqr()?
-        .sum_keepdim(candle_core::D::Minus1)?
-        .sqrt()?;
+    let norm = tensor.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
     let norm = norm.clamp(1e-12, f64::MAX)?;
     tensor.broadcast_div(&norm)
 }
@@ -358,8 +357,8 @@ fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
     use crate::config::ModelConfig;
+    use candle_core::DType;
 
     fn tiny_voyage_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();
@@ -394,11 +393,7 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let model = VoyageForEmbedding::new(&cfg, vb);
-        assert!(
-            model.is_ok(),
-            "Voyage should construct: {:?}",
-            model.err()
-        );
+        assert!(model.is_ok(), "Voyage should construct: {:?}", model.err());
 
         let model = model.unwrap();
         assert_eq!(model.embedding_size, 48);
@@ -435,8 +430,7 @@ mod tests {
         let batch_size = 2;
         let seq_len = 6;
         let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).unwrap();
-        let mask =
-            Tensor::ones((batch_size, seq_len), DType::F32, &device).unwrap();
+        let mask = Tensor::ones((batch_size, seq_len), DType::F32, &device).unwrap();
 
         let sentence_emb = model.encode(&input_ids, Some(&mask)).unwrap();
         assert_eq!(
@@ -491,11 +485,19 @@ mod tests {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
 
-        let attn = VoyageBidirectionalAttention::new(&cfg, vb.pp("model").pp("layers").pp("0").pp("self_attn")).unwrap();
+        let attn = VoyageBidirectionalAttention::new(
+            &cfg,
+            vb.pp("model").pp("layers").pp("0").pp("self_attn"),
+        )
+        .unwrap();
 
         let xs = Tensor::zeros((1, 4, 64), DType::F32, &device).unwrap();
         let output = attn.forward(&xs).unwrap();
-        assert_eq!(output.dims(), &[1, 4, 64], "attention output should preserve shape");
+        assert_eq!(
+            output.dims(),
+            &[1, 4, 64],
+            "attention output should preserve shape"
+        );
     }
 
     #[test]
@@ -505,7 +507,11 @@ mod tests {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
 
-        let attn = VoyageBidirectionalAttention::new(&cfg, vb.pp("model").pp("layers").pp("0").pp("self_attn")).unwrap();
+        let attn = VoyageBidirectionalAttention::new(
+            &cfg,
+            vb.pp("model").pp("layers").pp("0").pp("self_attn"),
+        )
+        .unwrap();
         assert_eq!(attn.num_heads, 4);
         assert_eq!(attn.num_kv_heads, 2);
 

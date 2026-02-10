@@ -105,7 +105,8 @@ mod tests {
     #[test]
     fn parse_single_tool_call() {
         let parser = Ernie45ToolParser::new();
-        let output = r#"<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
+        let output =
+            r#"<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);

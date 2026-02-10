@@ -124,16 +124,14 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
     #[test]
     fn parse_with_role_sep() {
         let parser = GigaChat3ToolParser::new();
-        let output =
-            "function call<|role_sep|>\n{\"name\": \"test\", \"arguments\": {\"x\": 1}}";
+        let output = "function call<|role_sep|>\n{\"name\": \"test\", \"arguments\": {\"x\": 1}}";
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -162,8 +160,7 @@ mod tests {
     #[test]
     fn extract_content_with_prefix() {
         let parser = GigaChat3ToolParser::new();
-        let output =
-            "Let me check. function call{\"name\": \"test\", \"arguments\": {}}";
+        let output = "Let me check. function call{\"name\": \"test\", \"arguments\": {}}";
 
         let content = parser.extract_content(output).unwrap();
         assert_eq!(content, "Let me check.");

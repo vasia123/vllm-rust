@@ -177,7 +177,10 @@ mod tests {
     #[test]
     fn test_fused_moe_config_is_act_and_mul_default() {
         let config = FusedMoEConfig::new(8, 2, 4096, 11008, true);
-        assert!(config.is_act_and_mul, "is_act_and_mul should default to true (SwiGLU)");
+        assert!(
+            config.is_act_and_mul,
+            "is_act_and_mul should default to true (SwiGLU)"
+        );
     }
 
     #[test]

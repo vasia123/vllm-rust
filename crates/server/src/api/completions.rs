@@ -49,9 +49,10 @@ pub async fn create_completion(
     });
 
     // Tokenize bad_words strings into token ID sequences
-    let bad_words_token_ids = req.bad_words.as_ref().map(|words| {
-        super::tokenize_bad_words(words, &state.tokenizer)
-    });
+    let bad_words_token_ids = req
+        .bad_words
+        .as_ref()
+        .map(|words| super::tokenize_bad_words(words, &state.tokenizer));
 
     if req.stream {
         // Streaming only supports n=1

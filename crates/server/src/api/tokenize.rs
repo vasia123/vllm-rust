@@ -72,9 +72,7 @@ pub struct TokenizerInfoResponse {
 /// Get tokenizer configuration metadata.
 ///
 /// GET /tokenizer_info
-pub async fn get_tokenizer_info(
-    State(state): State<AppState>,
-) -> Json<TokenizerInfoResponse> {
+pub async fn get_tokenizer_info(State(state): State<AppState>) -> Json<TokenizerInfoResponse> {
     let chat_template = state
         .chat_template
         .as_ref()

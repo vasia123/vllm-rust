@@ -19,9 +19,11 @@ where
                 .iter()
                 .filter(|v| !v.is_null())
                 .map(|v| {
-                    v.as_u64()
-                        .map(|n| n as usize)
-                        .ok_or_else(|| serde::de::Error::custom("sliding_window array must contain integers or null"))
+                    v.as_u64().map(|n| n as usize).ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "sliding_window array must contain integers or null",
+                        )
+                    })
                 })
                 .collect::<Result<_, _>>()?;
             if values.is_empty() {

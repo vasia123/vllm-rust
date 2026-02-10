@@ -177,7 +177,8 @@ mod tests {
     #[test]
     fn extract_content_with_prefix() {
         let parser = HunyuanToolParser::new();
-        let output = r#"Here's what I found: <tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
+        let output =
+            r#"Here's what I found: <tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
 
         let content = parser.extract_content(output).unwrap();
         assert_eq!(content, "Here's what I found:");
@@ -186,8 +187,7 @@ mod tests {
     #[test]
     fn extract_content_only_tool_calls() {
         let parser = HunyuanToolParser::new();
-        let output =
-            r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
+        let output = r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
 
         let content = parser.extract_content(output);
         assert!(content.is_none());
@@ -196,8 +196,7 @@ mod tests {
     #[test]
     fn parse_empty_arguments() {
         let parser = HunyuanToolParser::new();
-        let output =
-            r#"<tool_calls>[{"name": "get_time", "arguments": {}}]</tool_calls>"#;
+        let output = r#"<tool_calls>[{"name": "get_time", "arguments": {}}]</tool_calls>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -207,8 +206,7 @@ mod tests {
     #[test]
     fn tool_call_id_format() {
         let parser = HunyuanToolParser::new();
-        let output =
-            r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
+        let output = r#"<tool_calls>[{"name": "test", "arguments": {}}]</tool_calls>"#;
 
         let calls = parser.parse(output).unwrap();
         assert!(calls[0].id.starts_with("call_"));
@@ -218,8 +216,7 @@ mod tests {
     #[test]
     fn parse_single_object_no_array() {
         let parser = HunyuanToolParser::new();
-        let output =
-            r#"<tool_calls>{"name": "test", "arguments": {"x": 1}}</tool_calls>"#;
+        let output = r#"<tool_calls>{"name": "test", "arguments": {"x": 1}}</tool_calls>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);

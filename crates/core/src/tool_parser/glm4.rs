@@ -24,8 +24,7 @@ pub struct Glm4ToolParser;
 
 /// Matches complete `<tool_call>...</tool_call>` blocks (dotall for multiline).
 static FUNC_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)<tool_call>.*?</tool_call>")
-        .expect("FUNC_CALL_REGEX pattern is invalid")
+    Regex::new(r"(?s)<tool_call>.*?</tool_call>").expect("FUNC_CALL_REGEX pattern is invalid")
 });
 
 /// Extracts function name (group 1) and arguments body (group 2) from a block.
@@ -42,9 +41,8 @@ static FUNC_ARG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Matches the opening `<tool_call>` tag (for content extraction).
-static TOOL_CALL_START_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<tool_call>").expect("TOOL_CALL_START_REGEX pattern is invalid")
-});
+static TOOL_CALL_START_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<tool_call>").expect("TOOL_CALL_START_REGEX pattern is invalid"));
 
 /// Try to deserialize a raw string value into a JSON value.
 ///
@@ -170,8 +168,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "get_weather");
         assert!(calls[0].id.starts_with("call_"));
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "Beijing");
         assert_eq!(args["date"], "2025-08-01");
     }
@@ -207,8 +204,7 @@ mod tests {
 </tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "rust programming");
         assert_eq!(args["limit"], 42); // deserialized to number
     }
@@ -227,8 +223,7 @@ mod tests {
 </tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["verbose"], true);
         assert_eq!(args["debug"], false);
         assert!(args["extra"].is_null());
@@ -246,8 +241,7 @@ mod tests {
 </tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["ids"], serde_json::json!([1, 2, 3]));
         assert_eq!(args["config"], serde_json::json!({"nested": true}));
     }
@@ -341,8 +335,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls[0].function.name, "fn_name");
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["key1"], "value1");
     }
 
@@ -380,10 +373,7 @@ mod tests {
 
     #[test]
     fn deserialize_value_json_array() {
-        assert_eq!(
-            deserialize_value("[1, 2, 3]"),
-            serde_json::json!([1, 2, 3])
-        );
+        assert_eq!(deserialize_value("[1, 2, 3]"), serde_json::json!([1, 2, 3]));
     }
 
     #[test]
@@ -412,8 +402,7 @@ I'll help you.\n\
 </tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["temperature"], 0.7);
     }
 
@@ -429,8 +418,7 @@ I'll help you.\n\
 </tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         // serde_json::Map insert overwrites on duplicate key
         assert_eq!(args["x"], "second");
     }
@@ -447,8 +435,7 @@ I'll help you.\n\
 </tool_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert!(args.get("").is_none());
         assert_eq!(args["real"], "value");
     }

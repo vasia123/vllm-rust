@@ -155,11 +155,7 @@ fn validate_greedy(reference: &ReferenceResult, actual_token_ids: &[u32]) {
 /// For sampling: compare logprobs within tolerance.
 /// Token IDs may differ due to random sampling, but the logprob distribution
 /// should be similar (top tokens should appear in both outputs' top-k).
-fn validate_logprobs(
-    reference: &ReferenceResult,
-    actual_logprobs: &[f32],
-    tolerance: f32,
-) {
+fn validate_logprobs(reference: &ReferenceResult, actual_logprobs: &[f32], tolerance: f32) {
     if reference.output.logprobs.is_empty() || actual_logprobs.is_empty() {
         return;
     }
@@ -190,8 +186,8 @@ fn validate_logprobs(
 #[tokio::test]
 #[ignore = "requires reference data and model weights"]
 async fn test_greedy_match() {
-    let model_name = std::env::var("VLLM_TEST_MODEL")
-        .unwrap_or_else(|_| "meta-llama/Llama-2-7b-hf".to_string());
+    let model_name =
+        std::env::var("VLLM_TEST_MODEL").unwrap_or_else(|_| "meta-llama/Llama-2-7b-hf".to_string());
 
     let reference = match load_reference(&model_name) {
         Some(r) => r,
@@ -220,7 +216,11 @@ async fn test_greedy_match() {
     // TODO: Initialize real model and engine here
     // For now, this test validates the framework structure
     for case in &greedy_cases {
-        eprintln!("  Test case: {} (prompt: '{}')", case.id, &case.prompt[..case.prompt.len().min(40)]);
+        eprintln!(
+            "  Test case: {} (prompt: '{}')",
+            case.id,
+            &case.prompt[..case.prompt.len().min(40)]
+        );
         // When engine is connected:
         // let result = engine.generate(request).await.unwrap();
         // validate_greedy(case, &result.generated_token_ids);
@@ -234,8 +234,8 @@ async fn test_greedy_match() {
 #[tokio::test]
 #[ignore = "requires reference data and model weights"]
 async fn test_sampling_logprobs() {
-    let model_name = std::env::var("VLLM_TEST_MODEL")
-        .unwrap_or_else(|_| "meta-llama/Llama-2-7b-hf".to_string());
+    let model_name =
+        std::env::var("VLLM_TEST_MODEL").unwrap_or_else(|_| "meta-llama/Llama-2-7b-hf".to_string());
 
     let reference = match load_reference(&model_name) {
         Some(r) => r,

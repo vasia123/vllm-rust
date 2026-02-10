@@ -25,9 +25,8 @@ static TOOL_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Regex to extract function name from `<function=NAME>`.
-static FUNCTION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<function=([^>]+)>").expect("FUNCTION_REGEX pattern is invalid")
-});
+static FUNCTION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<function=([^>]+)>").expect("FUNCTION_REGEX pattern is invalid"));
 
 /// Regex to extract parameters: `<parameter=KEY>VALUE</parameter>`.
 static PARAMETER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -156,8 +155,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
@@ -179,8 +177,7 @@ mod tests {
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "rust");
         assert_eq!(args["limit"], 10);
     }

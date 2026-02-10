@@ -343,11 +343,7 @@ pub async fn pooling(
 
     for input in &inputs {
         let count = match input {
-            InputItem::Text(text) => state
-                .tokenizer
-                .encode(text)
-                .map(|t| t.len())
-                .unwrap_or(0),
+            InputItem::Text(text) => state.tokenizer.encode(text).map(|t| t.len()).unwrap_or(0),
             InputItem::TokenIds(ids) => ids.len(),
         };
         total_tokens += count;
@@ -425,11 +421,7 @@ pub async fn classify(
 
     for input in &inputs {
         let count = match input {
-            InputItem::Text(text) => state
-                .tokenizer
-                .encode(text)
-                .map(|t| t.len())
-                .unwrap_or(0),
+            InputItem::Text(text) => state.tokenizer.encode(text).map(|t| t.len()).unwrap_or(0),
             InputItem::TokenIds(ids) => ids.len(),
         };
         total_tokens += count;
@@ -559,16 +551,8 @@ pub async fn score(
     // Tokenize all texts to count tokens
     let mut total_tokens = 0;
     for &(_, q, d) in &pairs {
-        total_tokens += state
-            .tokenizer
-            .encode(q)
-            .map(|t| t.len())
-            .unwrap_or(0);
-        total_tokens += state
-            .tokenizer
-            .encode(d)
-            .map(|t| t.len())
-            .unwrap_or(0);
+        total_tokens += state.tokenizer.encode(q).map(|t| t.len()).unwrap_or(0);
+        total_tokens += state.tokenizer.encode(d).map(|t| t.len()).unwrap_or(0);
     }
 
     // Placeholder: return zero scores (real implementation uses embedding model)

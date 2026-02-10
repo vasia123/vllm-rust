@@ -338,10 +338,7 @@ impl LogitsProcessorPipeline {
 
         if params.min_tokens > 0 {
             if let Some(eos_id) = params.eos_token_id {
-                pipeline.push(Box::new(MinTokensProcessor::new(
-                    params.min_tokens,
-                    eos_id,
-                )));
+                pipeline.push(Box::new(MinTokensProcessor::new(params.min_tokens, eos_id)));
             }
         }
 

@@ -60,9 +60,7 @@ impl ToolCallParser for LlamaToolParser {
                 let args = parsed.arguments.or(parsed.parameters);
                 let arguments = match args {
                     None | Some(serde_json::Value::Null) => "{}".to_string(),
-                    Some(ref val @ serde_json::Value::Object(_)) => {
-                        serde_json::to_string(val)?
-                    }
+                    Some(ref val @ serde_json::Value::Object(_)) => serde_json::to_string(val)?,
                     Some(other) => other.to_string(),
                 };
 
@@ -264,9 +262,7 @@ mod tests {
     #[test]
     fn has_tool_calls_positive() {
         let parser = LlamaToolParser::new();
-        assert!(parser.has_tool_calls(
-            r#"<|python_tag|>{"name": "fn", "arguments": {}}"#
-        ));
+        assert!(parser.has_tool_calls(r#"<|python_tag|>{"name": "fn", "arguments": {}}"#));
     }
 
     #[test]
@@ -283,8 +279,7 @@ mod tests {
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["data"]["items"], serde_json::json!([1, 2, 3]));
         assert_eq!(args["data"]["config"]["verbose"], true);
     }

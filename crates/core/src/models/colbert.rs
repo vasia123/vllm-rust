@@ -85,10 +85,7 @@ impl ColBERTForRetrieval {
 
 /// L2-normalize along the last dimension.
 fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
-    let norm = tensor
-        .sqr()?
-        .sum_keepdim(candle_core::D::Minus1)?
-        .sqrt()?;
+    let norm = tensor.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
     // Clamp norm to avoid division by zero
     let norm = norm.clamp(1e-12, f64::MAX)?;
     tensor.broadcast_div(&norm)
@@ -189,8 +186,8 @@ pub fn maxsim_score(query_emb: &Tensor, doc_emb: &Tensor) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
     use crate::config::ModelConfig;
+    use candle_core::DType;
 
     fn tiny_colbert_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();
@@ -227,11 +224,7 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let model = ColBERTForRetrieval::new(&cfg, vb);
-        assert!(
-            model.is_ok(),
-            "ColBERT should construct: {:?}",
-            model.err()
-        );
+        assert!(model.is_ok(), "ColBERT should construct: {:?}", model.err());
 
         let model = model.unwrap();
         assert_eq!(model.colbert_dim, 32);
@@ -278,11 +271,7 @@ mod tests {
     fn test_colbert_l2_normalized() {
         let device = Device::Cpu;
 
-        let tensor = Tensor::new(
-            vec![vec![vec![3.0f32, 4.0], vec![1.0, 0.0]]],
-            &device,
-        )
-        .unwrap();
+        let tensor = Tensor::new(vec![vec![vec![3.0f32, 4.0], vec![1.0, 0.0]]], &device).unwrap();
 
         let normalized = l2_normalize(&tensor).unwrap();
         let vals: Vec<Vec<Vec<f32>>> = normalized.to_vec3().unwrap();
@@ -336,11 +325,8 @@ mod tests {
         let device = Device::Cpu;
 
         // Query: 2 tokens × 3 dims
-        let query = Tensor::new(
-            vec![vec![1.0f32, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
-            &device,
-        )
-        .unwrap();
+        let query =
+            Tensor::new(vec![vec![1.0f32, 0.0, 0.0], vec![0.0, 1.0, 0.0]], &device).unwrap();
 
         // Document: 3 tokens × 3 dims
         let doc = Tensor::new(
@@ -358,7 +344,10 @@ mod tests {
         // query[0]=[1,0,0] max sims: doc[0]=0.5, doc[1]=1.0, doc[2]=0.0 → max=1.0
         // query[1]=[0,1,0] max sims: doc[0]=0.5, doc[1]=0.0, doc[2]=0.0 → max=0.5
         // sum = 1.5
-        assert!((score - 1.5).abs() < 1e-5, "MaxSim score should be 1.5, got {score}");
+        assert!(
+            (score - 1.5).abs() < 1e-5,
+            "MaxSim score should be 1.5, got {score}"
+        );
     }
 
     #[test]

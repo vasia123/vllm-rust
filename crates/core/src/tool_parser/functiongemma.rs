@@ -19,10 +19,8 @@ const END_TAG: &str = "<end_function_call>";
 /// Regex to match complete function calls:
 /// `<start_function_call>call:NAME{PARAMS}<end_function_call>`
 static COMPLETE_CALL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"<start_function_call>call:(?P<name>\w+)\{(?P<params>.*?)\}<end_function_call>",
-    )
-    .expect("COMPLETE_CALL_REGEX pattern is invalid")
+    Regex::new(r"<start_function_call>call:(?P<name>\w+)\{(?P<params>.*?)\}<end_function_call>")
+        .expect("COMPLETE_CALL_REGEX pattern is invalid")
 });
 
 /// Regex to extract individual parameters: `key:<escape>value<escape>`
@@ -132,8 +130,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
@@ -144,8 +141,7 @@ mod tests {
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "rust lang");
         assert_eq!(args["limit"], 10);
     }
@@ -173,8 +169,7 @@ mod tests {
     #[test]
     fn parse_no_params() {
         let parser = FunctionGemmaToolParser::new();
-        let output =
-            "<start_function_call>call:get_time{}<end_function_call>";
+        let output = "<start_function_call>call:get_time{}<end_function_call>";
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -193,8 +188,7 @@ mod tests {
     #[test]
     fn extract_content_only_tool_calls() {
         let parser = FunctionGemmaToolParser::new();
-        let output =
-            "<start_function_call>call:test{}<end_function_call>";
+        let output = "<start_function_call>call:test{}<end_function_call>";
 
         let content = parser.extract_content(output);
         assert!(content.is_none());
@@ -203,8 +197,7 @@ mod tests {
     #[test]
     fn tool_call_id_format() {
         let parser = FunctionGemmaToolParser::new();
-        let output =
-            "<start_function_call>call:test{}<end_function_call>";
+        let output = "<start_function_call>call:test{}<end_function_call>";
 
         let calls = parser.parse(output).unwrap();
         assert!(calls[0].id.starts_with("call_"));
@@ -214,11 +207,11 @@ mod tests {
     #[test]
     fn parse_boolean_param() {
         let parser = FunctionGemmaToolParser::new();
-        let output = "<start_function_call>call:set_alarm{enabled:<escape>true<escape>}<end_function_call>";
+        let output =
+            "<start_function_call>call:set_alarm{enabled:<escape>true<escape>}<end_function_call>";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["enabled"], true);
     }
 }

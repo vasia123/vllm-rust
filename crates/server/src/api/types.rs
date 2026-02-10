@@ -375,7 +375,6 @@ pub struct ChatCompletionRequest {
     pub suffix: Option<String>,
 
     // ─── Chat template control ────────────────────────────────────
-
     /// Whether to add the generation prompt to the chat template.
     /// Default is true. Set to false for models that don't use generation prompts.
     #[serde(default = "default_true")]
@@ -398,7 +397,6 @@ pub struct ChatCompletionRequest {
     pub documents: Option<Vec<HashMap<String, String>>>,
 
     // ─── Token output control ─────────────────────────────────────
-
     /// Number of prompt token logprobs to return. None = no prompt logprobs.
     #[serde(default)]
     pub prompt_logprobs: Option<u32>,
@@ -411,7 +409,6 @@ pub struct ChatCompletionRequest {
     pub return_tokens_as_token_ids: Option<bool>,
 
     // ─── Scheduling ───────────────────────────────────────────────
-
     /// Request priority for priority-based scheduling. Higher = more urgent. Default 0.
     #[serde(default)]
     pub priority: i32,
@@ -2027,10 +2024,7 @@ mod tests {
             ]
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            req.messages[0].reasoning.as_deref(),
-            Some("I think so")
-        );
+        assert_eq!(req.messages[0].reasoning.as_deref(), Some("I think so"));
     }
 
     // ─── New API fields (max_completion_tokens, parallel_tool_calls, etc.) ──

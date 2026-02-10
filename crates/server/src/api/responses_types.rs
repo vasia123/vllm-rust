@@ -230,14 +230,10 @@ impl From<Usage> for ResponseUsage {
 pub enum ResponseStreamEvent {
     /// Initial response object (status = in_progress).
     #[serde(rename = "response.created")]
-    ResponseCreated {
-        response: ResponsesResponse,
-    },
+    ResponseCreated { response: ResponsesResponse },
     /// Response is now in progress.
     #[serde(rename = "response.in_progress")]
-    ResponseInProgress {
-        response: ResponsesResponse,
-    },
+    ResponseInProgress { response: ResponsesResponse },
     /// A new output item was added.
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded {
@@ -280,9 +276,7 @@ pub enum ResponseStreamEvent {
     },
     /// Final completed response.
     #[serde(rename = "response.completed")]
-    ResponseCompleted {
-        response: ResponsesResponse,
-    },
+    ResponseCompleted { response: ResponsesResponse },
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────

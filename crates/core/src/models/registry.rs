@@ -343,10 +343,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
     },
     ArchitectureInfo {
-        arch_names: &[
-            "MistralModel",
-            "Gemma2Model",
-        ],
+        arch_names: &["MistralModel", "Gemma2Model"],
         display_name: "Mistral/Gemma2 (base)",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
@@ -361,10 +358,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
     ArchitectureInfo {
-        arch_names: &[
-            "StableLMEpochForCausalLM",
-            "StableLmForCausalLM",
-        ],
+        arch_names: &["StableLMEpochForCausalLM", "StableLmForCausalLM"],
         display_name: "StableLM",
         capabilities: ModelCapabilities::new().with_tp(),
     },
@@ -668,8 +662,8 @@ mod tests {
             find_architecture("DeepseekV2ForCausalLM").expect("should find DeepseekV2ForCausalLM");
         let v3 =
             find_architecture("DeepseekV3ForCausalLM").expect("should find DeepseekV3ForCausalLM");
-        let v32 =
-            find_architecture("DeepseekV32ForCausalLM").expect("should find DeepseekV32ForCausalLM");
+        let v32 = find_architecture("DeepseekV32ForCausalLM")
+            .expect("should find DeepseekV32ForCausalLM");
         assert_eq!(v2.display_name, v3.display_name);
         assert_eq!(v2.display_name, v32.display_name);
         assert_eq!(v2.display_name, "DeepSeek");

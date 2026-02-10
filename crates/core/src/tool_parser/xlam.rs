@@ -110,9 +110,7 @@ impl XLamToolParser {
 
         // Bare JSON array
         let trimmed = output.trim();
-        if trimmed.starts_with('[')
-            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
-        {
+        if trimmed.starts_with('[') && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
             return Some((None, trimmed.to_string()));
         }
 
@@ -227,7 +225,8 @@ mod tests {
     #[test]
     fn parse_json_code_block() {
         let parser = XLamToolParser::new();
-        let output = "```json\n[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}]\n```";
+        let output =
+            "```json\n[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}]\n```";
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -270,7 +269,8 @@ mod tests {
     #[test]
     fn parse_tool_call_tags() {
         let parser = XLamToolParser::new();
-        let output = r#"<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
+        let output =
+            r#"<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);

@@ -231,14 +231,8 @@ mod tests {
             serde_json::to_string(&PauseMode::Abort).unwrap(),
             "\"abort\""
         );
-        assert_eq!(
-            serde_json::to_string(&PauseMode::Wait).unwrap(),
-            "\"wait\""
-        );
-        assert_eq!(
-            serde_json::to_string(&PauseMode::Keep).unwrap(),
-            "\"keep\""
-        );
+        assert_eq!(serde_json::to_string(&PauseMode::Wait).unwrap(), "\"wait\"");
+        assert_eq!(serde_json::to_string(&PauseMode::Keep).unwrap(), "\"keep\"");
     }
 
     #[test]

@@ -134,8 +134,12 @@ impl<M: ModelForward> SpeculativeExecution<M> {
             let req = requests
                 .get_mut(&req_id)
                 .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
-            self.proposer
-                .propose_for_request(req_id, last_target_token, &mut req.state, tokenizer)?
+            self.proposer.propose_for_request(
+                req_id,
+                last_target_token,
+                &mut req.state,
+                tokenizer,
+            )?
         };
         let actual_k = draft_tokens.len().min(k);
 
@@ -165,9 +169,8 @@ impl<M: ModelForward> SpeculativeExecution<M> {
 
         let mut verify_input = vec![last_target_token];
         verify_input.extend_from_slice(&draft_tokens[..actual_k]);
-        let input =
-            Tensor::from_vec(verify_input, (1, k_plus_1), self.target_model.device())
-                .map_err(|e| EngineError::Model(e.to_string()))?;
+        let input = Tensor::from_vec(verify_input, (1, k_plus_1), self.target_model.device())
+            .map_err(|e| EngineError::Model(e.to_string()))?;
 
         let logits = self
             .target_model

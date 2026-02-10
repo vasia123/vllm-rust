@@ -633,31 +633,40 @@ mod tests {
     fn test_fp8_linear_expected_block_scale_shape() {
         // 512x256 with blocks [128, 128] → scale [4, 2]
         let linear = Fp8Linear::new(
-            256, 512, false,
+            256,
+            512,
+            false,
             ActivationScheme::Dynamic,
             Some([128, 128]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(linear.expected_block_scale_shape(), Some([4, 2]));
 
         // 300x200 with blocks [128, 64] → scale [ceil(300/128), ceil(200/64)] = [3, 4]
         let linear = Fp8Linear::new(
-            200, 300, false,
+            200,
+            300,
+            false,
             ActivationScheme::Dynamic,
             Some([128, 64]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(linear.expected_block_scale_shape(), Some([3, 4]));
     }
 
     #[test]
     fn test_fp8_linear_block_scale_validation_correct() {
         let linear = Fp8Linear::new(
-            256, 512, false,
+            256,
+            512,
+            false,
             ActivationScheme::Dynamic,
             Some([128, 128]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
         // Expected: [4, 2]
         let scale = Tensor::ones(&[4, 2], DType::F32, &Device::Cpu).unwrap();
         assert!(linear.validate_block_scales(&scale).is_ok());
@@ -666,11 +675,14 @@ mod tests {
     #[test]
     fn test_fp8_linear_block_scale_validation_wrong_shape() {
         let linear = Fp8Linear::new(
-            256, 512, false,
+            256,
+            512,
+            false,
             ActivationScheme::Dynamic,
             Some([128, 128]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
         // Wrong shape: [4, 4] instead of [4, 2]
         let scale = Tensor::ones(&[4, 4], DType::F32, &Device::Cpu).unwrap();
         assert!(linear.validate_block_scales(&scale).is_err());
@@ -679,11 +691,14 @@ mod tests {
     #[test]
     fn test_fp8_linear_block_load_weights() {
         let mut linear = Fp8Linear::new(
-            8, 16, false,
+            8,
+            16,
+            false,
             ActivationScheme::Dynamic,
             Some([8, 4]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         // FP8 weights as U8
@@ -705,11 +720,14 @@ mod tests {
     #[test]
     fn test_fp8_linear_block_load_weights_wrong_scale_fails() {
         let mut linear = Fp8Linear::new(
-            8, 16, false,
+            8,
+            16,
+            false,
             ActivationScheme::Dynamic,
             Some([8, 4]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(
@@ -729,11 +747,14 @@ mod tests {
     fn test_fp8_linear_block_forward_f32() {
         // Use F32 for CPU testing (U8→F32 dequantization)
         let mut linear = Fp8Linear::new(
-            4, 8, false,
+            4,
+            8,
+            false,
             ActivationScheme::Dynamic,
             Some([4, 4]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(
@@ -755,11 +776,14 @@ mod tests {
     #[test]
     fn test_fp8_linear_block_forward_with_bias() {
         let mut linear = Fp8Linear::new(
-            4, 8, true,
+            4,
+            8,
+            true,
             ActivationScheme::Dynamic,
             Some([4, 4]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(
@@ -784,11 +808,14 @@ mod tests {
     #[test]
     fn test_fp8_linear_weight_scale_inv_takes_priority() {
         let mut linear = Fp8Linear::new(
-            4, 8, false,
+            4,
+            8,
+            false,
             ActivationScheme::Dynamic,
             Some([4, 4]),
             &Device::Cpu,
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut weights = HashMap::new();
         weights.insert(

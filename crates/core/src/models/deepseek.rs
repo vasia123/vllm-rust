@@ -576,7 +576,11 @@ mod tests {
 
         // GlmMoeDsaForCausalLM is a type alias for DeepSeekForCausalLM
         let model = GlmMoeDsaForCausalLM::new(&cfg, vb);
-        assert!(model.is_ok(), "GLM-5 alias should construct: {:?}", model.err());
+        assert!(
+            model.is_ok(),
+            "GLM-5 alias should construct: {:?}",
+            model.err()
+        );
     }
 
     #[test]

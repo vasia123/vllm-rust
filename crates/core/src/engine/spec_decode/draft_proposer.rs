@@ -119,22 +119,12 @@ impl<D: ModelForward> DraftProposer for DraftModelDraftProposer<D> {
             .map_err(|e| EngineError::Cache(e.to_string()))?;
         let slot_mapping = block_table.slot_mapping(0, prompt_len);
 
-        let input = Tensor::from_vec(
-            prompt_tokens.to_vec(),
-            (1, prompt_len),
-            self.model.device(),
-        )
-        .map_err(|e| EngineError::Model(e.to_string()))?;
+        let input = Tensor::from_vec(prompt_tokens.to_vec(), (1, prompt_len), self.model.device())
+            .map_err(|e| EngineError::Model(e.to_string()))?;
 
         let _logits = self
             .model
-            .forward(
-                &input,
-                0,
-                &mut self.kv_cache,
-                &block_table,
-                &slot_mapping,
-            )
+            .forward(&input, 0, &mut self.kv_cache, &block_table, &slot_mapping)
             .map_err(|e| EngineError::Model(e.to_string()))?;
 
         block_table.advance(prompt_len);
@@ -352,7 +342,9 @@ mod tests {
         state.generated_token_ids.push(10); // simulate one decode step
         let tok = tokenizer();
 
-        let drafts = proposer.propose_for_request(0, 10, &mut state, &tok).unwrap();
+        let drafts = proposer
+            .propose_for_request(0, 10, &mut state, &tok)
+            .unwrap();
         assert_eq!(drafts, vec![42, 42, 42]);
     }
 
@@ -366,7 +358,9 @@ mod tests {
         state.generated_token_ids.push(10);
         let tok = tokenizer();
 
-        let drafts = proposer.propose_for_request(0, 10, &mut state, &tok).unwrap();
+        let drafts = proposer
+            .propose_for_request(0, 10, &mut state, &tok)
+            .unwrap();
         assert_eq!(drafts.len(), 3);
     }
 
@@ -381,7 +375,9 @@ mod tests {
         let tok = tokenizer();
 
         let original_offset = 5; // prompt len
-        let _drafts = proposer.propose_for_request(0, 10, &mut state, &tok).unwrap();
+        let _drafts = proposer
+            .propose_for_request(0, 10, &mut state, &tok)
+            .unwrap();
 
         // Only 1 of 3 drafts accepted
         proposer.on_tokens_verified(0, 1, original_offset).unwrap();
@@ -444,8 +440,12 @@ mod tests {
         state1.generated_token_ids.push(20);
         let tok = tokenizer();
 
-        let d0 = proposer.propose_for_request(0, 10, &mut state0, &tok).unwrap();
-        let d1 = proposer.propose_for_request(1, 20, &mut state1, &tok).unwrap();
+        let d0 = proposer
+            .propose_for_request(0, 10, &mut state0, &tok)
+            .unwrap();
+        let d1 = proposer
+            .propose_for_request(1, 20, &mut state1, &tok)
+            .unwrap();
 
         assert_eq!(d0.len(), 3);
         assert_eq!(d1.len(), 3);

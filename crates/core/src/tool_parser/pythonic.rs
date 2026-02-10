@@ -441,8 +441,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "San Francisco");
         assert_eq!(args["metric"], "celsius");
     }
@@ -477,8 +476,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["name"], "John");
         assert_eq!(args["age"], 37);
         assert_eq!(args["active"], true);
@@ -488,14 +486,12 @@ mod tests {
     #[test]
     fn parse_nested_dict() {
         let parser = PythonicToolParser::new();
-        let output =
-            "[register(name='John', address={'city': 'SF', 'state': 'CA'})]";
+        let output = "[register(name='John', address={'city': 'SF', 'state': 'CA'})]";
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["name"], "John");
         assert_eq!(args["address"]["city"], "SF");
         assert_eq!(args["address"]["state"], "CA");
@@ -509,8 +505,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["aliases"][0], "John");
         assert_eq!(args["aliases"][1], "Johnny");
     }
@@ -524,8 +519,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "register_user");
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["name"], "John Doe");
         assert_eq!(args["age"], 37);
         assert!(args["role"].is_null());
@@ -570,8 +564,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["place"], "Martha's Vineyard");
     }
 
@@ -583,8 +576,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert!((args["value"].as_f64().unwrap() - 36.6).abs() < f64::EPSILON);
     }
 
@@ -596,8 +588,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["enabled"], false);
     }
 
@@ -617,8 +608,7 @@ mod tests {
         let output = "[create(config={})]";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["config"], serde_json::json!({}));
     }
 
@@ -628,8 +618,7 @@ mod tests {
         let output = "[create(items=[])]";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["items"], serde_json::json!([]));
     }
 
@@ -639,8 +628,7 @@ mod tests {
         let output = "[adjust(offset=-5)]";
 
         let calls = parser.parse(output).unwrap();
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["offset"], -5);
     }
 }

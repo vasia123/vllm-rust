@@ -72,9 +72,7 @@ impl ToolCallParser for LongcatToolParser {
                         let arguments = parsed.get_arguments();
                         let arguments_str = match &arguments {
                             serde_json::Value::Null => "{}".to_string(),
-                            serde_json::Value::Object(_) => {
-                                serde_json::to_string(&arguments)?
-                            }
+                            serde_json::Value::Object(_) => serde_json::to_string(&arguments)?,
                             other => other.to_string(),
                         };
 
@@ -88,9 +86,7 @@ impl ToolCallParser for LongcatToolParser {
                         });
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse Longcat tool call JSON: {json_str}: {e}"
-                        );
+                        tracing::warn!("Failed to parse Longcat tool call JSON: {json_str}: {e}");
                     }
                 }
             }
@@ -125,8 +121,7 @@ mod tests {
     #[test]
     fn parse_single_tool_call() {
         let parser = LongcatToolParser::new();
-        let output =
-            r#"<longcat_tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</longcat_tool_call>"#;
+        let output = r#"<longcat_tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</longcat_tool_call>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -170,8 +165,7 @@ mod tests {
     #[test]
     fn extract_content_only_tool_calls() {
         let parser = LongcatToolParser::new();
-        let output =
-            r#"<longcat_tool_call>{"name": "test", "arguments": {}}</longcat_tool_call>"#;
+        let output = r#"<longcat_tool_call>{"name": "test", "arguments": {}}</longcat_tool_call>"#;
 
         let content = parser.extract_content(output);
         assert!(content.is_none());
@@ -180,21 +174,18 @@ mod tests {
     #[test]
     fn parse_with_parameters_field() {
         let parser = LongcatToolParser::new();
-        let output =
-            r#"<longcat_tool_call>{"name": "search", "parameters": {"query": "test"}}</longcat_tool_call>"#;
+        let output = r#"<longcat_tool_call>{"name": "search", "parameters": {"query": "test"}}</longcat_tool_call>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "test");
     }
 
     #[test]
     fn tool_call_id_format() {
         let parser = LongcatToolParser::new();
-        let output =
-            r#"<longcat_tool_call>{"name": "test", "arguments": {}}</longcat_tool_call>"#;
+        let output = r#"<longcat_tool_call>{"name": "test", "arguments": {}}</longcat_tool_call>"#;
 
         let calls = parser.parse(output).unwrap();
         assert!(calls[0].id.starts_with("call_"));

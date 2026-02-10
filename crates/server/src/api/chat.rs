@@ -13,7 +13,6 @@ use vllm_core::sampling::{
 };
 use vllm_core::tokenizer::{MessageContent, TokenizerWrapper};
 
-
 use super::admin::prometheus;
 use super::error::ApiError;
 use super::response_format::{inject_json_system_prompt, validate_response_format};
@@ -97,9 +96,10 @@ pub async fn create_chat_completion(
     });
 
     // Tokenize bad_words strings into token ID sequences
-    let bad_words_token_ids = req.bad_words.as_ref().map(|words| {
-        super::tokenize_bad_words(words, &state.tokenizer)
-    });
+    let bad_words_token_ids = req
+        .bad_words
+        .as_ref()
+        .map(|words| super::tokenize_bad_words(words, &state.tokenizer));
 
     if req.stream {
         // Streaming only supports n=1
@@ -561,9 +561,10 @@ pub async fn render_chat_completion(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let chat_template = state.chat_template.as_ref().ok_or_else(|| {
-        ApiError::TemplateError("no chat template available".to_string())
-    })?;
+    let chat_template = state
+        .chat_template
+        .as_ref()
+        .ok_or_else(|| ApiError::TemplateError("no chat template available".to_string()))?;
 
     let mut messages = req.messages.clone();
     super::response_format::inject_json_system_prompt(&mut messages, req.response_format.as_ref());

@@ -221,8 +221,7 @@ mod tests {
     #[test]
     fn parse_v11_multiple() {
         let parser = MistralToolParser::new();
-        let output =
-            r#"[TOOL_CALLS]get_weather{"city": "NYC"}[TOOL_CALLS]get_time{"tz": "EST"}"#;
+        let output = r#"[TOOL_CALLS]get_weather{"city": "NYC"}[TOOL_CALLS]get_time{"tz": "EST"}"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 2);
@@ -290,12 +289,8 @@ mod tests {
     #[test]
     fn has_tool_calls_positive() {
         let parser = MistralToolParser::new();
-        assert!(parser.has_tool_calls(
-            r#"[TOOL_CALLS][{"name": "fn", "arguments": {}}]"#
-        ));
-        assert!(parser.has_tool_calls(
-            r#"[TOOL_CALLS]fn{"x": 1}"#
-        ));
+        assert!(parser.has_tool_calls(r#"[TOOL_CALLS][{"name": "fn", "arguments": {}}]"#));
+        assert!(parser.has_tool_calls(r#"[TOOL_CALLS]fn{"x": 1}"#));
     }
 
     #[test]
@@ -307,20 +302,19 @@ mod tests {
     #[test]
     fn parse_v11_complex_arguments() {
         let parser = MistralToolParser::new();
-        let output =
-            r#"[TOOL_CALLS]analyze{"data": [1, 2, 3], "config": {"verbose": true}}"#;
+        let output = r#"[TOOL_CALLS]analyze{"data": [1, 2, 3], "config": {"verbose": true}}"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["data"], serde_json::json!([1, 2, 3]));
     }
 
     #[test]
     fn parse_pre_v11_with_content_before() {
         let parser = MistralToolParser::new();
-        let output = r#"Let me search for you.[TOOL_CALLS][{"name": "search", "arguments": {"q": "test"}}]"#;
+        let output =
+            r#"Let me search for you.[TOOL_CALLS][{"name": "search", "arguments": {"q": "test"}}]"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);

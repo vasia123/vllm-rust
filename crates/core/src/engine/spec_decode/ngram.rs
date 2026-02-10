@@ -495,7 +495,9 @@ mod tests {
 
         // Full sequence: [1, 2, 3, 4, 1, 2, 3]
         // Suffix [2, 3] matches at position 1, continuation: [4, 1, 2]
-        let result = proposer.propose_for_request(0, 3, &mut state, &tokenizer).unwrap();
+        let result = proposer
+            .propose_for_request(0, 3, &mut state, &tokenizer)
+            .unwrap();
         assert!(!result.is_empty());
     }
 

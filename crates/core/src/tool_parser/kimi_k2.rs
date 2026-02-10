@@ -171,10 +171,22 @@ mod tests {
 
     #[test]
     fn extract_function_name_from_id() {
-        assert_eq!(KimiK2ToolParser::extract_function_name("functions.get_weather:0"), "get_weather");
-        assert_eq!(KimiK2ToolParser::extract_function_name("get_weather:0"), "get_weather");
-        assert_eq!(KimiK2ToolParser::extract_function_name("a.b.get_weather:1"), "get_weather");
-        assert_eq!(KimiK2ToolParser::extract_function_name("get_weather"), "get_weather");
+        assert_eq!(
+            KimiK2ToolParser::extract_function_name("functions.get_weather:0"),
+            "get_weather"
+        );
+        assert_eq!(
+            KimiK2ToolParser::extract_function_name("get_weather:0"),
+            "get_weather"
+        );
+        assert_eq!(
+            KimiK2ToolParser::extract_function_name("a.b.get_weather:1"),
+            "get_weather"
+        );
+        assert_eq!(
+            KimiK2ToolParser::extract_function_name("get_weather"),
+            "get_weather"
+        );
     }
 
     #[test]
@@ -195,8 +207,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "test");
         assert_eq!(args["filters"]["type"], "article");
     }

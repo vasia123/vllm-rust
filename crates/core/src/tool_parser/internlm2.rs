@@ -71,9 +71,7 @@ impl ToolCallParser for InternLm2ToolParser {
                 let arguments = parsed.get_arguments();
                 let arguments_str = match &arguments {
                     serde_json::Value::Null => "{}".to_string(),
-                    serde_json::Value::Object(_) => {
-                        serde_json::to_string(&arguments)?
-                    }
+                    serde_json::Value::Object(_) => serde_json::to_string(&arguments)?,
                     other => other.to_string(),
                 };
 
@@ -125,8 +123,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "NYC");
     }
 
@@ -138,8 +135,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "search");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "rust");
     }
 
@@ -169,7 +165,8 @@ mod tests {
     #[test]
     fn extract_content_only_tool_call() {
         let parser = InternLm2ToolParser::new();
-        let output = r#"<|action_start|><|plugin|>{"name": "test", "parameters": {}}<|action_end|>"#;
+        let output =
+            r#"<|action_start|><|plugin|>{"name": "test", "parameters": {}}<|action_end|>"#;
 
         let content = parser.extract_content(output);
         assert!(content.is_none());
@@ -178,8 +175,7 @@ mod tests {
     #[test]
     fn parse_empty_parameters() {
         let parser = InternLm2ToolParser::new();
-        let output =
-            r#"<|action_start|><|plugin|>{"name": "get_time"}<|action_end|>"#;
+        let output = r#"<|action_start|><|plugin|>{"name": "get_time"}<|action_end|>"#;
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -195,8 +191,7 @@ mod tests {
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);
 
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["query"], "test");
         assert_eq!(args["filters"]["type"], "article");
         assert_eq!(args["filters"]["limit"], 10);
@@ -226,7 +221,8 @@ mod tests {
     #[test]
     fn tool_call_id_format() {
         let parser = InternLm2ToolParser::new();
-        let output = r#"<|action_start|><|plugin|>{"name": "test", "parameters": {}}<|action_end|>"#;
+        let output =
+            r#"<|action_start|><|plugin|>{"name": "test", "parameters": {}}<|action_end|>"#;
 
         let calls = parser.parse(output).unwrap();
         assert!(calls[0].id.starts_with("call_"));

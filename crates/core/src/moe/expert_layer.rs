@@ -1004,7 +1004,10 @@ mod tests {
             .unwrap()
             .to_scalar()
             .unwrap();
-        assert!(diff < 1e-5, "inplace=true/false should produce same output, diff={diff}");
+        assert!(
+            diff < 1e-5,
+            "inplace=true/false should produce same output, diff={diff}"
+        );
     }
 
     #[test]

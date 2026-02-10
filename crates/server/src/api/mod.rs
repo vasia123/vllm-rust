@@ -242,9 +242,7 @@ pub fn build_cors_layer(config: &CorsConfig) -> CorsLayer {
 
 /// Simple health check for load balancers and orchestration systems.
 /// Returns 200 if the server is accepting requests, 503 otherwise.
-async fn health_check(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> StatusCode {
+async fn health_check(axum::extract::State(state): axum::extract::State<AppState>) -> StatusCode {
     if state.accepting_requests() {
         StatusCode::OK
     } else {
@@ -449,10 +447,7 @@ async fn prometheus_metrics() -> Result<axum::response::Response, error::ApiErro
 /// Each bad word is tokenized both with and without a leading space (to handle
 /// prefix-space tokenization variants). Multi-token sequences only ban the last
 /// token when the prefix matches generated output.
-pub fn tokenize_bad_words(
-    bad_words: &[String],
-    tokenizer: &TokenizerWrapper,
-) -> Vec<Vec<u32>> {
+pub fn tokenize_bad_words(bad_words: &[String], tokenizer: &TokenizerWrapper) -> Vec<Vec<u32>> {
     let mut result: Vec<Vec<u32>> = Vec::new();
 
     for word in bad_words {
@@ -473,9 +468,9 @@ pub fn tokenize_bad_words(
         if let Ok(ids) = tokenizer.encode(&with_space) {
             if !ids.is_empty() {
                 // Only add if it differs from the no-space variant
-                let dominated = result.last().is_none_or(|prev| {
-                    ids[0] != prev[0] && ids.len() == prev.len()
-                });
+                let dominated = result
+                    .last()
+                    .is_none_or(|prev| ids[0] != prev[0] && ids.len() == prev.len());
                 if dominated {
                     result.push(ids);
                 }
@@ -511,10 +506,7 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
         )
         .route("/v1/responses", post(responses::create_response))
         .route("/v1/responses/{response_id}", get(get_response))
-        .route(
-            "/v1/responses/{response_id}/cancel",
-            post(cancel_response),
-        )
+        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
         .route("/v1/embeddings", post(embeddings::create_embedding))
         .route("/score", post(embeddings::score))
         .route("/v1/score", post(embeddings::score))
@@ -592,10 +584,7 @@ pub fn create_full_router_with_options(
         )
         .route("/v1/responses", post(responses::create_response))
         .route("/v1/responses/{response_id}", get(get_response))
-        .route(
-            "/v1/responses/{response_id}/cancel",
-            post(cancel_response),
-        )
+        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
         .route("/v1/embeddings", post(embeddings::create_embedding))
         .route("/score", post(embeddings::score))
         .route("/v1/score", post(embeddings::score))
@@ -1563,9 +1552,7 @@ mod tests {
         let state = test_app_state();
         let app = create_router(state);
 
-        let req = Request::get("/tokenizer_info")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::get("/tokenizer_info").body(Body::empty()).unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1950,9 +1937,7 @@ mod tests {
     fn create_tool_call_parser_unknown_defaults_to_hermes() {
         let parser = create_tool_call_parser("nonexistent");
         // Should still work (defaults to hermes)
-        let result = parser.parse(
-            r#"<tool_call>{"name": "test", "arguments": {}}</tool_call>"#,
-        );
+        let result = parser.parse(r#"<tool_call>{"name": "test", "arguments": {}}</tool_call>"#);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -2025,10 +2010,7 @@ mod tests {
     async fn load_returns_zero_initially() {
         let state = test_app_state();
         let router = create_router(state);
-        let request = Request::builder()
-            .uri("/load")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/load").body(Body::empty()).unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2077,11 +2059,10 @@ mod tests {
     async fn load_lora_adapter_rejects_duplicate() {
         let state = test_app_state();
         // Pre-populate an adapter
-        state
-            .lora_adapters
-            .write()
-            .await
-            .insert("existing".into(), LoraRequest::new("existing".to_string(), 1, "/p".to_string()));
+        state.lora_adapters.write().await.insert(
+            "existing".into(),
+            LoraRequest::new("existing".to_string(), 1, "/p".to_string()),
+        );
         let router = create_router(state);
         let body = serde_json::json!({
             "lora_name": "existing",
@@ -2100,11 +2081,10 @@ mod tests {
     #[tokio::test]
     async fn unload_lora_adapter_succeeds() {
         let state = test_app_state();
-        state
-            .lora_adapters
-            .write()
-            .await
-            .insert("my-adapter".into(), LoraRequest::new("my-adapter".to_string(), 1, "/p".to_string()));
+        state.lora_adapters.write().await.insert(
+            "my-adapter".into(),
+            LoraRequest::new("my-adapter".to_string(), 1, "/p".to_string()),
+        );
         let router = create_router(state);
         let body = serde_json::json!({ "lora_name": "my-adapter" });
         let request = Request::builder()
