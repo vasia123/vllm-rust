@@ -99,19 +99,16 @@ pub fn get_cuda_stream_ptr(device: &Device) -> Result<*mut std::ffi::c_void> {
     }
 }
 
-/// Allocate a GPU tensor of i32 data and return its raw pointer for FFI use.
+/// Allocate a GPU tensor of i32-compatible data for FFI use.
 ///
-/// Since candle doesn't support i32 tensors (no WithDType impl for i32),
-/// we store the data as i64 and provide the raw pointer.
-/// For FFI calls that expect i32*, use `tensor_to_device_ptr` directly
-/// with the i64 tensor and cast at the call site.
-///
-/// Alternatively, for actual i32 GPU buffers needed by FlashInfer FFI,
-/// use `alloc_gpu_i32_raw` which allocates via cudarc directly.
+/// Candle doesn't have an i32 dtype, so we store as u32 (same size, 4 bytes).
+/// For FFI calls expecting `*const i32`, cast via `tensor_to_device_ptr() as *const i32`.
+/// This is correct because u32 and i32 have the same size and bit representation
+/// for the non-negative values used in FlashInfer metadata (indices, lengths, indptrs).
 #[cfg(feature = "flashinfer")]
 pub fn alloc_gpu_i32(data: &[i32], device: &Device) -> Result<Tensor> {
-    let data_i64: Vec<i64> = data.iter().map(|&x| x as i64).collect();
-    Tensor::from_vec(data_i64, (data.len(),), device)
+    let data_u32: Vec<u32> = data.iter().map(|&x| x as u32).collect();
+    Tensor::from_vec(data_u32, (data.len(),), device)
 }
 
 /// Convert candle DType to flashinfer-rs FFI DType.

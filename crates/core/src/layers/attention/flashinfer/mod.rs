@@ -21,7 +21,7 @@ pub mod wrapper;
 
 pub use metadata::FlashInferMetadata;
 pub use workspace::{WorkspaceBuffer, DEFAULT_WORKSPACE_SIZE};
-pub use wrapper::{DecodeWrapper, FlashInferConfig, PrefillWrapper};
+pub use wrapper::{DecodeWrapper, FlashInferConfig, MlaConfig, MlaWrapper, PrefillWrapper};
 
 #[cfg(feature = "flashinfer")]
 use candle_core::DType;

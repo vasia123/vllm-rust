@@ -353,6 +353,250 @@ impl DecodeWrapper {
     }
 }
 
+/// Configuration for FlashInfer MLA attention operations.
+///
+/// MLA uses compressed KV cache (ckv + kpe) instead of separate K/V.
+/// Queries are split into q_nope (absorbed, head_dim_ckv) and q_pe (head_dim_kpe).
+#[derive(Debug, Clone)]
+pub struct MlaConfig {
+    /// Number of attention heads (128 for DeepSeek)
+    pub num_heads: u32,
+    /// Compressed KV dimension (512 for DeepSeek)
+    pub head_dim_ckv: u32,
+    /// K position embedding dimension (64 for DeepSeek)
+    pub head_dim_kpe: u32,
+    /// Page/block size for paged KV cache
+    pub page_size: u32,
+    /// Use causal mask
+    pub causal: bool,
+    /// Softmax scale (1/sqrt(192) for DeepSeek; 0.0 = auto)
+    pub sm_scale: f32,
+}
+
+impl MlaConfig {
+    /// Create DeepSeek v2/v3 MLA configuration.
+    pub fn deepseek(page_size: u32) -> Self {
+        Self {
+            num_heads: 128,
+            head_dim_ckv: 512,
+            head_dim_kpe: 64,
+            page_size,
+            causal: true,
+            sm_scale: 1.0 / 192.0_f32.sqrt(),
+        }
+    }
+
+    /// Create MLA configuration with custom parameters.
+    pub fn new(
+        num_heads: u32,
+        head_dim_ckv: u32,
+        head_dim_kpe: u32,
+        page_size: u32,
+        sm_scale: f32,
+    ) -> Self {
+        Self {
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            causal: true,
+            sm_scale,
+        }
+    }
+
+    /// Set causal masking.
+    pub fn with_causal(mut self, causal: bool) -> Self {
+        self.causal = causal;
+        self
+    }
+}
+
+/// Wrapper for FlashInfer MLA attention via direct FFI calls.
+///
+/// Handles Multi-head Latent Attention for DeepSeek V2/V3 models.
+/// Takes absorbed queries (q_nope in CKV space + q_pe) and reads
+/// directly from compressed paged caches (ckv_cache + kpe_cache).
+#[cfg(feature = "flashinfer")]
+pub struct MlaWrapper {
+    config: MlaConfig,
+    device: Device,
+}
+
+#[cfg(feature = "flashinfer")]
+impl MlaWrapper {
+    /// Create a new MLA wrapper.
+    pub fn new(config: MlaConfig, device: &Device) -> Result<Self> {
+        if !device.is_cuda() {
+            return Err(candle_core::Error::Msg(
+                "MlaWrapper requires CUDA device".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            config,
+            device: device.clone(),
+        })
+    }
+
+    /// Run MLA attention via FlashInfer FFI.
+    ///
+    /// # Arguments
+    /// * `q_nope` - Absorbed query nope `[nnz, num_heads, head_dim_ckv]`
+    /// * `q_pe` - Query PE `[nnz, num_heads, head_dim_kpe]`
+    /// * `ckv_cache` - Compressed KV cache `[num_pages, page_size, head_dim_ckv]`
+    /// * `kpe_cache` - K position embedding cache `[num_pages, page_size, head_dim_kpe]`
+    /// * `workspace` - Workspace buffer
+    /// * `qo_indptr` - Cumulative query lengths `[batch_size + 1]`, i32 GPU
+    /// * `kv_indptr` - Cumulative page counts `[batch_size + 1]`, i32 GPU
+    /// * `kv_indices` - Flattened page IDs `[total_pages]`, i32 GPU
+    /// * `kv_lengths` - KV lengths per sequence (host)
+    /// * `batch_size` - Number of sequences
+    /// * `total_tokens` - Total query tokens
+    ///
+    /// # Returns
+    /// Output tensor `[nnz, num_heads, head_dim_ckv]`
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        q_nope: &Tensor,
+        q_pe: &Tensor,
+        ckv_cache: &Tensor,
+        kpe_cache: &Tensor,
+        workspace: &mut WorkspaceBuffer,
+        qo_indptr: &Tensor,
+        kv_indptr: &Tensor,
+        kv_indices: &Tensor,
+        kv_lengths: &[usize],
+        batch_size: usize,
+        total_tokens: usize,
+    ) -> Result<Tensor> {
+        let q_nope = tensor_bridge::ensure_contiguous(q_nope)?;
+        let q_pe = tensor_bridge::ensure_contiguous(q_pe)?;
+
+        // Ensure workspace is large enough
+        let required_size = estimate_mla_workspace(
+            batch_size,
+            self.config.num_heads as usize,
+            self.config.head_dim_ckv as usize,
+        );
+        workspace.ensure_size(required_size)?;
+
+        // Get raw pointers
+        let qn_ptr = tensor_bridge::tensor_to_device_ptr(&q_nope)?;
+        let qp_ptr = tensor_bridge::tensor_to_device_ptr(&q_pe)?;
+        let ckv_ptr = tensor_bridge::tensor_to_device_ptr(ckv_cache)?;
+        let kpe_ptr = tensor_bridge::tensor_to_device_ptr(kpe_cache)?;
+        let qo_indptr_ptr = tensor_bridge::tensor_to_device_ptr(qo_indptr)? as *const i32;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(kv_indices)? as *const i32;
+        let workspace_ptr = workspace.as_ptr()?;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+
+        // kv_lengths as i32 on GPU for plan
+        let kv_len_i32: Vec<i32> = kv_lengths.iter().map(|&l| l as i32).collect();
+        let kv_len_gpu = tensor_bridge::alloc_gpu_i32(&kv_len_i32, &self.device)?;
+        let kv_len_ptr = tensor_bridge::tensor_to_device_ptr(&kv_len_gpu)? as *const i32;
+
+        // Allocate output: same shape as q_nope [nnz, num_heads, head_dim_ckv]
+        let output = Tensor::zeros_like(&q_nope)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
+
+        let dtype = tensor_bridge::candle_to_ffi_dtype(q_nope.dtype())?;
+
+        // Split workspace: first half float, second half int
+        let ws_size = workspace.size();
+        let float_ws_size = ws_size / 2;
+        let int_ws_size = ws_size - float_ws_size;
+        let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
+        let int_ws_ptr =
+            unsafe { (workspace_ptr as *mut u8).add(float_ws_size) } as *mut std::ffi::c_void;
+
+        // Create MLA plan
+        let plan = unsafe {
+            flashinfer_rs::ffi::MLAPlan::new(
+                float_ws_ptr,
+                float_ws_size,
+                int_ws_ptr,
+                int_ws_size,
+                std::ptr::null_mut(), // page_locked_workspace
+                0,                    // page_locked_size
+                qo_indptr_ptr,
+                kv_indptr_ptr,
+                kv_len_ptr,
+                batch_size as i32,
+                self.config.num_heads as i32,
+                self.config.head_dim_ckv as i32,
+                self.config.head_dim_kpe as i32,
+                self.config.page_size as i32,
+                self.config.causal,
+                stream_ptr,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer MLA plan failed: {e}")))?
+        };
+
+        // Determine mask mode
+        let mask_mode = if self.config.causal {
+            flashinfer_rs::ffi::MaskMode::Causal
+        } else {
+            flashinfer_rs::ffi::MaskMode::None
+        };
+
+        // Run MLA kernel
+        unsafe {
+            plan.run(
+                qn_ptr,
+                qp_ptr,
+                ckv_ptr,
+                kpe_ptr,
+                kv_indices_ptr,
+                output_ptr,
+                std::ptr::null_mut(), // lse
+                mask_mode,
+                self.config.sm_scale,
+                dtype,
+                dtype, // KV cache same dtype as query
+                stream_ptr,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer MLA forward failed: {e}")))?;
+        }
+
+        Ok(output)
+    }
+}
+
+/// Stub MLA wrapper when flashinfer feature is disabled.
+#[cfg(not(feature = "flashinfer"))]
+pub struct MlaWrapper {
+    _config: MlaConfig,
+}
+
+#[cfg(not(feature = "flashinfer"))]
+impl MlaWrapper {
+    pub fn new(config: MlaConfig, _device: &Device) -> Result<Self> {
+        Ok(Self { _config: config })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        _q_nope: &Tensor,
+        _q_pe: &Tensor,
+        _ckv_cache: &Tensor,
+        _kpe_cache: &Tensor,
+        _workspace: &mut WorkspaceBuffer,
+        _qo_indptr: &Tensor,
+        _kv_indptr: &Tensor,
+        _kv_indices: &Tensor,
+        _kv_lengths: &[usize],
+        _batch_size: usize,
+        _total_tokens: usize,
+    ) -> Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "FlashInfer MLA not available - enable 'flashinfer' feature".to_string(),
+        ))
+    }
+}
+
 /// Estimate workspace size for prefill operations.
 #[cfg(feature = "flashinfer")]
 fn estimate_prefill_workspace(
@@ -387,6 +631,24 @@ fn estimate_decode_workspace(
     // Total with generous padding
     let total = tmp_v_size + tmp_s_size + partition_info_size + 16384;
     // Ensure at least 16 MB
+    total.max(16 * 1024 * 1024)
+}
+
+/// Estimate workspace size for MLA operations.
+#[cfg(feature = "flashinfer")]
+fn estimate_mla_workspace(
+    batch_size: usize,
+    num_heads: usize,
+    head_dim_ckv: usize,
+) -> usize {
+    // Float workspace: tmp_v for split-K + tmp_s for softmax
+    let tmp_v_size = batch_size * num_heads * head_dim_ckv * 4; // f32
+    let tmp_s_size = batch_size * num_heads * 4; // f32
+    // Int workspace: partition info
+    let partition_info_size = batch_size * 2 * 4; // i32
+    // Total with generous padding
+    let total = tmp_v_size + tmp_s_size + partition_info_size + 16384;
+    // Ensure at least 16 MB (MLA has large intermediate state due to 128 heads)
     total.max(16 * 1024 * 1024)
 }
 
@@ -494,5 +756,34 @@ mod tests {
     fn test_estimate_decode_workspace() {
         let size = estimate_decode_workspace(4, 32, 128);
         assert!(size >= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_mla_config_deepseek() {
+        let config = MlaConfig::deepseek(16);
+        assert_eq!(config.num_heads, 128);
+        assert_eq!(config.head_dim_ckv, 512);
+        assert_eq!(config.head_dim_kpe, 64);
+        assert_eq!(config.page_size, 16);
+        assert!(config.causal);
+        let expected_scale = 1.0 / 192.0_f32.sqrt();
+        assert!((config.sm_scale - expected_scale).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mla_config_custom() {
+        let config = MlaConfig::new(128, 512, 64, 16, 0.072).with_causal(false);
+        assert_eq!(config.num_heads, 128);
+        assert!(!config.causal);
+    }
+
+    #[test]
+    #[cfg(feature = "flashinfer")]
+    fn test_estimate_mla_workspace() {
+        let size = estimate_mla_workspace(4, 128, 512);
+        // Should be at least 16 MB
+        assert!(size >= 16 * 1024 * 1024);
+        // Should cover tmp_v for split-K: 4 * 128 * 512 * 4 = 1048576
+        assert!(size >= 4 * 128 * 512 * 4);
     }
 }
