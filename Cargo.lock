@@ -968,6 +968,7 @@ checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
 [[package]]
 name = "flashinfer-rs"
 version = "0.1.0"
+source = "git+https://github.com/vasia123/flashinfer-rs#9da92d7108bcf211b720ebda64657fce681a39e8"
 dependencies = [
  "bindgen",
  "cc",
