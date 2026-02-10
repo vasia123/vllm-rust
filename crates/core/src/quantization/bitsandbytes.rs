@@ -924,7 +924,7 @@ mod tests {
 
         // Generate random weights and quantize them
         let weight_data: Vec<f32> = (0..in_features * out_features)
-            .map(|i| ((i as f32 * 0.01).sin() * 0.5))
+            .map(|i| (i as f32 * 0.01).sin() * 0.5)
             .collect();
 
         let (packed, absmax_data) = quantize_nf4(&weight_data, block_size);
@@ -968,7 +968,7 @@ mod tests {
         let block_size = 32;
 
         let weight_data: Vec<f32> = (0..in_features * out_features)
-            .map(|i| ((i as f32 * 0.01).cos() * 0.3))
+            .map(|i| (i as f32 * 0.01).cos() * 0.3)
             .collect();
 
         let (quantized, absmax_data) = quantize_int8(&weight_data, block_size);
@@ -1136,7 +1136,7 @@ mod tests {
             device: &Device,
         ) -> BitsAndBytesLinear {
             let weight_data: Vec<f32> = (0..in_features * out_features)
-                .map(|i| ((i as f32 * 0.037).sin() * 0.6))
+                .map(|i| (i as f32 * 0.037).sin() * 0.6)
                 .collect();
             let (packed, absmax_data) = quantize_nf4(&weight_data, block_size);
 
@@ -1181,7 +1181,7 @@ mod tests {
             device: &Device,
         ) -> BitsAndBytesLinear {
             let weight_data: Vec<f32> = (0..in_features * out_features)
-                .map(|i| ((i as f32 * 0.023).cos() * 0.4))
+                .map(|i| (i as f32 * 0.023).cos() * 0.4)
                 .collect();
             let (quantized, absmax_data) = quantize_int8(&weight_data, block_size);
 
