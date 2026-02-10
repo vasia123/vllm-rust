@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Supported quantization methods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuantizationMethod {
     /// No quantization (full precision)
+    #[default]
     None,
     /// FP8 quantization (E4M3 or E5M2)
     Fp8,
@@ -35,12 +36,6 @@ pub enum QuantizationMethod {
     Torchao,
 }
 
-impl Default for QuantizationMethod {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 impl std::fmt::Display for QuantizationMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -59,19 +54,14 @@ impl std::fmt::Display for QuantizationMethod {
 }
 
 /// Activation quantization scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActivationScheme {
     /// Static quantization with pre-computed scales
     Static,
     /// Dynamic quantization computing scales at runtime
+    #[default]
     Dynamic,
-}
-
-impl Default for ActivationScheme {
-    fn default() -> Self {
-        Self::Dynamic
-    }
 }
 
 /// Base trait for quantization configurations.

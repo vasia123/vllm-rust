@@ -572,7 +572,7 @@ impl Qwen2MoeDecoderLayer {
 
         let is_moe_layer = !mlp_only_layers.contains(&layer_idx)
             && num_experts > 0
-            && (layer_idx + 1) % decoder_sparse_step == 0;
+            && (layer_idx + 1).is_multiple_of(decoder_sparse_step);
 
         // NOTE: MoE block remains replicated across all GPUs (no expert parallelism)
         // Dense MLP also remains replicated for simplicity
@@ -619,7 +619,7 @@ impl Qwen2MoeDecoderLayer {
 
         let is_moe_layer = !mlp_only_layers.contains(&layer_idx)
             && num_experts > 0
-            && (layer_idx + 1) % decoder_sparse_step == 0;
+            && (layer_idx + 1).is_multiple_of(decoder_sparse_step);
 
         let mlp = if is_moe_layer {
             MlpVariant::Sparse(Box::new(Qwen2MoeSparseMoeBlock::new_with_ep(

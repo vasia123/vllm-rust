@@ -140,7 +140,7 @@ impl Gemma3ExtraConfig {
         if self.sliding_window_pattern == 0 {
             return false;
         }
-        layer_idx % self.sliding_window_pattern == 0
+        layer_idx.is_multiple_of(self.sliding_window_pattern)
     }
 }
 

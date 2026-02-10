@@ -248,7 +248,7 @@ pub fn normalize_audio(audio: &AudioData, spec: &AudioSpec) -> Result<AudioData,
     if audio.samples.is_empty() {
         return Err(AudioError::InvalidData("audio has no samples".to_string()));
     }
-    if audio.samples.len() % audio.channels != 0 {
+    if !audio.samples.len().is_multiple_of(audio.channels) {
         return Err(AudioError::InvalidData(format!(
             "sample count {} is not divisible by channel count {}",
             audio.samples.len(),

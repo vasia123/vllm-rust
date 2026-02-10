@@ -90,20 +90,15 @@ pub trait VideoEncoder: Send + Sync + 'static {
 }
 
 /// Frame sampling strategy for videos.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum FrameSamplingStrategy {
     /// Sample frames uniformly across the video duration.
+    #[default]
     Uniform,
     /// Sample at a fixed frames-per-second rate.
     FixedFps(f32),
     /// Use keyframes only (I-frames).
     Keyframes,
-}
-
-impl Default for FrameSamplingStrategy {
-    fn default() -> Self {
-        Self::Uniform
-    }
 }
 
 /// Compute frame indices for uniform sampling.

@@ -32,18 +32,13 @@ pub struct AwqConfig {
 }
 
 /// AWQ kernel version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AwqVersion {
     /// GEMM version (batch matrix multiplication)
+    #[default]
     Gemm,
     /// GEMV version (matrix-vector multiplication, optimized for single-token decode)
     Gemv,
-}
-
-impl Default for AwqVersion {
-    fn default() -> Self {
-        Self::Gemm
-    }
 }
 
 impl AwqConfig {

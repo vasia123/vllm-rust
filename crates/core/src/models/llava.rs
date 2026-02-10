@@ -44,20 +44,15 @@ pub struct LLaVAConfig {
 }
 
 /// Which vision features to use from the encoder output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VisionSelectFeature {
     /// Use all features including CLS token (default for CLIP).
+    #[default]
     Default,
     /// Use only patch features (exclude CLS token).
     PatchOnly,
     /// Use only CLS token.
     ClsOnly,
-}
-
-impl Default for VisionSelectFeature {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl VisionSelectFeature {

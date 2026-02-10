@@ -329,7 +329,7 @@ pub fn check_marlin_supports_shape(
     }
 
     // Check group size divides input evenly
-    if group_size > 0 && (input_size % group_size as usize != 0) {
+    if group_size > 0 && !input_size.is_multiple_of(group_size as usize) {
         candle_core::bail!(
             "Marlin requires input_size ({}) to be divisible by group_size ({})",
             input_size,

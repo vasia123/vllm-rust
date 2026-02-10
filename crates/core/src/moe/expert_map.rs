@@ -87,7 +87,7 @@ impl ExpertMap {
         assert!(ep_size > 0, "ep_size must be > 0");
         assert!(ep_rank < ep_size, "ep_rank must be < ep_size");
         assert!(
-            num_experts % ep_size == 0,
+            num_experts.is_multiple_of(ep_size),
             "num_experts ({}) must be divisible by ep_size ({})",
             num_experts,
             ep_size

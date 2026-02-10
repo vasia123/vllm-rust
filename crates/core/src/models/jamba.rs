@@ -130,7 +130,7 @@ impl JambaConfig {
             return false;
         }
         layer_idx >= self.attn_layer_offset
-            && (layer_idx - self.attn_layer_offset) % self.attn_layer_period == 0
+            && (layer_idx - self.attn_layer_offset).is_multiple_of(self.attn_layer_period)
     }
 }
 
