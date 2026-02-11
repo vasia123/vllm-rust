@@ -36,6 +36,10 @@ pub enum QuantizationMethod {
     Torchao,
     /// ModelOpt quantization (NVIDIA MXFP8)
     ModelOpt,
+    /// ExpertsInt8: online INT8 quantization for MoE expert weights (W8A16)
+    ExpertsInt8,
+    /// MoeWNA16: GPTQ/AWQ weight-only INT4/INT8 for MoE experts
+    MoeWNA16,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -52,6 +56,8 @@ impl std::fmt::Display for QuantizationMethod {
             Self::CompressedTensors => write!(f, "compressed-tensors"),
             Self::Torchao => write!(f, "torchao"),
             Self::ModelOpt => write!(f, "modelopt"),
+            Self::ExpertsInt8 => write!(f, "experts_int8"),
+            Self::MoeWNA16 => write!(f, "moe_wna16"),
         }
     }
 }

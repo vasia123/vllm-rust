@@ -81,28 +81,173 @@ pub(crate) trait ExecutionStrategy: Send {
     }
 }
 
-/// Unified engine loop that works with any ExecutionStrategy.
-pub async fn run_engine_loop<S: ExecutionStrategy>(
-    mut strategy: S,
-    mut state: OwnedExecutionState,
-    mut kv_cache_mgr: KVCacheManager,
-    config: EngineConfig,
-    tokenizer: crate::tokenizer::TokenizerWrapper,
-    mut cmd_rx: mpsc::Receiver<EngineCommand>,
+// ─── Engine Step Execution ───────────────────────────────────────────────
+
+/// Execute one complete engine step: preemptions, prefills, decodes,
+/// stream token delivery, completion checking, and request finalization.
+///
+/// This function runs inside `spawn_blocking` so the tokio async runtime
+/// stays free during GPU work. All channel sends within are non-blocking
+/// (`send` for oneshot, `try_send` for mpsc).
+fn execute_engine_step<S: ExecutionStrategy>(
+    strategy: &mut S,
+    state: &mut OwnedExecutionState,
+    kv_cache_mgr: &mut KVCacheManager,
+    tokenizer: &TokenizerWrapper,
+    output: &SchedulerOutput,
+    multi_step_count: usize,
 ) {
     use super::helpers::{
         build_generation_result, check_beam_finished, check_finished, finalize_beam_request,
-        handle_command, is_beam_request, send_stream_token,
+        is_beam_request, send_stream_token,
     };
     use super::types::ResponseChannel;
     use crate::request::FinishReason;
 
-    // Initialize prefix cache on the KVCacheManager so all prefix operations
-    // (match, register, release, eviction) are coordinated through the manager's
-    // block pool. This ensures eviction can reclaim cached blocks when needed.
+    // Handle preemptions
+    strategy.handle_preemptions(output, state, kv_cache_mgr);
+
+    // Execute prefills
+    strategy.execute_prefills(output, state, kv_cache_mgr, tokenizer);
+
+    // Send stream tokens after prefill
+    for schedule in &output.prefill_requests {
+        send_stream_token(schedule.request_id, tokenizer, &mut state.requests);
+    }
+
+    // Execute decodes
+    strategy.execute_decodes(output, state, kv_cache_mgr, multi_step_count, tokenizer);
+
+    // Send stream tokens after decode
+    for &req_id in &output.decode_requests {
+        if state.requests.contains_key(&req_id) {
+            send_stream_token(req_id, tokenizer, &mut state.requests);
+        }
+    }
+
+    // Check completion
+    let mut finished = Vec::new();
+    let scheduled_ids: Vec<RequestId> = output
+        .prefill_requests
+        .iter()
+        .map(|s| s.request_id)
+        .chain(output.decode_requests.iter().copied())
+        .collect();
+    for &req_id in &scheduled_ids {
+        if let Some(req) = state.requests.get(&req_id) {
+            let check = if is_beam_request(req) {
+                check_beam_finished(req)
+            } else {
+                check_finished(&req.state, tokenizer)
+            };
+            if let Some(check) = check {
+                finished.push((req_id, check));
+            }
+        }
+    }
+
+    // Finalize completed requests
+    for (req_id, check) in finished {
+        strategy.on_request_completed(req_id, state);
+
+        let Some(mut req) = state.requests.remove(&req_id) else {
+            continue;
+        };
+        state.scheduler.remove_request(req_id);
+
+        let (mut text, finish_reason) = if req.beam_state.is_some() {
+            finalize_beam_request(&mut req, kv_cache_mgr, tokenizer)
+        } else {
+            let text = tokenizer
+                .decode(&req.state.generated_token_ids)
+                .unwrap_or_default();
+            (text, check.reason)
+        };
+
+        let block_ids = req.state.block_table.release();
+        if kv_cache_mgr.has_prefix_cache() {
+            kv_cache_mgr.register_prefix(&req.state.prompt_token_ids, &block_ids);
+            let to_free = kv_cache_mgr.release_prefix(&req.state.prompt_token_ids, &block_ids);
+            if !to_free.is_empty() {
+                if let Err(e) = kv_cache_mgr.free_blocks(&to_free) {
+                    warn!(error = %e, blocks = ?to_free, "Failed to free uncached blocks");
+                }
+            }
+
+            if let Some(cache) = kv_cache_mgr.prefix_cache_mut() {
+                cache.record_request(
+                    req.state.prompt_token_ids.len(),
+                    req.state
+                        .num_computed_tokens
+                        .min(req.state.prompt_token_ids.len()),
+                );
+            }
+        } else if !block_ids.is_empty() {
+            if let Err(e) = kv_cache_mgr.free_blocks(&block_ids) {
+                warn!(error = %e, blocks = ?block_ids, "Failed to free cache blocks");
+            }
+        }
+
+        if check.trim_bytes > 0 {
+            let new_len = text.len().saturating_sub(check.trim_bytes);
+            text.truncate(new_len);
+        }
+
+        if finish_reason == FinishReason::Stop && !req.state.stop_token_ids.is_empty() {
+            if let Some(&last) = req.state.generated_token_ids.last() {
+                if req.state.stop_token_ids.contains(&last) {
+                    req.state.generated_token_ids.pop();
+                }
+            }
+        }
+
+        let stop_reason = check.stop_reason;
+        match req.response {
+            ResponseChannel::Complete(tx) => {
+                let result = build_generation_result(
+                    req_id,
+                    text,
+                    &mut req.state,
+                    finish_reason,
+                    stop_reason,
+                );
+                let _ = tx.send(Ok(result));
+            }
+            ResponseChannel::Stream(tx) => {
+                let _ = tx.try_send(super::types::StreamEvent::Done {
+                    finish_reason,
+                    generated_text: text,
+                    stop_reason,
+                });
+            }
+        }
+    }
+}
+
+// ─── Engine Loop ─────────────────────────────────────────────────────────
+
+/// Pipelined engine loop that works with any ExecutionStrategy.
+///
+/// Model execution (prefills + decodes) runs in `tokio::task::spawn_blocking`
+/// to free the async runtime during GPU work. Incoming commands are buffered
+/// via `tokio::select!` while the blocking task runs and processed once
+/// execution completes. See ADR-0006 for the design rationale.
+pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
+    mut strategy: S,
+    mut state: OwnedExecutionState,
+    mut kv_cache_mgr: KVCacheManager,
+    config: EngineConfig,
+    mut tokenizer: crate::tokenizer::TokenizerWrapper,
+    mut cmd_rx: mpsc::Receiver<EngineCommand>,
+) {
+    use super::helpers::handle_command;
+
     if config.enable_prefix_caching && !kv_cache_mgr.has_prefix_cache() {
         kv_cache_mgr.enable_prefix_cache();
     }
+
+    let multi_step_count = config.multi_step_count;
+    let block_size = config.block_size;
 
     // Pause state: `paused` rejects new requests, `frozen` skips scheduling.
     let mut paused = false;
@@ -119,7 +264,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &tokenizer,
                         &mut state.scheduler,
                         &mut state.requests,
-                        config.block_size,
+                        block_size,
                         &mut kv_cache_mgr,
                         &mut paused,
                         &mut frozen,
@@ -144,7 +289,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &tokenizer,
                         &mut state.scheduler,
                         &mut state.requests,
-                        config.block_size,
+                        block_size,
                         &mut kv_cache_mgr,
                         &mut paused,
                         &mut frozen,
@@ -168,7 +313,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
                         &tokenizer,
                         &mut state.scheduler,
                         &mut state.requests,
-                        config.block_size,
+                        block_size,
                         &mut kv_cache_mgr,
                         &mut paused,
                         &mut frozen,
@@ -192,133 +337,65 @@ pub async fn run_engine_loop<S: ExecutionStrategy>(
             .scheduler
             .schedule(&states_view, kv_cache_mgr.num_free_blocks());
 
-        // Phase 4: Handle preemptions
-        strategy.handle_preemptions(&output, &mut state, &mut kv_cache_mgr);
+        // Phase 4: Execute in spawn_blocking, buffer commands concurrently.
+        //
+        // All GPU-facing state (strategy, execution state, KV cache, tokenizer)
+        // moves into the blocking thread pool. The async task remains free to
+        // receive new commands via the channel. When execution returns, we
+        // reclaim ownership and process the buffered commands.
+        let exec_future = tokio::task::spawn_blocking(move || {
+            execute_engine_step(
+                &mut strategy,
+                &mut state,
+                &mut kv_cache_mgr,
+                &tokenizer,
+                &output,
+                multi_step_count,
+            );
+            (strategy, state, kv_cache_mgr, tokenizer)
+        });
 
-        // Phase 5: Execute prefills
-        strategy.execute_prefills(&output, &mut state, &mut kv_cache_mgr, &tokenizer);
+        let mut pending_cmds: Vec<EngineCommand> = Vec::new();
+        tokio::pin!(exec_future);
 
-        // Send stream tokens after prefill
-        for schedule in &output.prefill_requests {
-            send_stream_token(schedule.request_id, &tokenizer, &mut state.requests);
-        }
+        loop {
+            tokio::select! {
+                biased;
 
-        // Phase 6: Execute decodes
-        strategy.execute_decodes(
-            &output,
-            &mut state,
-            &mut kv_cache_mgr,
-            config.multi_step_count,
-            &tokenizer,
-        );
+                result = &mut exec_future => {
+                    let (s, st, kv, tok) = result.expect("engine execution task panicked");
+                    strategy = s;
+                    state = st;
+                    kv_cache_mgr = kv;
+                    tokenizer = tok;
+                    break;
+                }
 
-        // Send stream tokens after decode
-        for &req_id in &output.decode_requests {
-            if state.requests.contains_key(&req_id) {
-                send_stream_token(req_id, &tokenizer, &mut state.requests);
-            }
-        }
-
-        // Phase 7: Check completion
-        let mut finished = Vec::new();
-        let scheduled_ids: Vec<RequestId> = output
-            .prefill_requests
-            .iter()
-            .map(|s| s.request_id)
-            .chain(output.decode_requests.iter().copied())
-            .collect();
-        for &req_id in &scheduled_ids {
-            if let Some(req) = state.requests.get(&req_id) {
-                let check = if is_beam_request(req) {
-                    check_beam_finished(req)
-                } else {
-                    check_finished(&req.state, &tokenizer)
-                };
-                if let Some(check) = check {
-                    finished.push((req_id, check));
+                // Buffer incoming commands while GPU runs. If the channel
+                // closes (all senders dropped), the pattern fails and this
+                // branch is disabled — select then waits solely on exec_future.
+                Some(cmd) = cmd_rx.recv() => {
+                    pending_cmds.push(cmd);
                 }
             }
         }
 
-        // Phase 8: Finalize completed requests
-        for (req_id, check) in finished {
-            // Let strategy clean up owned resources (e.g., draft cache)
-            strategy.on_request_completed(req_id, &mut state);
-
-            let Some(mut req) = state.requests.remove(&req_id) else {
-                continue;
-            };
-            state.scheduler.remove_request(req_id);
-
-            // Beam search finalization: select best hypothesis and free beam block tables
-            let (mut text, finish_reason) = if req.beam_state.is_some() {
-                finalize_beam_request(&mut req, &mut kv_cache_mgr, &tokenizer)
-            } else {
-                let text = tokenizer
-                    .decode(&req.state.generated_token_ids)
-                    .unwrap_or_default();
-                (text, check.reason)
-            };
-
-            let block_ids = req.state.block_table.release();
-            if kv_cache_mgr.has_prefix_cache() {
-                kv_cache_mgr.register_prefix(&req.state.prompt_token_ids, &block_ids);
-                let to_free = kv_cache_mgr.release_prefix(&req.state.prompt_token_ids, &block_ids);
-                if !to_free.is_empty() {
-                    if let Err(e) = kv_cache_mgr.free_blocks(&to_free) {
-                        warn!(error = %e, blocks = ?to_free, "Failed to free uncached blocks");
-                    }
-                }
-
-                if let Some(cache) = kv_cache_mgr.prefix_cache_mut() {
-                    cache.record_request(
-                        req.state.prompt_token_ids.len(),
-                        req.state
-                            .num_computed_tokens
-                            .min(req.state.prompt_token_ids.len()),
-                    );
-                }
-            } else if !block_ids.is_empty() {
-                if let Err(e) = kv_cache_mgr.free_blocks(&block_ids) {
-                    warn!(error = %e, blocks = ?block_ids, "Failed to free cache blocks");
-                }
-            }
-
-            if check.trim_bytes > 0 {
-                let new_len = text.len().saturating_sub(check.trim_bytes);
-                text.truncate(new_len);
-            }
-
-            if finish_reason == FinishReason::Stop && !req.state.stop_token_ids.is_empty() {
-                if let Some(&last) = req.state.generated_token_ids.last() {
-                    if req.state.stop_token_ids.contains(&last) {
-                        req.state.generated_token_ids.pop();
-                    }
-                }
-            }
-
-            let stop_reason = check.stop_reason;
-            match req.response {
-                ResponseChannel::Complete(tx) => {
-                    let result = build_generation_result(
-                        req_id,
-                        text,
-                        &mut req.state,
-                        finish_reason,
-                        stop_reason,
-                    );
-                    let _ = tx.send(Ok(result));
-                }
-                ResponseChannel::Stream(tx) => {
-                    let _ = tx.try_send(super::types::StreamEvent::Done {
-                        finish_reason,
-                        generated_text: text,
-                        stop_reason,
-                    });
-                }
+        // Phase 5: Process commands that arrived during execution
+        for cmd in pending_cmds {
+            if handle_command(
+                cmd,
+                &mut state.next_id,
+                &tokenizer,
+                &mut state.scheduler,
+                &mut state.requests,
+                block_size,
+                &mut kv_cache_mgr,
+                &mut paused,
+                &mut frozen,
+                strategy.spec_decode_stats(),
+            ) {
+                return; // shutdown
             }
         }
-
-        tokio::task::yield_now().await;
     }
 }

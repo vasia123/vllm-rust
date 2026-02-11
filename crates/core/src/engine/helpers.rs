@@ -221,6 +221,7 @@ fn admit_request(
     state.num_top_logprobs = request.logprobs.map(|n| n as usize);
     state.echo = request.echo;
     state.lora_request = request.lora_request;
+    state.prompt_adapter_request = request.prompt_adapter_request;
     state.constraint = request.constraint;
 
     // Check prefix cache for reusable blocks via the KVCacheManager
@@ -423,6 +424,53 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     }
 
     Ok(())
+}
+
+/// Reclaim KV cache blocks that are entirely outside the sliding window.
+///
+/// For each request in the batch, computes how many leading blocks are
+/// no longer needed based on the sequence's current token count and the
+/// sliding window size. Replaces those blocks with `NULL_BLOCK` in the
+/// block table and returns them to the free pool.
+///
+/// This is called before block allocation in the decode step to maximize
+/// available blocks. No-op if `sliding_window` is `None`.
+pub(crate) fn reclaim_sliding_window_blocks(
+    request_ids: &[RequestId],
+    sliding_window: Option<usize>,
+    block_size: usize,
+    kv_cache_mgr: &mut KVCacheManager,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+) {
+    let window = match sliding_window {
+        Some(w) => w,
+        None => return,
+    };
+
+    for &req_id in request_ids {
+        let Some(req) = requests.get_mut(&req_id) else {
+            continue;
+        };
+        let total_tokens = req.state.block_table.num_tokens();
+        if total_tokens <= window {
+            continue;
+        }
+        // Tokens [0, num_skipped) are entirely outside the window
+        let num_skipped_tokens = total_tokens - window;
+        let num_skipped_blocks = num_skipped_tokens / block_size;
+        let already_null = req.state.block_table.num_null_blocks();
+        if num_skipped_blocks <= already_null {
+            continue;
+        }
+        let freed = req
+            .state
+            .block_table
+            .reclaim_leading_blocks(num_skipped_blocks);
+        if !freed.is_empty() {
+            // Ignore errors — blocks should always be freeable
+            let _ = kv_cache_mgr.free_blocks(&freed);
+        }
+    }
 }
 
 pub(crate) fn execute_decode<M: ModelForward>(
@@ -670,6 +718,92 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         }
     };
 
+    // Step 5: Sample tokens and update state.
+    //
+    // GPU fast path: if all sequences are GPU-eligible (no penalties, logit bias,
+    // constraints, logprobs, or bad words), sample entirely on GPU. Only the
+    // final token IDs ([batch_size] u32) are transferred back — not the full
+    // [batch_size, vocab_size] logit matrix.
+    let all_gpu_eligible = batch_ids.iter().all(|&id| {
+        requests.get(&id).is_some_and(|r| {
+            r.state.sampling_params.gpu_eligible()
+                && r.state.num_top_logprobs.is_none()
+                && r.state.constraint.is_none()
+                && r.state
+                    .sampling_params
+                    .bad_words_token_ids
+                    .as_ref()
+                    .is_none_or(|bw| bw.is_empty())
+        })
+    });
+
+    if all_gpu_eligible && sampling::gpu::gpu_sampling_available(last_logits.device()) {
+        // Pre-generate random values (needs mutable access to sampler_state)
+        let rand_vals: Vec<f32> = batch_ids
+            .iter()
+            .map(|&id| {
+                let req = requests.get_mut(&id).unwrap();
+                if req.state.sampling_params.is_greedy() {
+                    0.0
+                } else {
+                    req.state.sampler_state.next_rand_f32()
+                }
+            })
+            .collect();
+
+        // Build per-sequence GPU sampling configs (immutable borrow)
+        let configs: Vec<sampling::gpu::GpuSamplingConfig> = batch_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let params = &requests[&id].state.sampling_params;
+                if params.is_greedy() {
+                    sampling::gpu::GpuSamplingConfig {
+                        inv_temperature: 0.0,
+                        top_k: 0,
+                        top_p: 1.0,
+                        rand_val: 0.0,
+                    }
+                } else {
+                    sampling::gpu::GpuSamplingConfig {
+                        inv_temperature: 1.0 / params.temperature.max(1e-6),
+                        top_k: params.top_k as i32,
+                        top_p: params.top_p,
+                        rand_val: rand_vals[i],
+                    }
+                }
+            })
+            .collect();
+
+        match sampling::gpu::gpu_sample_batch(&last_logits, &configs) {
+            Ok(token_ids) => {
+                for (i, &req_id) in batch_ids.iter().enumerate() {
+                    let Some(req) = requests.get_mut(&req_id) else {
+                        failed.push(req_id);
+                        continue;
+                    };
+                    req.state.block_table.advance(1);
+                    req.state.seqlen_offset += 1;
+                    req.state.generated_token_ids.push(token_ids[i]);
+                }
+                return failed;
+            }
+            Err(_) => {
+                // Fall through to CPU path on GPU sampling failure
+            }
+        }
+    }
+
+    // CPU path: transfer logits and sample per-sequence
+    let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
+        Ok(v) => v.into_iter().flatten().collect(),
+        Err(_) => {
+            failed.extend(&batch_ids);
+            return failed;
+        }
+    };
+    let vocab_size = last_logits.dims()[1];
+
     let all_greedy = batch_ids.iter().all(|&id| {
         requests
             .get(&id)
@@ -683,16 +817,6 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             .unwrap_or(false)
     });
 
-    let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
-        Ok(v) => v.into_iter().flatten().collect(),
-        Err(_) => {
-            failed.extend(&batch_ids);
-            return failed;
-        }
-    };
-    let vocab_size = last_logits.dims()[1];
-
-    // Step 5: Sample tokens and update state
     if all_greedy && !any_need_logprobs {
         for (i, &req_id) in batch_ids.iter().enumerate() {
             let Some(req) = requests.get_mut(&req_id) else {
@@ -1334,5 +1458,140 @@ mod tests {
         let check = check_finished(&state, &tok).unwrap();
         assert_eq!(check.reason, FinishReason::Stop);
         assert_eq!(check.stop_reason, Some(42));
+    }
+
+    // ---- Sliding window reclamation tests ----
+
+    fn make_active_request_with_blocks(
+        block_ids: &[usize],
+        num_tokens: usize,
+        block_size: usize,
+    ) -> ActiveRequest {
+        use crate::engine::types::ResponseChannel;
+        use crate::kv_cache::BlockTable;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut state = crate::request::SequenceState::new(
+            1,
+            vec![0; num_tokens],
+            100,
+            0,
+            block_size,
+            0,
+        );
+        state.block_table = {
+            let mut bt = BlockTable::new(block_size);
+            bt.append_blocks(block_ids);
+            bt.advance(num_tokens);
+            bt
+        };
+        state.seqlen_offset = num_tokens;
+        ActiveRequest {
+            state,
+            response: ResponseChannel::Complete(tx),
+            num_streamed_tokens: 0,
+            streamed_text_len: 0,
+            beam_state: None,
+        }
+    }
+
+    #[test]
+    fn test_reclaim_sliding_window_none_is_noop() {
+        use candle_core::{DType, Device};
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+
+        let config = CacheConfig {
+            block_size: 4, num_blocks: 16, num_layers: 1,
+            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
+            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+        let mut requests = HashMap::new();
+        let req = make_active_request_with_blocks(&[0, 1, 2, 3], 16, 4);
+        requests.insert(1, req);
+
+        reclaim_sliding_window_blocks(&[1], None, 4, &mut mgr, &mut requests);
+        // No change — sliding_window is None
+        assert_eq!(requests[&1].state.block_table.num_null_blocks(), 0);
+    }
+
+    #[test]
+    fn test_reclaim_sliding_window_reclaims_blocks() {
+        use candle_core::{DType, Device};
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+
+        let config = CacheConfig {
+            block_size: 4, num_blocks: 16, num_layers: 1,
+            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
+            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        // Allocate 4 blocks (blocks 0-3) for a 16-token sequence
+        let mut requests = HashMap::new();
+        let mut table = crate::kv_cache::BlockTable::new(4);
+        mgr.allocate_for_request(&mut table, 16).unwrap();
+        table.advance(16);
+        let block_ids: Vec<usize> = table.block_ids().to_vec();
+        assert_eq!(block_ids.len(), 4);
+
+        let mut req = make_active_request_with_blocks(&block_ids, 16, 4);
+        req.state.block_table = table;
+        requests.insert(1, req);
+
+        assert_eq!(mgr.num_free_blocks(), 12); // 16 - 4
+
+        // sliding_window = 8 → 16 - 8 = 8 skipped tokens → 8/4 = 2 blocks to reclaim
+        reclaim_sliding_window_blocks(&[1], Some(8), 4, &mut mgr, &mut requests);
+
+        assert_eq!(requests[&1].state.block_table.num_null_blocks(), 2);
+        assert_eq!(mgr.num_free_blocks(), 14); // 12 + 2 reclaimed
+    }
+
+    #[test]
+    fn test_reclaim_sliding_window_within_window_is_noop() {
+        use candle_core::{DType, Device};
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+
+        let config = CacheConfig {
+            block_size: 4, num_blocks: 16, num_layers: 1,
+            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
+            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+        let mut requests = HashMap::new();
+        // 8 tokens, window = 10 → nothing to reclaim
+        let req = make_active_request_with_blocks(&[0, 1], 8, 4);
+        requests.insert(1, req);
+
+        reclaim_sliding_window_blocks(&[1], Some(10), 4, &mut mgr, &mut requests);
+        assert_eq!(requests[&1].state.block_table.num_null_blocks(), 0);
+    }
+
+    #[test]
+    fn test_reclaim_sliding_window_partial_block() {
+        use candle_core::{DType, Device};
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+
+        let config = CacheConfig {
+            block_size: 4, num_blocks: 16, num_layers: 1,
+            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
+            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+        let mut requests = HashMap::new();
+        // 10 tokens, window = 8 → 2 skipped tokens → 2/4 = 0 blocks (partial, not full)
+        let req = make_active_request_with_blocks(&[0, 1, 2], 10, 4);
+        requests.insert(1, req);
+
+        reclaim_sliding_window_blocks(&[1], Some(8), 4, &mut mgr, &mut requests);
+        assert_eq!(requests[&1].state.block_table.num_null_blocks(), 0);
     }
 }

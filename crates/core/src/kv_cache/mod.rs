@@ -15,7 +15,7 @@ pub mod prefix_cache_stats;
 pub mod quantization;
 
 pub use block_metrics::{BlockEvictionEvent, BlockMetricsCollector, BlockMetricsState};
-pub use block_pool::BlockId;
+pub use block_pool::{BlockId, NULL_BLOCK};
 pub use block_table::BlockTable;
 pub use cache_engine::CacheEngine;
 pub use config::{CacheConfig, KVCacheLayout};
@@ -373,11 +373,17 @@ impl KVCacheManager {
         self.block_pool.num_total()
     }
 
-    /// Free specific blocks back to the pool (used during speculative decode rollback).
+    /// Free specific blocks back to the pool (used during speculative decode rollback
+    /// and sliding window reclamation). Silently skips `NULL_BLOCK` sentinels.
     pub fn free_blocks(&mut self, block_ids: &[BlockId]) -> Result<(), CacheError> {
-        if !block_ids.is_empty() {
-            self.metrics.record_free(block_ids.len());
-            self.block_pool.free(block_ids)?;
+        let real_blocks: Vec<BlockId> = block_ids
+            .iter()
+            .copied()
+            .filter(|&id| id != NULL_BLOCK)
+            .collect();
+        if !real_blocks.is_empty() {
+            self.metrics.record_free(real_blocks.len());
+            self.block_pool.free(&real_blocks)?;
         }
         Ok(())
     }

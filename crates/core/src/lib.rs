@@ -9,6 +9,7 @@ pub mod layers;
 pub mod loader;
 pub mod lora;
 pub mod models;
+pub mod prompt_adapter;
 pub mod moe;
 pub mod multimodal;
 pub mod quantization;

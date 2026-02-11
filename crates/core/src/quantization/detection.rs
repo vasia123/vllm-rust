@@ -125,6 +125,8 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("squeezellm") => QuantizationMethod::SqueezeLlm,
         Some("compressed-tensors") => QuantizationMethod::CompressedTensors,
         Some("torchao") => QuantizationMethod::Torchao,
+        Some("experts_int8") => QuantizationMethod::ExpertsInt8,
+        Some("moe_wna16") => QuantizationMethod::MoeWNA16,
         Some("modelopt") => {
             let quant_algo = quant_config
                 .get("quantization")
@@ -217,6 +219,8 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "squeezellm" => QuantizationMethod::SqueezeLlm,
                 "compressed-tensors" => QuantizationMethod::CompressedTensors,
                 "torchao" => QuantizationMethod::Torchao,
+                "experts_int8" => QuantizationMethod::ExpertsInt8,
+                "moe_wna16" => QuantizationMethod::MoeWNA16,
                 "modelopt" => {
                     let quant_algo = quant_config
                         .get("quantization")
@@ -375,5 +379,33 @@ mod tests {
 
         let detected = detect_from_json(&config);
         assert_eq!(detected.method, QuantizationMethod::None);
+    }
+
+    #[test]
+    fn test_detect_experts_int8_from_json() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "experts_int8"
+            }
+        });
+
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::ExpertsInt8);
+    }
+
+    #[test]
+    fn test_detect_moe_wna16_from_json() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "moe_wna16",
+                "bits": 4,
+                "group_size": 128
+            }
+        });
+
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::MoeWNA16);
+        assert_eq!(detected.bits, Some(4));
+        assert_eq!(detected.group_size, Some(128));
     }
 }

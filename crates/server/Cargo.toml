@@ -32,6 +32,7 @@ async-trait = "0.1"
 prometheus = "0.13"
 once_cell = "1.19"
 governor = "0.6"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 [dev-dependencies]
 vllm-core = { path = "../core", features = ["test-utils"] }

@@ -138,6 +138,7 @@ fn test_engine_config() -> EngineConfig {
         multi_step_count: 1,
         enable_prefix_caching: false,
         cuda_graph_config: CudaGraphConfig::default(),
+        sliding_window: None,
     }
 }
 
@@ -152,7 +153,9 @@ fn make_request(prompt: &str, max_new_tokens: usize, eos_token_id: u32) -> Gener
         include_stop_str_in_output: false,
         logprobs: None,
         echo: false,
+        ignore_eos: false,
         lora_request: None,
+        prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
     }
@@ -312,7 +315,9 @@ async fn test_engine_generation_stops_at_stop_token() {
         include_stop_str_in_output: false,
         logprobs: None,
         echo: false,
+        ignore_eos: false,
         lora_request: None,
+        prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
     };
@@ -364,7 +369,9 @@ async fn test_engine_generation_stops_at_stop_string() {
         include_stop_str_in_output: false,
         logprobs: None,
         echo: false,
+        ignore_eos: false,
         lora_request: None,
+        prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
     };

@@ -14,7 +14,7 @@ use super::cuda_graph::CudaGraphDispatcher;
 use super::cuda_graph_runner::CudaGraphRunner;
 use super::helpers::{
     execute_batched_decode_with_graph, execute_beam_decode, execute_prefill,
-    finish_request_with_error, is_beam_request,
+    finish_request_with_error, is_beam_request, reclaim_sliding_window_blocks,
 };
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
@@ -31,6 +31,10 @@ pub struct StandardExecution<M: ModelForward> {
     /// CUDA graph runner for optimized decode execution.
     /// Wrapped in Arc for shared access during decode operations.
     graph_runner: Option<Arc<CudaGraphRunner>>,
+    /// Sliding window size for KV cache reclamation.
+    sliding_window: Option<usize>,
+    /// Block size for sliding window reclamation math.
+    block_size: usize,
 }
 
 impl<M: ModelForward> StandardExecution<M> {
@@ -38,7 +42,15 @@ impl<M: ModelForward> StandardExecution<M> {
         Self {
             model,
             graph_runner: None,
+            sliding_window: None,
+            block_size: 16,
         }
+    }
+
+    pub fn with_sliding_window(mut self, sliding_window: Option<usize>, block_size: usize) -> Self {
+        self.sliding_window = sliding_window;
+        self.block_size = block_size;
+        self
     }
 
     // ─── Warmup Methods ───────────────────────────────────────────────────
@@ -289,6 +301,15 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
 
         // Execute regular batched decode
         if !regular_ids.is_empty() {
+            // Reclaim blocks outside sliding window before allocation
+            reclaim_sliding_window_blocks(
+                &regular_ids,
+                self.sliding_window,
+                self.block_size,
+                kv_cache_mgr,
+                &mut state.requests,
+            );
+
             let num_steps = multi_step_count.max(1);
             let mut active_decode_ids = regular_ids;
 

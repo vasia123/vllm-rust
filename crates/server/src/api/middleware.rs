@@ -225,6 +225,82 @@ pub async fn reject_during_restart(
     next.run(request).await
 }
 
+/// State for API key authentication middleware.
+#[derive(Clone)]
+pub struct ApiKeyState {
+    /// The expected API key. None means no authentication required.
+    pub api_key: Option<Arc<String>>,
+}
+
+impl ApiKeyState {
+    /// Create an API key state with a required key.
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key: Some(Arc::new(api_key)),
+        }
+    }
+
+    /// Create an API key state with no authentication.
+    pub fn disabled() -> Self {
+        Self { api_key: None }
+    }
+}
+
+/// Paths that are excluded from API key authentication.
+const AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/version", "/metrics"];
+
+/// Middleware that checks for a valid API key in the `Authorization: Bearer <key>` header.
+///
+/// Excluded paths (health, version, metrics) are always allowed without auth.
+/// Returns 401 Unauthorized if the key is missing or invalid.
+pub async fn api_key_auth(
+    State(state): State<ApiKeyState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let expected_key = match &state.api_key {
+        Some(key) => key,
+        None => return next.run(request).await, // No auth configured
+    };
+
+    let path = request.uri().path();
+    if AUTH_EXEMPT_PATHS.contains(&path) {
+        return next.run(request).await;
+    }
+
+    let auth_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.starts_with("Bearer ") => {
+            let provided_key = &header[7..];
+            if provided_key == expected_key.as_str() {
+                next.run(request).await
+            } else {
+                unauthorized_response("Invalid API key")
+            }
+        }
+        Some(_) => unauthorized_response("Authorization header must use Bearer scheme"),
+        None => unauthorized_response("Missing Authorization header"),
+    }
+}
+
+fn unauthorized_response(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "authentication_error",
+                "code": "invalid_api_key"
+            }
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +476,103 @@ mod tests {
             .expect("header value must be valid UTF-8");
 
         assert_eq!(echoed, client_id);
+    }
+
+    // ─── API key auth tests ───────────────────────────────────────────
+
+    fn app_with_api_key(key: &str) -> Router {
+        let state = ApiKeyState::new(key.to_string());
+        Router::new()
+            .route("/test", get(test_handler))
+            .route("/health", get(test_handler))
+            .route("/version", get(test_handler))
+            .route("/metrics", get(test_handler))
+            .layer(axum::middleware::from_fn_with_state(state, api_key_auth))
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_passes_with_valid_key() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/test")
+            .header("authorization", "Bearer secret123")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_rejects_invalid_key() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/test")
+            .header("authorization", "Bearer wrong-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_rejects_missing_header() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing"));
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_rejects_non_bearer_scheme() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/test")
+            .header("authorization", "Basic c2VjcmV0MTIz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_exempts_health() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/health").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_exempts_version() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/version").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_exempts_metrics() {
+        let app = app_with_api_key("secret123");
+        let req = Request::get("/metrics").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_disabled_allows_all() {
+        let state = ApiKeyState::disabled();
+        let app = Router::new()
+            .route("/test", get(test_handler))
+            .layer(axum::middleware::from_fn_with_state(state, api_key_auth));
+        let req = Request::get("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

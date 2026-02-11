@@ -122,6 +122,12 @@ pub fn quantization_info(files: &ModelFiles) -> String {
         QuantizationMethod::CompressedTensors => "Compressed-Tensors".to_string(),
         QuantizationMethod::Torchao => "TorchAO".to_string(),
         QuantizationMethod::ModelOpt => "ModelOpt (MXFP8)".to_string(),
+        QuantizationMethod::ExpertsInt8 => "ExpertsInt8 (W8A16 MoE)".to_string(),
+        QuantizationMethod::MoeWNA16 => {
+            let bits = files.quantization.bits.unwrap_or(4);
+            let group_size = files.quantization.group_size.unwrap_or(128);
+            format!("MoeWNA16 (bits: {}, group_size: {})", bits, group_size)
+        }
     }
 }
 

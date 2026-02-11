@@ -33,6 +33,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI struct parsed once at startup
 enum Command {
     /// Start the OpenAI-compatible HTTP server
     Serve {
@@ -108,6 +109,19 @@ enum Command {
         /// deepseek_v32, step3, qwen3coder
         #[arg(long, default_value = "hermes")]
         tool_call_parser: String,
+
+        /// Model name returned by /v1/models and echoed in responses.
+        /// Defaults to the model identifier.
+        #[arg(long)]
+        served_model_name: Option<String>,
+
+        /// Path to TLS certificate file (PEM format). Requires --ssl-keyfile.
+        #[arg(long)]
+        ssl_certfile: Option<String>,
+
+        /// Path to TLS private key file (PEM format). Requires --ssl-certfile.
+        #[arg(long)]
+        ssl_keyfile: Option<String>,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -168,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
             allowed_headers,
             max_body_size_mb,
             tool_call_parser,
+            served_model_name,
+            ssl_certfile,
+            ssl_keyfile,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = if model == "Qwen/Qwen3-0.6B" {
@@ -238,6 +255,15 @@ async fn main() -> anyhow::Result<()> {
                 allowed_headers,
             };
 
+            // Resolve served model name: CLI > config file > model identifier
+            let served_model_name = served_model_name
+                .or(file_config.served_model_name)
+                .unwrap_or_else(|| model.clone());
+
+            // TLS: CLI > config file
+            let ssl_certfile = ssl_certfile.or(file_config.ssl_certfile);
+            let ssl_keyfile = ssl_keyfile.or(file_config.ssl_keyfile);
+
             run_server(
                 model,
                 draft_model,
@@ -254,6 +280,9 @@ async fn main() -> anyhow::Result<()> {
                 cors_config,
                 max_body_size_mb,
                 tool_call_parser,
+                served_model_name,
+                ssl_certfile,
+                ssl_keyfile,
             )
             .await
         }
@@ -300,6 +329,9 @@ async fn run_server(
     cors_config: api::CorsConfig,
     max_body_size_mb: usize,
     tool_call_parser: String,
+    served_model_name: String,
+    ssl_certfile: Option<String>,
+    ssl_keyfile: Option<String>,
 ) -> anyhow::Result<()> {
     logging::init();
     prometheus::init_metrics();
@@ -433,6 +465,7 @@ async fn run_server(
             multi_step_count: 1,
             enable_prefix_caching,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+            sliding_window: None,
         };
 
         eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
@@ -457,6 +490,7 @@ async fn run_server(
             multi_step_count,
             enable_prefix_caching,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+            sliding_window: None,
         };
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
@@ -470,7 +504,7 @@ async fn run_server(
     let max_model_len = num_blocks * 16;
     let state = AppState::new(
         atomic_engine.clone(),
-        model_id.clone(),
+        served_model_name,
         tokenizer,
         chat_template,
         eos_token_id,
@@ -518,13 +552,52 @@ async fn run_server(
         max_body_size,
     );
     let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("Serving on http://{addr}/v1");
-    tracing::info!("Admin panel: http://{addr}/admin/");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Branch: TLS (axum-server with rustls) vs plain HTTP (axum::serve)
+    match (ssl_certfile, ssl_keyfile) {
+        (Some(certfile), Some(keyfile)) => {
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&certfile, &keyfile)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to load TLS config: {e}"))?;
+
+            let socket_addr: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid bind address '{addr}': {e}"))?;
+
+            tracing::info!("Serving on https://{addr}/v1 (TLS)");
+            tracing::info!("Admin panel: https://{addr}/admin/");
+
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(
+                    shutdown_timeout,
+                )));
+            });
+
+            axum_server::bind_rustls(socket_addr, tls_config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        (Some(_), None) => {
+            anyhow::bail!("--ssl-certfile requires --ssl-keyfile");
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("--ssl-keyfile requires --ssl-certfile");
+        }
+        (None, None) => {
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!("Serving on http://{addr}/v1");
+            tracing::info!("Admin panel: http://{addr}/admin/");
+
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
 
     tracing::info!(
         timeout_secs = shutdown_timeout,
@@ -644,6 +717,7 @@ async fn run_generate(
             multi_step_count: 1,
             enable_prefix_caching: false,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+            sliding_window: None,
         };
 
         eprintln!(
@@ -673,6 +747,7 @@ async fn run_generate(
             multi_step_count,
             enable_prefix_caching: false,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+            sliding_window: None,
         };
 
         eprintln!(

@@ -28,12 +28,100 @@ pub struct PrefixCache {
     sliding_window: SlidingWindowMetrics,
     /// Whether cache was reset (for sliding window signaling)
     was_reset: bool,
+    /// O(1) LRU eviction queue for unreferenced blocks
+    eviction_queue: EvictionQueue,
 }
 
 struct CachedBlock {
     block_id: BlockId,
     ref_count: usize,
     last_access: u64,
+    /// Token content of this block, used to verify hash matches and prevent collisions.
+    tokens: Vec<u32>,
+    /// Whether this block is in the eviction queue (ref_count == 0).
+    in_eviction_queue: bool,
+    /// Previous hash in the eviction LRU queue (None if head or not in queue).
+    eviction_prev: Option<u64>,
+    /// Next hash in the eviction LRU queue (None if tail or not in queue).
+    eviction_next: Option<u64>,
+}
+
+/// O(1) LRU eviction queue for unreferenced prefix cache blocks.
+///
+/// Maintains a doubly-linked list of block hashes ordered by last_access time.
+/// Head = least recently used (evict first), tail = most recently used.
+/// The prev/next pointers are stored inline in CachedBlock to avoid separate allocation.
+struct EvictionQueue {
+    head: Option<u64>,
+    tail: Option<u64>,
+    len: usize,
+}
+
+impl EvictionQueue {
+    fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            len: 0,
+        }
+    }
+
+    /// Append a hash to the tail of the eviction queue (most recently evictable).
+    fn append(&mut self, hash: u64, cache: &mut HashMap<u64, CachedBlock>) {
+        let entry = cache.get_mut(&hash).expect("append: hash not in cache");
+        debug_assert!(!entry.in_eviction_queue, "double-append to eviction queue");
+        entry.in_eviction_queue = true;
+        entry.eviction_prev = self.tail;
+        entry.eviction_next = None;
+
+        if let Some(old_tail) = self.tail {
+            cache.get_mut(&old_tail).expect("tail missing").eviction_next = Some(hash);
+        } else {
+            self.head = Some(hash);
+        }
+        self.tail = Some(hash);
+        self.len += 1;
+    }
+
+    /// Remove a hash from anywhere in the eviction queue.
+    fn remove(&mut self, hash: u64, cache: &mut HashMap<u64, CachedBlock>) {
+        let entry = cache.get(&hash).expect("remove: hash not in cache");
+        if !entry.in_eviction_queue {
+            return;
+        }
+        let prev = entry.eviction_prev;
+        let next = entry.eviction_next;
+
+        if let Some(p) = prev {
+            cache.get_mut(&p).expect("prev missing").eviction_next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(n) = next {
+            cache.get_mut(&n).expect("next missing").eviction_prev = prev;
+        } else {
+            self.tail = prev;
+        }
+
+        let entry = cache.get_mut(&hash).expect("remove: hash not in cache");
+        entry.in_eviction_queue = false;
+        entry.eviction_prev = None;
+        entry.eviction_next = None;
+        self.len -= 1;
+    }
+
+    /// Pop the least recently used hash from the head.
+    fn popleft(&mut self, cache: &mut HashMap<u64, CachedBlock>) -> Option<u64> {
+        let head = self.head?;
+        self.remove(head, cache);
+        Some(head)
+    }
+
+    fn clear(&mut self) {
+        self.head = None;
+        self.tail = None;
+        self.len = 0;
+    }
 }
 
 impl PrefixCache {
@@ -49,6 +137,7 @@ impl PrefixCache {
             stats: Arc::new(PrefixCacheStats::new()),
             sliding_window: SlidingWindowMetrics::new(Self::DEFAULT_WINDOW_SIZE),
             was_reset: false,
+            eviction_queue: EvictionQueue::new(),
         }
     }
 
@@ -62,6 +151,7 @@ impl PrefixCache {
             stats: Arc::new(PrefixCacheStats::new()),
             sliding_window: SlidingWindowMetrics::new(Self::DEFAULT_WINDOW_SIZE),
             was_reset: false,
+            eviction_queue: EvictionQueue::new(),
         }
     }
 
@@ -75,6 +165,7 @@ impl PrefixCache {
             stats: Arc::new(PrefixCacheStats::new()),
             sliding_window: SlidingWindowMetrics::new(window_size),
             was_reset: false,
+            eviction_queue: EvictionQueue::new(),
         }
     }
 
@@ -93,6 +184,7 @@ impl PrefixCache {
             stats,
             sliding_window: SlidingWindowMetrics::new(window_size),
             was_reset: false,
+            eviction_queue: EvictionQueue::new(),
         }
     }
 
@@ -110,16 +202,32 @@ impl PrefixCache {
     pub fn match_prefix(&mut self, prompt_tokens: &[u32]) -> (Vec<BlockId>, usize) {
         let hashes = compute_block_hashes(prompt_tokens, self.block_size);
         let mut matched_blocks = Vec::new();
+        let mut matched_hashes = Vec::new();
 
-        for hash in &hashes {
+        for (i, hash) in hashes.iter().enumerate() {
             if let Some(entry) = self.cache.get_mut(hash) {
+                // Verify token content to guard against hash collisions
+                let chunk_start = i * self.block_size;
+                let chunk = &prompt_tokens[chunk_start..chunk_start + self.block_size];
+                if entry.tokens != chunk {
+                    break; // hash collision — treat as cache miss
+                }
+                let was_evictable = entry.ref_count == 0;
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 entry.ref_count += 1;
                 matched_blocks.push(entry.block_id);
+                if was_evictable {
+                    matched_hashes.push(*hash);
+                }
             } else {
                 break; // prefix continuity broken
             }
+        }
+
+        // Remove newly-referenced blocks from eviction queue
+        for hash in matched_hashes {
+            self.eviction_queue.remove(hash, &mut self.cache);
         }
 
         // Record metrics: hits = matched blocks, misses = total needed - matched
@@ -168,12 +276,18 @@ impl PrefixCache {
             if i >= block_ids.len() {
                 break;
             }
+            let block_size = self.block_size;
+            let chunk_start = i * block_size;
             self.cache.entry(*hash).or_insert_with(|| {
                 self.access_counter += 1;
                 CachedBlock {
                     block_id: block_ids[i],
                     ref_count: 1, // Owner has a reference
                     last_access: self.access_counter,
+                    tokens: prompt_tokens[chunk_start..chunk_start + block_size].to_vec(),
+                    in_eviction_queue: false,
+                    eviction_prev: None,
+                    eviction_next: None,
                 }
             });
         }
@@ -193,50 +307,48 @@ impl PrefixCache {
             .collect();
 
         let mut to_free = Vec::new();
+        let mut newly_evictable = Vec::new();
         for &block_id in block_ids {
             if let Some(&hash) = cached_block_set.get(&block_id) {
                 if let Some(entry) = self.cache.get_mut(&hash) {
                     if entry.block_id == block_id {
                         entry.ref_count = entry.ref_count.saturating_sub(1);
+                        if entry.ref_count == 0 {
+                            newly_evictable.push(hash);
+                        }
                         continue;
                     }
                 }
             }
             to_free.push(block_id);
         }
+
+        // Add newly unreferenced blocks to eviction queue
+        for hash in newly_evictable {
+            self.eviction_queue.append(hash, &mut self.cache);
+        }
+
         to_free
     }
 
     /// Evict up to `count` unreferenced blocks from the cache (LRU order).
     ///
+    /// O(count) — pops from the head of the eviction queue.
     /// Returns the block IDs that were evicted (caller should free them to pool).
     pub fn evict(&mut self, count: usize) -> Vec<BlockId> {
-        if count == 0 {
-            return Vec::new();
+        let mut evicted = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.eviction_queue.popleft(&mut self.cache) {
+                Some(hash) => {
+                    if let Some(entry) = self.cache.remove(&hash) {
+                        evicted.push(entry.block_id);
+                    }
+                }
+                None => break, // no more evictable blocks
+            }
         }
 
-        // Collect evictable entries (ref_count == 0)
-        let mut evictable: Vec<(u64, u64, BlockId)> = self
-            .cache
-            .iter()
-            .filter(|(_, entry)| entry.ref_count == 0)
-            .map(|(&hash, entry)| (hash, entry.last_access, entry.block_id))
-            .collect();
-
-        // Sort by last_access ascending (LRU first)
-        evictable.sort_by_key(|&(_, access, _)| access);
-
-        let mut evicted = Vec::new();
-        for (hash, _, block_id) in evictable.into_iter().take(count) {
-            self.cache.remove(&hash);
-            evicted.push(block_id);
-        }
-
-        // Record eviction in internal stats
-        // Note: legacy KVCacheMetrics eviction is still recorded by the caller
-        // (KVCacheManager) to avoid double-counting when manager coordinates.
         self.stats.record_eviction(evicted.len());
-
         evicted
     }
 
@@ -245,9 +357,9 @@ impl PrefixCache {
         self.cache.len()
     }
 
-    /// Number of blocks with no active references (evictable).
+    /// Number of blocks with no active references (evictable). O(1).
     pub fn num_evictable_blocks(&self) -> usize {
-        self.cache.values().filter(|e| e.ref_count == 0).count()
+        self.eviction_queue.len
     }
 
     /// Get a snapshot of the detailed prefix cache statistics.
@@ -299,6 +411,7 @@ impl PrefixCache {
 
         self.cache.clear();
         self.access_counter = 0;
+        self.eviction_queue.clear();
 
         // Record eviction in stats
         self.stats.record_eviction(num_evicted);
@@ -849,5 +962,137 @@ mod tests {
 
         // Shared stats can be accessed externally
         assert_eq!(cache.stats().num_hits(), 1);
+    }
+
+    // ─── Hash collision guard tests ───────────────────────────────────────────
+
+    #[test]
+    fn hash_collision_causes_cache_miss() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register prefix [1, 2, 3, 4]
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+
+        // Manually insert a second entry with the SAME hash but different tokens.
+        // This simulates a hash collision.
+        let hash = compute_block_hashes(&[1, 2, 3, 4], 4)[0];
+        // Verify the hash exists
+        assert!(cache.cache.contains_key(&hash));
+
+        // Overwrite the token content to simulate a collision scenario:
+        // the hash matches but the tokens differ.
+        cache.cache.get_mut(&hash).unwrap().tokens = vec![9, 9, 9, 9];
+
+        // Now matching [1, 2, 3, 4] should fail because tokens don't match
+        let (matched, cached) = cache.match_prefix(&[1, 2, 3, 4]);
+        assert!(matched.is_empty());
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn hash_collision_breaks_prefix_chain() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register 2 blocks: [1,2,3,4] [5,6,7,8]
+        cache.register_blocks(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]);
+
+        // Corrupt the second block's token content
+        let hashes = compute_block_hashes(&[1, 2, 3, 4, 5, 6, 7, 8], 4);
+        cache.cache.get_mut(&hashes[1]).unwrap().tokens = vec![0, 0, 0, 0];
+
+        // First block matches, second block is a collision → only 1 matched
+        let (matched, cached) = cache.match_prefix(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(matched, vec![10]);
+        assert_eq!(cached, 4);
+    }
+
+    #[test]
+    fn registered_tokens_stored_correctly() {
+        let mut cache = PrefixCache::new(4);
+        cache.register_blocks(&[10, 20, 30, 40, 50, 60, 70, 80], &[1, 2]);
+
+        let hashes = compute_block_hashes(&[10, 20, 30, 40, 50, 60, 70, 80], 4);
+        assert_eq!(cache.cache[&hashes[0]].tokens, vec![10, 20, 30, 40]);
+        assert_eq!(cache.cache[&hashes[1]].tokens, vec![50, 60, 70, 80]);
+    }
+
+    // ─── O(1) eviction queue tests ────────────────────────────────────────────
+
+    #[test]
+    fn eviction_queue_tracks_unreferenced_blocks() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register 3 different prefixes
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        cache.register_blocks(&[5, 6, 7, 8], &[20]);
+        cache.register_blocks(&[9, 10, 11, 12], &[30]);
+
+        // All have ref_count=1 (owner), none evictable
+        assert_eq!(cache.eviction_queue.len, 0);
+        assert_eq!(cache.num_evictable_blocks(), 0);
+
+        // Release all owners → ref_count=0, should be in eviction queue
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+        cache.release_blocks(&[5, 6, 7, 8], &[20]);
+        cache.release_blocks(&[9, 10, 11, 12], &[30]);
+
+        assert_eq!(cache.eviction_queue.len, 3);
+        assert_eq!(cache.num_evictable_blocks(), 3);
+    }
+
+    #[test]
+    fn eviction_queue_removes_on_re_reference() {
+        let mut cache = PrefixCache::new(4);
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+
+        // Release owner → evictable
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+        assert_eq!(cache.num_evictable_blocks(), 1);
+
+        // Re-match → no longer evictable
+        cache.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!(cache.num_evictable_blocks(), 0);
+    }
+
+    #[test]
+    fn eviction_queue_lru_order() {
+        let mut cache = PrefixCache::new(4);
+
+        // Register 3 prefixes — released in order: A, B, C
+        cache.register_blocks(&[1, 2, 3, 4], &[10]); // A
+        cache.register_blocks(&[5, 6, 7, 8], &[20]); // B
+        cache.register_blocks(&[9, 10, 11, 12], &[30]); // C
+
+        // Release: A first (LRU), then B, then C (MRU)
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+        cache.release_blocks(&[5, 6, 7, 8], &[20]);
+        cache.release_blocks(&[9, 10, 11, 12], &[30]);
+
+        // Evict 1 → should get A's block (10, released first)
+        let evicted = cache.evict(1);
+        assert_eq!(evicted, vec![10]);
+
+        // Evict 1 → should get B's block (20)
+        let evicted = cache.evict(1);
+        assert_eq!(evicted, vec![20]);
+
+        // Evict 1 → should get C's block (30)
+        let evicted = cache.evict(1);
+        assert_eq!(evicted, vec![30]);
+
+        assert_eq!(cache.num_evictable_blocks(), 0);
+        assert_eq!(cache.num_cached_blocks(), 0);
+    }
+
+    #[test]
+    fn eviction_queue_clear_resets() {
+        let mut cache = PrefixCache::new(4);
+        cache.register_blocks(&[1, 2, 3, 4], &[10]);
+        cache.release_blocks(&[1, 2, 3, 4], &[10]);
+        assert_eq!(cache.num_evictable_blocks(), 1);
+
+        cache.clear();
+        assert_eq!(cache.num_evictable_blocks(), 0);
+        assert_eq!(cache.eviction_queue.len, 0);
     }
 }

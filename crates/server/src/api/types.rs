@@ -72,6 +72,9 @@ pub struct CompletionRequest {
     pub repetition_penalty: f32,
     #[serde(default)]
     pub min_p: f32,
+    /// Typical sampling threshold (0..1). 1.0 = disabled.
+    #[serde(default = "default_typical_p")]
+    pub typical_p: f32,
     /// Frequency penalty (OpenAI convention). Range: -2.0 to 2.0.
     #[serde(default)]
     pub frequency_penalty: f32,
@@ -294,6 +297,9 @@ pub struct ChatCompletionRequest {
     pub repetition_penalty: f32,
     #[serde(default)]
     pub min_p: f32,
+    /// Typical sampling threshold (0..1). 1.0 = disabled.
+    #[serde(default = "default_typical_p")]
+    pub typical_p: f32,
     /// Frequency penalty (OpenAI convention). Range: -2.0 to 2.0.
     #[serde(default)]
     pub frequency_penalty: f32,
@@ -719,6 +725,10 @@ fn default_n() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_typical_p() -> f32 {
+    1.0
 }
 
 // ─── Structured Output / Response Format ─────────────────────────────────

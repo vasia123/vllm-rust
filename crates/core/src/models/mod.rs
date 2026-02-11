@@ -48,6 +48,7 @@ pub mod qwen2;
 pub mod qwen2_lora;
 pub mod qwen2_moe;
 pub mod qwen2_quantized;
+pub mod qwen2_vl;
 pub mod qwen3;
 pub mod qwen3_lora;
 pub mod qwen3_moe;
@@ -110,6 +111,7 @@ pub use qwen2::Qwen2ForCausalLM;
 pub use qwen2_lora::Qwen2WithLora;
 pub use qwen2_moe::Qwen2MoeForCausalLM;
 pub use qwen2_quantized::QuantizedQwen2ForCausalLM;
+pub use qwen2_vl::Qwen2VLForConditionalGeneration;
 pub use qwen3::Qwen3ForCausalLM;
 pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_moe::Qwen3MoeForCausalLM;
@@ -201,6 +203,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Mamba2ForCausalLM" => Ok(Box::new(Mamba2ForCausalLM::new(cfg, vb)?)),
         "LlavaForConditionalGeneration" | "LlavaNextForConditionalGeneration" => Ok(Box::new(
             LLaVAForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
+        "Qwen2VLForConditionalGeneration" => Ok(Box::new(
+            Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))

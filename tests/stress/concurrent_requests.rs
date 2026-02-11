@@ -104,6 +104,7 @@ fn stress_engine_config(max_running: usize) -> EngineConfig {
         multi_step_count: 1,
         enable_prefix_caching: false,
         cuda_graph_config: CudaGraphConfig::default(),
+        sliding_window: None,
     }
 }
 
@@ -118,7 +119,9 @@ fn make_stress_request(id: usize, max_tokens: usize, eos_token: u32) -> Generati
         include_stop_str_in_output: false,
         logprobs: None,
         echo: false,
+        ignore_eos: false,
         lora_request: None,
+        prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
     }

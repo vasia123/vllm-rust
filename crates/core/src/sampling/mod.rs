@@ -76,6 +76,10 @@ pub struct SamplingParams {
     /// single-token sequences are banned unconditionally, multi-token sequences
     /// ban the last token only when generated tokens end with the prefix.
     pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
+    /// Typical sampling threshold (0..1). 1.0 = disabled.
+    /// Keeps tokens whose information content `|log(p_i) - entropy|` is small,
+    /// accumulating probability mass until `typical_p` is reached.
+    pub typical_p: f32,
 }
 
 impl Default for SamplingParams {
@@ -96,6 +100,7 @@ impl Default for SamplingParams {
             banned_token_ids: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
+            typical_p: 1.0,
         }
     }
 }
@@ -114,6 +119,23 @@ impl SamplingParams {
 
     pub fn is_beam_search(&self) -> bool {
         self.beam_search.is_some()
+    }
+
+    /// Whether this sequence can use the GPU sampling fast path.
+    ///
+    /// GPU sampling handles greedy (argmax) and standard top-k/top-p multinomial.
+    /// Sequences requiring penalties, logit bias, min_p, typical_p, constraints,
+    /// banned/allowed tokens, or bad words must fall back to CPU sampling.
+    pub fn gpu_eligible(&self) -> bool {
+        self.repetition_penalty == 1.0
+            && self.frequency_penalty == 0.0
+            && self.presence_penalty == 0.0
+            && self.min_p == 0.0
+            && self.typical_p == 1.0
+            && self.logit_bias.is_none()
+            && self.banned_token_ids.is_none()
+            && self.allowed_token_ids.is_none()
+            && self.beam_search.is_none()
     }
 
     /// Create sampling params configured for beam search.
@@ -145,6 +167,12 @@ impl SamplerState {
     /// Access the underlying RNG for use in rejection sampling.
     pub fn rng_mut(&mut self) -> &mut StdRng {
         &mut self.rng
+    }
+
+    /// Generate a uniform random f32 in [0, 1) for GPU sampling.
+    pub fn next_rand_f32(&mut self) -> f32 {
+        use rand::Rng;
+        self.rng.gen::<f32>()
     }
 }
 
@@ -264,6 +292,9 @@ pub fn sample_n(
     }
     if params.top_p < 1.0 && params.top_p > 0.0 {
         apply_top_p(&mut probs, params.top_p);
+    }
+    if params.typical_p < 1.0 && params.typical_p > 0.0 {
+        apply_typical_p(&mut probs, params.typical_p);
     }
 
     // Renormalize
@@ -434,6 +465,11 @@ pub fn sample(
     // Step 7: Apply top-p (nucleus) filtering
     if params.top_p < 1.0 && params.top_p > 0.0 {
         apply_top_p(&mut probs, params.top_p);
+    }
+
+    // Step 7b: Apply typical_p filtering
+    if params.typical_p < 1.0 && params.typical_p > 0.0 {
+        apply_typical_p(&mut probs, params.typical_p);
     }
 
     // Step 8: Renormalize
@@ -618,6 +654,53 @@ fn apply_top_p(probs: &mut [f32], top_p: f32) {
     // Zero out everything after cutoff
     for &(idx, _) in &indexed[cutoff_idx..] {
         probs[idx] = 0.0;
+    }
+}
+
+/// Typical sampling: keep tokens whose information content is close to the
+/// distribution entropy, accumulating until `typical_p` probability mass.
+///
+/// Reference: Meister et al. "Typical Decoding for Natural Language Generation"
+/// https://arxiv.org/abs/2202.00666
+fn apply_typical_p(probs: &mut [f32], typical_p: f32) {
+    // Compute entropy H = -sum(p * log(p))
+    let entropy: f32 = probs
+        .iter()
+        .filter(|&&p| p > 0.0)
+        .map(|&p| -p * p.ln())
+        .sum();
+
+    // Compute |log(p_i) - (-H)| = |log(p_i) + H| for each token
+    // Smaller deviation = more "typical"
+    let mut indexed: Vec<(usize, f32, f32)> = probs
+        .iter()
+        .enumerate()
+        .filter(|(_, &p)| p > 0.0)
+        .map(|(i, &p)| {
+            let deviation = (p.ln() + entropy).abs();
+            (i, p, deviation)
+        })
+        .collect();
+
+    // Sort by deviation ascending (most typical first)
+    indexed.sort_unstable_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Accumulate probability until typical_p threshold
+    let mut cumsum = 0.0f32;
+    let mut keep = std::collections::HashSet::new();
+    for &(idx, p, _) in &indexed {
+        cumsum += p;
+        keep.insert(idx);
+        if cumsum >= typical_p {
+            break;
+        }
+    }
+
+    // Zero out non-typical tokens
+    for (i, p) in probs.iter_mut().enumerate() {
+        if !keep.contains(&i) {
+            *p = 0.0;
+        }
     }
 }
 
@@ -2047,5 +2130,199 @@ mod tests {
         let logits = vec![0.0, 0.0, 0.0, 100.0];
         let result = sample(&logits, &params, &[2], &mut state, None, &[]);
         assert_ne!(result.token_id, 3);
+    }
+
+    // ---- typical_p tests ----
+
+    #[test]
+    fn test_apply_typical_p_disabled() {
+        // typical_p = 1.0 should not be called (disabled), but if called keeps all tokens
+        let mut probs = vec![0.25, 0.25, 0.25, 0.25];
+        apply_typical_p(&mut probs, 1.0);
+        // All tokens are equally typical; cumsum reaches 1.0 only after all
+        let nonzero: usize = probs.iter().filter(|&&p| p > 0.0).count();
+        assert_eq!(nonzero, 4);
+    }
+
+    #[test]
+    fn test_apply_typical_p_filters_outliers() {
+        // Distribution: one dominant token, rest low
+        // Token 0: 0.9, Token 1: 0.05, Token 2: 0.03, Token 3: 0.02
+        let mut probs = vec![0.9, 0.05, 0.03, 0.02];
+        apply_typical_p(&mut probs, 0.5);
+        // With typical_p=0.5, only the most typical token(s) should remain
+        let nonzero: Vec<usize> = probs
+            .iter()
+            .enumerate()
+            .filter(|(_, &p)| p > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!nonzero.is_empty());
+        // Sum of remaining should be >= 0.5 of original cumulative
+        let remaining_sum: f32 = probs.iter().sum();
+        assert!(remaining_sum >= 0.5 * 0.99); // allowing for float tolerance
+    }
+
+    #[test]
+    fn test_apply_typical_p_uniform_keeps_all() {
+        // Uniform distribution: all tokens equally typical
+        let mut probs = vec![0.2, 0.2, 0.2, 0.2, 0.2];
+        apply_typical_p(&mut probs, 0.9);
+        // All tokens have same deviation, cumsum grows linearly
+        let nonzero: usize = probs.iter().filter(|&&p| p > 0.0).count();
+        assert!(nonzero >= 4); // need at least 4 to reach 0.8 ≥ 0.9 might need 5
+    }
+
+    #[test]
+    fn test_apply_typical_p_preserves_zeros() {
+        // Tokens with zero probability stay zero
+        let mut probs = vec![0.5, 0.0, 0.3, 0.0, 0.2];
+        apply_typical_p(&mut probs, 0.9);
+        assert_eq!(probs[1], 0.0);
+        assert_eq!(probs[3], 0.0);
+    }
+
+    #[test]
+    fn test_typical_p_sampling_integration() {
+        // End-to-end: sample with typical_p should still pick a valid token
+        let logits = vec![10.0, 0.0, -5.0, -10.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            typical_p: 0.5,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
+        assert!(result.token_id < 4);
+    }
+
+    #[test]
+    fn test_typical_p_greedy_still_works() {
+        // typical_p with temperature 0 (greedy): typical_p is applied after softmax
+        // but before greedy argmax
+        let logits = vec![10.0, 0.0, -5.0, -10.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            typical_p: 0.9,
+            ..Default::default()
+        };
+        let mut state = SamplerState::new(None);
+        let result = sample(&logits, &params, &[], &mut state, None, &[]);
+        // Token 0 has highest probability, should still win
+        assert_eq!(result.token_id, 0);
+    }
+
+    #[test]
+    fn gpu_eligible_greedy() {
+        let params = SamplingParams::greedy();
+        assert!(params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_eligible_standard_stochastic() {
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 50,
+            ..Default::default()
+        };
+        assert!(params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_repetition_penalty() {
+        let params = SamplingParams {
+            temperature: 0.8,
+            repetition_penalty: 1.1,
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_frequency_penalty() {
+        let params = SamplingParams {
+            frequency_penalty: 0.5,
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_presence_penalty() {
+        let params = SamplingParams {
+            presence_penalty: 0.5,
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_min_p() {
+        let params = SamplingParams {
+            min_p: 0.1,
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_typical_p() {
+        let params = SamplingParams {
+            typical_p: 0.9,
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_logit_bias() {
+        let params = SamplingParams {
+            logit_bias: Some(vec![(42, 5.0)]),
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_banned_tokens() {
+        let params = SamplingParams {
+            banned_token_ids: Some(vec![42]),
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_allowed_tokens() {
+        let params = SamplingParams {
+            allowed_token_ids: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn gpu_ineligible_with_beam_search() {
+        let params = SamplingParams::beam_search(4);
+        assert!(!params.gpu_eligible());
+    }
+
+    #[test]
+    fn next_rand_f32_in_range() {
+        let mut state = SamplerState::new(Some(42));
+        for _ in 0..100 {
+            let val = state.next_rand_f32();
+            assert!((0.0..1.0).contains(&val), "rand_f32 out of range: {val}");
+        }
+    }
+
+    #[test]
+    fn next_rand_f32_deterministic_with_seed() {
+        let mut state1 = SamplerState::new(Some(123));
+        let mut state2 = SamplerState::new(Some(123));
+        for _ in 0..10 {
+            assert_eq!(state1.next_rand_f32(), state2.next_rand_f32());
+        }
     }
 }

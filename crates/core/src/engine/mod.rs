@@ -87,7 +87,8 @@ pub fn start_engine<M: ModelForward>(
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let state = OwnedExecutionState::new(&config);
-    let strategy = StandardExecution::new(model);
+    let strategy = StandardExecution::new(model)
+        .with_sliding_window(config.sliding_window, config.block_size);
 
     tokio::spawn(strategy::run_engine_loop(
         strategy,
@@ -186,7 +187,8 @@ pub fn start_engine_with_warmup<M: ModelForward>(
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let state = OwnedExecutionState::new(&config);
-    let mut strategy = StandardExecution::new(model);
+    let mut strategy = StandardExecution::new(model)
+        .with_sliding_window(config.sliding_window, config.block_size);
 
     // Synchronous warmup before starting loop
     let warmup_config = WarmupConfig::from(&config.cuda_graph_config);
@@ -505,6 +507,7 @@ mod tests {
             multi_step_count: 1,
             enable_prefix_caching: false,
             cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+            sliding_window: None,
         }
     }
 
@@ -656,6 +659,7 @@ mod tests {
             multi_step_count: 1,
             enable_prefix_caching: false,
             cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+            sliding_window: None,
         }
     }
 
@@ -1132,6 +1136,7 @@ mod tests {
             multi_step_count: 1,
             enable_prefix_caching: true,
             cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+            sliding_window: None,
         }
     }
 
@@ -1244,6 +1249,7 @@ mod tests {
             multi_step_count: 1,
             enable_prefix_caching: true,
             cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+            sliding_window: None,
         };
 
         // First request: 8 tokens (2 blocks of 4) + 1 generated token (needs 1 more block) = 3 blocks
@@ -1274,6 +1280,7 @@ mod tests {
             multi_step_count: 1,
             enable_prefix_caching: true,
             cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
+            sliding_window: None,
         };
         let prompt2: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
         let (results, _kv_cache_mgr) =

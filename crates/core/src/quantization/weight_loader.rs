@@ -658,6 +658,215 @@ impl QuantizedWeightLoader for MxFp8WeightLoader {
     }
 }
 
+/// Weight loader for compressed-tensors models.
+///
+/// Delegates to the appropriate inner loader (FP8, GPTQ, INT8) based on
+/// the scheme resolved from the model's quantization config.
+pub struct CompressedTensorsWeightLoader {
+    /// Inner weight loader determined by the resolved scheme
+    inner: Box<dyn QuantizedWeightLoader>,
+    config: super::compressed_tensors::CompressedTensorsConfig,
+}
+
+impl CompressedTensorsWeightLoader {
+    /// Create a new compressed-tensors weight loader.
+    pub fn new(
+        vb: VarBuilder<'static>,
+        config: super::compressed_tensors::CompressedTensorsConfig,
+    ) -> Self {
+        // Determine the inner loader based on the default scheme.
+        // The config's create_linear already delegates appropriately,
+        // but we also need to load weights in the right format.
+        let inner: Box<dyn QuantizedWeightLoader> = {
+            let quant_config: Box<dyn QuantizationConfig> = Box::new(config.clone());
+            let min_cap = quant_config.min_capability();
+
+            if min_cap >= 89 {
+                // FP8 scheme: use Fp8WeightLoader
+                let fp8_config = Fp8Config::dynamic();
+                Box::new(Fp8WeightLoader::new(vb, fp8_config))
+            } else if min_cap >= 75 {
+                // GPTQ/Marlin or INT8: use GptqWeightLoader as default
+                let gptq_config = GptqConfig::int4(128);
+                Box::new(GptqWeightLoader::new(vb.clone(), gptq_config))
+            } else {
+                Box::new(UnquantizedWeightLoader::new(vb))
+            }
+        };
+
+        Self { inner, config }
+    }
+}
+
+impl QuantizedWeightLoader for CompressedTensorsWeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        if self.config.is_layer_skipped(prefix) {
+            // Unquantized fallback for skipped layers
+            return self.inner.load_linear(prefix, in_features, out_features, bias);
+        }
+        self.inner
+            .load_linear(prefix, in_features, out_features, bias)
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::CompressedTensors
+    }
+
+    fn device(&self) -> &Device {
+        self.inner.device()
+    }
+
+    fn dtype(&self) -> DType {
+        self.inner.dtype()
+    }
+}
+
+// ─── ExpertsInt8 Weight Loader ─────────────────────────────────────────────
+
+/// Weight loader for ExpertsInt8 quantization.
+///
+/// Non-MoE layers are loaded as unquantized. MoE expert layers
+/// are loaded as FP16/BF16 and quantized to INT8 online via
+/// `ExpertsInt8Linear::load_weights()`.
+pub struct ExpertsInt8WeightLoader {
+    inner: UnquantizedWeightLoader,
+    config: super::experts_int8::ExpertsInt8Config,
+}
+
+impl ExpertsInt8WeightLoader {
+    /// Create a new ExpertsInt8 weight loader.
+    pub fn new(
+        vb: VarBuilder<'static>,
+        config: super::experts_int8::ExpertsInt8Config,
+    ) -> Self {
+        let inner = UnquantizedWeightLoader::new(vb);
+        Self { inner, config }
+    }
+
+    /// Create an empty INT8 linear for MoE expert weights.
+    ///
+    /// Returns an `ExpertsInt8Linear` initialized with zero weights.
+    /// Model code should call `load_weights()` with the FP16/BF16 weight
+    /// tensor from VarBuilder — this triggers online INT8 quantization.
+    pub fn create_int8_linear(
+        &self,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        self.config
+            .create_int8_linear(in_features, out_features, bias, self.inner.device())
+    }
+}
+
+impl QuantizedWeightLoader for ExpertsInt8WeightLoader {
+    /// Load a linear layer. For ExpertsInt8, non-MoE layers return unquantized.
+    /// Models should call `load_int8_linear()` for MoE expert layers.
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        self.inner.load_linear(prefix, in_features, out_features, bias)
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::ExpertsInt8
+    }
+
+    fn device(&self) -> &Device {
+        self.inner.device()
+    }
+
+    fn dtype(&self) -> DType {
+        self.inner.dtype()
+    }
+}
+
+// ─── MoeWNA16 Weight Loader ───────────────────────────────────────────────
+
+/// Weight loader for MoeWNA16 quantization.
+///
+/// Non-MoE layers are loaded as unquantized. MoE expert layers
+/// are loaded via GPTQ weight loader (packed INT4/INT8 format).
+pub struct MoeWNA16WeightLoader {
+    /// Unquantized loader for non-MoE layers
+    unquant_inner: UnquantizedWeightLoader,
+    /// GPTQ loader for MoE expert layers
+    gptq_inner: GptqWeightLoader,
+    #[allow(dead_code)] // Used by tests / future code
+    config: super::moe_wna16::MoeWNA16Config,
+}
+
+impl MoeWNA16WeightLoader {
+    /// Create a new MoeWNA16 weight loader.
+    pub fn new(
+        vb: VarBuilder<'static>,
+        config: super::moe_wna16::MoeWNA16Config,
+    ) -> Self {
+        let gptq_config = GptqConfig::from_detected(
+            Some(config.weight_bits()),
+            Some(config.group_size()),
+            Some(false),
+            &HashMap::new(),
+        );
+        let unquant_inner = UnquantizedWeightLoader::new(vb.clone());
+        let gptq_inner = GptqWeightLoader::new(vb, gptq_config);
+        Self {
+            unquant_inner,
+            gptq_inner,
+            config,
+        }
+    }
+
+    /// Load a GPTQ-quantized linear for MoE expert weights.
+    pub fn load_expert_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        self.gptq_inner
+            .load_linear(prefix, in_features, out_features, bias)
+    }
+}
+
+impl QuantizedWeightLoader for MoeWNA16WeightLoader {
+    /// Load a linear layer. For MoeWNA16, non-MoE layers return unquantized.
+    /// Models should call `load_expert_linear()` for MoE expert layers.
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        self.unquant_inner
+            .load_linear(prefix, in_features, out_features, bias)
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::MoeWNA16
+    }
+
+    fn device(&self) -> &Device {
+        self.unquant_inner.device()
+    }
+
+    fn dtype(&self) -> DType {
+        self.unquant_inner.dtype()
+    }
+}
+
 /// Create an appropriate weight loader for a model directory.
 ///
 /// This function detects the quantization method from the model config
@@ -706,6 +915,20 @@ pub fn create_weight_loader_from_config(
             let mxfp8_config = MxFp8Config::default();
             Box::new(MxFp8WeightLoader::new(vb, mxfp8_config))
         }
+        QuantizationMethod::CompressedTensors => {
+            let ct_config =
+                super::compressed_tensors::CompressedTensorsConfig::from_detected(&HashMap::new());
+            Box::new(CompressedTensorsWeightLoader::new(vb, ct_config))
+        }
+        QuantizationMethod::ExpertsInt8 => {
+            let ei8_config = super::experts_int8::ExpertsInt8Config::from_detected(&HashMap::new());
+            Box::new(ExpertsInt8WeightLoader::new(vb, ei8_config))
+        }
+        QuantizationMethod::MoeWNA16 => {
+            let wna16_config =
+                super::moe_wna16::MoeWNA16Config::from_detected(&HashMap::new());
+            Box::new(MoeWNA16WeightLoader::new(vb, wna16_config))
+        }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }
 }
@@ -745,6 +968,22 @@ pub fn create_weight_loader_with_params(
         QuantizationMethod::ModelOpt => {
             let mxfp8_config = MxFp8Config::from_detected(&detected.raw_config);
             Box::new(MxFp8WeightLoader::new(vb, mxfp8_config))
+        }
+        QuantizationMethod::CompressedTensors => {
+            let ct_config = super::compressed_tensors::CompressedTensorsConfig::from_detected(
+                &detected.raw_config,
+            );
+            Box::new(CompressedTensorsWeightLoader::new(vb, ct_config))
+        }
+        QuantizationMethod::ExpertsInt8 => {
+            let ei8_config =
+                super::experts_int8::ExpertsInt8Config::from_detected(&detected.raw_config);
+            Box::new(ExpertsInt8WeightLoader::new(vb, ei8_config))
+        }
+        QuantizationMethod::MoeWNA16 => {
+            let wna16_config =
+                super::moe_wna16::MoeWNA16Config::from_detected(&detected.raw_config);
+            Box::new(MoeWNA16WeightLoader::new(vb, wna16_config))
         }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }

@@ -28,8 +28,10 @@ pub mod awq;
 pub mod bitsandbytes;
 #[cfg(feature = "cuda-kernels")]
 pub mod bnb_cuda;
+pub mod compressed_tensors;
 mod config;
 mod detection;
+pub mod experts_int8;
 pub mod fp8;
 #[cfg(feature = "cuda-kernels")]
 pub mod fp8_cuda;
@@ -40,6 +42,7 @@ pub mod gptq_cuda;
 pub mod marlin;
 #[cfg(feature = "marlin")]
 pub mod marlin_cuda;
+pub mod moe_wna16;
 pub mod mxfp8;
 pub mod weight_loader;
 
@@ -73,10 +76,14 @@ pub use marlin::{
 };
 #[cfg(feature = "marlin")]
 pub use marlin_cuda::marlin_gemm;
+pub use compressed_tensors::CompressedTensorsConfig;
+pub use experts_int8::{ExpertsInt8Config, ExpertsInt8Linear};
+pub use moe_wna16::{MoeWNA16Config, MoeWNA16Format};
 pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
-    AwqWeightLoader, BitsAndBytesWeightLoader, Fp8WeightLoader, GptqWeightLoader,
+    AwqWeightLoader, BitsAndBytesWeightLoader, CompressedTensorsWeightLoader,
+    ExpertsInt8WeightLoader, Fp8WeightLoader, GptqWeightLoader, MoeWNA16WeightLoader,
     MxFp8WeightLoader, QuantizedWeightLoader, UnquantizedWeightLoader,
 };
 
@@ -126,6 +133,15 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             Box::new(BitsAndBytesConfig::from_detected(&detected.raw_config))
         }
         QuantizationMethod::ModelOpt => Box::new(MxFp8Config::from_detected(&detected.raw_config)),
+        QuantizationMethod::CompressedTensors => {
+            Box::new(CompressedTensorsConfig::from_detected(&detected.raw_config))
+        }
+        QuantizationMethod::ExpertsInt8 => {
+            Box::new(ExpertsInt8Config::from_detected(&detected.raw_config))
+        }
+        QuantizationMethod::MoeWNA16 => {
+            Box::new(MoeWNA16Config::from_detected(&detected.raw_config))
+        }
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -165,6 +181,8 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::CompressedTensors => 70, // Volta
         QuantizationMethod::Torchao => 70,           // Volta
         QuantizationMethod::ModelOpt => 0,           // Emulation on any GPU
+        QuantizationMethod::ExpertsInt8 => 0,        // CPU supported (online quantization)
+        QuantizationMethod::MoeWNA16 => 70,          // Volta (GPTQ/AWQ based)
     };
     capability >= min_cap
 }
@@ -283,5 +301,103 @@ mod tests {
         assert!(is_supported(0, QuantizationMethod::ModelOpt));
         assert!(is_supported(70, QuantizationMethod::ModelOpt));
         assert!(is_supported(90, QuantizationMethod::ModelOpt));
+    }
+
+    #[test]
+    fn test_create_config_compressed_tensors() {
+        let mut raw_config = std::collections::HashMap::new();
+        raw_config.insert(
+            "format".to_string(),
+            serde_json::Value::String("float-quantized".to_string()),
+        );
+        raw_config.insert(
+            "config_groups".to_string(),
+            serde_json::json!({
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "symmetric": true,
+                        "strategy": "tensor"
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "symmetric": true,
+                        "dynamic": true
+                    }
+                }
+            }),
+        );
+
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::CompressedTensors,
+            bits: Some(8),
+            group_size: None,
+            desc_act: None,
+            activation_scheme: None,
+            raw_config,
+        };
+
+        let config = create_config(&detected);
+        assert_eq!(config.method(), QuantizationMethod::CompressedTensors);
+        assert_eq!(config.min_capability(), 89); // W8A8Fp8
+    }
+
+    #[test]
+    fn test_create_config_experts_int8() {
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::ExpertsInt8,
+            bits: None,
+            group_size: None,
+            desc_act: None,
+            activation_scheme: None,
+            raw_config: Default::default(),
+        };
+
+        let config = create_config(&detected);
+        assert_eq!(config.method(), QuantizationMethod::ExpertsInt8);
+        assert_eq!(config.min_capability(), 0);
+    }
+
+    #[test]
+    fn test_create_config_moe_wna16() {
+        let mut raw_config = std::collections::HashMap::new();
+        raw_config.insert(
+            "weight_bits".to_string(),
+            serde_json::Value::Number(4.into()),
+        );
+        raw_config.insert(
+            "group_size".to_string(),
+            serde_json::Value::Number(128.into()),
+        );
+
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::MoeWNA16,
+            bits: Some(4),
+            group_size: Some(128),
+            desc_act: None,
+            activation_scheme: None,
+            raw_config,
+        };
+
+        let config = create_config(&detected);
+        assert_eq!(config.method(), QuantizationMethod::MoeWNA16);
+        assert_eq!(config.min_capability(), 70);
+    }
+
+    #[test]
+    fn test_is_supported_experts_int8() {
+        assert!(is_supported(0, QuantizationMethod::ExpertsInt8));
+        assert!(is_supported(70, QuantizationMethod::ExpertsInt8));
+        assert!(is_supported(90, QuantizationMethod::ExpertsInt8));
+    }
+
+    #[test]
+    fn test_is_supported_moe_wna16() {
+        assert!(!is_supported(0, QuantizationMethod::MoeWNA16));
+        assert!(is_supported(70, QuantizationMethod::MoeWNA16));
+        assert!(is_supported(90, QuantizationMethod::MoeWNA16));
     }
 }

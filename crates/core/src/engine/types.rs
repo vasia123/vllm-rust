@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::kv_cache::{MetricsSnapshot, PrefixCacheStatsSnapshot, SlidingWindowSnapshot};
 use crate::lora::LoraRequest;
 use crate::multimodal::ImageData;
+use crate::prompt_adapter::PromptAdapterRequest;
 use crate::request::{FinishReason, RequestId};
 use crate::sampling::{SamplingConstraint, SamplingParams};
 
@@ -65,6 +66,8 @@ pub struct GenerationRequest {
     pub echo: bool,
     /// LoRA adapter to use for this request (None = no adapter).
     pub lora_request: Option<LoraRequest>,
+    /// Prompt adapter (soft prompt tuning) for this request (None = no adapter).
+    pub prompt_adapter_request: Option<PromptAdapterRequest>,
     /// Sampling constraint for structured output (JSON schema, regex, etc.).
     pub constraint: Option<Box<dyn SamplingConstraint>>,
     /// Image inputs for multimodal models (e.g. LLaVA).
@@ -86,6 +89,7 @@ impl Default for GenerationRequest {
             logprobs: None,
             echo: false,
             lora_request: None,
+            prompt_adapter_request: None,
             constraint: None,
             image_inputs: Vec::new(),
         }
@@ -119,6 +123,9 @@ pub struct EngineConfig {
     pub multi_step_count: usize,
     pub enable_prefix_caching: bool,
     pub cuda_graph_config: super::cuda_graph::CudaGraphConfig,
+    /// Sliding window size for attention. When set, blocks entirely outside
+    /// the window are reclaimed during decode to reduce memory usage.
+    pub sliding_window: Option<usize>,
 }
 
 // ─── Pause mode ──────────────────────────────────────────────────────────

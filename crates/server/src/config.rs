@@ -76,6 +76,22 @@ pub struct ServerConfig {
     /// Comma-separated list of allowed CORS headers. "*" allows all headers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_headers: Option<String>,
+
+    /// API key for Bearer token authentication. Set via `--api-key` or `VLLM_API_KEY` env.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// Path to TLS certificate file (PEM format).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssl_certfile: Option<String>,
+
+    /// Path to TLS private key file (PEM format).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssl_keyfile: Option<String>,
+
+    /// Model name returned by `/v1/models`. Defaults to model identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_model_name: Option<String>,
 }
 
 impl ServerConfig {
@@ -165,6 +181,18 @@ impl ServerConfig {
         }
         if other.allowed_headers.is_some() {
             self.allowed_headers = other.allowed_headers.clone();
+        }
+        if other.api_key.is_some() {
+            self.api_key = other.api_key.clone();
+        }
+        if other.ssl_certfile.is_some() {
+            self.ssl_certfile = other.ssl_certfile.clone();
+        }
+        if other.ssl_keyfile.is_some() {
+            self.ssl_keyfile = other.ssl_keyfile.clone();
+        }
+        if other.served_model_name.is_some() {
+            self.served_model_name = other.served_model_name.clone();
         }
     }
 }

@@ -100,6 +100,7 @@ pub async fn create_response(
                 banned_token_ids: None,
                 allowed_token_ids: None,
                 bad_words_token_ids: None,
+                typical_p: 1.0,
             },
             stop_strings: req.stop,
             stop_token_ids: Vec::new(),
@@ -108,6 +109,7 @@ pub async fn create_response(
             logprobs: None,
             echo: false,
             lora_request,
+            prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
         };
@@ -174,6 +176,7 @@ pub async fn create_response(
                 banned_token_ids: None,
                 allowed_token_ids: None,
                 bad_words_token_ids: None,
+                typical_p: 1.0,
             },
             stop_strings: req.stop,
             stop_token_ids: Vec::new(),
@@ -182,6 +185,7 @@ pub async fn create_response(
             logprobs: None,
             echo: false,
             lora_request,
+            prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
         };

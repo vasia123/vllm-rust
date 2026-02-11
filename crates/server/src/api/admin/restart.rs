@@ -155,6 +155,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                 multi_step_count: 1,
                 enable_prefix_caching: config.enable_prefix_caching,
                 cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+                sliding_window: None,
             };
 
             eprintln!(
@@ -182,6 +183,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                 multi_step_count: config.multi_step_count,
                 enable_prefix_caching: config.enable_prefix_caching,
                 cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+                sliding_window: None,
             };
 
             eprintln!(

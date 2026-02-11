@@ -2,6 +2,12 @@ use super::error::CacheError;
 
 pub type BlockId = usize;
 
+/// Sentinel value for a null/reclaimed block in a block table.
+/// Used for sliding window KV cache reclamation: blocks entirely outside the
+/// attention window are freed and replaced with this sentinel. Attention kernels
+/// skip these positions via masking.
+pub const NULL_BLOCK: BlockId = usize::MAX;
+
 /// Manages physical block allocation. Pure bookkeeping, no GPU awareness.
 pub struct BlockPool {
     num_blocks: usize,

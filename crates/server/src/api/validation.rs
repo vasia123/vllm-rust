@@ -12,6 +12,7 @@ pub fn validate_completion_request(req: &CompletionRequest) -> Result<(), ApiErr
     validate_presence_penalty(req.presence_penalty)?;
     validate_repetition_penalty(req.repetition_penalty)?;
     validate_min_p(req.min_p)?;
+    validate_typical_p(req.typical_p)?;
     validate_max_tokens(req.max_tokens)?;
     validate_min_tokens(req.min_tokens, req.max_tokens)?;
     validate_n(req.n)?;
@@ -46,6 +47,7 @@ pub fn validate_chat_completion_request(req: &ChatCompletionRequest) -> Result<(
     validate_presence_penalty(req.presence_penalty)?;
     validate_repetition_penalty(req.repetition_penalty)?;
     validate_min_p(req.min_p)?;
+    validate_typical_p(req.typical_p)?;
     validate_max_tokens(max_tokens)?;
     validate_min_tokens(req.min_tokens, max_tokens)?;
     validate_n(req.n)?;
@@ -132,6 +134,15 @@ fn validate_min_p(min_p: f32) -> Result<(), ApiError> {
     if !(0.0..=1.0).contains(&min_p) {
         return Err(ApiError::InvalidRequest(format!(
             "min_p must be between 0 and 1, got {min_p}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_typical_p(typical_p: f32) -> Result<(), ApiError> {
+    if !(0.0..=1.0).contains(&typical_p) {
+        return Err(ApiError::InvalidRequest(format!(
+            "typical_p must be between 0 and 1, got {typical_p}"
         )));
     }
     Ok(())
@@ -1239,5 +1250,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(so.active_constraint_count(), 2);
+    }
+
+    #[test]
+    fn test_typical_p_valid() {
+        assert!(validate_typical_p(0.0).is_ok());
+        assert!(validate_typical_p(0.5).is_ok());
+        assert!(validate_typical_p(1.0).is_ok());
+    }
+
+    #[test]
+    fn test_typical_p_invalid() {
+        assert!(validate_typical_p(-0.1).is_err());
+        assert!(validate_typical_p(1.1).is_err());
+        assert!(validate_typical_p(f32::NAN).is_err());
     }
 }

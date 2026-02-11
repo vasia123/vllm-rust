@@ -160,6 +160,16 @@ impl RotaryEmbedding {
         self.rotary_dim < self.head_dim
     }
 
+    /// Access the precomputed cosine table [max_seq_len, rotary_dim/2].
+    pub fn cos(&self) -> &Tensor {
+        &self.cos
+    }
+
+    /// Access the precomputed sine table [max_seq_len, rotary_dim/2].
+    pub fn sin(&self) -> &Tensor {
+        &self.sin
+    }
+
     /// Apply RoPE to Q and K tensors.
     ///
     /// # Arguments

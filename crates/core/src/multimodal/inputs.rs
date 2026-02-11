@@ -270,6 +270,9 @@ pub struct ProcessedImage {
     pub num_tokens: usize,
     /// Original image dimensions (width, height).
     pub original_size: Option<(usize, usize)>,
+    /// Grid dimensions (height_patches, width_patches) after spatial merge.
+    /// Used by models like Qwen2-VL for spatial position encoding.
+    pub grid_size: Option<(usize, usize)>,
 }
 
 impl ProcessedImage {
@@ -279,6 +282,7 @@ impl ProcessedImage {
             embedding,
             num_tokens,
             original_size: None,
+            grid_size: None,
         }
     }
 

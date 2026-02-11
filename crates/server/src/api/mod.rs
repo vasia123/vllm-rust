@@ -571,6 +571,25 @@ pub fn create_full_router_with_options(
     rate_limit_state: middleware::RateLimitState,
     max_body_size: usize,
 ) -> Router {
+    create_full_router_with_all_options(
+        app_state,
+        admin_state,
+        cors,
+        rate_limit_state,
+        max_body_size,
+        middleware::ApiKeyState::disabled(),
+    )
+}
+
+/// Create the full router with all configurable options including API key auth.
+pub fn create_full_router_with_all_options(
+    app_state: AppState,
+    admin_state: AdminState,
+    cors: CorsLayer,
+    rate_limit_state: middleware::RateLimitState,
+    max_body_size: usize,
+    api_key_state: middleware::ApiKeyState,
+) -> Router {
     let accepting = app_state.accepting.clone();
     Router::new()
         .route("/health", get(health_check))
@@ -608,6 +627,10 @@ pub fn create_full_router_with_options(
         .route("/v1/detokenize", post(tokenize::detokenize))
         .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
         .layer(DefaultBodyLimit::max(max_body_size))
+        .layer(axum::middleware::from_fn_with_state(
+            api_key_state,
+            middleware::api_key_auth,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state,
             middleware::rate_limit,
@@ -694,6 +717,7 @@ mod tests {
             multi_step_count: 1,
             enable_prefix_caching: false,
             cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
+            sliding_window: None,
         };
         let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
         let (atomic_handle, _controller) = AtomicEngineHandle::new(handle);

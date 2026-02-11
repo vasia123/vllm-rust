@@ -132,6 +132,7 @@ pub async fn create_chat_completion(
                 banned_token_ids: req.banned_token_ids.clone(),
                 allowed_token_ids: req.allowed_token_ids.clone(),
                 bad_words_token_ids: bad_words_token_ids.clone(),
+                typical_p: req.typical_p,
             },
             stop_strings: req.stop,
             stop_token_ids: req.stop_token_ids,
@@ -140,6 +141,7 @@ pub async fn create_chat_completion(
             logprobs: logprobs_count,
             echo: false,
             lora_request,
+            prompt_adapter_request: None,
             constraint,
             image_inputs,
         };
@@ -239,6 +241,7 @@ pub async fn create_chat_completion(
                     banned_token_ids: req.banned_token_ids.clone(),
                     allowed_token_ids: req.allowed_token_ids.clone(),
                     bad_words_token_ids: bad_words_token_ids.clone(),
+                    typical_p: req.typical_p,
                 },
                 stop_strings: req.stop.clone(),
                 stop_token_ids: req.stop_token_ids.clone(),
@@ -247,6 +250,7 @@ pub async fn create_chat_completion(
                 logprobs: internal_logprobs_count,
                 echo: false,
                 lora_request: lora_request.clone(),
+                prompt_adapter_request: None,
                 constraint: iter_constraint,
                 image_inputs: image_inputs.clone(),
             };

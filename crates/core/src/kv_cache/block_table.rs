@@ -1,4 +1,4 @@
-use super::block_pool::BlockId;
+use super::block_pool::{BlockId, NULL_BLOCK};
 
 /// Per-request mapping: logical block index → physical BlockId.
 #[derive(Clone)]
@@ -79,6 +79,39 @@ impl BlockTable {
     pub fn release(&mut self) -> Vec<BlockId> {
         self.num_tokens_stored = 0;
         std::mem::take(&mut self.blocks)
+    }
+
+    /// Reclaim leading blocks that are entirely outside a sliding window.
+    ///
+    /// Replaces the first `count` blocks with `NULL_BLOCK` and returns
+    /// the old (non-null) block IDs for freeing. Already-null blocks are skipped.
+    ///
+    /// This preserves the block table's positional structure (length, token count)
+    /// so slot_mapping for active positions remains correct.
+    pub fn reclaim_leading_blocks(&mut self, count: usize) -> Vec<BlockId> {
+        let count = count.min(self.blocks.len());
+        let mut freed = Vec::new();
+        for block in self.blocks[..count].iter_mut() {
+            if *block != NULL_BLOCK {
+                freed.push(*block);
+                *block = NULL_BLOCK;
+            }
+        }
+        freed
+    }
+
+    /// Get block IDs excluding null blocks (for attention backends that need clean lists).
+    pub fn active_block_ids(&self) -> Vec<BlockId> {
+        self.blocks
+            .iter()
+            .copied()
+            .filter(|&id| id != NULL_BLOCK)
+            .collect()
+    }
+
+    /// Number of leading null blocks (already reclaimed).
+    pub fn num_null_blocks(&self) -> usize {
+        self.blocks.iter().take_while(|&&id| id == NULL_BLOCK).count()
     }
 
     /// Trim the block table to hold exactly `target_tokens` tokens.
@@ -251,5 +284,81 @@ mod tests {
         let freed = table.trim_to(10);
         assert!(freed.is_empty());
         assert_eq!(table.num_tokens(), 10);
+    }
+
+    // ---- null block / reclaim tests ----
+
+    #[test]
+    fn reclaim_leading_blocks_basic() {
+        let mut table = BlockTable::new(4);
+        table.append_blocks(&[10, 20, 30, 40]);
+        table.advance(16);
+
+        let freed = table.reclaim_leading_blocks(2);
+        assert_eq!(freed, vec![10, 20]);
+        assert_eq!(table.block_ids(), &[NULL_BLOCK, NULL_BLOCK, 30, 40]);
+        assert_eq!(table.num_tokens(), 16); // unchanged
+    }
+
+    #[test]
+    fn reclaim_leading_blocks_idempotent() {
+        let mut table = BlockTable::new(4);
+        table.append_blocks(&[10, 20, 30]);
+        table.advance(12);
+
+        // First reclaim
+        let freed1 = table.reclaim_leading_blocks(2);
+        assert_eq!(freed1, vec![10, 20]);
+
+        // Second reclaim on same range — already null
+        let freed2 = table.reclaim_leading_blocks(2);
+        assert!(freed2.is_empty());
+    }
+
+    #[test]
+    fn reclaim_leading_blocks_exceeds_length() {
+        let mut table = BlockTable::new(4);
+        table.append_blocks(&[5, 6]);
+        table.advance(8);
+
+        let freed = table.reclaim_leading_blocks(10); // more than block count
+        assert_eq!(freed, vec![5, 6]);
+        assert_eq!(table.block_ids(), &[NULL_BLOCK, NULL_BLOCK]);
+    }
+
+    #[test]
+    fn reclaim_leading_blocks_zero_is_noop() {
+        let mut table = BlockTable::new(4);
+        table.append_blocks(&[1, 2]);
+        table.advance(8);
+
+        let freed = table.reclaim_leading_blocks(0);
+        assert!(freed.is_empty());
+        assert_eq!(table.block_ids(), &[1, 2]);
+    }
+
+    #[test]
+    fn active_block_ids_filters_null() {
+        let mut table = BlockTable::new(4);
+        table.append_blocks(&[10, 20, 30]);
+        table.advance(12);
+
+        table.reclaim_leading_blocks(1);
+        assert_eq!(table.active_block_ids(), vec![20, 30]);
+    }
+
+    #[test]
+    fn num_null_blocks_counts_leading() {
+        let mut table = BlockTable::new(4);
+        table.append_blocks(&[1, 2, 3, 4]);
+        table.advance(16);
+
+        assert_eq!(table.num_null_blocks(), 0);
+
+        table.reclaim_leading_blocks(2);
+        assert_eq!(table.num_null_blocks(), 2);
+
+        table.reclaim_leading_blocks(3);
+        assert_eq!(table.num_null_blocks(), 3);
     }
 }
