@@ -7,9 +7,9 @@ pub mod cohere;
 pub mod colbert;
 pub mod dbrx;
 pub mod deepseek;
+pub mod deepseek_quantized;
 pub mod eagle3;
 pub mod eagle3_mistral_large3;
-pub mod deepseek_quantized;
 pub mod exaone;
 pub mod falcon;
 pub mod gemma;
@@ -25,6 +25,7 @@ pub mod glm4_moe;
 pub mod gpt2;
 pub mod gpt_neox;
 pub mod internlm2;
+pub mod internvl;
 pub mod jamba;
 pub mod llama;
 pub mod llama_lora;
@@ -70,9 +71,9 @@ pub use cohere::CohereForCausalLM;
 pub use colbert::ColBERTForRetrieval;
 pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
+pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
-pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use exaone::ExaoneForCausalLM;
 pub use falcon::FalconForCausalLM;
 pub use gemma::GemmaForCausalLM;
@@ -88,6 +89,7 @@ pub use glm4_moe::Glm4MoeForCausalLM;
 pub use gpt2::GPT2LMHeadModel;
 pub use gpt_neox::GPTNeoXForCausalLM;
 pub use internlm2::InternLM2ForCausalLM;
+pub use internvl::InternVLChatModel;
 pub use jamba::JambaForCausalLM;
 pub use llama::LlamaForCausalLM;
 pub use llama_lora::LlamaWithLora;
@@ -207,6 +209,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2VLForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "InternVLChatModel" => Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?)),
         "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))
         }

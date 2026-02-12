@@ -148,6 +148,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
+        arch_names: &["InternVLChatModel"],
+        display_name: "InternVL2",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &[
             "LlavaForConditionalGeneration",
             "LlavaNextForConditionalGeneration",
