@@ -8,6 +8,7 @@ pub mod colbert;
 pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_quantized;
+pub mod e5_mistral;
 pub mod eagle3;
 pub mod eagle3_mistral_large3;
 pub mod exaone;
@@ -24,6 +25,7 @@ pub mod glm4;
 pub mod glm4_moe;
 pub mod gpt2;
 pub mod gpt_neox;
+pub mod gte;
 pub mod internlm2;
 pub mod internvl;
 pub mod jamba;
@@ -33,6 +35,7 @@ pub mod llama_quantized;
 pub mod llava;
 pub mod mamba;
 pub mod mamba2;
+pub mod minicpmv;
 pub mod mistral;
 pub mod mistral_lora;
 pub mod mistral_quantized;
@@ -45,7 +48,9 @@ pub mod phi;
 pub mod phi3;
 pub mod phi3_lora;
 pub mod phi3_quantized;
+pub mod pixtral;
 pub mod qwen2;
+pub mod qwen2_5_vl;
 pub mod qwen2_lora;
 pub mod qwen2_moe;
 pub mod qwen2_quantized;
@@ -72,6 +77,7 @@ pub use colbert::ColBERTForRetrieval;
 pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
+pub use e5_mistral::E5MistralForEmbedding;
 pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
 pub use exaone::ExaoneForCausalLM;
@@ -88,6 +94,7 @@ pub use glm4::Glm4ForCausalLM;
 pub use glm4_moe::Glm4MoeForCausalLM;
 pub use gpt2::GPT2LMHeadModel;
 pub use gpt_neox::GPTNeoXForCausalLM;
+pub use gte::{GteNewForEmbedding, GteNewForSequenceClassification};
 pub use internlm2::InternLM2ForCausalLM;
 pub use internvl::InternVLChatModel;
 pub use jamba::JambaForCausalLM;
@@ -97,6 +104,7 @@ pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use llava::LLaVAForConditionalGeneration;
 pub use mamba::MambaForCausalLM;
 pub use mamba2::Mamba2ForCausalLM;
+pub use minicpmv::MiniCPMVForConditionalGeneration;
 pub use mistral::MistralForCausalLM;
 pub use mistral_lora::MistralWithLora;
 pub use mistral_quantized::QuantizedMistralForCausalLM;
@@ -109,7 +117,9 @@ pub use phi::PhiForCausalLM;
 pub use phi3::Phi3ForCausalLM;
 pub use phi3_lora::Phi3WithLora;
 pub use phi3_quantized::QuantizedPhi3ForCausalLM;
+pub use pixtral::PixtralForConditionalGeneration;
 pub use qwen2::Qwen2ForCausalLM;
+pub use qwen2_5_vl::Qwen25VLForConditionalGeneration;
 pub use qwen2_lora::Qwen2WithLora;
 pub use qwen2_moe::Qwen2MoeForCausalLM;
 pub use qwen2_quantized::QuantizedQwen2ForCausalLM;
@@ -209,15 +219,33 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2VLForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "Qwen2_5_VLForConditionalGeneration" | "Qwen25VLForConditionalGeneration" => {
+            Ok(Box::new(Qwen25VLForConditionalGeneration::new(cfg, vb)?))
+        }
+        "PixtralForConditionalGeneration" => {
+            Ok(Box::new(PixtralForConditionalGeneration::new(cfg, vb)?))
+        }
+        "MiniCPMV" | "MiniCPMVForConditionalGeneration" => {
+            Ok(Box::new(MiniCPMVForConditionalGeneration::new(cfg, vb)?))
+        }
         "InternVLChatModel" => Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?)),
         "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))
         }
         "HF_ColBERT" | "ColBERTModel" => Ok(Box::new(ColBERTForRetrieval::new(cfg, vb)?)),
+        "GteNewModel" | "GteModel" => Ok(Box::new(GteNewForEmbedding::new(cfg, vb)?)),
+        "NomicBertModel" => Ok(Box::new(GteNewForEmbedding::new_nomic(cfg, vb)?)),
+        "XLMRobertaModel" | "JinaRobertaModel" => {
+            Ok(Box::new(GteNewForEmbedding::new_jina(cfg, vb)?))
+        }
+        "GteNewForSequenceClassification" => {
+            Ok(Box::new(GteNewForSequenceClassification::new(cfg, vb)?))
+        }
         // Eagle3LlamaForCausalLM: loaded by speculative decode pipeline (not from_config)
         // because its forward pass requires hidden_states from the target model.
         "Step3p5ForCausalLM" => Ok(Box::new(Step3p5ForCausalLM::new(cfg, vb)?)),
         "VoyageQwen3BidirectionalEmbedModel" => Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?)),
+        "MistralModel" | "E5MistralModel" => Ok(Box::new(E5MistralForEmbedding::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

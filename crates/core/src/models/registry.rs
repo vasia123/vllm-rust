@@ -799,6 +799,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["MiniCPMV", "MiniCPMVForConditionalGeneration"],
+        display_name: "MiniCPM-V",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["Qwen2VLForConditionalGeneration"],
         display_name: "Qwen2-VL",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
