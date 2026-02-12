@@ -186,7 +186,7 @@ impl Qwen2VLConfig {
 /// Splits the rotary dimension into sections (temporal/height/width) and
 /// applies different position IDs per section. For text-only tokens, all
 /// sections use the same sequential position, degenerating to standard RoPE.
-struct MRoPE {
+pub(crate) struct MRoPE {
     sin: Tensor,
     cos: Tensor,
     /// Half-dim count per section (e.g., [16, 24, 24] for head_dim=128).
@@ -194,7 +194,7 @@ struct MRoPE {
 }
 
 impl MRoPE {
-    fn new(
+    pub(crate) fn new(
         head_dim: usize,
         max_seq_len: usize,
         rope_theta: f64,
@@ -236,7 +236,12 @@ impl MRoPE {
     /// * `q` - [batch, heads, seq_len, head_dim]
     /// * `k` - [batch, kv_heads, seq_len, head_dim]
     /// * `position_ids` - [3, seq_len] (temporal, height, width)
-    fn apply(&self, q: &Tensor, k: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub(crate) fn apply(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         // Assemble per-section cos/sin from different position dimensions
         let mut cos_parts = Vec::new();
         let mut sin_parts = Vec::new();
@@ -273,7 +278,7 @@ impl MRoPE {
 
     /// Apply MRoPE with scalar position offset (text-only decode).
     /// All 3 dimensions use the same position.
-    fn apply_scalar(
+    pub(crate) fn apply_scalar(
         &self,
         q: &Tensor,
         k: &Tensor,
@@ -292,7 +297,7 @@ impl MRoPE {
 
     /// Apply MRoPE with per-token scalar positions (batched decode).
     #[allow(dead_code)]
-    fn apply_varlen(
+    pub(crate) fn apply_varlen(
         &self,
         q: &Tensor,
         k: &Tensor,
@@ -674,7 +679,7 @@ impl Qwen2VisionTransformer {
 
 // ─── Language Model (Qwen2 backbone with MRoPE) ─────────────────────────────
 
-struct Qwen2VLAttention {
+pub(crate) struct Qwen2VLAttention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -686,7 +691,7 @@ struct Qwen2VLAttention {
 }
 
 impl Qwen2VLAttention {
-    fn new(cfg: &ModelConfig, mrope_section: &[usize], vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ModelConfig, mrope_section: &[usize], vb: VarBuilder) -> Result<Self> {
         let use_bias = cfg.attention_bias.unwrap_or(true);
 
         let q_proj = candle_nn::linear_b(
@@ -731,7 +736,7 @@ impl Qwen2VLAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -779,7 +784,7 @@ impl Qwen2VLAttention {
         )
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
@@ -892,7 +897,7 @@ impl Qwen2VLAttention {
     }
 }
 
-struct Qwen2VLDecoderLayer {
+pub(crate) struct Qwen2VLDecoderLayer {
     self_attn: Qwen2VLAttention,
     mlp_gate_proj: Linear,
     mlp_up_proj: Linear,
@@ -902,7 +907,7 @@ struct Qwen2VLDecoderLayer {
 }
 
 impl Qwen2VLDecoderLayer {
-    fn new(cfg: &ModelConfig, mrope_section: &[usize], vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ModelConfig, mrope_section: &[usize], vb: VarBuilder) -> Result<Self> {
         let self_attn = Qwen2VLAttention::new(cfg, mrope_section, vb.pp("self_attn"))?;
         let mlp_vb = vb.pp("mlp");
         let mlp_gate_proj = candle_nn::linear_no_bias(
@@ -945,7 +950,7 @@ impl Qwen2VLDecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -973,7 +978,7 @@ impl Qwen2VLDecoderLayer {
         residual + xs
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],

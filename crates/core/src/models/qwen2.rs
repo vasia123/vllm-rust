@@ -21,7 +21,7 @@ use super::tp_layers::{TpEmbedding, TpLinear, TpSwiGluMlp};
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
-struct Qwen2Attention {
+pub(crate) struct Qwen2Attention {
     q_proj: TpLinear,
     k_proj: TpLinear,
     v_proj: TpLinear,
@@ -33,7 +33,11 @@ struct Qwen2Attention {
 }
 
 impl Qwen2Attention {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -117,7 +121,7 @@ impl Qwen2Attention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -165,7 +169,7 @@ impl Qwen2Attention {
         self.o_proj.forward(&attn_output, tp_ctx)
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
@@ -289,7 +293,7 @@ impl Qwen2Attention {
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
 
-struct Qwen2DecoderLayer {
+pub(crate) struct Qwen2DecoderLayer {
     self_attn: Qwen2Attention,
     mlp: TpSwiGluMlp,
     input_layernorm: RmsNorm,
@@ -297,7 +301,11 @@ struct Qwen2DecoderLayer {
 }
 
 impl Qwen2DecoderLayer {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let self_attn = Qwen2Attention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
         let mlp = TpSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
@@ -316,7 +324,7 @@ impl Qwen2DecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -346,7 +354,7 @@ impl Qwen2DecoderLayer {
         residual + xs
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],

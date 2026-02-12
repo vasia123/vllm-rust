@@ -53,7 +53,7 @@ fn sliding_window_mask(
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
-struct MistralAttention {
+pub(crate) struct MistralAttention {
     q_proj: TpLinear,
     k_proj: TpLinear,
     v_proj: TpLinear,
@@ -66,7 +66,11 @@ struct MistralAttention {
 }
 
 impl MistralAttention {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -147,7 +151,7 @@ impl MistralAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -247,7 +251,7 @@ impl MistralAttention {
         }
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
@@ -422,7 +426,7 @@ impl MistralAttention {
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
 
-struct MistralDecoderLayer {
+pub(crate) struct MistralDecoderLayer {
     self_attn: MistralAttention,
     mlp: TpSwiGluMlp,
     input_layernorm: RmsNorm,
@@ -430,7 +434,11 @@ struct MistralDecoderLayer {
 }
 
 impl MistralDecoderLayer {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let self_attn = MistralAttention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
         let mlp = TpSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
@@ -449,7 +457,7 @@ impl MistralDecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -479,7 +487,7 @@ impl MistralDecoderLayer {
         residual + xs
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
