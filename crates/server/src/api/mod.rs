@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod batch;
 pub mod chat;
 pub mod completions;
 pub mod embeddings;
@@ -58,6 +59,8 @@ pub struct AppState {
     next_lora_id: Arc<AtomicUsize>,
     /// In-memory store for completed Responses API objects (response_id → response).
     pub response_store: Arc<RwLock<HashMap<String, ResponsesResponse>>>,
+    /// In-memory store for batch jobs (batch_id → job).
+    pub batch_store: batch::BatchStore,
 }
 
 impl AppState {
@@ -85,6 +88,7 @@ impl AppState {
             lora_adapters: Arc::new(RwLock::new(HashMap::new())),
             next_lora_id: Arc::new(AtomicUsize::new(1)),
             response_store: Arc::new(RwLock::new(HashMap::new())),
+            batch_store: batch::new_batch_store(),
         }
     }
 
@@ -527,6 +531,13 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))
         .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
+        .route("/v1/batches", post(batch::create_batch))
+        .route("/v1/batches/{batch_id}", get(batch::get_batch))
+        .route(
+            "/v1/batches/{batch_id}/output",
+            get(batch::get_batch_output),
+        )
+        .route("/v1/batches/{batch_id}/cancel", post(batch::cancel_batch))
         .layer(axum::middleware::from_fn_with_state(
             accepting,
             middleware::reject_during_restart,
@@ -624,6 +635,13 @@ pub fn create_full_router_with_all_options(
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))
         .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
+        .route("/v1/batches", post(batch::create_batch))
+        .route("/v1/batches/{batch_id}", get(batch::get_batch))
+        .route(
+            "/v1/batches/{batch_id}/output",
+            get(batch::get_batch_output),
+        )
+        .route("/v1/batches/{batch_id}/cancel", post(batch::cancel_batch))
         .layer(DefaultBodyLimit::max(max_body_size))
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
@@ -709,6 +727,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
