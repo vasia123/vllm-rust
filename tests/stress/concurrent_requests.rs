@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, Tensor};
 use vllm_core::{
-    engine::{start_engine, CudaGraphConfig, EngineConfig, GenerationRequest, ModelForward},
+    engine::{start_engine, EngineConfig, GenerationRequest, ModelForward},
     kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager},
     sampling::SamplingParams,
     scheduler::{SchedulerConfig, SchedulingPolicy},

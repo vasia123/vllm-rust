@@ -7,7 +7,7 @@
 use candle_core::{Device, Tensor};
 use vllm_core::{
     engine::{
-        start_engine, CudaGraphConfig, EngineConfig, GenerationRequest, ModelForward, StreamEvent,
+        start_engine, EngineConfig, GenerationRequest, ModelForward, StreamEvent,
     },
     kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager},
     sampling::SamplingParams,
