@@ -372,11 +372,7 @@ impl Eagle3LlamaModel {
                 .unwrap_or(cfg.hidden_size)
                 .checked_mul(3)
                 .expect("fc_input_size overflow");
-            Some(linear_no_bias(
-                fc_input_size,
-                cfg.hidden_size,
-                vb.pp("fc"),
-            )?)
+            Some(linear_no_bias(fc_input_size, cfg.hidden_size, vb.pp("fc"))?)
         } else {
             None
         };
@@ -538,8 +534,14 @@ impl Eagle3LlamaForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<(Tensor, Tensor)> {
-        self.model
-            .forward(input_ids, hidden_states, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)
+        self.model.forward(
+            input_ids,
+            hidden_states,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 
     /// Compute logits from hidden states, with optional draft→target vocab remapping.
@@ -566,10 +568,8 @@ impl Eagle3LlamaForCausalLM {
 
                 // Extract draft logits and scatter into target-sized tensor.
                 // Uses SET semantics (not add) — unmapped positions stay -inf.
-                let flat_data: Vec<f32> =
-                    flat.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                let mut result_data =
-                    vec![f32::NEG_INFINITY; batch_seq * self.target_vocab_size];
+                let flat_data: Vec<f32> = flat.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                let mut result_data = vec![f32::NEG_INFINITY; batch_seq * self.target_vocab_size];
 
                 for batch in 0..batch_seq {
                     for (draft_idx, &target_idx) in mapping.iter().enumerate() {
@@ -733,10 +733,8 @@ mod tests {
             "use_aux_hidden_state".to_string(),
             serde_json::Value::Bool(use_aux),
         );
-        cfg.extra.insert(
-            "eagle_config".to_string(),
-            serde_json::Value::Object(eagle),
-        );
+        cfg.extra
+            .insert("eagle_config".to_string(), serde_json::Value::Object(eagle));
         cfg.extra.insert(
             "norm_before_residual".to_string(),
             serde_json::Value::Bool(norm_before),
@@ -790,10 +788,8 @@ mod tests {
             "use_aux_hidden_state".to_string(),
             serde_json::Value::Bool(false),
         );
-        cfg.extra.insert(
-            "eagle_config".to_string(),
-            serde_json::Value::Object(eagle),
-        );
+        cfg.extra
+            .insert("eagle_config".to_string(), serde_json::Value::Object(eagle));
         cfg.extra.insert(
             "norm_before_residual".to_string(),
             serde_json::Value::Bool(true),
@@ -875,12 +871,9 @@ mod tests {
         let seq_len = 3;
         let input_ids =
             Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input ids");
-        let hidden_states = Tensor::zeros(
-            (batch_size, seq_len, cfg.hidden_size),
-            DType::F32,
-            &device,
-        )
-        .expect("hidden states");
+        let hidden_states =
+            Tensor::zeros((batch_size, seq_len, cfg.hidden_size), DType::F32, &device)
+                .expect("hidden states");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)
@@ -964,7 +957,10 @@ mod tests {
             &block_table,
             &slot_mapping,
         );
-        assert!(result.is_ok(), "forward with norm_before_residual should work");
+        assert!(
+            result.is_ok(),
+            "forward with norm_before_residual should work"
+        );
     }
 
     // ─── Logits & Vocab Remapping ───────────────────────────────────────
@@ -1001,9 +997,19 @@ mod tests {
 
         // With zero weights, all draft logits are 0.0.
         // Mapped positions should be 0.0, unmapped should be -inf.
-        let logits_vec: Vec<f32> = logits.flatten_all().expect("flatten").to_vec1().expect("vec");
-        assert!(logits_vec[10].is_finite(), "mapped position should be finite");
-        assert!(logits_vec[5].is_finite(), "mapped position should be finite");
+        let logits_vec: Vec<f32> = logits
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("vec");
+        assert!(
+            logits_vec[10].is_finite(),
+            "mapped position should be finite"
+        );
+        assert!(
+            logits_vec[5].is_finite(),
+            "mapped position should be finite"
+        );
         assert!(
             logits_vec[0].is_infinite() && logits_vec[0] < 0.0,
             "unmapped position should be -inf"
@@ -1075,7 +1081,14 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 3);
 
         let (out, _) = model
-            .forward(&prompt, &hs, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &prompt,
+                &hs,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("prefill");
         assert_eq!(out.dims(), &[1, 3, cfg.hidden_size]);
         block_table.advance(3);
@@ -1086,8 +1099,7 @@ mod tests {
             .expect("allocate decode");
         let slot_mapping = block_table.slot_mapping(3, 1);
         let next_token = Tensor::zeros((1, 1), DType::U32, &device).expect("next token");
-        let next_hs =
-            Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).expect("next hs");
+        let next_hs = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).expect("next hs");
 
         let (out, _) = model
             .forward(

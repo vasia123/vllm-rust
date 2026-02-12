@@ -54,10 +54,7 @@ impl MinimaxM2ToolParser {
         let mut calls = Vec::new();
 
         for invoke_cap in INVOKE_REGEX.captures_iter(block) {
-            let name = invoke_cap
-                .get(1)
-                .map(|m| m.as_str().trim())
-                .unwrap_or("");
+            let name = invoke_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
             let invoke_body = invoke_cap.get(2).map(|m| m.as_str()).unwrap_or("");
 
             if name.is_empty() {
@@ -68,10 +65,7 @@ impl MinimaxM2ToolParser {
             let mut params = serde_json::Map::new();
             for param_cap in PARAMETER_REGEX.captures_iter(invoke_body) {
                 let key = param_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-                let value = param_cap
-                    .get(2)
-                    .map(|m| m.as_str().trim())
-                    .unwrap_or("");
+                let value = param_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
 
                 if key.is_empty() {
                     continue;
@@ -290,8 +284,7 @@ mod tests {
     #[test]
     fn tool_call_id_format() {
         let parser = MinimaxM2ToolParser::new();
-        let output =
-            "<minimax:tool_call>\n<invoke name=\"test\">\n</invoke>\n</minimax:tool_call>";
+        let output = "<minimax:tool_call>\n<invoke name=\"test\">\n</invoke>\n</minimax:tool_call>";
         let calls = parser.parse(output).unwrap();
         assert!(calls[0].id.starts_with("call_"));
         assert_eq!(calls[0].call_type, "function");

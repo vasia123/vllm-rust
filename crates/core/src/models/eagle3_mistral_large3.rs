@@ -293,14 +293,9 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 4;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).unwrap();
-        let hidden_states = Tensor::zeros(
-            (batch_size, seq_len, cfg.hidden_size),
-            DType::F32,
-            &device,
-        )
-        .unwrap();
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).unwrap();
+        let hidden_states =
+            Tensor::zeros((batch_size, seq_len, cfg.hidden_size), DType::F32, &device).unwrap();
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)
@@ -333,8 +328,7 @@ mod tests {
         let mut block_table = BlockTable::new(4);
 
         let input_ids = Tensor::zeros((1, 1), DType::U32, &device).unwrap();
-        let hidden_states =
-            Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hidden_states = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 1)
@@ -366,8 +360,7 @@ mod tests {
         let mut block_table = BlockTable::new(4);
 
         let input_ids = Tensor::zeros((1, 1), DType::U32, &device).unwrap();
-        let hidden_states =
-            Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hidden_states = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 1)
@@ -400,8 +393,7 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Eagle3MistralLarge3ForCausalLM::new(&cfg, vb).unwrap();
 
-        let hidden =
-            Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hidden = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
         let logits = model.compute_logits(&hidden).unwrap();
 
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
@@ -414,8 +406,7 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Eagle3MistralLarge3ForCausalLM::new(&cfg, vb).unwrap();
 
-        let hidden =
-            Tensor::zeros((2, 3, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hidden = Tensor::zeros((2, 3, cfg.hidden_size), DType::F32, &device).unwrap();
         let logits = model.compute_logits(&hidden).unwrap();
 
         assert_eq!(logits.dims(), &[2, 3, cfg.vocab_size]);
@@ -435,8 +426,7 @@ mod tests {
 
         // Prefill with 3 tokens
         let prompt = Tensor::zeros((1, 3), DType::U32, &device).unwrap();
-        let hs_prefill =
-            Tensor::zeros((1, 3, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hs_prefill = Tensor::zeros((1, 3, cfg.hidden_size), DType::F32, &device).unwrap();
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 3)
@@ -462,8 +452,7 @@ mod tests {
             .unwrap();
         let slot_mapping = block_table.slot_mapping(3, 1);
         let next_token = Tensor::zeros((1, 1), DType::U32, &device).unwrap();
-        let next_hs =
-            Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
+        let next_hs = Tensor::zeros((1, 1, cfg.hidden_size), DType::F32, &device).unwrap();
 
         let (out, _) = model
             .forward(
@@ -504,8 +493,7 @@ mod tests {
         let mut block_table = BlockTable::new(4);
 
         let input_ids = Tensor::zeros((1, 2), DType::U32, &device).unwrap();
-        let hidden_states =
-            Tensor::zeros((1, 2, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hidden_states = Tensor::zeros((1, 2, cfg.hidden_size), DType::F32, &device).unwrap();
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 2)
@@ -536,8 +524,7 @@ mod tests {
         let mut block_table = BlockTable::new(4);
 
         let input_ids = Tensor::zeros((1, 2), DType::U32, &device).unwrap();
-        let hidden_states =
-            Tensor::zeros((1, 2, cfg.hidden_size), DType::F32, &device).unwrap();
+        let hidden_states = Tensor::zeros((1, 2, cfg.hidden_size), DType::F32, &device).unwrap();
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 2)

@@ -151,9 +151,7 @@ mod tests {
     #[test]
     fn parse_empty_function_calls_block() {
         let parser = Olmo3PythonicToolParser::new();
-        let calls = parser
-            .parse("<function_calls>\n</function_calls>")
-            .unwrap();
+        let calls = parser.parse("<function_calls>\n</function_calls>").unwrap();
         assert!(calls.is_empty());
     }
 
@@ -182,7 +180,8 @@ mod tests {
     #[test]
     fn parse_with_nested_args() {
         let parser = Olmo3PythonicToolParser::new();
-        let output = "<function_calls>\nsearch(query='rust', tags=['systems', 'lang'])\n</function_calls>";
+        let output =
+            "<function_calls>\nsearch(query='rust', tags=['systems', 'lang'])\n</function_calls>";
 
         let calls = parser.parse(output).unwrap();
         assert_eq!(calls.len(), 1);

@@ -346,7 +346,11 @@ impl LogitsProcessorPipeline {
 
         if params.min_tokens > 0 {
             if let Some(eos_id) = params.eos_token_id {
-                pipeline.push(Box::new(MinTokensProcessor::new(params.min_tokens, eos_id, stop_token_ids.to_vec())));
+                pipeline.push(Box::new(MinTokensProcessor::new(
+                    params.min_tokens,
+                    eos_id,
+                    stop_token_ids.to_vec(),
+                )));
             }
         }
 
@@ -442,9 +446,18 @@ mod tests {
         // Enough tokens — nothing suppressed
         let mut logits = vec![1.0, 2.0, 3.0, 4.0];
         proc.process(&mut logits, &[5, 6, 7]);
-        assert!((logits[1] - 2.0).abs() < 1e-6, "stop token 1 not suppressed after min_tokens");
-        assert!((logits[2] - 3.0).abs() < 1e-6, "eos not suppressed after min_tokens");
-        assert!((logits[3] - 4.0).abs() < 1e-6, "stop token 3 not suppressed after min_tokens");
+        assert!(
+            (logits[1] - 2.0).abs() < 1e-6,
+            "stop token 1 not suppressed after min_tokens"
+        );
+        assert!(
+            (logits[2] - 3.0).abs() < 1e-6,
+            "eos not suppressed after min_tokens"
+        );
+        assert!(
+            (logits[3] - 4.0).abs() < 1e-6,
+            "stop token 3 not suppressed after min_tokens"
+        );
     }
 
     #[test]

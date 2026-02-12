@@ -566,7 +566,11 @@ pub(crate) fn apply_allowed_tokens(logits: &mut [f32], allowed: &[u32]) {
     }
 }
 
-pub(crate) fn apply_bad_words(logits: &mut [f32], bad_words: &[Vec<u32>], generated_tokens: &[u32]) {
+pub(crate) fn apply_bad_words(
+    logits: &mut [f32],
+    bad_words: &[Vec<u32>],
+    generated_tokens: &[u32],
+) {
     for word_ids in bad_words {
         if word_ids.is_empty() {
             continue;

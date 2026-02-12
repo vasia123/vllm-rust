@@ -9,9 +9,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
 
-use super::config::{
-    QuantizationConfig, QuantizationMethod, QuantizedLinear, UnquantizedLinear,
-};
+use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear, UnquantizedLinear};
 
 /// Configuration for ExpertsInt8 quantization.
 ///
@@ -265,9 +263,7 @@ mod tests {
     #[test]
     fn test_experts_int8_config_non_moe_layer_unquantized() {
         let config = ExpertsInt8Config::new(DType::F32);
-        let linear = config
-            .create_linear(64, 128, false, &Device::Cpu)
-            .unwrap();
+        let linear = config.create_linear(64, 128, false, &Device::Cpu).unwrap();
         assert_eq!(linear.in_features(), 64);
         assert_eq!(linear.out_features(), 128);
         // Non-MoE layers should be full precision
@@ -428,10 +424,7 @@ mod tests {
         // Create a weight where values are exact multiples of scale
         // to verify quantization is numerically exact
         let w = Tensor::new(
-            &[
-                [1.0f32, 2.0, 3.0, 4.0],
-                [-1.0, -2.0, -3.0, -4.0],
-            ],
+            &[[1.0f32, 2.0, 3.0, 4.0], [-1.0, -2.0, -3.0, -4.0]],
             &Device::Cpu,
         )
         .unwrap();

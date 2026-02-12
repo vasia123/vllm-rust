@@ -164,10 +164,7 @@ impl KVCacheManager {
     }
 
     /// Create a KVCacheManager with explicit cache layout.
-    pub fn with_layout(
-        config: &CacheConfig,
-        layout: KVCacheLayout,
-    ) -> Result<Self, CacheError> {
+    pub fn with_layout(config: &CacheConfig, layout: KVCacheLayout) -> Result<Self, CacheError> {
         Self::with_metrics_and_layout(config, Arc::new(KVCacheMetrics::new()), layout)
     }
 

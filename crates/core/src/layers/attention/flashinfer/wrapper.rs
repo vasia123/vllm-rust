@@ -164,8 +164,7 @@ impl PrefillWrapper {
         let float_ws_size = ws_size / 2;
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
-        let int_ws_ptr =
-            unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
+        let int_ws_ptr = unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
 
         // PrefillPlan writes plan metadata to page-locked host memory, then
         // copies it to device via cudaMemcpyAsync. Must match int workspace size.
@@ -298,10 +297,7 @@ impl DecodeWrapper {
         // FlashInfer's DecodePlan reads indptr on the CPU for work estimation
         // (the C++ parameter is named `indptr_h` — the `_h` suffix = host).
         let kv_indptr_host_u32: Vec<u32> = kv_indptr.to_vec1::<u32>()?;
-        let kv_indptr_host: Vec<i32> = kv_indptr_host_u32
-            .iter()
-            .map(|&x| x as i32)
-            .collect();
+        let kv_indptr_host: Vec<i32> = kv_indptr_host_u32.iter().map(|&x| x as i32).collect();
 
         // Allocate output
         let output = Tensor::zeros_like(&q)?;
@@ -314,8 +310,7 @@ impl DecodeWrapper {
         let float_ws_size = ws_size / 2;
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
-        let int_ws_ptr =
-            unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
+        let int_ws_ptr = unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
 
         // DecodePlan writes plan metadata to page-locked host memory, then
         // copies it to device via cudaMemcpyAsync. Must match int workspace size.
@@ -532,8 +527,7 @@ impl MlaWrapper {
         let float_ws_size = ws_size / 2;
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
-        let int_ws_ptr =
-            unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
+        let int_ws_ptr = unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
 
         // MLA plan writes metadata to page-locked host memory, then copies to device.
         let mut page_locked_buf: Vec<u8> = vec![0u8; int_ws_size];
@@ -634,10 +628,10 @@ fn estimate_prefill_workspace(
 ) -> usize {
     // Float workspace: temporary output for split-K
     let tmp_size = total_tokens * num_qo_heads * head_dim * 4; // f32
-    // Int workspace: request and tile info
+                                                               // Int workspace: request and tile info
     let request_info_size = batch_size * 4 * 4; // i32
     let tile_info_size = total_tokens * 4; // i32
-    // Total with generous padding
+                                           // Total with generous padding
     let total = tmp_size + request_info_size + tile_info_size + 16384;
     // Ensure at least 16 MB
     total.max(16 * 1024 * 1024)
@@ -645,17 +639,13 @@ fn estimate_prefill_workspace(
 
 /// Estimate workspace size for decode operations.
 #[cfg(feature = "flashinfer")]
-fn estimate_decode_workspace(
-    batch_size: usize,
-    num_qo_heads: usize,
-    head_dim: usize,
-) -> usize {
+fn estimate_decode_workspace(batch_size: usize, num_qo_heads: usize, head_dim: usize) -> usize {
     // Float workspace: tmp_v for split-K, tmp_s for softmax
     let tmp_v_size = batch_size * num_qo_heads * head_dim * 4; // f32
     let tmp_s_size = batch_size * num_qo_heads * 4; // f32
-    // Int workspace: partition info
+                                                    // Int workspace: partition info
     let partition_info_size = batch_size * num_qo_heads * 2 * 4; // i32
-    // Total with generous padding
+                                                                 // Total with generous padding
     let total = tmp_v_size + tmp_s_size + partition_info_size + 16384;
     // Ensure at least 16 MB
     total.max(16 * 1024 * 1024)
@@ -663,17 +653,13 @@ fn estimate_decode_workspace(
 
 /// Estimate workspace size for MLA operations.
 #[cfg(feature = "flashinfer")]
-fn estimate_mla_workspace(
-    batch_size: usize,
-    num_heads: usize,
-    head_dim_ckv: usize,
-) -> usize {
+fn estimate_mla_workspace(batch_size: usize, num_heads: usize, head_dim_ckv: usize) -> usize {
     // Float workspace: tmp_v for split-K + tmp_s for softmax
     let tmp_v_size = batch_size * num_heads * head_dim_ckv * 4; // f32
     let tmp_s_size = batch_size * num_heads * 4; // f32
-    // Int workspace: partition info
+                                                 // Int workspace: partition info
     let partition_info_size = batch_size * 2 * 4; // i32
-    // Total with generous padding
+                                                  // Total with generous padding
     let total = tmp_v_size + tmp_s_size + partition_info_size + 16384;
     // Ensure at least 16 MB (MLA has large intermediate state due to 128 heads)
     total.max(16 * 1024 * 1024)

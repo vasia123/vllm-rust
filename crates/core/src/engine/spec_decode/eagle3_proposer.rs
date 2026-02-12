@@ -97,12 +97,9 @@ impl DraftProposer for Eagle3DraftProposer {
         request_id: RequestId,
         hidden_states: Tensor,
     ) -> Result<(), EngineError> {
-        let req_state = self
-            .requests
-            .get_mut(&request_id)
-            .ok_or_else(|| {
-                EngineError::Model(format!("Eagle3 state for {request_id} not found"))
-            })?;
+        let req_state = self.requests.get_mut(&request_id).ok_or_else(|| {
+            EngineError::Model(format!("Eagle3 state for {request_id} not found"))
+        })?;
 
         // Project auxiliary hidden states (3×hs → hs) if needed
         let hidden_states = if self.model.use_aux_hidden_state() {
@@ -125,19 +122,14 @@ impl DraftProposer for Eagle3DraftProposer {
         tokenizer: &TokenizerWrapper,
     ) -> Result<Vec<u32>, EngineError> {
         let k = self.num_speculative_tokens;
-        let req_state = self
-            .requests
-            .get_mut(&request_id)
-            .ok_or_else(|| {
-                EngineError::Model(format!("Eagle3 state for {request_id} not found"))
-            })?;
+        let req_state = self.requests.get_mut(&request_id).ok_or_else(|| {
+            EngineError::Model(format!("Eagle3 state for {request_id} not found"))
+        })?;
 
         let target_hs = req_state
             .target_hidden_states
             .take()
-            .ok_or_else(|| {
-                EngineError::Model("Eagle3: target hidden states not set".into())
-            })?;
+            .ok_or_else(|| EngineError::Model("Eagle3: target hidden states not set".into()))?;
 
         // Prefill Eagle3 KV cache on first call
         let mut current_hs = if req_state.needs_prefill {
@@ -235,12 +227,9 @@ impl DraftProposer for Eagle3DraftProposer {
         num_accepted: usize,
         original_offset: usize,
     ) -> Result<(), EngineError> {
-        let req_state = self
-            .requests
-            .get_mut(&request_id)
-            .ok_or_else(|| {
-                EngineError::Model(format!("Eagle3 state for {request_id} not found"))
-            })?;
+        let req_state = self.requests.get_mut(&request_id).ok_or_else(|| {
+            EngineError::Model(format!("Eagle3 state for {request_id} not found"))
+        })?;
 
         let draft_total = original_offset + num_accepted;
         let freed = req_state.block_table.trim_to(draft_total);
@@ -333,10 +322,8 @@ mod tests {
             "use_aux_hidden_state".to_string(),
             serde_json::Value::Bool(false),
         );
-        cfg.extra.insert(
-            "eagle_config".to_string(),
-            serde_json::Value::Object(eagle),
-        );
+        cfg.extra
+            .insert("eagle_config".to_string(), serde_json::Value::Object(eagle));
         cfg
     }
 
@@ -606,10 +593,8 @@ mod tests {
             "use_aux_hidden_state".to_string(),
             serde_json::Value::Bool(true),
         );
-        cfg.extra.insert(
-            "eagle_config".to_string(),
-            serde_json::Value::Object(eagle),
-        );
+        cfg.extra
+            .insert("eagle_config".to_string(), serde_json::Value::Object(eagle));
 
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);

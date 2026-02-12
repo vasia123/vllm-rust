@@ -111,7 +111,10 @@ impl BlockTable {
 
     /// Number of leading null blocks (already reclaimed).
     pub fn num_null_blocks(&self) -> usize {
-        self.blocks.iter().take_while(|&&id| id == NULL_BLOCK).count()
+        self.blocks
+            .iter()
+            .take_while(|&&id| id == NULL_BLOCK)
+            .count()
     }
 
     /// Trim the block table to hold exactly `target_tokens` tokens.

@@ -72,9 +72,10 @@ impl FlashInferBackend {
     /// methods take `&self`.
     #[cfg(feature = "flashinfer")]
     fn get_or_create_workspace(&self, device: &Device) -> Result<()> {
-        let mut ws_guard = self.workspace.lock().map_err(|e| {
-            candle_core::Error::Msg(format!("workspace lock poisoned: {e}"))
-        })?;
+        let mut ws_guard = self
+            .workspace
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
 
         if let Some(ref ws) = *ws_guard {
             if ws.device().same_device(device) {
@@ -139,12 +140,13 @@ impl FlashInferBackend {
         let wrapper = PrefillWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
-        let mut ws_guard = self.workspace.lock().map_err(|e| {
-            candle_core::Error::Msg(format!("workspace lock poisoned: {e}"))
-        })?;
-        let ws = ws_guard.as_mut().ok_or_else(|| {
-            candle_core::Error::Msg("workspace not initialized".to_string())
-        })?;
+        let mut ws_guard = self
+            .workspace
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
+        let ws = ws_guard
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("workspace not initialized".to_string()))?;
 
         let output = wrapper.run(
             &q_flat,
@@ -207,12 +209,13 @@ impl FlashInferBackend {
         let wrapper = DecodeWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
-        let mut ws_guard = self.workspace.lock().map_err(|e| {
-            candle_core::Error::Msg(format!("workspace lock poisoned: {e}"))
-        })?;
-        let ws = ws_guard.as_mut().ok_or_else(|| {
-            candle_core::Error::Msg("workspace not initialized".to_string())
-        })?;
+        let mut ws_guard = self
+            .workspace
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
+        let ws = ws_guard
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("workspace not initialized".to_string()))?;
 
         let output = wrapper.run(
             q,
@@ -683,8 +686,7 @@ mod gpu_tests {
         let ws_ptr = tensor_bridge::tensor_to_device_ptr(&ws_tensor).unwrap();
         let float_ws = ws_ptr as *mut std::ffi::c_void;
         let int_ws_size = ws_size / 2;
-        let int_ws =
-            unsafe { (ws_ptr as *const u8).add(int_ws_size) } as *mut std::ffi::c_void;
+        let int_ws = unsafe { (ws_ptr as *const u8).add(int_ws_size) } as *mut std::ffi::c_void;
 
         let stream = tensor_bridge::get_cuda_stream_ptr(&device).unwrap();
         let kv_indptr_host: Vec<i32> = vec![0, 1];
@@ -699,10 +701,17 @@ mod gpu_tests {
                 page_locked_buf.as_mut_ptr() as *mut std::ffi::c_void,
                 int_ws_size,
                 kv_indptr_host.as_ptr(),
-                1, 8, 4, 128, 16,
+                1,
+                8,
+                4,
+                128,
+                16,
                 flashinfer_rs::ffi::DType::Float16,
                 flashinfer_rs::ffi::PosEncoding::None,
-                0.0, -1, false, stream,
+                0.0,
+                -1,
+                false,
+                stream,
             )
         }
         .unwrap();
@@ -716,33 +725,46 @@ mod gpu_tests {
 
         let q = Tensor::zeros((batch_size, num_qo_heads, head_dim), DType::F16, &device).unwrap();
         let k_cache = Tensor::zeros(
-            (num_pages, block_size, num_kv_heads, head_dim), DType::F16, &device,
-        ).unwrap();
+            (num_pages, block_size, num_kv_heads, head_dim),
+            DType::F16,
+            &device,
+        )
+        .unwrap();
         let v_cache = Tensor::zeros(
-            (num_pages, block_size, num_kv_heads, head_dim), DType::F16, &device,
-        ).unwrap();
-        let output = Tensor::zeros(
-            (batch_size, num_qo_heads, head_dim), DType::F16, &device,
-        ).unwrap();
+            (num_pages, block_size, num_kv_heads, head_dim),
+            DType::F16,
+            &device,
+        )
+        .unwrap();
+        let output =
+            Tensor::zeros((batch_size, num_qo_heads, head_dim), DType::F16, &device).unwrap();
 
         let q_ptr = tensor_bridge::tensor_to_device_ptr(&q).unwrap();
         let k_ptr = tensor_bridge::tensor_to_device_ptr(&k_cache).unwrap();
         let v_ptr = tensor_bridge::tensor_to_device_ptr(&v_cache).unwrap();
-        let out_ptr = tensor_bridge::tensor_to_device_ptr(&output).unwrap() as *mut std::ffi::c_void;
+        let out_ptr =
+            tensor_bridge::tensor_to_device_ptr(&output).unwrap() as *mut std::ffi::c_void;
 
         let kv_indptr_gpu = tensor_bridge::alloc_gpu_i32(&[0i32, 1i32], &device).unwrap();
         let kv_indices_gpu = tensor_bridge::alloc_gpu_i32(&[0i32], &device).unwrap();
         let kv_last_page_gpu = tensor_bridge::alloc_gpu_i32(&[1i32], &device).unwrap();
         let indptr_d = tensor_bridge::tensor_to_device_ptr(&kv_indptr_gpu).unwrap() as *const i32;
         let indices_d = tensor_bridge::tensor_to_device_ptr(&kv_indices_gpu).unwrap() as *const i32;
-        let last_page_d = tensor_bridge::tensor_to_device_ptr(&kv_last_page_gpu).unwrap() as *const i32;
+        let last_page_d =
+            tensor_bridge::tensor_to_device_ptr(&kv_last_page_gpu).unwrap() as *const i32;
 
         unsafe {
             plan.run(
-                q_ptr, k_ptr, v_ptr,
-                indptr_d, indices_d, last_page_d,
-                out_ptr, std::ptr::null_mut(),
-                flashinfer_rs::ffi::KVLayout::NHD, stream,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                indptr_d,
+                indices_d,
+                last_page_d,
+                out_ptr,
+                std::ptr::null_mut(),
+                flashinfer_rs::ffi::KVLayout::NHD,
+                stream,
             )
         }
         .unwrap();
@@ -836,7 +858,14 @@ mod gpu_tests {
         let backend = FlashInferBackend::with_block_size(BLOCK_SIZE);
         let output = backend
             .batched_decode_attention(
-                &q, &k_new, &v_new, &mut cache, &metadata, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+                &q,
+                &k_new,
+                &v_new,
+                &mut cache,
+                &metadata,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
             )
             .unwrap();
 
@@ -1033,7 +1062,14 @@ mod gpu_tests {
         let backend = FlashInferBackend::with_block_size(BLOCK_SIZE);
         let output = backend
             .batched_decode_attention(
-                &q, &k_new, &v_new, &mut cache, &metadata, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
+                &q,
+                &k_new,
+                &v_new,
+                &mut cache,
+                &metadata,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
             )
             .unwrap();
 

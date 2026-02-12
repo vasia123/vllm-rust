@@ -189,12 +189,7 @@ impl EncoderCacheManager {
     ///
     /// When the reference count drops to zero, the item moves to the
     /// freeable queue (remains cached until eviction is triggered).
-    pub fn free_encoder_input(
-        &mut self,
-        request_id: RequestId,
-        mm_hash: &str,
-        num_embeds: usize,
-    ) {
+    pub fn free_encoder_input(&mut self, request_id: RequestId, mm_hash: &str, num_embeds: usize) {
         let refs = match self.cached.get_mut(mm_hash) {
             Some(refs) if !refs.is_empty() => refs,
             _ => return,
@@ -288,11 +283,7 @@ impl EncoderDecoderCacheManager {
     }
 
     /// Always returns false — encoder-decoder models don't cache across requests.
-    pub fn check_and_update_cache(
-        &mut self,
-        _request_id: RequestId,
-        _mm_hash: &str,
-    ) -> bool {
+    pub fn check_and_update_cache(&mut self, _request_id: RequestId, _mm_hash: &str) -> bool {
         false
     }
 

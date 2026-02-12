@@ -57,9 +57,7 @@ impl MinimaxToolParser {
                 }
             }
             None => match v.get("parameters") {
-                Some(params) => {
-                    serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string())
-                }
+                Some(params) => serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string()),
                 None => "{}".to_string(),
             },
         };
@@ -199,8 +197,7 @@ mod tests {
     #[test]
     fn extract_content_only_tool_calls() {
         let parser = MinimaxToolParser::new();
-        let content =
-            parser.extract_content(r#"<tool_calls>{"name": "test"}</tool_calls>"#);
+        let content = parser.extract_content(r#"<tool_calls>{"name": "test"}</tool_calls>"#);
         assert!(content.is_none());
     }
 

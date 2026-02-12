@@ -121,7 +121,10 @@ impl QuantizedMoELayer {
     }
 
     /// Create the router from a VarBuilder.
-    pub fn create_router(config: &QuantizedMoELayerConfig, vb: candle_nn::VarBuilder) -> Result<TopKRouter> {
+    pub fn create_router(
+        config: &QuantizedMoELayerConfig,
+        vb: candle_nn::VarBuilder,
+    ) -> Result<TopKRouter> {
         let router_config = RouterConfig {
             hidden_size: config.hidden_size,
             num_experts: config.num_experts,
@@ -260,8 +263,8 @@ impl QuantizedMoELayer {
 
         // Apply routed scaling factor
         if (self.config.routed_scaling_factor - 1.0).abs() > 1e-9 {
-            let scale =
-                Tensor::new(&[self.config.routed_scaling_factor as f32], device)?.to_dtype(dtype)?;
+            let scale = Tensor::new(&[self.config.routed_scaling_factor as f32], device)?
+                .to_dtype(dtype)?;
             output = output.broadcast_mul(&scale)?;
         }
 

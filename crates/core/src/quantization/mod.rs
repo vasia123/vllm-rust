@@ -53,11 +53,13 @@ pub use bitsandbytes::{
 };
 #[cfg(feature = "cuda-kernels")]
 pub use bnb_cuda::{bnb_int8_gemm, bnb_nf4_gemm};
+pub use compressed_tensors::CompressedTensorsConfig;
 pub use config::{
     ActivationScheme, NoQuantizationConfig, QuantizationConfig, QuantizationMethod,
     QuantizedLinear, UnquantizedLinear,
 };
 pub use detection::{detect_from_directory, detect_from_json, DetectedQuantConfig};
+pub use experts_int8::{ExpertsInt8Config, ExpertsInt8Linear};
 pub use fp8::Fp8Config;
 #[cfg(feature = "cuda-kernels")]
 pub use fp8_cuda::{fp8_dequantize, fp8_gemm, fp8_quantize_dynamic_per_token, fp8_quantize_static};
@@ -76,8 +78,6 @@ pub use marlin::{
 };
 #[cfg(feature = "marlin")]
 pub use marlin_cuda::marlin_gemm;
-pub use compressed_tensors::CompressedTensorsConfig;
-pub use experts_int8::{ExpertsInt8Config, ExpertsInt8Linear};
 pub use moe_wna16::{MoeWNA16Config, MoeWNA16Format};
 pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 pub use weight_loader::{

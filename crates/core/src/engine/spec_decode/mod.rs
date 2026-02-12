@@ -43,10 +43,10 @@ pub use tree_attention::SpeculationTree;
 // Re-export for sibling modules
 pub(crate) use draft_proposer::sample_speculative;
 
-use candle_core::Tensor;
 use crate::engine::types::EngineError;
 use crate::request::{RequestId, SequenceState};
 use crate::tokenizer::TokenizerWrapper;
+use candle_core::Tensor;
 
 /// Trait for speculative token proposers with full lifecycle management.
 ///

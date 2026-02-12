@@ -353,9 +353,7 @@ impl MLAAttention {
         let per_head = weight.reshape((self.num_heads, per_head_dim, self.kv_lora_rank))?;
 
         // Extract K-nope slice: [num_heads, qk_nope, kv_lora_rank]
-        per_head
-            .narrow(1, 0, self.qk_nope_head_dim)?
-            .contiguous()
+        per_head.narrow(1, 0, self.qk_nope_head_dim)?.contiguous()
     }
 
     /// Extract the V weight matrix from kv_b_proj for output de-absorption.
@@ -401,11 +399,10 @@ impl MLAAttention {
         let q_absorbed = q.matmul(w_kb_nope)?;
 
         // Transpose back: [nnz, num_heads, kv_lora_rank]
-        q_absorbed.transpose(0, 1)?.contiguous()?.reshape((
-            nnz,
-            self.num_heads,
-            self.kv_lora_rank,
-        ))
+        q_absorbed
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((nnz, self.num_heads, self.kv_lora_rank))
     }
 
     /// Absorbed decode: computes attention directly in compressed space.
@@ -439,8 +436,7 @@ impl MLAAttention {
         // KV projection for new token
         let kv_latent = self.kv_a_proj_with_mqa.forward(x)?;
         let kv_a = kv_latent.narrow(D::Minus1, 0, self.kv_lora_rank)?;
-        let k_pe_raw =
-            kv_latent.narrow(D::Minus1, self.kv_lora_rank, self.qk_rope_head_dim)?;
+        let k_pe_raw = kv_latent.narrow(D::Minus1, self.kv_lora_rank, self.qk_rope_head_dim)?;
 
         // Normalize
         let kv_a = self.kv_a_layernorm.forward(&kv_a)?;
@@ -531,8 +527,7 @@ impl MLAAttention {
         // KV projection + RoPE + cache write
         let kv_latent = self.kv_a_proj_with_mqa.forward(x)?;
         let kv_a = kv_latent.narrow(D::Minus1, 0, self.kv_lora_rank)?;
-        let k_pe_raw =
-            kv_latent.narrow(D::Minus1, self.kv_lora_rank, self.qk_rope_head_dim)?;
+        let k_pe_raw = kv_latent.narrow(D::Minus1, self.kv_lora_rank, self.qk_rope_head_dim)?;
         let kv_a = self.kv_a_layernorm.forward(&kv_a)?;
 
         let q_pe_for_rope = q_pe.transpose(1, 2)?;
@@ -559,17 +554,17 @@ impl MLAAttention {
         let block_size = cache.config().block_size;
 
         // qo_indptr: [0, 1] for single-token decode
-        let qo_indptr =
-            super::flashinfer::tensor_bridge::alloc_gpu_i32(&[0, 1], device)?;
+        let qo_indptr = super::flashinfer::tensor_bridge::alloc_gpu_i32(&[0, 1], device)?;
 
         let fi_metadata = super::flashinfer::FlashInferMetadata::from_single_sequence(
-            block_ids,
-            num_tokens,
-            block_size,
-            device,
+            block_ids, num_tokens, block_size, device,
         )?;
-        let kv_indptr = fi_metadata.paged_kv_indptr.to_dtype(candle_core::DType::U32)?;
-        let kv_indices = fi_metadata.paged_kv_indices.to_dtype(candle_core::DType::U32)?;
+        let kv_indptr = fi_metadata
+            .paged_kv_indptr
+            .to_dtype(candle_core::DType::U32)?;
+        let kv_indices = fi_metadata
+            .paged_kv_indices
+            .to_dtype(candle_core::DType::U32)?;
 
         // Run MLA kernel — output in CKV space [batch, num_heads, kv_lora_rank]
         let output_absorbed = mla_wrapper.run(
@@ -787,9 +782,17 @@ mod tests {
         // kv_b_proj expands: [5, 16] → [5, 4*(8+8)] = [5, 64]
         let expanded = attn.kv_b_proj().forward(&kv_c).unwrap();
         // k_nope = first 4*8 = 32 → reshape [5, 4, 8]
-        let k_nope_std = expanded.narrow(1, 0, 32).unwrap().reshape((5, 4, 8)).unwrap();
+        let k_nope_std = expanded
+            .narrow(1, 0, 32)
+            .unwrap()
+            .reshape((5, 4, 8))
+            .unwrap();
         // v = next 4*8 = 32 → reshape [5, 4, 8] (unused in score comparison)
-        let _v_std = expanded.narrow(1, 32, 32).unwrap().reshape((5, 4, 8)).unwrap();
+        let _v_std = expanded
+            .narrow(1, 32, 32)
+            .unwrap()
+            .reshape((5, 4, 8))
+            .unwrap();
 
         // Standard attention: q_nope @ k_nope.T → [nnz, 4, 5] (ignoring rope part)
         let q_t = q_nope.transpose(0, 1).unwrap(); // [4, nnz, 8]
@@ -804,7 +807,7 @@ mod tests {
 
         // Absorbed attention: q_absorbed @ kv_c.T → [nnz, 4, 5]
         let qa_t = q_absorbed.transpose(0, 1).unwrap(); // [4, nnz, 16]
-        // kv_c: [5, 16] → broadcast to [4, 5, 16] for batched matmul
+                                                        // kv_c: [5, 16] → broadcast to [4, 5, 16] for batched matmul
         let kv_c_expanded = kv_c
             .unsqueeze(0)
             .unwrap()
@@ -818,7 +821,15 @@ mod tests {
 
         // The scores should be approximately equal
         let diff = (scores_std - scores_abs).unwrap().abs().unwrap();
-        let max_diff: f32 = diff.max(0).unwrap().max(0).unwrap().max(0).unwrap().to_scalar().unwrap();
+        let max_diff: f32 = diff
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
         assert!(
             max_diff < 1e-4,
             "Absorption roundtrip error too large: {max_diff}"
@@ -889,13 +900,7 @@ mod tests {
         let slot_mapping_decode = vec![3];
 
         let output = attn
-            .forward_decode_absorbed(
-                &x_decode,
-                3,
-                &mut cache,
-                &block_ids,
-                &slot_mapping_decode,
-            )
+            .forward_decode_absorbed(&x_decode, 3, &mut cache, &block_ids, &slot_mapping_decode)
             .unwrap();
 
         assert_eq!(output.dims(), &[1, 1, 64]);
@@ -921,18 +926,12 @@ mod tests {
 
                 map.insert(
                     "q.weight".to_string(),
-                    Tensor::randn(0f32, 0.1, (num_heads * head_dim, hidden_size), &device)
-                        .unwrap(),
+                    Tensor::randn(0f32, 0.1, (num_heads * head_dim, hidden_size), &device).unwrap(),
                 );
                 map.insert(
                     "kv_a.weight".to_string(),
-                    Tensor::randn(
-                        0f32,
-                        0.1,
-                        (kv_lora_rank + qk_rope, hidden_size),
-                        &device,
-                    )
-                    .unwrap(),
+                    Tensor::randn(0f32, 0.1, (kv_lora_rank + qk_rope, hidden_size), &device)
+                        .unwrap(),
                 );
                 map.insert(
                     "kv_a_ln.weight".to_string(),
@@ -959,21 +958,30 @@ mod tests {
             &device,
         );
 
-        let q_proj =
-            candle_nn::linear_no_bias(64, 4 * 12, vb.pp("q")).unwrap();
-        let kv_a =
-            candle_nn::linear_no_bias(64, 16 + 4, vb.pp("kv_a")).unwrap();
+        let q_proj = candle_nn::linear_no_bias(64, 4 * 12, vb.pp("q")).unwrap();
+        let kv_a = candle_nn::linear_no_bias(64, 16 + 4, vb.pp("kv_a")).unwrap();
         let kv_a_ln = candle_nn::rms_norm(16, 1e-5, vb.pp("kv_a_ln")).unwrap();
-        let kv_b =
-            candle_nn::linear_no_bias(16, 4 * (8 + 8), vb.pp("kv_b")).unwrap();
-        let o_proj =
-            candle_nn::linear_no_bias(4 * 8, 64, vb.pp("o")).unwrap();
-        let rotary = crate::layers::RotaryEmbedding::new(4, 512, 10000.0, DType::F32, &device)
-            .unwrap();
+        let kv_b = candle_nn::linear_no_bias(16, 4 * (8 + 8), vb.pp("kv_b")).unwrap();
+        let o_proj = candle_nn::linear_no_bias(4 * 8, 64, vb.pp("o")).unwrap();
+        let rotary =
+            crate::layers::RotaryEmbedding::new(4, 512, 10000.0, DType::F32, &device).unwrap();
 
         let attn = MLAAttention::new(
-            None, None, None, Some(q_proj), kv_a, kv_a_ln, kv_b, o_proj, rotary,
-            4, 8, 4, 8, 16, 1.0,
+            None,
+            None,
+            None,
+            Some(q_proj),
+            kv_a,
+            kv_a_ln,
+            kv_b,
+            o_proj,
+            rotary,
+            4,
+            8,
+            4,
+            8,
+            16,
+            1.0,
         );
 
         // Prefill 3 tokens into both caches
@@ -983,10 +991,24 @@ mod tests {
         let mut cache_std = create_test_cache(&device);
         let mut cache_abs = create_test_cache(&device);
 
-        attn.forward_prefill(&x_prefill, None, 0, &mut cache_std, &block_ids, &(0..3).collect::<Vec<_>>())
-            .unwrap();
-        attn.forward_prefill(&x_prefill, None, 0, &mut cache_abs, &block_ids, &(0..3).collect::<Vec<_>>())
-            .unwrap();
+        attn.forward_prefill(
+            &x_prefill,
+            None,
+            0,
+            &mut cache_std,
+            &block_ids,
+            &(0..3).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        attn.forward_prefill(
+            &x_prefill,
+            None,
+            0,
+            &mut cache_abs,
+            &block_ids,
+            &(0..3).collect::<Vec<_>>(),
+        )
+        .unwrap();
 
         // Decode 1 token
         let x_decode = Tensor::randn(0f32, 0.5, (1, 1, 64), &device).unwrap();

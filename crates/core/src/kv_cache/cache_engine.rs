@@ -48,10 +48,7 @@ impl CacheEngine {
     /// The layout determines tensor shape:
     /// - NHD: `[num_blocks, block_size, num_kv_heads, head_dim]`
     /// - HND: `[num_blocks, num_kv_heads, block_size, head_dim]`
-    pub fn with_layout(
-        config: &CacheConfig,
-        layout: KVCacheLayout,
-    ) -> Result<Self, CacheError> {
+    pub fn with_layout(config: &CacheConfig, layout: KVCacheLayout) -> Result<Self, CacheError> {
         let shape = layout.cache_shape(
             config.num_blocks,
             config.block_size,
@@ -298,10 +295,8 @@ impl CacheEngine {
                 )?;
 
                 // Reshape src from [new_tokens, H, D] to [new_tokens * H, D]
-                let k_2d =
-                    k_src.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
-                let v_2d =
-                    v_src.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+                let k_2d = k_src.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
+                let v_2d = v_src.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
 
                 k_flat.scatter_set(&hnd_indices, &k_2d, 0)?;
                 v_flat.scatter_set(&hnd_indices, &v_2d, 0)?;
@@ -411,13 +406,8 @@ impl CacheEngine {
         let v_transposed = v.transpose(0, 1)?.contiguous()?;
 
         // Apply quantization if enabled
-        let (k_src, v_src) = self.quantize_write_data(
-            &k_transposed,
-            &v_transposed,
-            k,
-            v,
-            new_tokens,
-        )?;
+        let (k_src, v_src) =
+            self.quantize_write_data(&k_transposed, &v_transposed, k, v, new_tokens)?;
 
         // Scatter into cache (layout-aware)
         self.scatter_into_cache(&k_src, &v_src, slot_mapping)?;
@@ -440,13 +430,8 @@ impl CacheEngine {
         let v_contiguous = v.contiguous()?;
 
         // Apply quantization if enabled
-        let (k_src, v_src) = self.quantize_write_data(
-            &k_contiguous,
-            &v_contiguous,
-            k,
-            v,
-            new_tokens,
-        )?;
+        let (k_src, v_src) =
+            self.quantize_write_data(&k_contiguous, &v_contiguous, k, v, new_tokens)?;
 
         self.scatter_into_cache(&k_src, &v_src, slot_mapping)?;
 
@@ -1131,8 +1116,14 @@ mod tests {
         let v_nhd_flat: Vec<f32> = v_nhd.flatten_all().unwrap().to_vec1().unwrap();
         let v_hnd_flat: Vec<f32> = v_hnd.flatten_all().unwrap().to_vec1().unwrap();
 
-        assert_eq!(k_nhd_flat, k_hnd_flat, "K values must match between NHD and HND");
-        assert_eq!(v_nhd_flat, v_hnd_flat, "V values must match between NHD and HND");
+        assert_eq!(
+            k_nhd_flat, k_hnd_flat,
+            "K values must match between NHD and HND"
+        );
+        assert_eq!(
+            v_nhd_flat, v_hnd_flat,
+            "V values must match between NHD and HND"
+        );
     }
 
     #[test]
@@ -1159,17 +1150,11 @@ mod tests {
 
             let k_nhd_flat: Vec<f32> = k_nhd.flatten_all().unwrap().to_vec1().unwrap();
             let k_hnd_flat: Vec<f32> = k_hnd.flatten_all().unwrap().to_vec1().unwrap();
-            assert_eq!(
-                k_nhd_flat, k_hnd_flat,
-                "K mismatch in block {block_id}"
-            );
+            assert_eq!(k_nhd_flat, k_hnd_flat, "K mismatch in block {block_id}");
 
             let v_nhd_flat: Vec<f32> = v_nhd.flatten_all().unwrap().to_vec1().unwrap();
             let v_hnd_flat: Vec<f32> = v_hnd.flatten_all().unwrap().to_vec1().unwrap();
-            assert_eq!(
-                v_nhd_flat, v_hnd_flat,
-                "V mismatch in block {block_id}"
-            );
+            assert_eq!(v_nhd_flat, v_hnd_flat, "V mismatch in block {block_id}");
         }
     }
 }

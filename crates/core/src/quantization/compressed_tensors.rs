@@ -83,10 +83,7 @@ pub struct CtQuantArgs {
 impl CtQuantArgs {
     fn from_json(val: &Value) -> Option<Self> {
         let obj = val.as_object()?;
-        let num_bits = obj
-            .get("num_bits")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(8) as u32;
+        let num_bits = obj.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u32;
         let quant_type = obj
             .get("type")
             .and_then(|v| v.as_str())
@@ -393,7 +390,7 @@ impl QuantizationConfig for CompressedTensorsConfig {
 
     fn min_capability(&self) -> u32 {
         match &self.default_scheme {
-            CtScheme::W8A8Fp8 { .. } => 89, // FP8 needs Ada/Hopper
+            CtScheme::W8A8Fp8 { .. } => 89,  // FP8 needs Ada/Hopper
             CtScheme::W8A16Fp8 { .. } => 75, // Marlin can handle this on Turing+
             CtScheme::W8A8Int8 { .. } => 75, // INT8 on Turing+
             CtScheme::WNA16 { .. } => 75,    // Marlin on Turing+
@@ -786,9 +783,7 @@ mod tests {
         .unwrap();
         let config = CompressedTensorsConfig::from_detected(&raw);
 
-        let linear = config
-            .create_linear(64, 128, true, &Device::Cpu)
-            .unwrap();
+        let linear = config.create_linear(64, 128, true, &Device::Cpu).unwrap();
         assert_eq!(linear.in_features(), 64);
         assert_eq!(linear.out_features(), 128);
         assert!(linear.has_bias());
@@ -799,9 +794,7 @@ mod tests {
         let raw = make_int8_config();
         let config = CompressedTensorsConfig::from_detected(&raw);
 
-        let linear = config
-            .create_linear(64, 128, false, &Device::Cpu)
-            .unwrap();
+        let linear = config.create_linear(64, 128, false, &Device::Cpu).unwrap();
         assert_eq!(linear.in_features(), 64);
         assert_eq!(linear.out_features(), 128);
         assert!(!linear.has_bias());
@@ -828,7 +821,11 @@ mod tests {
 
         // Each output: sum of 4 weights (1.0) * scale (0.5) * input (1.0) = 4 * 0.5 = 2.0
         let vals: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
-        assert!((vals[0] - 2.0).abs() < 1e-5, "Expected 2.0, got {}", vals[0]);
+        assert!(
+            (vals[0] - 2.0).abs() < 1e-5,
+            "Expected 2.0, got {}",
+            vals[0]
+        );
     }
 
     #[test]
@@ -867,7 +864,10 @@ mod tests {
             CompressionFormat::from_str("int_quantized"),
             CompressionFormat::IntQuantized
         );
-        assert_eq!(CompressionFormat::from_str("dense"), CompressionFormat::Dense);
+        assert_eq!(
+            CompressionFormat::from_str("dense"),
+            CompressionFormat::Dense
+        );
         assert_eq!(
             CompressionFormat::from_str("unknown"),
             CompressionFormat::Dense
@@ -938,8 +938,7 @@ mod tests {
 
     #[test]
     fn test_empty_config_groups() {
-        let raw: HashMap<String, Value> =
-            serde_json::from_str(r#"{"format": "dense"}"#).unwrap();
+        let raw: HashMap<String, Value> = serde_json::from_str(r#"{"format": "dense"}"#).unwrap();
         let config = CompressedTensorsConfig::from_detected(&raw);
         assert!(config.groups.is_empty());
         assert!(matches!(config.default_scheme, CtScheme::Unquantized));

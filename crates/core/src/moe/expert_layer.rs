@@ -784,8 +784,7 @@ impl MoELayerWithShared {
             let batch_input = Tensor::cat(&input_rows, 0)?;
 
             // Expert forward with LoRA
-            let expert_output =
-                expert_forward_with_lora(&batch_input, expert, expert_id, lora)?;
+            let expert_output = expert_forward_with_lora(&batch_input, expert, expert_id, lora)?;
 
             let weights_vec: Vec<f32> = tokens.iter().map(|(_, _, w)| *w).collect();
             let weights_tensor =

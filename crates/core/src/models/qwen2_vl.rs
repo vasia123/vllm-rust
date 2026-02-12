@@ -100,11 +100,13 @@ impl Qwen2VLVisionConfig {
             temporal_patch_size: json
                 .get("temporal_patch_size")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.temporal_patch_size as u64) as usize,
+                .unwrap_or(defaults.temporal_patch_size as u64)
+                as usize,
             spatial_merge_size: json
                 .get("spatial_merge_size")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.spatial_merge_size as u64) as usize,
+                .unwrap_or(defaults.spatial_merge_size as u64)
+                as usize,
         }
     }
 }
@@ -234,12 +236,7 @@ impl MRoPE {
     /// * `q` - [batch, heads, seq_len, head_dim]
     /// * `k` - [batch, kv_heads, seq_len, head_dim]
     /// * `position_ids` - [3, seq_len] (temporal, height, width)
-    fn apply(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        position_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+    fn apply(&self, q: &Tensor, k: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         // Assemble per-section cos/sin from different position dimensions
         let mut cos_parts = Vec::new();
         let mut sin_parts = Vec::new();
@@ -386,8 +383,16 @@ impl Qwen2VLVisionAttention {
 
         // Split: [num_tokens, num_heads, head_dim] each
         let q = qkv.narrow(1, 0, self.num_heads * self.head_dim)?;
-        let k = qkv.narrow(1, self.num_heads * self.head_dim, self.num_heads * self.head_dim)?;
-        let v = qkv.narrow(1, 2 * self.num_heads * self.head_dim, self.num_heads * self.head_dim)?;
+        let k = qkv.narrow(
+            1,
+            self.num_heads * self.head_dim,
+            self.num_heads * self.head_dim,
+        )?;
+        let v = qkv.narrow(
+            1,
+            2 * self.num_heads * self.head_dim,
+            self.num_heads * self.head_dim,
+        )?;
 
         let q = q.reshape((num_tokens, self.num_heads, self.head_dim))?;
         let k = k.reshape((num_tokens, self.num_heads, self.head_dim))?;
@@ -508,11 +513,7 @@ struct Qwen2VLPatchMerger {
 
 #[allow(dead_code)]
 impl Qwen2VLPatchMerger {
-    fn new(
-        cfg: &Qwen2VLVisionConfig,
-        hidden_size: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(cfg: &Qwen2VLVisionConfig, hidden_size: usize, vb: VarBuilder) -> Result<Self> {
         let merger_hidden = cfg.merger_hidden_dim();
         let ln_q = layer_norm(cfg.embed_dim, 1e-6, vb.pp("ln_q"))?;
         // mlp.0 and mlp.2 (Linear layers in nn.Sequential)
@@ -563,11 +564,7 @@ struct Qwen2VisionTransformer {
 
 #[allow(dead_code)]
 impl Qwen2VisionTransformer {
-    fn new(
-        cfg: &Qwen2VLVisionConfig,
-        hidden_size: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(cfg: &Qwen2VLVisionConfig, hidden_size: usize, vb: VarBuilder) -> Result<Self> {
         let patch_embed = Qwen2VLPatchEmbed::new(cfg, vb.pp("patch_embed"))?;
 
         // 2D RoPE for vision: partial_rotary_factor=0.5, neox style
@@ -605,12 +602,7 @@ impl Qwen2VisionTransformer {
     ///
     /// # Returns
     /// [num_merged_tokens, hidden_size]
-    fn forward(
-        &self,
-        patches: &Tensor,
-        grid_h: usize,
-        grid_w: usize,
-    ) -> Result<Tensor> {
+    fn forward(&self, patches: &Tensor, grid_h: usize, grid_w: usize) -> Result<Tensor> {
         let num_tokens = patches.dim(0)?;
 
         // Patch embedding
@@ -697,9 +689,24 @@ impl Qwen2VLAttention {
     fn new(cfg: &ModelConfig, mrope_section: &[usize], vb: VarBuilder) -> Result<Self> {
         let use_bias = cfg.attention_bias.unwrap_or(true);
 
-        let q_proj = candle_nn::linear_b(cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim, use_bias, vb.pp("q_proj"))?;
-        let k_proj = candle_nn::linear_b(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, use_bias, vb.pp("k_proj"))?;
-        let v_proj = candle_nn::linear_b(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, use_bias, vb.pp("v_proj"))?;
+        let q_proj = candle_nn::linear_b(
+            cfg.hidden_size,
+            cfg.num_attention_heads * cfg.head_dim,
+            use_bias,
+            vb.pp("q_proj"),
+        )?;
+        let k_proj = candle_nn::linear_b(
+            cfg.hidden_size,
+            cfg.num_key_value_heads * cfg.head_dim,
+            use_bias,
+            vb.pp("k_proj"),
+        )?;
+        let v_proj = candle_nn::linear_b(
+            cfg.hidden_size,
+            cfg.num_key_value_heads * cfg.head_dim,
+            use_bias,
+            vb.pp("v_proj"),
+        )?;
         let o_proj = candle_nn::linear_b(cfg.hidden_size, cfg.hidden_size, false, vb.pp("o_proj"))?;
 
         let mrope = MRoPE::new(
@@ -898,9 +905,21 @@ impl Qwen2VLDecoderLayer {
     fn new(cfg: &ModelConfig, mrope_section: &[usize], vb: VarBuilder) -> Result<Self> {
         let self_attn = Qwen2VLAttention::new(cfg, mrope_section, vb.pp("self_attn"))?;
         let mlp_vb = vb.pp("mlp");
-        let mlp_gate_proj = candle_nn::linear_no_bias(cfg.hidden_size, cfg.intermediate_size, mlp_vb.pp("gate_proj"))?;
-        let mlp_up_proj = candle_nn::linear_no_bias(cfg.hidden_size, cfg.intermediate_size, mlp_vb.pp("up_proj"))?;
-        let mlp_down_proj = candle_nn::linear_no_bias(cfg.intermediate_size, cfg.hidden_size, mlp_vb.pp("down_proj"))?;
+        let mlp_gate_proj = candle_nn::linear_no_bias(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            mlp_vb.pp("gate_proj"),
+        )?;
+        let mlp_up_proj = candle_nn::linear_no_bias(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            mlp_vb.pp("up_proj"),
+        )?;
+        let mlp_down_proj = candle_nn::linear_no_bias(
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            mlp_vb.pp("down_proj"),
+        )?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -1078,8 +1097,7 @@ impl Qwen2VLForConditionalGeneration {
             while i < seq_len {
                 if input_ids[i] == self.config.image_token_id {
                     // Find the image info for this position
-                    let grid_info = mm_inputs
-                        .and_then(|m| self.find_image_grid_at(m, i));
+                    let grid_info = mm_inputs.and_then(|m| self.find_image_grid_at(m, i));
                     let (grid_h, grid_w) = grid_info.unwrap_or((1, 1));
                     let merge = self.config.vision_config.spatial_merge_size;
                     let merged_h = grid_h / merge;
@@ -1116,7 +1134,11 @@ impl Qwen2VLForConditionalGeneration {
     }
 
     /// Find the grid dimensions for an image at the given token position.
-    fn find_image_grid_at(&self, mm_inputs: &MultimodalInputs, pos: usize) -> Option<(usize, usize)> {
+    fn find_image_grid_at(
+        &self,
+        mm_inputs: &MultimodalInputs,
+        pos: usize,
+    ) -> Option<(usize, usize)> {
         for (img_pos, processed) in &mm_inputs.image_embeddings {
             if *img_pos == pos {
                 return processed.grid_size;
@@ -1139,8 +1161,7 @@ impl Qwen2VLForConditionalGeneration {
         let mut merged = text_embeddings.to_vec3::<f32>()?;
 
         for (position, processed) in &mm_inputs.image_embeddings {
-            let emb_vec: Vec<Vec<f32>> =
-                processed.embedding.to_dtype(DType::F32)?.to_vec2()?;
+            let emb_vec: Vec<Vec<f32>> = processed.embedding.to_dtype(DType::F32)?.to_vec2()?;
             let batch_idx = *position / seq_len;
             let start_pos = *position % seq_len;
 
@@ -1169,7 +1190,12 @@ impl crate::engine::ModelForward for Qwen2VLForConditionalGeneration {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            Some(causal_mask(seq_len, seqlen_offset, self.dtype, &self.device)?)
+            Some(causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
         };
 
         let mut xs = self.embed_tokens.forward(input_ids)?;
@@ -1221,7 +1247,12 @@ impl crate::engine::ModelForward for Qwen2VLForConditionalGeneration {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            Some(causal_mask(seq_len, seqlen_offset, self.dtype, &self.device)?)
+            Some(causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
         };
 
         // Compute 3D position IDs
@@ -1415,8 +1446,7 @@ mod tests {
 
         // 3D positions [3, 4]
         let position_ids =
-            Tensor::from_vec(vec![0u32, 1, 2, 3, 0, 0, 1, 1, 0, 1, 0, 1], (3, 4), &device)
-                .unwrap();
+            Tensor::from_vec(vec![0u32, 1, 2, 3, 0, 0, 1, 1, 0, 1, 0, 1], (3, 4), &device).unwrap();
 
         let (q_rot, k_rot) = mrope.apply(&q, &k, &position_ids).unwrap();
         assert_eq!(q_rot.dims(), &[1, 4, 4, 16]);

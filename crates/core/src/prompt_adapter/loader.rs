@@ -136,15 +136,12 @@ impl PromptAdapterLoader {
             .map_err(|e| PromptAdapterLoadError::Weights(format!("safetensors load: {e}")))?;
 
         // PEFT stores the embeddings under "prompt_embeddings"
-        tensors
-            .get("prompt_embeddings")
-            .cloned()
-            .ok_or_else(|| {
-                let keys: Vec<&String> = tensors.keys().collect();
-                PromptAdapterLoadError::Weights(format!(
-                    "tensor 'prompt_embeddings' not found; available keys: {keys:?}"
-                ))
-            })
+        tensors.get("prompt_embeddings").cloned().ok_or_else(|| {
+            let keys: Vec<&String> = tensors.keys().collect();
+            PromptAdapterLoadError::Weights(format!(
+                "tensor 'prompt_embeddings' not found; available keys: {keys:?}"
+            ))
+        })
     }
 }
 

@@ -9,9 +9,7 @@
 use candle_core::{DType, Device, Result};
 use std::collections::HashMap;
 
-use super::config::{
-    QuantizationConfig, QuantizationMethod, QuantizedLinear, UnquantizedLinear,
-};
+use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear, UnquantizedLinear};
 use super::gptq::GptqConfig;
 
 /// Which packed format the MoE expert weights use.
@@ -194,8 +192,7 @@ mod tests {
 
     #[test]
     fn test_moe_wna16_config_basic() {
-        let config =
-            MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::BF16);
+        let config = MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::BF16);
         assert_eq!(config.method(), QuantizationMethod::MoeWNA16);
         assert_eq!(config.weight_bits(), 4);
         assert_eq!(config.group_size(), 128);
@@ -215,10 +212,7 @@ mod tests {
             "group_size".to_string(),
             serde_json::Value::Number(64.into()),
         );
-        raw.insert(
-            "has_zp".to_string(),
-            serde_json::Value::Bool(true),
-        );
+        raw.insert("has_zp".to_string(), serde_json::Value::Bool(true));
         raw.insert(
             "linear_quant_method".to_string(),
             serde_json::Value::String("awq".to_string()),
@@ -243,11 +237,8 @@ mod tests {
 
     #[test]
     fn test_moe_wna16_non_moe_layer_unquantized() {
-        let config =
-            MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::F32);
-        let linear = config
-            .create_linear(64, 128, false, &Device::Cpu)
-            .unwrap();
+        let config = MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::F32);
+        let linear = config.create_linear(64, 128, false, &Device::Cpu).unwrap();
         assert_eq!(linear.in_features(), 64);
         assert_eq!(linear.out_features(), 128);
         // Non-MoE layers should be full precision
@@ -256,8 +247,7 @@ mod tests {
 
     #[test]
     fn test_moe_wna16_expert_linear_creation() {
-        let config =
-            MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::F32);
+        let config = MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::F32);
         let linear = config
             .create_expert_linear(128, 256, false, &Device::Cpu)
             .unwrap();
@@ -267,8 +257,7 @@ mod tests {
 
     #[test]
     fn test_moe_wna16_8bit() {
-        let config =
-            MoeWNA16Config::new(8, 128, false, MoeWNA16Format::Gptq, DType::BF16);
+        let config = MoeWNA16Config::new(8, 128, false, MoeWNA16Format::Gptq, DType::BF16);
         assert_eq!(config.weight_bits(), 8);
     }
 
@@ -286,8 +275,7 @@ mod tests {
 
     #[test]
     fn test_moe_wna16_clone_box() {
-        let config =
-            MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::BF16);
+        let config = MoeWNA16Config::new(4, 128, false, MoeWNA16Format::Gptq, DType::BF16);
         let boxed: Box<dyn QuantizationConfig> = config.clone_box();
         assert_eq!(boxed.method(), QuantizationMethod::MoeWNA16);
     }

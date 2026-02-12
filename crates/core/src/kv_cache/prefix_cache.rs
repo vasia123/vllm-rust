@@ -75,7 +75,10 @@ impl EvictionQueue {
         entry.eviction_next = None;
 
         if let Some(old_tail) = self.tail {
-            cache.get_mut(&old_tail).expect("tail missing").eviction_next = Some(hash);
+            cache
+                .get_mut(&old_tail)
+                .expect("tail missing")
+                .eviction_next = Some(hash);
         } else {
             self.head = Some(hash);
         }

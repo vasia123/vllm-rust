@@ -262,10 +262,10 @@ async fn save_config(
         allowed_origins: None,         // CORS configured via CLI
         allowed_methods: None,
         allowed_headers: None,
-        api_key: None,            // Sensitive — never persisted
-        ssl_certfile: None,       // TLS configured via CLI
+        api_key: None,      // Sensitive — never persisted
+        ssl_certfile: None, // TLS configured via CLI
         ssl_keyfile: None,
-        served_model_name: None,  // Model name configured via CLI
+        served_model_name: None, // Model name configured via CLI
     };
 
     let path = config

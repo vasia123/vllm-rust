@@ -708,7 +708,9 @@ impl QuantizedWeightLoader for CompressedTensorsWeightLoader {
     ) -> Result<Box<dyn QuantizedLinear>> {
         if self.config.is_layer_skipped(prefix) {
             // Unquantized fallback for skipped layers
-            return self.inner.load_linear(prefix, in_features, out_features, bias);
+            return self
+                .inner
+                .load_linear(prefix, in_features, out_features, bias);
         }
         self.inner
             .load_linear(prefix, in_features, out_features, bias)
@@ -741,10 +743,7 @@ pub struct ExpertsInt8WeightLoader {
 
 impl ExpertsInt8WeightLoader {
     /// Create a new ExpertsInt8 weight loader.
-    pub fn new(
-        vb: VarBuilder<'static>,
-        config: super::experts_int8::ExpertsInt8Config,
-    ) -> Self {
+    pub fn new(vb: VarBuilder<'static>, config: super::experts_int8::ExpertsInt8Config) -> Self {
         let inner = UnquantizedWeightLoader::new(vb);
         Self { inner, config }
     }
@@ -775,7 +774,8 @@ impl QuantizedWeightLoader for ExpertsInt8WeightLoader {
         out_features: usize,
         bias: bool,
     ) -> Result<Box<dyn QuantizedLinear>> {
-        self.inner.load_linear(prefix, in_features, out_features, bias)
+        self.inner
+            .load_linear(prefix, in_features, out_features, bias)
     }
 
     fn method(&self) -> QuantizationMethod {
@@ -808,10 +808,7 @@ pub struct MoeWNA16WeightLoader {
 
 impl MoeWNA16WeightLoader {
     /// Create a new MoeWNA16 weight loader.
-    pub fn new(
-        vb: VarBuilder<'static>,
-        config: super::moe_wna16::MoeWNA16Config,
-    ) -> Self {
+    pub fn new(vb: VarBuilder<'static>, config: super::moe_wna16::MoeWNA16Config) -> Self {
         let gptq_config = GptqConfig::from_detected(
             Some(config.weight_bits()),
             Some(config.group_size()),
@@ -925,8 +922,7 @@ pub fn create_weight_loader_from_config(
             Box::new(ExpertsInt8WeightLoader::new(vb, ei8_config))
         }
         QuantizationMethod::MoeWNA16 => {
-            let wna16_config =
-                super::moe_wna16::MoeWNA16Config::from_detected(&HashMap::new());
+            let wna16_config = super::moe_wna16::MoeWNA16Config::from_detected(&HashMap::new());
             Box::new(MoeWNA16WeightLoader::new(vb, wna16_config))
         }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),

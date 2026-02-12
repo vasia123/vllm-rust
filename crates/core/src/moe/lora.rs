@@ -218,8 +218,13 @@ pub fn expert_forward_with_lora(
 
     // Down projection + LoRA
     let down = candle_nn::Module::forward(&expert.down_proj, &hidden)?;
-    let down_lora =
-        apply_expert_lora(&hidden, &lora.w2_lora_a, &lora.w2_lora_b, expert_id, lora.scale)?;
+    let down_lora = apply_expert_lora(
+        &hidden,
+        &lora.w2_lora_a,
+        &lora.w2_lora_b,
+        expert_id,
+        lora.scale,
+    )?;
     down.add(&down_lora)
 }
 
@@ -392,7 +397,10 @@ mod tests {
             .unwrap()
             .to_scalar()
             .unwrap();
-        assert!(diff > 0.0, "Different experts should produce different LoRA outputs");
+        assert!(
+            diff > 0.0,
+            "Different experts should produce different LoRA outputs"
+        );
     }
 
     #[test]

@@ -67,9 +67,7 @@ mod cuda_ops {
                 let idx = row
                     .iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i as u32)
                     .unwrap_or(0);
                 ids.push(idx);
@@ -77,11 +75,7 @@ mod cuda_ops {
             Ok((CpuStorage::U32(ids), Shape::from_dims(&[num_seqs])))
         }
 
-        fn cuda_fwd(
-            &self,
-            s: &CudaStorage,
-            l: &Layout,
-        ) -> Result<(CudaStorage, Shape)> {
+        fn cuda_fwd(&self, s: &CudaStorage, l: &Layout) -> Result<(CudaStorage, Shape)> {
             let dev = &s.device;
             let (num_seqs, vocab_size) = (l.dims()[0], l.dims()[1]);
 
@@ -108,9 +102,8 @@ mod cuda_ops {
                     builder.arg(&output_slice);
                     builder.arg(data);
                     builder.arg(&vocab_size_i32);
-                    unsafe { builder.launch(cfg) }.map_err(|e| {
-                        candle_core::Error::Msg(format!("argmax_bf16 launch: {e}"))
-                    })?;
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("argmax_bf16 launch: {e}")))?;
                 }
                 CudaStorageSlice::F32(data) => {
                     let func = dev
@@ -125,9 +118,8 @@ mod cuda_ops {
                     builder.arg(&output_slice);
                     builder.arg(data);
                     builder.arg(&vocab_size_i32);
-                    unsafe { builder.launch(cfg) }.map_err(|e| {
-                        candle_core::Error::Msg(format!("argmax_f32 launch: {e}"))
-                    })?;
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| candle_core::Error::Msg(format!("argmax_f32 launch: {e}")))?;
                 }
                 _ => candle_core::bail!("gpu_argmax: unsupported dtype (expected BF16 or F32)"),
             }
@@ -152,11 +144,7 @@ mod cuda_ops {
             candle_core::bail!("SoftmaxOp: use gpu_softmax() which has CPU fallback")
         }
 
-        fn cuda_fwd(
-            &self,
-            s: &CudaStorage,
-            l: &Layout,
-        ) -> Result<(CudaStorage, Shape)> {
+        fn cuda_fwd(&self, s: &CudaStorage, l: &Layout) -> Result<(CudaStorage, Shape)> {
             let dev = &s.device;
             let (num_seqs, vocab_size) = (l.dims()[0], l.dims()[1]);
 
@@ -189,11 +177,7 @@ mod cuda_ops {
                 }
                 CudaStorageSlice::F32(data) => {
                     let func = dev
-                        .get_or_load_custom_func(
-                            "softmax_to_probs_f32",
-                            "sampling",
-                            SAMPLING_PTX,
-                        )
+                        .get_or_load_custom_func("softmax_to_probs_f32", "sampling", SAMPLING_PTX)
                         .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
                     let cfg = LaunchConfig {
                         grid_dim: (num_seqs as u32, 1, 1),
@@ -277,11 +261,7 @@ mod cuda_ops {
             let vocab_size_i32 = vocab_size as i32;
 
             let func = dev
-                .get_or_load_custom_func(
-                    "top_k_top_p_sample_per_seq",
-                    "sampling",
-                    SAMPLING_PTX,
-                )
+                .get_or_load_custom_func("top_k_top_p_sample_per_seq", "sampling", SAMPLING_PTX)
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
             let cfg = LaunchConfig {
@@ -403,9 +383,7 @@ fn gpu_top_k_top_p_sample_cpu(
         let mut threshold = 0.0f32;
         if k > 0 && (k as usize) < vocab_size {
             let mut sorted: Vec<f32> = row.to_vec();
-            sorted.sort_unstable_by(|a, b| {
-                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             threshold = sorted[k as usize - 1];
         }
 
@@ -416,9 +394,8 @@ fn gpu_top_k_top_p_sample_cpu(
             .filter(|(_, &v)| v >= threshold)
             .map(|(i, &v)| (i, v))
             .collect();
-        filtered.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        filtered
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Apply top-p
         if p < 1.0 && p > 0.0 {
@@ -586,8 +563,7 @@ pub fn gpu_top_p_filter(probs: &Tensor, p: f32) -> Result<Tensor> {
     for seq in 0..num_seqs {
         let row = &data[seq * vocab_size..(seq + 1) * vocab_size];
         let mut indexed: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
-        indexed
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut cumsum = 0.0f32;
         for &(idx, prob) in &indexed {
@@ -824,8 +800,7 @@ mod tests {
     #[test]
     fn test_gpu_sample_batch_top_k_restricts() {
         let device = Device::Cpu;
-        let logits =
-            Tensor::from_vec(vec![1.0f32, 1.0, 100.0, 1.0], (1, 4), &device).unwrap();
+        let logits = Tensor::from_vec(vec![1.0f32, 1.0, 100.0, 1.0], (1, 4), &device).unwrap();
 
         let configs = vec![GpuSamplingConfig {
             inv_temperature: 1.0,
@@ -931,14 +906,10 @@ mod tests {
     #[test]
     fn test_cuda_argmax_bf16() {
         let Some(dev) = cuda_device() else { return };
-        let logits = Tensor::from_vec(
-            vec![1.0f32, 5.0, 3.0, 7.0, 2.0, 4.0],
-            (2, 3),
-            &dev,
-        )
-        .unwrap()
-        .to_dtype(DType::BF16)
-        .unwrap();
+        let logits = Tensor::from_vec(vec![1.0f32, 5.0, 3.0, 7.0, 2.0, 4.0], (2, 3), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
 
         let result = gpu_argmax(&logits).unwrap();
         let ids: Vec<u32> = result.to_vec1().unwrap();
@@ -949,12 +920,7 @@ mod tests {
     #[test]
     fn test_cuda_softmax_f32() {
         let Some(dev) = cuda_device() else { return };
-        let logits = Tensor::from_vec(
-            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-            (2, 3),
-            &dev,
-        )
-        .unwrap();
+        let logits = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &dev).unwrap();
 
         let probs = gpu_softmax(&logits).unwrap();
         let data: Vec<f32> = probs.flatten_all().unwrap().to_vec1().unwrap();
@@ -990,16 +956,10 @@ mod tests {
     fn test_cuda_top_k_top_p_sample() {
         let Some(dev) = cuda_device() else { return };
         // Probabilities with one dominant token
-        let probs = Tensor::from_vec(
-            vec![0.01f32, 0.01, 0.96, 0.01, 0.01],
-            (1, 5),
-            &dev,
-        )
-        .unwrap();
+        let probs = Tensor::from_vec(vec![0.01f32, 0.01, 0.96, 0.01, 0.01], (1, 5), &dev).unwrap();
         let rand_vals = Tensor::from_vec(vec![0.5f32], 1, &dev).unwrap();
 
-        let result =
-            gpu_top_k_top_p_sample(&probs, &rand_vals, &[0], &[1.0]).unwrap();
+        let result = gpu_top_k_top_p_sample(&probs, &rand_vals, &[0], &[1.0]).unwrap();
         let ids: Vec<u32> = result.to_vec1().unwrap();
         assert_eq!(ids[0], 2, "Should pick the dominant token");
     }
@@ -1008,16 +968,10 @@ mod tests {
     #[test]
     fn test_cuda_top_k_1_is_argmax() {
         let Some(dev) = cuda_device() else { return };
-        let probs = Tensor::from_vec(
-            vec![0.1f32, 0.4, 0.3, 0.2],
-            (1, 4),
-            &dev,
-        )
-        .unwrap();
+        let probs = Tensor::from_vec(vec![0.1f32, 0.4, 0.3, 0.2], (1, 4), &dev).unwrap();
         let rand_vals = Tensor::from_vec(vec![0.99f32], 1, &dev).unwrap();
 
-        let result =
-            gpu_top_k_top_p_sample(&probs, &rand_vals, &[1], &[1.0]).unwrap();
+        let result = gpu_top_k_top_p_sample(&probs, &rand_vals, &[1], &[1.0]).unwrap();
         let ids: Vec<u32> = result.to_vec1().unwrap();
         assert_eq!(ids[0], 1, "top_k=1 should always pick argmax");
     }
@@ -1060,12 +1014,8 @@ mod tests {
     fn test_cuda_sample_batch_stochastic_dominant() {
         let Some(dev) = cuda_device() else { return };
         // One token has 100.0 logit, others -100.0 → effectively deterministic
-        let logits = Tensor::from_vec(
-            vec![-100.0f32, -100.0, 100.0, -100.0],
-            (1, 4),
-            &dev,
-        )
-        .unwrap();
+        let logits =
+            Tensor::from_vec(vec![-100.0f32, -100.0, 100.0, -100.0], (1, 4), &dev).unwrap();
 
         let configs = vec![GpuSamplingConfig {
             inv_temperature: 1.0,

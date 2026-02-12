@@ -1892,14 +1892,18 @@ pub fn reshape_and_cache_cuda(
                         let kc_slice = match &*kc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::BF16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: key_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
                         };
                         let vc_slice = match &*vc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::BF16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: value_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
                         };
@@ -1933,14 +1937,18 @@ pub fn reshape_and_cache_cuda(
                         let kc_slice = match &*kc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::F16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: key_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
                         };
                         let vc_slice = match &*vc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::F16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: value_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
                         };
@@ -1965,7 +1973,9 @@ pub fn reshape_and_cache_cuda(
                             candle_core::Error::Msg(format!("reshape_and_cache NHD launch: {e}"))
                         })?;
                     }
-                    _ => candle_core::bail!("reshape_and_cache: unsupported dtype, expected BF16 or F16"),
+                    _ => candle_core::bail!(
+                        "reshape_and_cache: unsupported dtype, expected BF16 or F16"
+                    ),
                 },
                 _ => candle_core::bail!("reshape_and_cache: key not on CUDA"),
             }
@@ -1989,14 +1999,18 @@ pub fn reshape_and_cache_cuda(
                         let kc_slice = match &*kc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::BF16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: key_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
                         };
                         let vc_slice = match &*vc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::BF16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: value_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
                         };
@@ -2030,14 +2044,18 @@ pub fn reshape_and_cache_cuda(
                         let kc_slice = match &*kc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::F16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: key_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: key_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: key_cache not on CUDA"),
                         };
                         let vc_slice = match &*vc_guard {
                             Storage::Cuda(cs) => match &cs.slice {
                                 CudaStorageSlice::F16(s) => s,
-                                _ => candle_core::bail!("reshape_and_cache: value_cache dtype mismatch"),
+                                _ => candle_core::bail!(
+                                    "reshape_and_cache: value_cache dtype mismatch"
+                                ),
                             },
                             _ => candle_core::bail!("reshape_and_cache: value_cache not on CUDA"),
                         };
@@ -2062,7 +2080,9 @@ pub fn reshape_and_cache_cuda(
                             candle_core::Error::Msg(format!("reshape_and_cache HND launch: {e}"))
                         })?;
                     }
-                    _ => candle_core::bail!("reshape_and_cache: unsupported dtype, expected BF16 or F16"),
+                    _ => candle_core::bail!(
+                        "reshape_and_cache: unsupported dtype, expected BF16 or F16"
+                    ),
                 },
                 _ => candle_core::bail!("reshape_and_cache: key not on CUDA"),
             }
