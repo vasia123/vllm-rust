@@ -556,6 +556,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -577,6 +578,7 @@ mod tests {
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: true,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             Some(SpeculativeConfig {
                 num_speculative_tokens: 5,

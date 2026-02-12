@@ -147,6 +147,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                     max_tokens_per_step: config.max_tokens_per_step,
                     enable_chunked_prefill: config.enable_chunked_prefill,
                     scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                    max_loras_per_batch: 0,
                 },
                 Some(SpeculativeConfig {
                     num_speculative_tokens: config.num_speculative_tokens,
@@ -175,6 +176,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                     max_tokens_per_step: config.max_tokens_per_step,
                     enable_chunked_prefill: config.enable_chunked_prefill,
                     scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                    max_loras_per_batch: 0,
                 },
                 None,
             )

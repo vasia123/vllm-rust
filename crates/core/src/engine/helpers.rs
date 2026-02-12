@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::Tensor;
+use candle_core::{IndexOp, Tensor};
 
 use crate::kv_cache::KVCacheManager;
 use crate::request::{FinishReason, RequestId, RequestStatus, SequenceState};
@@ -554,6 +554,79 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     )
 }
 
+/// Group sequences by LoRA adapter name and execute forward passes per group.
+///
+/// For a batch with mixed adapters (e.g., base + adapter_A + adapter_B),
+/// this creates sub-batches per adapter, calls `forward_decode_batch_with_lora`
+/// for each, then reassembles logits in original batch order.
+fn forward_grouped_by_adapter<M: ModelForward>(
+    model: &M,
+    token_ids: &[u32],
+    sequences: &[DecodeSequenceMetadata],
+    adapter_names: &[Option<String>],
+    kv_cache_mgr: &mut KVCacheManager,
+    batch_size: usize,
+) -> candle_core::Result<Tensor> {
+    // Build per-adapter groups: maps adapter_name → Vec<original_index>
+    let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+    for (i, name) in adapter_names.iter().enumerate() {
+        let key = name.as_deref();
+        if let Some(group) = groups.iter_mut().find(|(k, _)| *k == key) {
+            group.1.push(i);
+        } else {
+            groups.push((key, vec![i]));
+        }
+    }
+
+    // Fast path: single adapter (or all base) — no regrouping needed
+    if groups.len() == 1 {
+        let (adapter, indices) = &groups[0];
+        let input = Tensor::from_vec(token_ids.to_vec(), (batch_size, 1), model.device())?;
+        let lora_ctx = match adapter {
+            Some(name) => LoraContext::with_adapter(*name),
+            None => LoraContext::none(),
+        };
+        // indices covers entire batch in order, use directly
+        let _ = indices;
+        return model.forward_decode_batch_with_lora(&input, sequences, kv_cache_mgr, &lora_ctx);
+    }
+
+    // Multi-adapter path: forward each group, then reassemble
+    // We'll store (original_index, logits_row) pairs to reassemble in order
+    let mut all_logits: Vec<(usize, Tensor)> = Vec::with_capacity(batch_size);
+
+    for (adapter, indices) in &groups {
+        let group_tokens: Vec<u32> = indices.iter().map(|&i| token_ids[i]).collect();
+        let group_sequences: Vec<DecodeSequenceMetadata> =
+            indices.iter().map(|&i| sequences[i].clone()).collect();
+        let group_size = indices.len();
+
+        let group_input = Tensor::from_vec(group_tokens, (group_size, 1), model.device())?;
+        let lora_ctx = match adapter {
+            Some(name) => LoraContext::with_adapter(*name),
+            None => LoraContext::none(),
+        };
+
+        let group_logits = model.forward_decode_batch_with_lora(
+            &group_input,
+            &group_sequences,
+            kv_cache_mgr,
+            &lora_ctx,
+        )?;
+
+        // Extract per-sequence logit rows from the group output
+        for (local_idx, &orig_idx) in indices.iter().enumerate() {
+            let row = group_logits.i(local_idx)?;
+            all_logits.push((orig_idx, row));
+        }
+    }
+
+    // Reassemble in original batch order
+    all_logits.sort_by_key(|(idx, _)| *idx);
+    let ordered_rows: Vec<Tensor> = all_logits.into_iter().map(|(_, t)| t).collect();
+    Tensor::stack(&ordered_rows, 0)
+}
+
 /// Execute batched decode with optional CUDA graph support.
 /// When a dispatcher is provided, dispatches to cached graphs when available.
 /// When a graph runner is provided, uses it for optimized execution.
@@ -588,31 +661,17 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         return failed;
     }
 
-    // Step 2: Collect input tokens, per-sequence metadata, and LoRA context
+    // Step 2: Collect input tokens, per-sequence metadata, and adapter grouping
     let mut token_ids: Vec<u32> = Vec::with_capacity(batch_ids.len());
     let mut sequences: Vec<DecodeSequenceMetadata> = Vec::with_capacity(batch_ids.len());
-
-    // Determine batch LoRA context from first request with a LoRA adapter
-    // Note: In production, you'd want to batch requests by LoRA adapter for efficiency
-    let batch_lora_ctx = batch_ids
-        .iter()
-        .find_map(|&req_id| {
-            requests.get(&req_id).and_then(|req| {
-                req.state
-                    .lora_request
-                    .as_ref()
-                    .map(|lr| LoraContext::with_adapter(&lr.name))
-            })
-        })
-        .unwrap_or_else(LoraContext::none);
+    // Per-sequence adapter name (None = base model), in same order as token_ids/sequences
+    let mut adapter_names: Vec<Option<String>> = Vec::with_capacity(batch_ids.len());
 
     for &req_id in &batch_ids {
         let Some(req) = requests.get(&req_id) else {
-            // Request was removed between allocation and metadata collection
             continue;
         };
         let Some(&last_token) = req.state.generated_token_ids.last() else {
-            // No generated tokens yet - skip this request
             continue;
         };
         let slot_mapping = req
@@ -626,45 +685,23 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             block_ids: req.state.block_table.block_ids().to_vec(),
             slot_mapping,
         });
+        adapter_names.push(req.state.lora_request.as_ref().map(|lr| lr.name.clone()));
     }
 
-    // Step 3: Batched forward pass
+    // Step 3: Batched forward pass with multi-adapter grouping
     let batch_size = batch_ids.len();
+    let has_any_adapter = adapter_names.iter().any(|a| a.is_some());
 
-    // CUDA Graph dispatch: determine execution mode
-    let forward_ctx = if let Some(disp) = dispatcher {
-        let descriptor = BatchDescriptor::for_decode(batch_size);
-        match disp.read() {
-            Ok(disp_guard) => {
-                let result = disp_guard.dispatch(descriptor);
-                ForwardContext::from_dispatch(result)
-            }
-            Err(_poisoned) => {
-                // Lock was poisoned, fall back to eager execution
-                ForwardContext::eager()
-            }
-        }
-    } else {
-        ForwardContext::eager()
-    };
-
-    let input = match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
-        Ok(t) => t,
-        Err(_) => {
-            failed.extend(&batch_ids);
-            return failed;
-        }
-    };
-
-    // Execute forward pass - prioritize: LoRA > CUDA Graph Runner > Model Context > Eager
-    // Note: CUDA graphs and LoRA are currently mutually exclusive for simplicity
-    let logits = if batch_lora_ctx.has_adapter() {
-        // LoRA path - no graph support
-        match model.forward_decode_batch_with_lora(
-            &input,
+    let logits = if has_any_adapter {
+        // Multi-adapter path: group sequences by adapter, forward each group separately,
+        // then reassemble logits in original batch order.
+        match forward_grouped_by_adapter(
+            model,
+            &token_ids,
             &sequences,
+            &adapter_names,
             kv_cache_mgr,
-            &batch_lora_ctx,
+            batch_size,
         ) {
             Ok(l) => l,
             Err(_) => {
@@ -672,32 +709,54 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 return failed;
             }
         }
-    } else if let Some(runner) = graph_runner {
-        // Try CUDA graph runner path for optimized execution
-        match runner.execute(&input, |inp| {
-            model.forward_decode_batch(inp, &sequences, kv_cache_mgr)
-        }) {
-            Ok(l) => l,
+    } else {
+        // No adapters — use standard path with CUDA graph support
+        let forward_ctx = if let Some(disp) = dispatcher {
+            let descriptor = BatchDescriptor::for_decode(batch_size);
+            match disp.read() {
+                Ok(disp_guard) => {
+                    let result = disp_guard.dispatch(descriptor);
+                    ForwardContext::from_dispatch(result)
+                }
+                Err(_poisoned) => ForwardContext::eager(),
+            }
+        } else {
+            ForwardContext::eager()
+        };
+
+        let input = match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
+            Ok(t) => t,
             Err(_) => {
-                // Fall back to eager execution on runner error
-                match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
+                failed.extend(&batch_ids);
+                return failed;
+            }
+        };
+
+        if let Some(runner) = graph_runner {
+            match runner.execute(&input, |inp| {
+                model.forward_decode_batch(inp, &sequences, kv_cache_mgr)
+            }) {
+                Ok(l) => l,
+                Err(_) => match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
                     Ok(l) => l,
                     Err(_) => {
                         failed.extend(&batch_ids);
                         return failed;
                     }
-                }
+                },
             }
-        }
-    } else {
-        // Execute forward pass with CUDA graph context
-        // The context indicates whether we can replay a cached graph
-        // or should execute eagerly. Graph capture happens during warmup.
-        match model.forward_decode_batch_with_ctx(&input, &sequences, kv_cache_mgr, &forward_ctx) {
-            Ok(l) => l,
-            Err(_) => {
-                failed.extend(&batch_ids);
-                return failed;
+        } else {
+            match model.forward_decode_batch_with_ctx(
+                &input,
+                &sequences,
+                kv_cache_mgr,
+                &forward_ctx,
+            ) {
+                Ok(l) => l,
+                Err(_) => {
+                    failed.extend(&batch_ids);
+                    return failed;
+                }
             }
         }
     };
@@ -1613,5 +1672,235 @@ mod tests {
 
         reclaim_sliding_window_blocks(&[1], Some(8), 4, &mut mgr, &mut requests);
         assert_eq!(requests[&1].state.block_table.num_null_blocks(), 0);
+    }
+
+    // ---- Multi-LoRA grouping tests ----
+
+    /// Mock model that returns different logits based on LoRA adapter name.
+    /// Base (no adapter): all logits = 1.0
+    /// Adapter "A": logits[0] = 10.0 (rest 1.0)
+    /// Adapter "B": logits[1] = 10.0 (rest 1.0)
+    struct LoraAwareMockModel {
+        vocab_size: usize,
+        device: candle_core::Device,
+    }
+
+    impl ModelForward for LoraAwareMockModel {
+        fn forward(
+            &self,
+            input_ids: &Tensor,
+            _seqlen_offset: usize,
+            _kv_cache: &mut KVCacheManager,
+            _block_table: &crate::kv_cache::BlockTable,
+            _slot_mapping: &[usize],
+        ) -> candle_core::Result<Tensor> {
+            let batch = input_ids.dim(0)?;
+            Tensor::ones(
+                (batch, 1, self.vocab_size),
+                candle_core::DType::F32,
+                &self.device,
+            )
+        }
+
+        fn device(&self) -> &candle_core::Device {
+            &self.device
+        }
+
+        fn forward_decode_batch(
+            &self,
+            input_ids: &Tensor,
+            _sequences: &[DecodeSequenceMetadata],
+            _kv_cache_mgr: &mut KVCacheManager,
+        ) -> candle_core::Result<Tensor> {
+            let batch = input_ids.dim(0)?;
+            Tensor::ones(
+                (batch, 1, self.vocab_size),
+                candle_core::DType::F32,
+                &self.device,
+            )
+        }
+
+        fn forward_decode_batch_with_lora(
+            &self,
+            input_ids: &Tensor,
+            _sequences: &[DecodeSequenceMetadata],
+            _kv_cache_mgr: &mut KVCacheManager,
+            lora_ctx: &LoraContext,
+        ) -> candle_core::Result<Tensor> {
+            let batch = input_ids.dim(0)?;
+            let mut logits = vec![1.0f32; batch * self.vocab_size];
+
+            // Set a marker logit based on adapter name
+            match lora_ctx.adapter_name() {
+                Some("A") => {
+                    for b in 0..batch {
+                        logits[b * self.vocab_size] = 10.0; // index 0
+                    }
+                }
+                Some("B") => {
+                    for b in 0..batch {
+                        logits[b * self.vocab_size + 1] = 10.0; // index 1
+                    }
+                }
+                _ => {} // base: all 1.0
+            }
+
+            let t = Tensor::from_vec(logits, (batch, 1, self.vocab_size), &self.device)?;
+            Ok(t)
+        }
+    }
+
+    fn make_decode_metadata(req_id: RequestId) -> DecodeSequenceMetadata {
+        DecodeSequenceMetadata {
+            request_id: req_id,
+            seqlen_offset: 5,
+            block_ids: vec![0],
+            slot_mapping: vec![5],
+        }
+    }
+
+    #[test]
+    fn test_forward_grouped_single_adapter() {
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device, IndexOp};
+
+        let model = LoraAwareMockModel {
+            vocab_size: 4,
+            device: Device::Cpu,
+        };
+        let config = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        let tokens = vec![1u32, 2, 3];
+        let sequences = vec![
+            make_decode_metadata(1),
+            make_decode_metadata(2),
+            make_decode_metadata(3),
+        ];
+        let adapters = vec![
+            Some("A".to_string()),
+            Some("A".to_string()),
+            Some("A".to_string()),
+        ];
+
+        let logits =
+            forward_grouped_by_adapter(&model, &tokens, &sequences, &adapters, &mut mgr, 3)
+                .unwrap();
+
+        // All adapter "A" → logits[0] should be 10.0 for each row
+        let row0: Vec<f32> = logits.i(0).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+        assert_eq!(row0[0], 10.0);
+        assert_eq!(row0[1], 1.0);
+    }
+
+    #[test]
+    fn test_forward_grouped_multi_adapter() {
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device, IndexOp};
+
+        let model = LoraAwareMockModel {
+            vocab_size: 4,
+            device: Device::Cpu,
+        };
+        let config = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        let tokens = vec![1u32, 2, 3, 4];
+        let sequences = vec![
+            make_decode_metadata(1),
+            make_decode_metadata(2),
+            make_decode_metadata(3),
+            make_decode_metadata(4),
+        ];
+        // Mixed: 2 adapter "A", 1 adapter "B", 1 base (no adapter)
+        let adapters = vec![
+            Some("A".to_string()),
+            Some("B".to_string()),
+            None,
+            Some("A".to_string()),
+        ];
+
+        let logits =
+            forward_grouped_by_adapter(&model, &tokens, &sequences, &adapters, &mut mgr, 4)
+                .unwrap();
+
+        // Verify logits are in original batch order with correct adapter markers
+        // Row 0: adapter A → logits[0]=10, rest=1
+        let row0: Vec<f32> = logits.i(0).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+        assert_eq!(row0[0], 10.0);
+        assert_eq!(row0[1], 1.0);
+
+        // Row 1: adapter B → logits[1]=10, rest=1
+        let row1: Vec<f32> = logits.i(1).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+        assert_eq!(row1[0], 1.0);
+        assert_eq!(row1[1], 10.0);
+
+        // Row 2: base → all 1.0
+        let row2: Vec<f32> = logits.i(2).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+        assert_eq!(row2[0], 1.0);
+        assert_eq!(row2[1], 1.0);
+
+        // Row 3: adapter A → logits[0]=10
+        let row3: Vec<f32> = logits.i(3).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+        assert_eq!(row3[0], 10.0);
+        assert_eq!(row3[1], 1.0);
+    }
+
+    #[test]
+    fn test_forward_grouped_all_base() {
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device, IndexOp};
+
+        let model = LoraAwareMockModel {
+            vocab_size: 4,
+            device: Device::Cpu,
+        };
+        let config = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+
+        let tokens = vec![1u32, 2];
+        let sequences = vec![make_decode_metadata(1), make_decode_metadata(2)];
+        let adapters = vec![None, None];
+
+        let logits =
+            forward_grouped_by_adapter(&model, &tokens, &sequences, &adapters, &mut mgr, 2)
+                .unwrap();
+
+        // All base → all 1.0
+        let row0: Vec<f32> = logits.i(0).unwrap().to_vec2::<f32>().unwrap()[0].clone();
+        assert!(row0.iter().all(|&v| v == 1.0));
     }
 }

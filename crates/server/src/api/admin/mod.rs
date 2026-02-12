@@ -266,6 +266,21 @@ async fn save_config(
         ssl_certfile: None, // TLS configured via CLI
         ssl_keyfile: None,
         served_model_name: None, // Model name configured via CLI
+        dtype: Some(request.config.dtype.clone()),
+        quantization: None,
+        gpu_memory_utilization: None,
+        max_model_len: None,
+        tensor_parallel_size: None,
+        seed: None,
+        trust_remote_code: None,
+        max_lora_rank: None,
+        tokenizer: None,
+        revision: None,
+        max_num_batched_tokens: Some(request.config.max_tokens_per_step),
+        scheduling_policy: None,
+        disable_log_requests: None,
+        chat_template_path: None,
+        response_role: None,
     };
 
     let path = config

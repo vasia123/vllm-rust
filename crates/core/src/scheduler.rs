@@ -323,6 +323,10 @@ pub struct SchedulerConfig {
     pub enable_chunked_prefill: bool,
     /// Scheduling policy for request ordering.
     pub scheduling_policy: SchedulingPolicy,
+    /// Maximum number of distinct LoRA adapters in a single decode batch.
+    /// Requests exceeding this limit are deferred to the next step.
+    /// 0 means unlimited.
+    pub max_loras_per_batch: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -332,6 +336,7 @@ impl Default for SchedulerConfig {
             max_tokens_per_step: 8192,
             enable_chunked_prefill: false,
             scheduling_policy: SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
         }
     }
 }
@@ -715,6 +720,7 @@ mod tests {
             max_tokens_per_step: max_tokens,
             enable_chunked_prefill: chunked,
             scheduling_policy: SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
         }
     }
 
@@ -724,6 +730,7 @@ mod tests {
             max_tokens_per_step: max_tokens,
             enable_chunked_prefill: chunked,
             scheduling_policy: SchedulingPolicy::Priority,
+            max_loras_per_batch: 0,
         }
     }
 

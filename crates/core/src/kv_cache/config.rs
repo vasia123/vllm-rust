@@ -4,6 +4,41 @@ use std::fmt;
 use super::offload::CpuOffloadConfig;
 use super::quantization::KVCacheDtype;
 
+/// Query GPU memory info: returns (free_bytes, total_bytes).
+///
+/// Requires an active CUDA context (call after `Device::new_cuda()`).
+#[cfg(feature = "cuda")]
+pub fn gpu_memory_info() -> anyhow::Result<(usize, usize)> {
+    cudarc::driver::result::mem_get_info()
+        .map_err(|e| anyhow::anyhow!("Failed to query GPU memory: {e}"))
+}
+
+/// Estimate KV cache memory budget from GPU memory utilization.
+///
+/// Returns the number of bytes available for KV cache after accounting for
+/// estimated model parameters and a 10% overhead for activations.
+pub fn estimate_kv_budget_bytes(
+    total_vram: usize,
+    utilization: f32,
+    num_params_estimate: usize,
+    dtype: DType,
+) -> usize {
+    let available = (total_vram as f64 * utilization as f64) as usize;
+
+    let bytes_per_param = match dtype {
+        DType::BF16 | DType::F16 => 2,
+        DType::F32 => 4,
+        _ => 2,
+    };
+    let model_bytes = num_params_estimate * bytes_per_param;
+
+    // Reserve 10% of available for activations and fragmentation
+    let overhead = available / 10;
+    available
+        .saturating_sub(model_bytes)
+        .saturating_sub(overhead)
+}
+
 /// Memory layout of the paged KV cache tensor.
 ///
 /// Determines how the 4D cache tensor dimensions are arranged:
@@ -385,5 +420,43 @@ mod tests {
         assert_eq!(KVCacheLayout::NHD, KVCacheLayout::NHD);
         assert_eq!(KVCacheLayout::HND, KVCacheLayout::HND);
         assert_ne!(KVCacheLayout::NHD, KVCacheLayout::HND);
+    }
+
+    // ─── GPU memory budget estimation tests ────────────────────────────────
+
+    #[test]
+    fn estimate_kv_budget_basic() {
+        // 8 GiB total, 90% utilization, 1B params at BF16 (2 GB model)
+        let total: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let budget = estimate_kv_budget_bytes(total, 0.9, 1_000_000_000, DType::BF16);
+        // ~4.6 GiB of KV budget (8*0.9 - 2 - 10% overhead)
+        assert!(budget > 4 * 1024 * 1024 * 1024, "budget should be > 4 GiB");
+        assert!(budget < 6 * 1024 * 1024 * 1024, "budget should be < 6 GiB");
+    }
+
+    #[test]
+    fn estimate_kv_budget_fp32_model() {
+        let total = 8 * 1024 * 1024 * 1024;
+        let budget_bf16 = estimate_kv_budget_bytes(total, 0.9, 500_000_000, DType::BF16);
+        let budget_fp32 = estimate_kv_budget_bytes(total, 0.9, 500_000_000, DType::F32);
+        // FP32 model is twice as large, so less budget for KV
+        assert!(budget_fp32 < budget_bf16);
+    }
+
+    #[test]
+    fn estimate_kv_budget_insufficient_memory() {
+        // Model takes more memory than available
+        let total = 1 * 1024 * 1024 * 1024; // 1 GiB
+        let budget = estimate_kv_budget_bytes(total, 0.9, 2_000_000_000, DType::BF16);
+        // 2B params * 2 = 4GB > 0.9 * 1GB → 0
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn estimate_kv_budget_full_utilization() {
+        let total = 8 * 1024 * 1024 * 1024;
+        let budget_90 = estimate_kv_budget_bytes(total, 0.9, 100_000_000, DType::BF16);
+        let budget_100 = estimate_kv_budget_bytes(total, 1.0, 100_000_000, DType::BF16);
+        assert!(budget_100 > budget_90);
     }
 }

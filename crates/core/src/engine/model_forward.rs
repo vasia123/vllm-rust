@@ -9,6 +9,7 @@ use crate::multimodal::MultimodalInputs;
 use super::cuda_graph::ForwardContext;
 
 /// Per-sequence metadata for batched decode (one token per sequence).
+#[derive(Clone)]
 pub struct DecodeSequenceMetadata {
     /// Unique request identifier for per-request state tracking (e.g., SSM state).
     pub request_id: u64,

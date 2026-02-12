@@ -132,6 +132,7 @@ fn test_engine_config() -> EngineConfig {
             max_tokens_per_step: 512,
             enable_chunked_prefill: false,
             scheduling_policy: SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
         },
         None,
     )

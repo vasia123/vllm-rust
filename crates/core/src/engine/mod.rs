@@ -501,6 +501,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -649,6 +650,7 @@ mod tests {
                 max_tokens_per_step,
                 enable_chunked_prefill: true,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -1122,6 +1124,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -1232,6 +1235,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -1261,6 +1265,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -1911,11 +1916,7 @@ mod tests {
     async fn optimistic_scheduling_produces_same_output_as_disabled() {
         // Run identical requests through two real engine loops: one with
         // optimistic scheduling enabled, one disabled. Outputs must match.
-        let prompts = vec![
-            ("t1 t2 t3", 5),
-            ("t1 t2", 3),
-            ("t1 t2 t3 t4 t5", 4),
-        ];
+        let prompts = vec![("t1 t2 t3", 5), ("t1 t2", 3), ("t1 t2 t3 t4 t5", 4)];
 
         let mut results_on = Vec::new();
         let mut results_off = Vec::new();
@@ -1931,6 +1932,7 @@ mod tests {
                     max_tokens_per_step: 512,
                     enable_chunked_prefill: false,
                     scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                    max_loras_per_batch: 0,
                 },
                 None,
             )
@@ -1990,6 +1992,7 @@ mod tests {
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -2001,12 +2004,12 @@ mod tests {
         // Mix of short (1-2 tokens) and long (10-20 tokens) requests.
         // Short ones will complete quickly, invalidating pre-schedules.
         let requests: Vec<(&str, usize)> = vec![
-            ("t1 t2 t3", 1),       // short
+            ("t1 t2 t3", 1),        // short
             ("t1 t2 t3 t4 t5", 15), // long
-            ("t1 t2", 2),          // short
-            ("t1 t2 t3", 20),      // long
-            ("t1 t2 t3 t4", 1),    // short
-            ("t1 t2 t3", 10),      // long
+            ("t1 t2", 2),           // short
+            ("t1 t2 t3", 20),       // long
+            ("t1 t2 t3 t4", 1),     // short
+            ("t1 t2 t3", 10),       // long
         ];
 
         let mut join_handles = Vec::new();
@@ -2083,8 +2086,7 @@ mod tests {
         ) -> candle_core::Result<candle_core::Tensor> {
             // Burn GPU cycles with matmuls
             let n = self.matmul_dim;
-            let mut acc =
-                candle_core::Tensor::randn(0f32, 1.0, (n, n), &self.device)?;
+            let mut acc = candle_core::Tensor::randn(0f32, 1.0, (n, n), &self.device)?;
             for _ in 0..self.num_matmuls {
                 let b = candle_core::Tensor::randn(0f32, 1.0, (n, n), &self.device)?;
                 acc = acc.matmul(&b)?;
@@ -2128,7 +2130,11 @@ mod tests {
         eprintln!(
             "Device: {} ({})",
             if is_gpu { "CUDA" } else { "CPU" },
-            if is_gpu { "GPU matmuls" } else { "CPU fallback" }
+            if is_gpu {
+                "GPU matmuls"
+            } else {
+                "CPU fallback"
+            }
         );
 
         let num_requests = 8;
@@ -2142,13 +2148,7 @@ mod tests {
         for (label, enable) in [("optimistic=ON", true), ("optimistic=OFF", false)] {
             let cache_config = test_cache_config();
             let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
-            let model = GpuMockModel::new(
-                42,
-                1000,
-                gpu_device.clone(),
-                num_matmuls,
-                matmul_dim,
-            );
+            let model = GpuMockModel::new(42, 1000, gpu_device.clone(), num_matmuls, matmul_dim);
             let tokenizer = TokenizerWrapper::for_testing(1000);
             let config = EngineConfig::builder(
                 SchedulerConfig {
@@ -2156,6 +2156,7 @@ mod tests {
                     max_tokens_per_step: 512,
                     enable_chunked_prefill: false,
                     scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                    max_loras_per_batch: 0,
                 },
                 None,
             )

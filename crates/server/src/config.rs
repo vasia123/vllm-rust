@@ -92,6 +92,66 @@ pub struct ServerConfig {
     /// Model name returned by `/v1/models`. Defaults to model identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_model_name: Option<String>,
+
+    /// Data type for model weights (auto, bf16, fp16, fp32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+
+    /// Override quantization method (none, fp8, gptq, awq, bnb, gguf).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+
+    /// Fraction of GPU memory to use (0.0-1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_utilization: Option<f32>,
+
+    /// Maximum model context length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
+
+    /// Tensor parallel size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tensor_parallel_size: Option<usize>,
+
+    /// Random seed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+
+    /// Allow custom code from HuggingFace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_remote_code: Option<bool>,
+
+    /// Maximum LoRA rank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_lora_rank: Option<usize>,
+
+    /// Override tokenizer path or HuggingFace ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<String>,
+
+    /// HuggingFace model revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+
+    /// Maximum tokens per scheduling step (alias for max_tokens_per_step).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_num_batched_tokens: Option<usize>,
+
+    /// Scheduling policy (fcfs, priority).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_policy: Option<String>,
+
+    /// Suppress per-request logging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_log_requests: Option<bool>,
+
+    /// Override chat template file path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_path: Option<String>,
+
+    /// Default assistant role name in responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_role: Option<String>,
 }
 
 impl ServerConfig {
@@ -194,6 +254,51 @@ impl ServerConfig {
         if other.served_model_name.is_some() {
             self.served_model_name = other.served_model_name.clone();
         }
+        if other.dtype.is_some() {
+            self.dtype = other.dtype.clone();
+        }
+        if other.quantization.is_some() {
+            self.quantization = other.quantization.clone();
+        }
+        if other.gpu_memory_utilization.is_some() {
+            self.gpu_memory_utilization = other.gpu_memory_utilization;
+        }
+        if other.max_model_len.is_some() {
+            self.max_model_len = other.max_model_len;
+        }
+        if other.tensor_parallel_size.is_some() {
+            self.tensor_parallel_size = other.tensor_parallel_size;
+        }
+        if other.seed.is_some() {
+            self.seed = other.seed;
+        }
+        if other.trust_remote_code.is_some() {
+            self.trust_remote_code = other.trust_remote_code;
+        }
+        if other.max_lora_rank.is_some() {
+            self.max_lora_rank = other.max_lora_rank;
+        }
+        if other.tokenizer.is_some() {
+            self.tokenizer = other.tokenizer.clone();
+        }
+        if other.revision.is_some() {
+            self.revision = other.revision.clone();
+        }
+        if other.max_num_batched_tokens.is_some() {
+            self.max_num_batched_tokens = other.max_num_batched_tokens;
+        }
+        if other.scheduling_policy.is_some() {
+            self.scheduling_policy = other.scheduling_policy.clone();
+        }
+        if other.disable_log_requests.is_some() {
+            self.disable_log_requests = other.disable_log_requests;
+        }
+        if other.chat_template_path.is_some() {
+            self.chat_template_path = other.chat_template_path.clone();
+        }
+        if other.response_role.is_some() {
+            self.response_role = other.response_role.clone();
+        }
     }
 }
 
@@ -267,5 +372,75 @@ mod tests {
         assert_eq!(base.model, Some("base-model".to_string())); // Unchanged
         assert_eq!(base.num_blocks, Some(512)); // Overridden
         assert_eq!(base.max_requests, Some(16)); // Added
+    }
+
+    #[test]
+    fn test_new_fields_save_and_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config_new.toml");
+
+        let config = ServerConfig {
+            dtype: Some("fp16".to_string()),
+            quantization: Some("gptq".to_string()),
+            gpu_memory_utilization: Some(0.85),
+            max_model_len: Some(4096),
+            tensor_parallel_size: Some(1),
+            seed: Some(42),
+            trust_remote_code: Some(true),
+            max_lora_rank: Some(32),
+            tokenizer: Some("custom/tokenizer".to_string()),
+            revision: Some("v1.0".to_string()),
+            max_num_batched_tokens: Some(4096),
+            scheduling_policy: Some("priority".to_string()),
+            disable_log_requests: Some(true),
+            chat_template_path: Some("/tmp/template.jinja".to_string()),
+            response_role: Some("model".to_string()),
+            ..Default::default()
+        };
+
+        config.save_to(&path).unwrap();
+        let loaded = ServerConfig::load_from(&path).unwrap();
+
+        assert_eq!(loaded.dtype, Some("fp16".to_string()));
+        assert_eq!(loaded.quantization, Some("gptq".to_string()));
+        assert_eq!(loaded.gpu_memory_utilization, Some(0.85));
+        assert_eq!(loaded.max_model_len, Some(4096));
+        assert_eq!(loaded.tensor_parallel_size, Some(1));
+        assert_eq!(loaded.seed, Some(42));
+        assert_eq!(loaded.trust_remote_code, Some(true));
+        assert_eq!(loaded.max_lora_rank, Some(32));
+        assert_eq!(loaded.tokenizer, Some("custom/tokenizer".to_string()));
+        assert_eq!(loaded.revision, Some("v1.0".to_string()));
+        assert_eq!(loaded.max_num_batched_tokens, Some(4096));
+        assert_eq!(loaded.scheduling_policy, Some("priority".to_string()));
+        assert_eq!(loaded.disable_log_requests, Some(true));
+        assert_eq!(
+            loaded.chat_template_path,
+            Some("/tmp/template.jinja".to_string())
+        );
+        assert_eq!(loaded.response_role, Some("model".to_string()));
+    }
+
+    #[test]
+    fn test_merge_new_fields() {
+        let mut base = ServerConfig {
+            dtype: Some("bf16".to_string()),
+            seed: Some(0),
+            ..Default::default()
+        };
+
+        let other = ServerConfig {
+            dtype: Some("fp16".to_string()),
+            max_lora_rank: Some(128),
+            scheduling_policy: Some("priority".to_string()),
+            ..Default::default()
+        };
+
+        base.merge(&other);
+
+        assert_eq!(base.dtype, Some("fp16".to_string())); // Overridden
+        assert_eq!(base.seed, Some(0)); // Unchanged
+        assert_eq!(base.max_lora_rank, Some(128)); // Added
+        assert_eq!(base.scheduling_policy, Some("priority".to_string())); // Added
     }
 }

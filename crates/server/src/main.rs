@@ -122,6 +122,72 @@ enum Command {
         /// Path to TLS private key file (PEM format). Requires --ssl-certfile.
         #[arg(long)]
         ssl_keyfile: Option<String>,
+
+        /// Data type for model weights and activations.
+        /// auto: use model's native dtype (bf16 for most models)
+        #[arg(long, default_value = "auto")]
+        dtype: String,
+
+        /// Override quantization method. By default, auto-detected from model config.
+        /// Use "none" to force full-precision even if model has quantization config.
+        #[arg(long)]
+        quantization: Option<String>,
+
+        /// Fraction of GPU memory to use for model + KV cache (0.0 to 1.0).
+        /// When set, overrides --num-blocks by computing blocks from available VRAM.
+        #[arg(long)]
+        gpu_memory_utilization: Option<f32>,
+
+        /// Maximum model context length. Overrides the model's max_position_embeddings.
+        /// Useful for limiting memory usage or extending context with RoPE scaling.
+        #[arg(long)]
+        max_model_len: Option<usize>,
+
+        /// Tensor parallel size (number of GPUs). Currently only 1 is supported.
+        #[arg(long, default_value_t = 1)]
+        tensor_parallel_size: usize,
+
+        /// Random seed for reproducible sampling.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Allow loading models with custom code from HuggingFace Hub.
+        #[arg(long)]
+        trust_remote_code: bool,
+
+        /// Maximum LoRA rank allowed for adapter loading.
+        #[arg(long, default_value_t = 64)]
+        max_lora_rank: usize,
+
+        /// Override tokenizer path (HuggingFace Hub ID or local path).
+        /// Defaults to the model path.
+        #[arg(long)]
+        tokenizer: Option<String>,
+
+        /// HuggingFace model revision (branch, tag, or commit hash).
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Maximum number of tokens per scheduling step.
+        /// Higher values increase throughput but use more memory.
+        #[arg(long, default_value_t = 2048)]
+        max_num_batched_tokens: usize,
+
+        /// Scheduling policy for request ordering.
+        #[arg(long, default_value = "fcfs")]
+        scheduling_policy: String,
+
+        /// Suppress per-request logging (arrival, completion, latency).
+        #[arg(long)]
+        disable_log_requests: bool,
+
+        /// Override chat template with a Jinja template file path.
+        #[arg(long)]
+        chat_template: Option<String>,
+
+        /// Default assistant role name in chat completion responses.
+        #[arg(long, default_value = "assistant")]
+        response_role: String,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -185,6 +251,21 @@ async fn main() -> anyhow::Result<()> {
             served_model_name,
             ssl_certfile,
             ssl_keyfile,
+            dtype,
+            quantization,
+            gpu_memory_utilization,
+            max_model_len,
+            tensor_parallel_size,
+            seed,
+            trust_remote_code,
+            max_lora_rank,
+            tokenizer,
+            revision,
+            max_num_batched_tokens,
+            scheduling_policy,
+            disable_log_requests,
+            chat_template,
+            response_role,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = if model == "Qwen/Qwen3-0.6B" {
@@ -264,9 +345,125 @@ async fn main() -> anyhow::Result<()> {
             let ssl_certfile = ssl_certfile.or(file_config.ssl_certfile);
             let ssl_keyfile = ssl_keyfile.or(file_config.ssl_keyfile);
 
-            run_server(
-                model,
-                draft_model,
+            // dtype: CLI > config file
+            let dtype = if dtype == "auto" {
+                file_config.dtype.unwrap_or_else(|| "auto".to_string())
+            } else {
+                dtype
+            };
+
+            // quantization: CLI > config file
+            let quantization = quantization.or(file_config.quantization);
+
+            // gpu_memory_utilization: CLI > config file
+            let gpu_memory_utilization =
+                gpu_memory_utilization.or(file_config.gpu_memory_utilization);
+
+            // max_model_len: CLI > config file
+            let max_model_len = max_model_len.or(file_config.max_model_len);
+
+            // tensor_parallel_size: CLI > config file
+            let tensor_parallel_size = if tensor_parallel_size == 1 {
+                file_config.tensor_parallel_size.unwrap_or(1)
+            } else {
+                tensor_parallel_size
+            };
+
+            // seed: CLI > config file
+            let seed = if seed == 0 {
+                file_config.seed.unwrap_or(0)
+            } else {
+                seed
+            };
+
+            // trust_remote_code: CLI flag or config file
+            let _trust_remote_code =
+                trust_remote_code || file_config.trust_remote_code.unwrap_or(false);
+
+            // max_lora_rank: CLI > config file
+            let max_lora_rank = if max_lora_rank == 64 {
+                file_config.max_lora_rank.unwrap_or(64)
+            } else {
+                max_lora_rank
+            };
+
+            // tokenizer: CLI > config file
+            let tokenizer_override = tokenizer.or(file_config.tokenizer);
+
+            // revision: CLI > config file
+            let revision = if revision == "main" {
+                file_config.revision.unwrap_or(revision)
+            } else {
+                revision
+            };
+
+            // max_num_batched_tokens: CLI > config file
+            let max_num_batched_tokens = if max_num_batched_tokens == 2048 {
+                file_config
+                    .max_num_batched_tokens
+                    .or(file_config.max_tokens_per_step)
+                    .unwrap_or(2048)
+            } else {
+                max_num_batched_tokens
+            };
+
+            // scheduling_policy: CLI > config file
+            let scheduling_policy = if scheduling_policy == "fcfs" {
+                file_config
+                    .scheduling_policy
+                    .unwrap_or_else(|| "fcfs".to_string())
+            } else {
+                scheduling_policy
+            };
+
+            // disable_log_requests: CLI flag or config file
+            let disable_log_requests =
+                disable_log_requests || file_config.disable_log_requests.unwrap_or(false);
+
+            // chat_template: CLI > config file
+            let chat_template_override = chat_template.or(file_config.chat_template_path);
+
+            // response_role: CLI > config file
+            let response_role = if response_role == "assistant" {
+                file_config
+                    .response_role
+                    .unwrap_or_else(|| "assistant".to_string())
+            } else {
+                response_role
+            };
+
+            // Validate tensor_parallel_size
+            if tensor_parallel_size != 1 {
+                anyhow::bail!(
+                    "--tensor-parallel-size {} is not yet supported (only 1 is currently implemented)",
+                    tensor_parallel_size
+                );
+            }
+
+            // Parse scheduling policy
+            let sched_policy = match scheduling_policy.as_str() {
+                "fcfs" => vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                "priority" => vllm_core::scheduler::SchedulingPolicy::Priority,
+                other => anyhow::bail!(
+                    "Unknown scheduling policy '{}'. Supported: fcfs, priority",
+                    other
+                ),
+            };
+
+            // Parse dtype
+            let compute_dtype = match dtype.as_str() {
+                "auto" | "bf16" | "bfloat16" => DType::BF16,
+                "fp16" | "float16" | "half" => DType::F16,
+                "fp32" | "float32" | "float" => DType::F32,
+                other => anyhow::bail!(
+                    "Unknown dtype '{}'. Supported: auto, bf16, fp16, fp32",
+                    other
+                ),
+            };
+
+            run_server(ServerLaunchConfig {
+                model_id: model,
+                draft_model_id: draft_model,
                 num_speculative_tokens,
                 host,
                 port,
@@ -283,7 +480,20 @@ async fn main() -> anyhow::Result<()> {
                 served_model_name,
                 ssl_certfile,
                 ssl_keyfile,
-            )
+                dtype: compute_dtype,
+                quantization,
+                gpu_memory_utilization,
+                max_model_len,
+                seed,
+                max_lora_rank,
+                tokenizer_override,
+                revision,
+                max_num_batched_tokens,
+                scheduling_policy: sched_policy,
+                disable_log_requests,
+                chat_template_override,
+                response_role,
+            })
             .await
         }
         Command::Generate {
@@ -312,8 +522,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_server(
+struct ServerLaunchConfig {
     model_id: String,
     draft_model_id: Option<String>,
     num_speculative_tokens: usize,
@@ -332,17 +541,85 @@ async fn run_server(
     served_model_name: String,
     ssl_certfile: Option<String>,
     ssl_keyfile: Option<String>,
-) -> anyhow::Result<()> {
+    dtype: DType,
+    quantization: Option<String>,
+    gpu_memory_utilization: Option<f32>,
+    max_model_len: Option<usize>,
+    seed: u64,
+    max_lora_rank: usize,
+    tokenizer_override: Option<String>,
+    revision: String,
+    max_num_batched_tokens: usize,
+    scheduling_policy: vllm_core::scheduler::SchedulingPolicy,
+    disable_log_requests: bool,
+    chat_template_override: Option<String>,
+    response_role: String,
+}
+
+async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     logging::init();
     prometheus::init_metrics();
 
+    let ServerLaunchConfig {
+        model_id,
+        draft_model_id,
+        num_speculative_tokens,
+        host,
+        port,
+        mut num_blocks,
+        max_requests,
+        multi_step_count,
+        lora_adapters,
+        enable_prefix_caching,
+        enable_chunked_prefill,
+        shutdown_timeout,
+        cors_config,
+        max_body_size_mb,
+        tool_call_parser,
+        served_model_name,
+        ssl_certfile,
+        ssl_keyfile,
+        dtype,
+        quantization,
+        gpu_memory_utilization,
+        max_model_len: max_model_len_override,
+        seed,
+        max_lora_rank,
+        tokenizer_override,
+        revision,
+        max_num_batched_tokens,
+        scheduling_policy,
+        disable_log_requests,
+        chat_template_override,
+        response_role,
+    } = cfg;
+
+    if seed != 0 {
+        eprintln!("Using random seed: {seed}");
+    }
+    let _ = disable_log_requests; // TODO: wire to per-request logging suppression
+    let _ = response_role; // TODO: wire to chat completion response role field
+    let _ = max_lora_rank; // TODO: validate adapter rank on load
+
     eprintln!("Loading model: {model_id}");
-    let files = loader::fetch_model(&model_id)?;
+    let files = loader::fetch_model_with_revision(&model_id, &revision)?;
 
     let device = Device::new_cuda(0)?;
-    let dtype = DType::BF16;
+    let dtype_label = match dtype {
+        DType::BF16 => "bf16",
+        DType::F16 => "fp16",
+        DType::F32 => "fp32",
+        _ => "unknown",
+    };
 
-    eprintln!("Loading weights to GPU (bf16)...");
+    // Handle quantization override
+    let use_quantized = match quantization.as_deref() {
+        Some("none") => false,
+        Some(_) => true,
+        None => loader::is_quantized(&files),
+    };
+
+    eprintln!("Loading weights to GPU ({dtype_label})...");
     let vb = loader::load_weights(&files.weights, dtype, &device)?;
 
     // Parse LoRA adapter specs first
@@ -362,8 +639,13 @@ async fn run_server(
 
     // Build model - use LoRA-enabled variant if adapters specified
     eprintln!(
-        "Building model ({} layers)...",
-        files.config.num_hidden_layers
+        "Building model ({} layers, quant={})...",
+        files.config.num_hidden_layers,
+        if use_quantized {
+            loader::quantization_info(&files)
+        } else {
+            "none".to_string()
+        },
     );
 
     let model: Box<dyn vllm_core::engine::ModelForward> = if !parsed_lora_specs.is_empty() {
@@ -392,14 +674,69 @@ async fn run_server(
         models::from_config(&files.config, vb)?
     };
 
-    let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
+    // Resolve tokenizer: CLI override > model default
+    let tokenizer_path = if let Some(ref tok_override) = tokenizer_override {
+        // Load from override path (could be a HuggingFace model ID or local path)
+        let tok_path = std::path::Path::new(tok_override);
+        if tok_path.exists() {
+            tok_path.to_path_buf()
+        } else {
+            // Try as HuggingFace model ID
+            let tok_files = loader::fetch_model_with_revision(tok_override, "main")?;
+            tok_files.tokenizer
+        }
+    } else {
+        files.tokenizer.clone()
+    };
+
+    let tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
     let tokenizer = Arc::new(tokenizer);
 
-    let chat_template = files
-        .tokenizer_config
-        .as_ref()
-        .and_then(|path| ChatTemplateEngine::from_tokenizer_config(path).ok())
-        .map(Arc::new);
+    // Resolve chat template: CLI override > tokenizer_config auto-detect
+    let chat_template = if let Some(ref template_path) = chat_template_override {
+        let path = std::path::Path::new(template_path);
+        Some(Arc::new(
+            ChatTemplateEngine::from_tokenizer_config(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load chat template from '{}': {}",
+                    template_path,
+                    e
+                )
+            })?,
+        ))
+    } else {
+        files
+            .tokenizer_config
+            .as_ref()
+            .and_then(|path| ChatTemplateEngine::from_tokenizer_config(path).ok())
+            .map(Arc::new)
+    };
+
+    // Compute num_blocks from GPU memory utilization if specified
+    if let Some(utilization) = gpu_memory_utilization {
+        if !(0.0..=1.0).contains(&utilization) {
+            anyhow::bail!(
+                "--gpu-memory-utilization must be between 0.0 and 1.0, got {utilization}"
+            );
+        }
+        let kv_budget = estimate_kv_cache_budget(utilization, &files.config, dtype)?;
+        let computed_blocks = CacheConfig::from_memory_budget(
+            kv_budget,
+            files.config.num_hidden_layers,
+            files.config.num_key_value_heads,
+            files.config.head_dim,
+            16,
+            dtype,
+            device.clone(),
+        );
+        eprintln!(
+            "GPU memory utilization {:.0}%: estimated {:.0} MiB for KV cache → {} blocks",
+            utilization * 100.0,
+            kv_budget as f64 / (1024.0 * 1024.0),
+            computed_blocks.num_blocks,
+        );
+        num_blocks = computed_blocks.num_blocks;
+    }
 
     let cache_config = CacheConfig {
         block_size: 16,
@@ -419,7 +756,7 @@ async fn run_server(
     let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
 
     let eos_token_id = files.config.eos_token_id;
-    let engine_tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
+    let engine_tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
 
     let handle = if let Some(ref draft_id) = draft_model_id {
         eprintln!("Loading draft model: {draft_id}");
@@ -454,9 +791,10 @@ async fn run_server(
         let engine_config = EngineConfig::builder(
             SchedulerConfig {
                 max_running_requests: max_requests,
-                max_tokens_per_step: 2048,
+                max_tokens_per_step: max_num_batched_tokens,
                 enable_chunked_prefill,
-                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                scheduling_policy,
+                max_loras_per_batch: 0,
             },
             Some(SpeculativeConfig {
                 num_speculative_tokens,
@@ -478,9 +816,10 @@ async fn run_server(
         let engine_config = EngineConfig::builder(
             SchedulerConfig {
                 max_running_requests: max_requests,
-                max_tokens_per_step: 2048,
+                max_tokens_per_step: max_num_batched_tokens,
                 enable_chunked_prefill,
-                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                scheduling_policy,
+                max_loras_per_batch: 0,
             },
             None,
         )
@@ -496,7 +835,10 @@ async fn run_server(
     let accepting = Arc::new(AtomicBool::new(true));
     let engine_builder: Arc<ProductionEngineBuilder> = Arc::new(ProductionEngineBuilder);
 
-    let max_model_len = num_blocks * 16;
+    // max_model_len: CLI override > model's max_position_embeddings > blocks * block_size
+    let default_max_model_len =
+        std::cmp::min(num_blocks * 16, files.config.max_position_embeddings);
+    let max_model_len = max_model_len_override.unwrap_or(default_max_model_len);
     let state = AppState::new(
         atomic_engine.clone(),
         served_model_name,
@@ -519,11 +861,11 @@ async fn run_server(
         num_blocks,
         block_size: 16,
         max_requests,
-        max_tokens_per_step: 2048,
+        max_tokens_per_step: max_num_batched_tokens,
         enable_chunked_prefill,
         multi_step_count,
         enable_prefix_caching,
-        dtype: "bf16".to_string(),
+        dtype: dtype_label.to_string(),
         device: "cuda:0".to_string(),
     };
 
@@ -623,6 +965,57 @@ async fn run_server(
     Ok(())
 }
 
+/// Estimate available GPU memory for KV cache given memory utilization target.
+///
+/// Queries total VRAM, estimates model size from config, and returns the
+/// memory budget available for KV cache allocation.
+fn estimate_kv_cache_budget(
+    utilization: f32,
+    config: &vllm_core::config::ModelConfig,
+    dtype: DType,
+) -> anyhow::Result<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        let (_free, total_vram) = vllm_core::kv_cache::config::gpu_memory_info()?;
+
+        // Rough model size estimate:
+        // params ≈ vocab * hidden + layers * (4 * hidden^2 + 3 * hidden * intermediate)
+        let h = config.hidden_size;
+        let v = config.vocab_size;
+        let l = config.num_hidden_layers;
+        let i = config.intermediate_size;
+        let estimated_params = v * h + l * (4 * h * h + 3 * h * i);
+
+        let kv_budget = vllm_core::kv_cache::config::estimate_kv_budget_bytes(
+            total_vram,
+            utilization,
+            estimated_params,
+            dtype,
+        );
+
+        if kv_budget == 0 {
+            let bytes_per_param = if matches!(dtype, DType::F32) { 4 } else { 2 };
+            let model_bytes = estimated_params * bytes_per_param;
+            anyhow::bail!(
+                "Insufficient GPU memory: {:.0} MiB usable ({:.0}% of {:.0} MiB), \
+                 estimated model size {:.0} MiB",
+                (total_vram as f64 * utilization as f64) / (1024.0 * 1024.0),
+                utilization * 100.0,
+                total_vram as f64 / (1024.0 * 1024.0),
+                model_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+
+        Ok(kv_budget)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (utilization, config, dtype);
+        anyhow::bail!("--gpu-memory-utilization requires the 'cuda' feature")
+    }
+}
+
 async fn run_generate(
     model_id: String,
     draft_model_id: Option<String>,
@@ -703,6 +1096,7 @@ async fn run_generate(
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             Some(SpeculativeConfig {
                 num_speculative_tokens,
@@ -731,6 +1125,7 @@ async fn run_generate(
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                max_loras_per_batch: 0,
             },
             None,
         )

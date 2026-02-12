@@ -20,8 +20,17 @@ pub struct ModelFiles {
 
 /// Downloads model files from HuggingFace Hub (or uses cache).
 pub fn fetch_model(model_id: &str) -> anyhow::Result<ModelFiles> {
+    fetch_model_with_revision(model_id, "main")
+}
+
+/// Downloads model files from HuggingFace Hub at a specific revision.
+pub fn fetch_model_with_revision(model_id: &str, revision: &str) -> anyhow::Result<ModelFiles> {
     let api = Api::new()?;
-    let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
+    let repo = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision.to_string(),
+    ));
 
     let config_path = repo.get("config.json")?;
     let config_content = std::fs::read_to_string(&config_path)?;
@@ -240,6 +249,14 @@ mod tests {
         assert!(files.tokenizer.exists());
         // Qwen3-0.6B is not quantized
         assert_eq!(files.quantization.method, QuantizationMethod::None);
+    }
+
+    #[test]
+    #[ignore] // requires network
+    fn fetch_qwen3_06b_with_revision() {
+        let files =
+            fetch_model_with_revision("Qwen/Qwen3-0.6B", "main").expect("failed to fetch model");
+        assert_eq!(files.config.hidden_size, 1024);
     }
 
     #[test]
