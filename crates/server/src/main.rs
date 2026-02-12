@@ -188,6 +188,182 @@ enum Command {
         /// Default assistant role name in chat completion responses.
         #[arg(long, default_value = "assistant")]
         response_role: String,
+
+        // ─── KV Cache / Memory ──────────────────────────────────────────
+
+        /// KV cache block size (tokens per block).
+        #[arg(long, default_value_t = 16)]
+        block_size: usize,
+
+        /// Data type for KV cache (auto, fp8, fp8_e5m2, fp8_e4m3).
+        /// "auto" uses the model's compute dtype.
+        #[arg(long, default_value = "auto")]
+        kv_cache_dtype: String,
+
+        /// CPU swap space in GiB for offloading KV cache.
+        /// 0 disables CPU offloading.
+        #[arg(long, default_value_t = 0.0)]
+        swap_space: f32,
+
+        /// CPU memory budget in GiB for KV cache offloading.
+        /// Alias for swap-space behavior.
+        #[arg(long, default_value_t = 0.0)]
+        cpu_offload_gb: f32,
+
+        /// Override GPU block count directly (bypasses auto-calculation).
+        #[arg(long)]
+        num_gpu_blocks_override: Option<usize>,
+
+        /// Disable CUDA graph capture (use eager execution).
+        #[arg(long)]
+        enforce_eager: bool,
+
+        // ─── Model Loading ──────────────────────────────────────────────
+
+        /// Weight loading format: auto, safetensors, pt, npcache, dummy.
+        #[arg(long, default_value = "auto")]
+        load_format: String,
+
+        /// Directory for downloading/caching HuggingFace models.
+        /// Defaults to HF_HOME or ~/.cache/huggingface.
+        #[arg(long)]
+        download_dir: Option<String>,
+
+        /// Tokenizer mode: auto, slow.
+        /// "slow" forces the Python tokenizer fallback.
+        #[arg(long, default_value = "auto")]
+        tokenizer_mode: String,
+
+        /// HuggingFace revision for the tokenizer (if different from model).
+        #[arg(long)]
+        tokenizer_revision: Option<String>,
+
+        /// HuggingFace revision for custom model code (trust-remote-code).
+        #[arg(long)]
+        code_revision: Option<String>,
+
+        /// HuggingFace API token for private model access.
+        /// Can also be set via HUGGING_FACE_HUB_TOKEN or HF_TOKEN env vars.
+        #[arg(long, env = "HF_TOKEN")]
+        hf_token: Option<String>,
+
+        /// Number of parallel workers for loading model weights.
+        #[arg(long, default_value_t = 1)]
+        max_parallel_loading_workers: usize,
+
+        // ─── Scheduler Tuning ───────────────────────────────────────────
+
+        /// Maximum number of sequences (same as --max-requests, vLLM-compatible alias).
+        #[arg(long)]
+        max_num_seqs: Option<usize>,
+
+        /// Preemption mode when memory is exhausted: recompute or swap.
+        #[arg(long, default_value = "recompute")]
+        preemption_mode: String,
+
+        /// Maximum number of partial prefills per scheduling step.
+        #[arg(long)]
+        max_num_partial_prefills: Option<usize>,
+
+        /// Token count threshold for classifying a prefill as "long".
+        #[arg(long)]
+        long_prefill_token_threshold: Option<usize>,
+
+        /// Delay between streaming token emission (milliseconds).
+        /// 0 means emit every token immediately.
+        #[arg(long, default_value_t = 0)]
+        stream_interval: usize,
+
+        // ─── LoRA Configuration ─────────────────────────────────────────
+
+        /// Enable LoRA adapter support globally.
+        #[arg(long)]
+        enable_lora: bool,
+
+        /// Maximum number of concurrent LoRA adapters in a single batch.
+        #[arg(long, default_value_t = 1)]
+        max_loras: usize,
+
+        /// Extra vocabulary size reserved for LoRA adapters.
+        #[arg(long, default_value_t = 256)]
+        lora_extra_vocab_size: usize,
+
+        /// Data type for LoRA weights (auto, fp16, bf16, fp32).
+        #[arg(long)]
+        lora_dtype: Option<String>,
+
+        /// Maximum number of LoRA adapters cached on CPU.
+        #[arg(long)]
+        max_cpu_loras: Option<usize>,
+
+        // ─── Speculative Decoding ───────────────────────────────────────
+
+        /// Token acceptance method for speculative decoding.
+        /// Supported: rejection_sampler, typical_acceptance_sampler.
+        #[arg(long, default_value = "rejection_sampler")]
+        spec_decoding_acceptance_method: String,
+
+        /// Maximum n-gram size for prompt lookup speculative decoding.
+        #[arg(long)]
+        ngram_prompt_lookup_max: Option<usize>,
+
+        /// Minimum n-gram size for prompt lookup speculative decoding.
+        #[arg(long)]
+        ngram_prompt_lookup_min: Option<usize>,
+
+        // ─── Observability ──────────────────────────────────────────────
+
+        /// Suppress periodic engine performance statistics logging.
+        #[arg(long)]
+        disable_log_stats: bool,
+
+        /// Maximum number of log probabilities to return per token.
+        #[arg(long, default_value_t = 20)]
+        max_logprobs: usize,
+
+        /// OpenTelemetry OTLP endpoint for trace export.
+        #[arg(long)]
+        otlp_traces_endpoint: Option<String>,
+
+        /// Log level for the server (trace, debug, info, warn, error).
+        #[arg(long, default_value = "info")]
+        log_level: String,
+
+        // ─── Multimodal / VLM ───────────────────────────────────────────
+
+        /// Maximum multimodal items per prompt (JSON: {"image": 5, "video": 1}).
+        #[arg(long)]
+        limit_mm_per_prompt: Option<String>,
+
+        /// Disable caching for multimodal preprocessor outputs.
+        #[arg(long)]
+        disable_mm_preprocessor_cache: bool,
+
+        // ─── Pipeline Parallelism ───────────────────────────────────────
+
+        /// Pipeline parallel size (number of pipeline stages).
+        /// Currently only 1 is supported.
+        #[arg(long, default_value_t = 1)]
+        pipeline_parallel_size: usize,
+
+        // ─── Generation Defaults ────────────────────────────────────────
+
+        /// Backend for guided (structured) decoding: outlines, lm-format-enforcer.
+        #[arg(long, default_value = "outlines")]
+        guided_decoding_backend: String,
+
+        /// Maximum sequence length for CUDA graph capture.
+        /// Sequences longer than this use eager execution.
+        #[arg(long, default_value_t = 8192)]
+        max_seq_len_to_capture: usize,
+
+        /// Enable automatic tool choice for function calling.
+        #[arg(long)]
+        enable_auto_tool_choice: bool,
+
+        /// Return token IDs alongside text in completion responses by default.
+        #[arg(long)]
+        return_tokens_as_token_ids: bool,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -266,6 +442,52 @@ async fn main() -> anyhow::Result<()> {
             disable_log_requests,
             chat_template,
             response_role,
+            // KV Cache / Memory
+            block_size,
+            kv_cache_dtype,
+            swap_space,
+            cpu_offload_gb,
+            num_gpu_blocks_override,
+            enforce_eager,
+            // Model Loading
+            load_format,
+            download_dir,
+            tokenizer_mode,
+            tokenizer_revision,
+            code_revision,
+            hf_token,
+            max_parallel_loading_workers,
+            // Scheduler Tuning
+            max_num_seqs,
+            preemption_mode,
+            max_num_partial_prefills,
+            long_prefill_token_threshold,
+            stream_interval,
+            // LoRA
+            enable_lora,
+            max_loras,
+            lora_extra_vocab_size,
+            lora_dtype,
+            max_cpu_loras,
+            // Speculative Decoding
+            spec_decoding_acceptance_method,
+            ngram_prompt_lookup_max,
+            ngram_prompt_lookup_min,
+            // Observability
+            disable_log_stats,
+            max_logprobs,
+            otlp_traces_endpoint,
+            log_level,
+            // Multimodal
+            limit_mm_per_prompt,
+            disable_mm_preprocessor_cache,
+            // Pipeline Parallelism
+            pipeline_parallel_size,
+            // Generation Defaults
+            guided_decoding_backend,
+            max_seq_len_to_capture,
+            enable_auto_tool_choice,
+            return_tokens_as_token_ids,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = if model == "Qwen/Qwen3-0.6B" {
@@ -432,11 +654,170 @@ async fn main() -> anyhow::Result<()> {
                 response_role
             };
 
+            // ─── New args: CLI > config file merge ───────────────────
+
+            // KV Cache / Memory
+            let block_size = if block_size == 16 {
+                file_config.block_size.unwrap_or(16)
+            } else {
+                block_size
+            };
+            let kv_cache_dtype = if kv_cache_dtype == "auto" {
+                file_config
+                    .kv_cache_dtype
+                    .unwrap_or_else(|| "auto".to_string())
+            } else {
+                kv_cache_dtype
+            };
+            let swap_space = if swap_space == 0.0 {
+                file_config.swap_space.unwrap_or(0.0)
+            } else {
+                swap_space
+            };
+            let cpu_offload_gb = if cpu_offload_gb == 0.0 {
+                file_config.cpu_offload_gb.unwrap_or(0.0)
+            } else {
+                cpu_offload_gb
+            };
+            let num_gpu_blocks_override =
+                num_gpu_blocks_override.or(file_config.num_gpu_blocks_override);
+            let enforce_eager = enforce_eager || file_config.enforce_eager.unwrap_or(false);
+
+            // Model Loading
+            let load_format = if load_format == "auto" {
+                file_config
+                    .load_format
+                    .unwrap_or_else(|| "auto".to_string())
+            } else {
+                load_format
+            };
+            let download_dir = download_dir.or(file_config.download_dir);
+            let tokenizer_mode = if tokenizer_mode == "auto" {
+                file_config
+                    .tokenizer_mode
+                    .unwrap_or_else(|| "auto".to_string())
+            } else {
+                tokenizer_mode
+            };
+            let tokenizer_revision = tokenizer_revision.or(file_config.tokenizer_revision);
+            let code_revision = code_revision.or(file_config.code_revision);
+            let max_parallel_loading_workers = if max_parallel_loading_workers == 1 {
+                file_config.max_parallel_loading_workers.unwrap_or(1)
+            } else {
+                max_parallel_loading_workers
+            };
+
+            // Scheduler Tuning
+            let max_num_seqs = max_num_seqs.or(file_config.max_num_seqs);
+            let preemption_mode = if preemption_mode == "recompute" {
+                file_config
+                    .preemption_mode
+                    .unwrap_or_else(|| "recompute".to_string())
+            } else {
+                preemption_mode
+            };
+            let max_num_partial_prefills =
+                max_num_partial_prefills.or(file_config.max_num_partial_prefills);
+            let long_prefill_token_threshold =
+                long_prefill_token_threshold.or(file_config.long_prefill_token_threshold);
+            let stream_interval = if stream_interval == 0 {
+                file_config.stream_interval.unwrap_or(0)
+            } else {
+                stream_interval
+            };
+
+            // max_num_seqs overrides max_requests if provided
+            let max_requests = max_num_seqs.unwrap_or(max_requests);
+
+            // LoRA
+            let enable_lora = enable_lora || file_config.enable_lora.unwrap_or(false);
+            let max_loras = if max_loras == 1 {
+                file_config.max_loras.unwrap_or(1)
+            } else {
+                max_loras
+            };
+            let lora_extra_vocab_size = if lora_extra_vocab_size == 256 {
+                file_config.lora_extra_vocab_size.unwrap_or(256)
+            } else {
+                lora_extra_vocab_size
+            };
+            let lora_dtype = lora_dtype.or(file_config.lora_dtype);
+            let max_cpu_loras = max_cpu_loras.or(file_config.max_cpu_loras);
+
+            // Speculative Decoding
+            let spec_decoding_acceptance_method =
+                if spec_decoding_acceptance_method == "rejection_sampler" {
+                    file_config
+                        .spec_decoding_acceptance_method
+                        .unwrap_or_else(|| "rejection_sampler".to_string())
+                } else {
+                    spec_decoding_acceptance_method
+                };
+            let ngram_prompt_lookup_max =
+                ngram_prompt_lookup_max.or(file_config.ngram_prompt_lookup_max);
+            let ngram_prompt_lookup_min =
+                ngram_prompt_lookup_min.or(file_config.ngram_prompt_lookup_min);
+
+            // Observability
+            let disable_log_stats =
+                disable_log_stats || file_config.disable_log_stats.unwrap_or(false);
+            let max_logprobs = if max_logprobs == 20 {
+                file_config.max_logprobs.unwrap_or(20)
+            } else {
+                max_logprobs
+            };
+            let otlp_traces_endpoint = otlp_traces_endpoint.or(file_config.otlp_traces_endpoint);
+            let log_level = if log_level == "info" {
+                file_config
+                    .log_level
+                    .unwrap_or_else(|| "info".to_string())
+            } else {
+                log_level
+            };
+
+            // Multimodal
+            let limit_mm_per_prompt = limit_mm_per_prompt.or(file_config.limit_mm_per_prompt);
+            let disable_mm_preprocessor_cache = disable_mm_preprocessor_cache
+                || file_config.disable_mm_preprocessor_cache.unwrap_or(false);
+
+            // Pipeline Parallelism
+            let pipeline_parallel_size = if pipeline_parallel_size == 1 {
+                file_config.pipeline_parallel_size.unwrap_or(1)
+            } else {
+                pipeline_parallel_size
+            };
+
+            // Generation Defaults
+            let guided_decoding_backend = if guided_decoding_backend == "outlines" {
+                file_config
+                    .guided_decoding_backend
+                    .unwrap_or_else(|| "outlines".to_string())
+            } else {
+                guided_decoding_backend
+            };
+            let max_seq_len_to_capture = if max_seq_len_to_capture == 8192 {
+                file_config.max_seq_len_to_capture.unwrap_or(8192)
+            } else {
+                max_seq_len_to_capture
+            };
+            let enable_auto_tool_choice =
+                enable_auto_tool_choice || file_config.enable_auto_tool_choice.unwrap_or(false);
+            let return_tokens_as_token_ids = return_tokens_as_token_ids
+                || file_config.return_tokens_as_token_ids.unwrap_or(false);
+
             // Validate tensor_parallel_size
             if tensor_parallel_size != 1 {
                 anyhow::bail!(
                     "--tensor-parallel-size {} is not yet supported (only 1 is currently implemented)",
                     tensor_parallel_size
+                );
+            }
+
+            // Validate pipeline_parallel_size
+            if pipeline_parallel_size != 1 {
+                anyhow::bail!(
+                    "--pipeline-parallel-size {} is not yet supported (only 1 is currently implemented)",
+                    pipeline_parallel_size
                 );
             }
 
@@ -493,6 +874,42 @@ async fn main() -> anyhow::Result<()> {
                 disable_log_requests,
                 chat_template_override,
                 response_role,
+                // New args
+                block_size,
+                kv_cache_dtype,
+                swap_space,
+                cpu_offload_gb,
+                num_gpu_blocks_override,
+                enforce_eager,
+                load_format,
+                download_dir,
+                tokenizer_mode,
+                tokenizer_revision,
+                code_revision,
+                hf_token,
+                max_parallel_loading_workers,
+                preemption_mode,
+                max_num_partial_prefills,
+                long_prefill_token_threshold,
+                stream_interval,
+                enable_lora,
+                max_loras,
+                lora_extra_vocab_size,
+                lora_dtype,
+                max_cpu_loras,
+                spec_decoding_acceptance_method,
+                ngram_prompt_lookup_max,
+                ngram_prompt_lookup_min,
+                disable_log_stats,
+                max_logprobs,
+                otlp_traces_endpoint,
+                log_level,
+                limit_mm_per_prompt,
+                disable_mm_preprocessor_cache,
+                guided_decoding_backend,
+                max_seq_len_to_capture,
+                enable_auto_tool_choice,
+                return_tokens_as_token_ids,
             })
             .await
         }
@@ -554,6 +971,49 @@ struct ServerLaunchConfig {
     disable_log_requests: bool,
     chat_template_override: Option<String>,
     response_role: String,
+    // KV Cache / Memory
+    block_size: usize,
+    kv_cache_dtype: String,
+    swap_space: f32,
+    cpu_offload_gb: f32,
+    num_gpu_blocks_override: Option<usize>,
+    enforce_eager: bool,
+    // Model Loading
+    load_format: String,
+    download_dir: Option<String>,
+    tokenizer_mode: String,
+    tokenizer_revision: Option<String>,
+    code_revision: Option<String>,
+    hf_token: Option<String>,
+    max_parallel_loading_workers: usize,
+    // Scheduler Tuning
+    preemption_mode: String,
+    max_num_partial_prefills: Option<usize>,
+    long_prefill_token_threshold: Option<usize>,
+    stream_interval: usize,
+    // LoRA
+    enable_lora: bool,
+    max_loras: usize,
+    lora_extra_vocab_size: usize,
+    lora_dtype: Option<String>,
+    max_cpu_loras: Option<usize>,
+    // Speculative Decoding
+    spec_decoding_acceptance_method: String,
+    ngram_prompt_lookup_max: Option<usize>,
+    ngram_prompt_lookup_min: Option<usize>,
+    // Observability
+    disable_log_stats: bool,
+    max_logprobs: usize,
+    otlp_traces_endpoint: Option<String>,
+    log_level: String,
+    // Multimodal
+    limit_mm_per_prompt: Option<String>,
+    disable_mm_preprocessor_cache: bool,
+    // Generation Defaults
+    guided_decoding_backend: String,
+    max_seq_len_to_capture: usize,
+    enable_auto_tool_choice: bool,
+    return_tokens_as_token_ids: bool,
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
@@ -592,6 +1052,42 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         disable_log_requests,
         chat_template_override,
         response_role,
+        // New args
+        block_size,
+        kv_cache_dtype,
+        swap_space,
+        cpu_offload_gb,
+        num_gpu_blocks_override,
+        enforce_eager,
+        load_format,
+        download_dir,
+        tokenizer_mode,
+        tokenizer_revision,
+        code_revision,
+        hf_token,
+        max_parallel_loading_workers,
+        preemption_mode,
+        max_num_partial_prefills,
+        long_prefill_token_threshold,
+        stream_interval,
+        enable_lora,
+        max_loras,
+        lora_extra_vocab_size,
+        lora_dtype,
+        max_cpu_loras,
+        spec_decoding_acceptance_method,
+        ngram_prompt_lookup_max,
+        ngram_prompt_lookup_min,
+        disable_log_stats,
+        max_logprobs,
+        otlp_traces_endpoint,
+        log_level,
+        limit_mm_per_prompt,
+        disable_mm_preprocessor_cache,
+        guided_decoding_backend,
+        max_seq_len_to_capture,
+        enable_auto_tool_choice,
+        return_tokens_as_token_ids,
     } = cfg;
 
     if seed != 0 {
@@ -600,6 +1096,39 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = disable_log_requests; // TODO: wire to per-request logging suppression
     let _ = response_role; // TODO: wire to chat completion response role field
     let _ = max_lora_rank; // TODO: validate adapter rank on load
+
+    // Acknowledge new args (wire as features are implemented)
+    let _ = &kv_cache_dtype; // Used below in CacheConfig
+    let _ = enforce_eager; // TODO: wire to CUDA graph control
+    let _ = &load_format; // TODO: wire to weight loading strategy
+    let _ = &download_dir; // TODO: wire to HF cache dir
+    let _ = &tokenizer_mode; // TODO: wire to tokenizer selection
+    let _ = &tokenizer_revision; // TODO: wire to tokenizer revision
+    let _ = &code_revision; // TODO: wire to custom code loading
+    let _ = &hf_token; // TODO: wire to HF Hub authentication
+    let _ = max_parallel_loading_workers; // TODO: wire to parallel weight loading
+    let _ = &preemption_mode; // TODO: wire to scheduler preemption strategy
+    let _ = max_num_partial_prefills; // TODO: wire to partial prefill limits
+    let _ = long_prefill_token_threshold; // TODO: wire to long prefill classification
+    let _ = stream_interval; // TODO: wire to streaming interval
+    let _ = enable_lora; // TODO: wire to global LoRA enable
+    // max_loras: wired to SchedulerConfig.max_loras_per_batch below
+    let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
+    let _ = &lora_dtype; // TODO: wire to LoRA weight dtype
+    let _ = max_cpu_loras; // TODO: wire to CPU LoRA cache limit
+    let _ = &spec_decoding_acceptance_method; // TODO: wire to acceptance sampler type
+    let _ = ngram_prompt_lookup_max; // TODO: wire to NGram proposer config
+    let _ = ngram_prompt_lookup_min; // TODO: wire to NGram proposer config
+    let _ = disable_log_stats; // TODO: wire to periodic stats suppression
+    let _ = max_logprobs; // TODO: wire to logprobs cap
+    let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
+    let _ = &log_level; // TODO: wire to tracing log level
+    let _ = &limit_mm_per_prompt; // TODO: wire to multimodal limits
+    let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache
+    let _ = &guided_decoding_backend; // TODO: wire to structured output backend
+    let _ = max_seq_len_to_capture; // TODO: wire to CUDA graph capture
+    let _ = enable_auto_tool_choice; // TODO: wire to auto tool selection
+    let _ = return_tokens_as_token_ids; // TODO: wire to default response format
 
     eprintln!("Loading model: {model_id}");
     let files = loader::fetch_model_with_revision(&model_id, &revision)?;
@@ -712,6 +1241,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             .map(Arc::new)
     };
 
+    // Apply num_gpu_blocks_override if specified
+    if let Some(override_blocks) = num_gpu_blocks_override {
+        num_blocks = override_blocks;
+        eprintln!("Using GPU blocks override: {num_blocks}");
+    }
+
     // Compute num_blocks from GPU memory utilization if specified
     if let Some(utilization) = gpu_memory_utilization {
         if !(0.0..=1.0).contains(&utilization) {
@@ -725,7 +1260,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             files.config.num_hidden_layers,
             files.config.num_key_value_heads,
             files.config.head_dim,
-            16,
+            block_size,
             dtype,
             device.clone(),
         );
@@ -738,16 +1273,56 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         num_blocks = computed_blocks.num_blocks;
     }
 
+    // Parse kv_cache_dtype
+    let parsed_kv_cache_dtype = match kv_cache_dtype.as_str() {
+        "auto" => KVCacheDtype::Auto,
+        "fp8" | "fp8_e4m3" | "fp8_e5m2" => KVCacheDtype::Fp8E4m3,
+        other => anyhow::bail!(
+            "Unknown kv-cache-dtype '{}'. Supported: auto, fp8, fp8_e4m3, fp8_e5m2",
+            other
+        ),
+    };
+
+    // Compute CPU offload config from swap_space or cpu_offload_gb
+    let cpu_offload_config = {
+        let offload_gb = if cpu_offload_gb > 0.0 {
+            cpu_offload_gb
+        } else {
+            swap_space
+        };
+        if offload_gb > 0.0 {
+            // Estimate max_cpu_blocks from GiB budget
+            let bytes = (offload_gb * 1024.0 * 1024.0 * 1024.0) as usize;
+            let bytes_per_block = 2 * files.config.num_hidden_layers
+                * files.config.num_key_value_heads
+                * files.config.head_dim
+                * block_size
+                * dtype.size_in_bytes();
+            let max_blocks = if bytes_per_block > 0 {
+                bytes / bytes_per_block
+            } else {
+                256
+            };
+            Some(vllm_core::kv_cache::offload::CpuOffloadConfig {
+                max_cpu_blocks: max_blocks,
+                use_pinned_memory: false,
+                prefetch_count: 2,
+            })
+        } else {
+            None
+        }
+    };
+
     let cache_config = CacheConfig {
-        block_size: 16,
+        block_size,
         num_blocks,
         num_layers: files.config.num_hidden_layers,
         num_kv_heads: files.config.num_key_value_heads,
         head_dim: files.config.head_dim,
         dtype,
         device: device.clone(),
-        kv_cache_dtype: KVCacheDtype::Auto,
-        cpu_offload: None,
+        kv_cache_dtype: parsed_kv_cache_dtype,
+        cpu_offload: cpu_offload_config,
     };
     eprintln!(
         "Allocating KV cache ({} blocks)...",
@@ -794,7 +1369,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 max_tokens_per_step: max_num_batched_tokens,
                 enable_chunked_prefill,
                 scheduling_policy,
-                max_loras_per_batch: 0,
+                max_loras_per_batch: max_loras,
             },
             Some(SpeculativeConfig {
                 num_speculative_tokens,
@@ -819,7 +1394,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 max_tokens_per_step: max_num_batched_tokens,
                 enable_chunked_prefill,
                 scheduling_policy,
-                max_loras_per_batch: 0,
+                max_loras_per_batch: max_loras,
             },
             None,
         )
@@ -837,7 +1412,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     // max_model_len: CLI override > model's max_position_embeddings > blocks * block_size
     let default_max_model_len =
-        std::cmp::min(num_blocks * 16, files.config.max_position_embeddings);
+        std::cmp::min(num_blocks * block_size, files.config.max_position_embeddings);
     let max_model_len = max_model_len_override.unwrap_or(default_max_model_len);
     let state = AppState::new(
         atomic_engine.clone(),
@@ -859,7 +1434,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         draft_model: draft_model_id.clone(),
         num_speculative_tokens,
         num_blocks,
-        block_size: 16,
+        block_size,
         max_requests,
         max_tokens_per_step: max_num_batched_tokens,
         enable_chunked_prefill,

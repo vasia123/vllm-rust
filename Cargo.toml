@@ -45,7 +45,7 @@ uuid = { version = "1", features = ["v4"] }
 half = "2.5"
 minijinja = "2"
 minijinja-contrib = { version = "2", features = ["pycompat"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

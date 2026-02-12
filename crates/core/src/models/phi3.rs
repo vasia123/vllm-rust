@@ -571,6 +571,70 @@ impl Phi3ForCausalLM {
         Ok(logits)
     }
 
+    /// Embed text tokens (for VLM use — embed only, no layers).
+    pub fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids, &self.tp_ctx)
+    }
+
+    /// Forward with pre-computed embeddings (for VLM use — skips embedding layer).
+    pub fn forward_with_embeddings(
+        &self,
+        embeddings: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let seq_len = embeddings.dim(1)?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+
+        let mut xs = embeddings.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+                &self.tp_ctx,
+            )?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs, &self.tp_ctx)
+    }
+
+    /// Forward decode batch with pre-computed embeddings (for VLM use).
+    pub fn forward_decode_batch_with_embeddings(
+        &self,
+        embeddings: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Tensor> {
+        let mut xs = embeddings.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward_decode_batch(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                &self.tp_ctx,
+            )?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs, &self.tp_ctx)
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

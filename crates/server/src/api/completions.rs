@@ -179,13 +179,11 @@ pub async fn create_completion(
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input, req.max_tokens)?;
             total_prompt_tokens += prompt_tokens;
 
-            // Generate `best_of` candidates for this prompt
-            let mut candidates: Vec<(GenerationResult, Option<CompletionLogProbs>)> =
-                Vec::with_capacity(best_of);
-
-            for _ in 0..best_of {
-                // Recreate constraint for each generation call (constraints are stateful)
-                let request_constraint = if has_constraint {
+            // Generate `best_of` candidates for this prompt.
+            // First request runs serially to populate the prefix cache. Remaining
+            // requests run concurrently for KV cache reuse on shared prompts.
+            let build_gen_req = || -> GenerationRequest {
+                let constraint = if has_constraint {
                     create_constraint_from_response_format(
                         req.response_format.as_ref(),
                         &state.tokenizer,
@@ -193,11 +191,9 @@ pub async fn create_completion(
                 } else {
                     None
                 };
-
-                let iter_beam =
+                let beam =
                     build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
-
-                let gen_req = GenerationRequest {
+                GenerationRequest {
                     prompt: prompt.clone(),
                     max_new_tokens: req.max_tokens,
                     eos_token_id: state.eos_token_id,
@@ -210,7 +206,7 @@ pub async fn create_completion(
                         presence_penalty: req.presence_penalty,
                         min_p: req.min_p,
                         seed: req.seed,
-                        beam_search: iter_beam,
+                        beam_search: beam,
                         logit_bias: logit_bias.clone(),
                         min_tokens: req.min_tokens,
                         eos_token_id: Some(state.eos_token_id),
@@ -227,30 +223,65 @@ pub async fn create_completion(
                     echo: req.echo,
                     lora_request: lora_request.clone(),
                     prompt_adapter_request: None,
-                    constraint: request_constraint,
+                    constraint,
                     image_inputs: Vec::new(),
-                };
-
-                let result = state.engine.get().generate(gen_req).await.map_err(|e| {
-                    prometheus::inc_requests_error();
-                    ApiError::EngineError(e.to_string())
-                })?;
-
-                // Validate output against response_format after generation completes.
-                if let Err(e) =
-                    validate_response_format(&result.generated_text, req.response_format.as_ref())
-                {
-                    prometheus::inc_requests_error();
-                    return Err(ApiError::InvalidRequest(e.to_string()));
                 }
+            };
 
-                let logprobs_data = if internal_logprobs.is_some() {
-                    Some(build_logprobs(&result, &state.tokenizer, req.echo))
-                } else {
-                    None
-                };
+            let mut candidates: Vec<(GenerationResult, Option<CompletionLogProbs>)> =
+                Vec::with_capacity(best_of);
 
-                candidates.push((result, logprobs_data));
+            // First candidate — serial to populate prefix cache
+            let first_result =
+                state
+                    .engine
+                    .get()
+                    .generate(build_gen_req())
+                    .await
+                    .map_err(|e| {
+                        prometheus::inc_requests_error();
+                        ApiError::EngineError(e.to_string())
+                    })?;
+            if let Err(e) = validate_response_format(
+                &first_result.generated_text,
+                req.response_format.as_ref(),
+            ) {
+                prometheus::inc_requests_error();
+                return Err(ApiError::InvalidRequest(e.to_string()));
+            }
+            let first_logprobs = if internal_logprobs.is_some() {
+                Some(build_logprobs(&first_result, &state.tokenizer, req.echo))
+            } else {
+                None
+            };
+            candidates.push((first_result, first_logprobs));
+
+            if best_of > 1 {
+                // Remaining candidates — concurrent (prefix cache provides KV reuse)
+                let engine = state.engine.get();
+                let futs: Vec<_> = (1..best_of)
+                    .map(|_| engine.generate(build_gen_req()))
+                    .collect();
+                let results = futures::future::join_all(futs).await;
+                for result in results {
+                    let result = result.map_err(|e| {
+                        prometheus::inc_requests_error();
+                        ApiError::EngineError(e.to_string())
+                    })?;
+                    if let Err(e) = validate_response_format(
+                        &result.generated_text,
+                        req.response_format.as_ref(),
+                    ) {
+                        prometheus::inc_requests_error();
+                        return Err(ApiError::InvalidRequest(e.to_string()));
+                    }
+                    let logprobs_data = if internal_logprobs.is_some() {
+                        Some(build_logprobs(&result, &state.tokenizer, req.echo))
+                    } else {
+                        None
+                    };
+                    candidates.push((result, logprobs_data));
+                }
             }
 
             // Select the top `n` candidates by cumulative log probability

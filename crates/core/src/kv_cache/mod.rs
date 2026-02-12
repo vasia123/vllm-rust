@@ -509,6 +509,29 @@ impl KVCacheManager {
         }
     }
 
+    /// Fork a block table for n>1 generation with KV cache block sharing.
+    ///
+    /// Creates a copy of `source` that shares the same physical blocks for
+    /// prompt tokens. If prefix caching is enabled, increments reference counts
+    /// on the cached blocks so they are protected from eviction while the fork
+    /// is active. The forked table is ready for independent decode — the caller
+    /// allocates new blocks for generated tokens.
+    ///
+    /// When prefix caching is disabled, the fork shares block IDs directly
+    /// (safe because prompt KV data is read-only during decode) but the caller
+    /// must ensure the source outlives the fork or manage lifetimes externally.
+    pub fn fork_block_table(
+        &mut self,
+        source: &BlockTable,
+        prompt_tokens: &[u32],
+    ) -> BlockTable {
+        // Increment ref counts on cached prefix blocks so they survive eviction
+        if self.prefix_cache.is_some() {
+            let _ = self.match_prefix(prompt_tokens);
+        }
+        source.clone()
+    }
+
     /// Get prefix cache statistics.
     pub fn prefix_cache_stats(&self) -> Option<(usize, usize)> {
         self.prefix_cache
@@ -1075,6 +1098,135 @@ mod tests {
         assert_eq!(table_b.block_ids().len(), 2);
         // Second block should be different from A's
         assert_ne!(table_b.block_ids()[1], table_a.block_ids()[1]);
+    }
+
+    // ─── fork_block_table tests ────────────────────────────────────────────────
+
+    #[test]
+    fn fork_block_table_creates_clone() {
+        let mut config = test_config();
+        config.num_blocks = 16;
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut mgr = KVCacheManager::with_prefix_cache(&config, Arc::clone(&metrics)).unwrap();
+
+        let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 blocks
+        let mut table = BlockTable::new(config.block_size);
+        mgr.allocate_for_request(&mut table, 8).unwrap();
+        table.advance(8);
+        mgr.register_prefix(&prompt, table.block_ids());
+
+        // Fork creates a clone with same block IDs
+        let forked = mgr.fork_block_table(&table, &prompt);
+        assert_eq!(forked.block_ids(), table.block_ids());
+        assert_eq!(forked.num_tokens(), table.num_tokens());
+    }
+
+    #[test]
+    fn fork_block_table_increments_refcount() {
+        let mut config = test_config();
+        config.num_blocks = 16;
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut mgr = KVCacheManager::with_prefix_cache(&config, Arc::clone(&metrics)).unwrap();
+
+        let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 blocks
+        let mut table = BlockTable::new(config.block_size);
+        mgr.allocate_for_request(&mut table, 8).unwrap();
+        table.advance(8);
+        let block_ids = table.block_ids().to_vec();
+        mgr.register_prefix(&prompt, &block_ids);
+
+        // Fork increments ref_count via match_prefix
+        let _forked = mgr.fork_block_table(&table, &prompt);
+
+        // Release original owner — blocks should NOT be evictable (fork has reference)
+        let to_free = mgr.release_prefix(&prompt, &block_ids);
+        assert!(to_free.is_empty());
+        let (_, evictable) = mgr.prefix_cache_stats().unwrap();
+        assert_eq!(evictable, 0); // Fork still holds reference
+
+        // Release fork's reference — now evictable
+        mgr.release_prefix(&prompt, &block_ids);
+        let (_, evictable) = mgr.prefix_cache_stats().unwrap();
+        assert_eq!(evictable, 2);
+    }
+
+    #[test]
+    fn fork_block_table_multiple_forks() {
+        let mut config = test_config();
+        config.num_blocks = 16;
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut mgr = KVCacheManager::with_prefix_cache(&config, Arc::clone(&metrics)).unwrap();
+
+        let prompt = vec![1, 2, 3, 4]; // 1 block
+        let mut table = BlockTable::new(config.block_size);
+        mgr.allocate_for_request(&mut table, 4).unwrap();
+        table.advance(4);
+        let block_ids = table.block_ids().to_vec();
+        mgr.register_prefix(&prompt, &block_ids);
+
+        // Fork 5 times (simulating n=5 best_of)
+        let forks: Vec<_> = (0..5)
+            .map(|_| mgr.fork_block_table(&table, &prompt))
+            .collect();
+
+        // All forks share the same physical blocks
+        for fork in &forks {
+            assert_eq!(fork.block_ids(), table.block_ids());
+        }
+
+        // Release all: owner + 5 forks = 6 references total
+        // Need to release 6 times before blocks become evictable
+        for _ in 0..6 {
+            let (_, evictable) = mgr.prefix_cache_stats().unwrap();
+            assert_eq!(evictable, 0);
+            mgr.release_prefix(&prompt, &block_ids);
+        }
+        let (_, evictable) = mgr.prefix_cache_stats().unwrap();
+        assert_eq!(evictable, 1);
+    }
+
+    #[test]
+    fn fork_block_table_without_prefix_cache() {
+        let config = test_config();
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+        assert!(!mgr.has_prefix_cache());
+
+        let mut table = BlockTable::new(config.block_size);
+        mgr.allocate_for_request(&mut table, 8).unwrap();
+        table.advance(8);
+
+        // Fork without prefix cache still clones the table
+        let forked = mgr.fork_block_table(&table, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(forked.block_ids(), table.block_ids());
+        assert_eq!(forked.num_tokens(), 8);
+    }
+
+    #[test]
+    fn fork_block_table_independent_decode() {
+        let mut config = test_config();
+        config.num_blocks = 20;
+        let metrics = Arc::new(KVCacheMetrics::new());
+        let mut mgr = KVCacheManager::with_prefix_cache(&config, Arc::clone(&metrics)).unwrap();
+
+        let prompt = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 blocks
+        let mut table = BlockTable::new(config.block_size);
+        mgr.allocate_for_request(&mut table, 8).unwrap();
+        table.advance(8);
+        mgr.register_prefix(&prompt, table.block_ids());
+
+        // Fork and allocate independent decode blocks
+        let mut fork1 = mgr.fork_block_table(&table, &prompt);
+        let mut fork2 = mgr.fork_block_table(&table, &prompt);
+
+        mgr.allocate_for_request(&mut fork1, 4).unwrap(); // 1 new block
+        mgr.allocate_for_request(&mut fork2, 4).unwrap(); // 1 new block
+
+        // Shared prompt blocks are the same
+        assert_eq!(fork1.block_ids()[0], fork2.block_ids()[0]);
+        assert_eq!(fork1.block_ids()[1], fork2.block_ids()[1]);
+
+        // Decode blocks are different (independently allocated)
+        assert_ne!(fork1.block_ids()[2], fork2.block_ids()[2]);
     }
 
     // ─── CacheVariant and MLA cache tests ────────────────────────────────────────

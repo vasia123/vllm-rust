@@ -12,6 +12,7 @@ pub struct ModelCapabilities {
     pub supports_multimodal: bool,
     pub is_moe: bool,
     pub is_encoder_only: bool,
+    pub is_encoder_decoder: bool,
 }
 
 impl ModelCapabilities {
@@ -23,6 +24,7 @@ impl ModelCapabilities {
             supports_multimodal: false,
             is_moe: false,
             is_encoder_only: false,
+            is_encoder_decoder: false,
         }
     }
 
@@ -53,6 +55,11 @@ impl ModelCapabilities {
 
     const fn with_encoder_only(mut self) -> Self {
         self.is_encoder_only = true;
+        self
+    }
+
+    const fn with_encoder_decoder(mut self) -> Self {
+        self.is_encoder_decoder = true;
         self
     }
 }
@@ -778,6 +785,12 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         display_name: "HyperCLOVA X",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
+    // ─── Encoder-Decoder Models ────────────────────────────────────────────
+    ArchitectureInfo {
+        arch_names: &["T5ForConditionalGeneration", "T5Model"],
+        display_name: "T5",
+        capabilities: ModelCapabilities::new().with_encoder_decoder(),
+    },
     // ─── Multimodal Embedding / Cross-Encoder ───────────────────────────────
     ArchitectureInfo {
         arch_names: &["CLIPModel"],
@@ -796,6 +809,26 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
         arch_names: &["Phi3VForCausalLM"],
         display_name: "Phi-3 Vision",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["PaliGemmaForConditionalGeneration"],
+        display_name: "PaliGemma",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["LlavaOnevisionForConditionalGeneration"],
+        display_name: "LLaVA-OneVision",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MolmoForCausalLM"],
+        display_name: "Molmo",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GLM4VForCausalLM", "Glm4VForConditionalGeneration"],
+        display_name: "GLM-4V",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
@@ -1132,6 +1165,11 @@ mod tests {
             "CLIPModel",
             "SiglipModel",
             "Phi3VForCausalLM",
+            "PaliGemmaForConditionalGeneration",
+            "LlavaOnevisionForConditionalGeneration",
+            "MolmoForCausalLM",
+            "GLM4VForCausalLM",
+            "Glm4VForConditionalGeneration",
             "Qwen2VLForConditionalGeneration",
             "JinaVLForRanking",
             "PrithviGeoSpatialMAE",

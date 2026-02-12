@@ -208,20 +208,17 @@ pub async fn create_chat_completion(
             logprobs_count
         };
 
-        // Generate `best_of` candidates
-        let mut candidates: Vec<GenerationResult> = Vec::with_capacity(best_of);
-
-        for _ in 0..best_of {
-            // Recreate constraint for each iteration (constraints are stateful)
-            let iter_constraint = create_constraint_from_response_format(
+        // Generate `best_of` candidates.
+        // First request runs serially to populate the prefix cache. Remaining
+        // requests run concurrently — they get prefix cache hits and skip most
+        // of the prefill, saving significant GPU time for long prompts.
+        let build_gen_req = |req: &ChatCompletionRequest| -> GenerationRequest {
+            let constraint = create_constraint_from_response_format(
                 req.response_format.as_ref(),
                 &state.tokenizer,
             );
-
-            let iter_beam =
-                build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
-
-            let iter_gen_req = GenerationRequest {
+            let beam = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
+            GenerationRequest {
                 prompt: prompt.clone(),
                 max_new_tokens: max_tokens,
                 eos_token_id: state.eos_token_id,
@@ -234,7 +231,7 @@ pub async fn create_chat_completion(
                     presence_penalty: req.presence_penalty,
                     min_p: req.min_p,
                     seed: req.seed,
-                    beam_search: iter_beam,
+                    beam_search: beam,
                     logit_bias: logit_bias.clone(),
                     min_tokens: req.min_tokens,
                     eos_token_id: Some(state.eos_token_id),
@@ -251,29 +248,52 @@ pub async fn create_chat_completion(
                 echo: false,
                 lora_request: lora_request.clone(),
                 prompt_adapter_request: None,
-                constraint: iter_constraint,
+                constraint,
                 image_inputs: image_inputs.clone(),
-            };
+            }
+        };
 
-            let result = state
-                .engine
-                .get()
-                .generate(iter_gen_req)
-                .await
-                .map_err(|e| {
+        let mut candidates: Vec<GenerationResult> = Vec::with_capacity(best_of);
+
+        // First candidate — serial to populate prefix cache
+        let first_result = state
+            .engine
+            .get()
+            .generate(build_gen_req(&req))
+            .await
+            .map_err(|e| {
+                prometheus::inc_requests_error();
+                ApiError::EngineError(e.to_string())
+            })?;
+        if let Err(e) =
+            validate_response_format(&first_result.generated_text, req.response_format.as_ref())
+        {
+            prometheus::inc_requests_error();
+            return Err(ApiError::InvalidRequest(e.to_string()));
+        }
+        candidates.push(first_result);
+
+        if best_of > 1 {
+            // Remaining candidates — concurrent (prefix cache provides KV reuse)
+            let engine = state.engine.get();
+            let futs: Vec<_> = (1..best_of)
+                .map(|_| engine.generate(build_gen_req(&req)))
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            for result in results {
+                let result = result.map_err(|e| {
                     prometheus::inc_requests_error();
                     ApiError::EngineError(e.to_string())
                 })?;
-
-            // Validate output against response_format after generation completes.
-            if let Err(e) =
-                validate_response_format(&result.generated_text, req.response_format.as_ref())
-            {
-                prometheus::inc_requests_error();
-                return Err(ApiError::InvalidRequest(e.to_string()));
+                if let Err(e) = validate_response_format(
+                    &result.generated_text,
+                    req.response_format.as_ref(),
+                ) {
+                    prometheus::inc_requests_error();
+                    return Err(ApiError::InvalidRequest(e.to_string()));
+                }
+                candidates.push(result);
             }
-
-            candidates.push(result);
         }
 
         // Select the top `n` candidates by cumulative log probability

@@ -26,6 +26,7 @@ mod encoder_decoder;
 mod handle;
 mod helpers;
 mod model_forward;
+pub mod pipeline;
 pub mod spec_decode;
 mod speculative;
 mod standard;
@@ -46,6 +47,10 @@ pub use embedding_forward::{pool_embeddings, EmbeddingOutput, ModelForEmbedding,
 pub use encoder_decoder::{EncoderOutput, ModelForEncoderDecoder};
 pub use handle::EngineHandle;
 pub use model_forward::{DecodeSequenceMetadata, ModelForward};
+pub use pipeline::{
+    create_stage_cache_config, pipeline_worker_loop, send_worker_signal, PipelineForward,
+    PipelineStagedModel, SIGNAL_EXECUTE, SIGNAL_SHUTDOWN,
+};
 pub use spec_decode::{
     DraftModelDraftProposer, DraftModelProposer, DraftProposer, EagleConfig, EagleProposer,
     MedusaHead, MedusaProposer, NGramConfig, NGramProposer, SpeculationTree, SpeculativeProposer,
@@ -152,6 +157,36 @@ pub fn start_engine_with_proposer<M: ModelForward>(
     ));
 
     EngineHandle { cmd_tx }
+}
+
+/// Start the inference engine with pipeline parallelism.
+///
+/// Wraps a [`PipelineForward`] model in [`PipelineStagedModel`] which transparently
+/// handles inter-stage communication. The resulting model implements [`ModelForward`]
+/// and is used with standard execution.
+///
+/// This is the coordinator-side entry point (rank 0). Pipeline worker processes
+/// should use [`pipeline_worker_loop`] instead.
+///
+/// # Arguments
+/// * `model` - Partial model for this stage (only assigned layers loaded)
+/// * `stage_config` - Pipeline stage configuration
+/// * `comm` - Device communicator for inter-stage P2P communication
+/// * `vocab_size` - Vocabulary size (for recv buffer allocation)
+/// * `tokenizer` - Tokenizer for the model
+/// * `kv_cache_mgr` - KV cache manager (configured for this stage's layers)
+/// * `config` - Engine configuration
+pub fn start_engine_pipeline<M: PipelineForward>(
+    model: M,
+    stage_config: crate::distributed::PipelineStageConfig,
+    comm: std::sync::Arc<dyn crate::distributed::DeviceCommunicator>,
+    vocab_size: usize,
+    tokenizer: TokenizerWrapper,
+    kv_cache_mgr: KVCacheManager,
+    config: EngineConfig,
+) -> EngineHandle {
+    let staged_model = PipelineStagedModel::new(model, stage_config, comm, vocab_size);
+    start_engine(staged_model, tokenizer, kv_cache_mgr, config)
 }
 
 // ─── Engine start with warmup ─────────────────────────────────────────────

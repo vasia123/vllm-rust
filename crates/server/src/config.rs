@@ -152,6 +152,168 @@ pub struct ServerConfig {
     /// Default assistant role name in responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_role: Option<String>,
+
+    // ─── KV Cache / Memory ──────────────────────────────────────────────
+
+    /// KV cache block size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<usize>,
+
+    /// KV cache data type (auto, fp8, fp8_e5m2, fp8_e4m3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<String>,
+
+    /// CPU swap space in GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_space: Option<f32>,
+
+    /// CPU offload budget in GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_offload_gb: Option<f32>,
+
+    /// Override GPU block count directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_gpu_blocks_override: Option<usize>,
+
+    /// Disable CUDA graph capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforce_eager: Option<bool>,
+
+    // ─── Model Loading ──────────────────────────────────────────────────
+
+    /// Weight loading format (auto, safetensors, pt, npcache, dummy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_format: Option<String>,
+
+    /// HuggingFace model cache directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
+
+    /// Tokenizer mode (auto, slow).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer_mode: Option<String>,
+
+    /// Tokenizer revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer_revision: Option<String>,
+
+    /// Code revision for custom model code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_revision: Option<String>,
+
+    /// Parallel weight loading workers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_parallel_loading_workers: Option<usize>,
+
+    // ─── Scheduler Tuning ───────────────────────────────────────────────
+
+    /// Maximum concurrent sequences (alias for max_requests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_num_seqs: Option<usize>,
+
+    /// Preemption mode (recompute, swap).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preemption_mode: Option<String>,
+
+    /// Maximum partial prefills per step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_num_partial_prefills: Option<usize>,
+
+    /// Token threshold for "long" prefill classification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_prefill_token_threshold: Option<usize>,
+
+    /// Streaming token interval in ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_interval: Option<usize>,
+
+    // ─── LoRA Configuration ─────────────────────────────────────────────
+
+    /// Enable LoRA support globally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_lora: Option<bool>,
+
+    /// Max concurrent LoRA adapters per batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_loras: Option<usize>,
+
+    /// Extra vocab size for LoRA adapters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_extra_vocab_size: Option<usize>,
+
+    /// LoRA weight data type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lora_dtype: Option<String>,
+
+    /// CPU LoRA cache limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpu_loras: Option<usize>,
+
+    // ─── Speculative Decoding ───────────────────────────────────────────
+
+    /// Speculative acceptance method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_decoding_acceptance_method: Option<String>,
+
+    /// NGram prompt lookup max.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_prompt_lookup_max: Option<usize>,
+
+    /// NGram prompt lookup min.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ngram_prompt_lookup_min: Option<usize>,
+
+    // ─── Observability ──────────────────────────────────────────────────
+
+    /// Suppress periodic stats logging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_log_stats: Option<bool>,
+
+    /// Max logprobs per token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_logprobs: Option<usize>,
+
+    /// OpenTelemetry OTLP endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_traces_endpoint: Option<String>,
+
+    /// Server log level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+
+    // ─── Multimodal ─────────────────────────────────────────────────────
+
+    /// Multimodal items limit per prompt (JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_mm_per_prompt: Option<String>,
+
+    /// Disable multimodal preprocessor cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_mm_preprocessor_cache: Option<bool>,
+
+    // ─── Pipeline Parallelism ───────────────────────────────────────────
+
+    /// Pipeline parallel size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_parallel_size: Option<usize>,
+
+    // ─── Generation Defaults ────────────────────────────────────────────
+
+    /// Guided decoding backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guided_decoding_backend: Option<String>,
+
+    /// Max sequence length for CUDA graph capture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_seq_len_to_capture: Option<usize>,
+
+    /// Enable automatic tool choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_auto_tool_choice: Option<bool>,
+
+    /// Return token IDs by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_tokens_as_token_ids: Option<bool>,
 }
 
 impl ServerConfig {
@@ -298,6 +460,124 @@ impl ServerConfig {
         }
         if other.response_role.is_some() {
             self.response_role = other.response_role.clone();
+        }
+        // KV Cache / Memory
+        if other.block_size.is_some() {
+            self.block_size = other.block_size;
+        }
+        if other.kv_cache_dtype.is_some() {
+            self.kv_cache_dtype = other.kv_cache_dtype.clone();
+        }
+        if other.swap_space.is_some() {
+            self.swap_space = other.swap_space;
+        }
+        if other.cpu_offload_gb.is_some() {
+            self.cpu_offload_gb = other.cpu_offload_gb;
+        }
+        if other.num_gpu_blocks_override.is_some() {
+            self.num_gpu_blocks_override = other.num_gpu_blocks_override;
+        }
+        if other.enforce_eager.is_some() {
+            self.enforce_eager = other.enforce_eager;
+        }
+        // Model Loading
+        if other.load_format.is_some() {
+            self.load_format = other.load_format.clone();
+        }
+        if other.download_dir.is_some() {
+            self.download_dir = other.download_dir.clone();
+        }
+        if other.tokenizer_mode.is_some() {
+            self.tokenizer_mode = other.tokenizer_mode.clone();
+        }
+        if other.tokenizer_revision.is_some() {
+            self.tokenizer_revision = other.tokenizer_revision.clone();
+        }
+        if other.code_revision.is_some() {
+            self.code_revision = other.code_revision.clone();
+        }
+        if other.max_parallel_loading_workers.is_some() {
+            self.max_parallel_loading_workers = other.max_parallel_loading_workers;
+        }
+        // Scheduler Tuning
+        if other.max_num_seqs.is_some() {
+            self.max_num_seqs = other.max_num_seqs;
+        }
+        if other.preemption_mode.is_some() {
+            self.preemption_mode = other.preemption_mode.clone();
+        }
+        if other.max_num_partial_prefills.is_some() {
+            self.max_num_partial_prefills = other.max_num_partial_prefills;
+        }
+        if other.long_prefill_token_threshold.is_some() {
+            self.long_prefill_token_threshold = other.long_prefill_token_threshold;
+        }
+        if other.stream_interval.is_some() {
+            self.stream_interval = other.stream_interval;
+        }
+        // LoRA
+        if other.enable_lora.is_some() {
+            self.enable_lora = other.enable_lora;
+        }
+        if other.max_loras.is_some() {
+            self.max_loras = other.max_loras;
+        }
+        if other.lora_extra_vocab_size.is_some() {
+            self.lora_extra_vocab_size = other.lora_extra_vocab_size;
+        }
+        if other.lora_dtype.is_some() {
+            self.lora_dtype = other.lora_dtype.clone();
+        }
+        if other.max_cpu_loras.is_some() {
+            self.max_cpu_loras = other.max_cpu_loras;
+        }
+        // Speculative Decoding
+        if other.spec_decoding_acceptance_method.is_some() {
+            self.spec_decoding_acceptance_method =
+                other.spec_decoding_acceptance_method.clone();
+        }
+        if other.ngram_prompt_lookup_max.is_some() {
+            self.ngram_prompt_lookup_max = other.ngram_prompt_lookup_max;
+        }
+        if other.ngram_prompt_lookup_min.is_some() {
+            self.ngram_prompt_lookup_min = other.ngram_prompt_lookup_min;
+        }
+        // Observability
+        if other.disable_log_stats.is_some() {
+            self.disable_log_stats = other.disable_log_stats;
+        }
+        if other.max_logprobs.is_some() {
+            self.max_logprobs = other.max_logprobs;
+        }
+        if other.otlp_traces_endpoint.is_some() {
+            self.otlp_traces_endpoint = other.otlp_traces_endpoint.clone();
+        }
+        if other.log_level.is_some() {
+            self.log_level = other.log_level.clone();
+        }
+        // Multimodal
+        if other.limit_mm_per_prompt.is_some() {
+            self.limit_mm_per_prompt = other.limit_mm_per_prompt.clone();
+        }
+        if other.disable_mm_preprocessor_cache.is_some() {
+            self.disable_mm_preprocessor_cache = other.disable_mm_preprocessor_cache;
+        }
+        // Pipeline Parallelism
+        if other.pipeline_parallel_size.is_some() {
+            self.pipeline_parallel_size = other.pipeline_parallel_size;
+        }
+        // Generation Defaults
+        if other.guided_decoding_backend.is_some() {
+            self.guided_decoding_backend = other.guided_decoding_backend.clone();
+        }
+        if other.max_seq_len_to_capture.is_some() {
+            self.max_seq_len_to_capture = other.max_seq_len_to_capture;
+        }
+        if other.enable_auto_tool_choice.is_some() {
+            self.enable_auto_tool_choice = other.enable_auto_tool_choice;
+        }
+        if other.return_tokens_as_token_ids.is_some() {
+            self.return_tokens_as_token_ids = other.return_tokens_as_token_ids;
         }
     }
 }

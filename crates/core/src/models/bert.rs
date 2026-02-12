@@ -331,8 +331,8 @@ pub struct BertForSequenceEmbedding {
     embeddings: BertEmbeddings,
     encoder: BertEncoder,
     pooler: Option<BertPooler>,
-    hidden_size: usize,
-    max_position_embeddings: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) max_position_embeddings: usize,
     device: Device,
 }
 
@@ -364,7 +364,7 @@ impl BertForSequenceEmbedding {
     }
 
     /// Run the full encoder stack and return last hidden states.
-    fn encode_hidden(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub(crate) fn encode_hidden(&self, input_ids: &Tensor) -> Result<Tensor> {
         let embeddings = self.embeddings.forward(input_ids)?;
         self.encoder.forward(embeddings)
     }

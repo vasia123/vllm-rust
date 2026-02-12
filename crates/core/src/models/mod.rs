@@ -2,6 +2,7 @@
 mod macros;
 pub mod baichuan;
 pub mod bert;
+pub mod bge_reranker;
 pub mod bloom;
 pub mod cohere;
 pub mod colbert;
@@ -23,6 +24,7 @@ pub mod gemma_quantized;
 pub mod glm;
 pub mod glm4;
 pub mod glm4_moe;
+pub mod glm4v;
 pub mod gpt2;
 pub mod gpt_neox;
 pub mod gte;
@@ -33,6 +35,7 @@ pub mod llama;
 pub mod llama_lora;
 pub mod llama_quantized;
 pub mod llava;
+pub mod llava_onevision;
 pub mod mamba;
 pub mod mamba2;
 pub mod minicpmv;
@@ -41,13 +44,17 @@ pub mod mistral_lora;
 pub mod mistral_quantized;
 pub mod mixtral;
 pub mod mixtral_quantized;
+pub mod modernbert;
+pub mod molmo;
 pub mod mpt;
 pub mod olmo2;
+pub mod paligemma;
 pub mod persimmon;
 pub mod phi;
 pub mod phi3;
 pub mod phi3_lora;
 pub mod phi3_quantized;
+pub mod phi3v;
 pub mod pixtral;
 pub mod qwen2;
 pub mod qwen2_5_vl;
@@ -61,6 +68,7 @@ pub mod qwen3_moe;
 pub mod qwen3_quantized;
 pub mod registry;
 pub mod starcoder2;
+pub mod t5;
 pub mod step3p5;
 pub mod tp_layers;
 pub mod voyage;
@@ -71,6 +79,7 @@ pub use tp_layers::{TpContext, TpEmbedding, TpGeGluMlp, TpGeluMlp, TpLinear, TpS
 
 pub use baichuan::BaichuanForCausalLM;
 pub use bert::BertForSequenceEmbedding;
+pub use bge_reranker::BgeRerankerForClassification;
 pub use bloom::BloomForCausalLM;
 pub use cohere::CohereForCausalLM;
 pub use colbert::ColBERTForRetrieval;
@@ -92,6 +101,7 @@ pub use gemma_quantized::QuantizedGemmaForCausalLM;
 pub use glm::GlmForCausalLM;
 pub use glm4::Glm4ForCausalLM;
 pub use glm4_moe::Glm4MoeForCausalLM;
+pub use glm4v::Glm4VForConditionalGeneration;
 pub use gpt2::GPT2LMHeadModel;
 pub use gpt_neox::GPTNeoXForCausalLM;
 pub use gte::{GteNewForEmbedding, GteNewForSequenceClassification};
@@ -102,6 +112,7 @@ pub use llama::LlamaForCausalLM;
 pub use llama_lora::LlamaWithLora;
 pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use llava::LLaVAForConditionalGeneration;
+pub use llava_onevision::LlavaOnevisionForConditionalGeneration;
 pub use mamba::MambaForCausalLM;
 pub use mamba2::Mamba2ForCausalLM;
 pub use minicpmv::MiniCPMVForConditionalGeneration;
@@ -110,13 +121,17 @@ pub use mistral_lora::MistralWithLora;
 pub use mistral_quantized::QuantizedMistralForCausalLM;
 pub use mixtral::{MixtralForCausalLM, MixtralTpForCausalLM};
 pub use mixtral_quantized::QuantizedMixtralForCausalLM;
+pub use modernbert::ModernBertForEmbedding;
+pub use molmo::MolmoForCausalLM;
 pub use mpt::MptForCausalLM;
 pub use olmo2::Olmo2ForCausalLM;
+pub use paligemma::PaliGemmaForConditionalGeneration;
 pub use persimmon::PersimmonForCausalLM;
 pub use phi::PhiForCausalLM;
 pub use phi3::Phi3ForCausalLM;
 pub use phi3_lora::Phi3WithLora;
 pub use phi3_quantized::QuantizedPhi3ForCausalLM;
+pub use phi3v::Phi3VForCausalLM;
 pub use pixtral::PixtralForConditionalGeneration;
 pub use qwen2::Qwen2ForCausalLM;
 pub use qwen2_5_vl::Qwen25VLForConditionalGeneration;
@@ -132,6 +147,7 @@ pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
 pub use starcoder2::StarCoder2ForCausalLM;
+pub use t5::T5ForConditionalGeneration;
 pub use step3p5::Step3p5ForCausalLM;
 pub use voyage::VoyageForEmbedding;
 pub use yi::YiForCausalLM;
@@ -191,6 +207,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen3ForCausalLM" => Ok(Box::new(Qwen3ForCausalLM::new(cfg, vb)?)),
         "Qwen3MoeForCausalLM" => Ok(Box::new(Qwen3MoeForCausalLM::new(cfg, vb)?)),
         "Phi3ForCausalLM" => Ok(Box::new(Phi3ForCausalLM::new(cfg, vb)?)),
+        "Phi3VForCausalLM" => Ok(Box::new(Phi3VForCausalLM::new(cfg, vb)?)),
         "Olmo2ForCausalLM" => Ok(Box::new(Olmo2ForCausalLM::new(cfg, vb)?)),
         "GPT2LMHeadModel" => Ok(Box::new(GPT2LMHeadModel::new(cfg, vb)?)),
         "GlmForCausalLM" => Ok(Box::new(GlmForCausalLM::new(cfg, vb)?)),
@@ -216,6 +233,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "LlavaForConditionalGeneration" | "LlavaNextForConditionalGeneration" => Ok(Box::new(
             LLaVAForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "LlavaOnevisionForConditionalGeneration" => Ok(Box::new(
+            LlavaOnevisionForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
         "Qwen2VLForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
@@ -228,7 +248,14 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "MiniCPMV" | "MiniCPMVForConditionalGeneration" => {
             Ok(Box::new(MiniCPMVForConditionalGeneration::new(cfg, vb)?))
         }
+        "PaliGemmaForConditionalGeneration" => Ok(Box::new(
+            PaliGemmaForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
         "InternVLChatModel" => Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?)),
+        "MolmoForCausalLM" => Ok(Box::new(MolmoForCausalLM::from_model_config(cfg, vb)?)),
+        "GLM4VForCausalLM" | "Glm4VForConditionalGeneration" => {
+            Ok(Box::new(Glm4VForConditionalGeneration::new(cfg, vb)?))
+        }
         "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
             Ok(Box::new(BertForSequenceEmbedding::new(cfg, vb)?))
         }
@@ -246,6 +273,26 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Step3p5ForCausalLM" => Ok(Box::new(Step3p5ForCausalLM::new(cfg, vb)?)),
         "VoyageQwen3BidirectionalEmbedModel" => Ok(Box::new(VoyageForEmbedding::new(cfg, vb)?)),
         "MistralModel" | "E5MistralModel" => Ok(Box::new(E5MistralForEmbedding::new(cfg, vb)?)),
+        "ModernBertModel" | "ModernBertForSequenceClassification" => {
+            Ok(Box::new(ModernBertForEmbedding::new(cfg, vb)?))
+        }
+        "RobertaForSequenceClassification" | "BgeRerankerModel" => {
+            Ok(Box::new(BgeRerankerForClassification::new(cfg, vb)?))
+        }
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
+/// Construct an encoder-decoder model from config.architectures[0].
+pub fn from_config_encoder_decoder(
+    cfg: &ModelConfig,
+    vb: VarBuilder,
+) -> Result<Box<dyn crate::engine::ModelForEncoderDecoder>, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        "T5ForConditionalGeneration" | "T5Model" => {
+            Ok(Box::new(T5ForConditionalGeneration::new(cfg, vb)?))
+        }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

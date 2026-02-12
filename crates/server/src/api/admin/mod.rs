@@ -281,6 +281,7 @@ async fn save_config(
         disable_log_requests: None,
         chat_template_path: None,
         response_role: None,
+        ..Default::default()
     };
 
     let path = config
