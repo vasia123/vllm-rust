@@ -190,7 +190,6 @@ enum Command {
         response_role: String,
 
         // ─── KV Cache / Memory ──────────────────────────────────────────
-
         /// KV cache block size (tokens per block).
         #[arg(long, default_value_t = 16)]
         block_size: usize,
@@ -219,7 +218,6 @@ enum Command {
         enforce_eager: bool,
 
         // ─── Model Loading ──────────────────────────────────────────────
-
         /// Weight loading format: auto, safetensors, pt, npcache, dummy.
         #[arg(long, default_value = "auto")]
         load_format: String,
@@ -252,7 +250,6 @@ enum Command {
         max_parallel_loading_workers: usize,
 
         // ─── Scheduler Tuning ───────────────────────────────────────────
-
         /// Maximum number of sequences (same as --max-requests, vLLM-compatible alias).
         #[arg(long)]
         max_num_seqs: Option<usize>,
@@ -275,7 +272,6 @@ enum Command {
         stream_interval: usize,
 
         // ─── LoRA Configuration ─────────────────────────────────────────
-
         /// Enable LoRA adapter support globally.
         #[arg(long)]
         enable_lora: bool,
@@ -297,7 +293,6 @@ enum Command {
         max_cpu_loras: Option<usize>,
 
         // ─── Speculative Decoding ───────────────────────────────────────
-
         /// Token acceptance method for speculative decoding.
         /// Supported: rejection_sampler, typical_acceptance_sampler.
         #[arg(long, default_value = "rejection_sampler")]
@@ -312,7 +307,6 @@ enum Command {
         ngram_prompt_lookup_min: Option<usize>,
 
         // ─── Observability ──────────────────────────────────────────────
-
         /// Suppress periodic engine performance statistics logging.
         #[arg(long)]
         disable_log_stats: bool,
@@ -330,7 +324,6 @@ enum Command {
         log_level: String,
 
         // ─── Multimodal / VLM ───────────────────────────────────────────
-
         /// Maximum multimodal items per prompt (JSON: {"image": 5, "video": 1}).
         #[arg(long)]
         limit_mm_per_prompt: Option<String>,
@@ -340,14 +333,12 @@ enum Command {
         disable_mm_preprocessor_cache: bool,
 
         // ─── Pipeline Parallelism ───────────────────────────────────────
-
         /// Pipeline parallel size (number of pipeline stages).
         /// Currently only 1 is supported.
         #[arg(long, default_value_t = 1)]
         pipeline_parallel_size: usize,
 
         // ─── Generation Defaults ────────────────────────────────────────
-
         /// Backend for guided (structured) decoding: outlines, lm-format-enforcer.
         #[arg(long, default_value = "outlines")]
         guided_decoding_backend: String,
@@ -768,9 +759,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let otlp_traces_endpoint = otlp_traces_endpoint.or(file_config.otlp_traces_endpoint);
             let log_level = if log_level == "info" {
-                file_config
-                    .log_level
-                    .unwrap_or_else(|| "info".to_string())
+                file_config.log_level.unwrap_or_else(|| "info".to_string())
             } else {
                 log_level
             };
@@ -1112,7 +1101,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = long_prefill_token_threshold; // TODO: wire to long prefill classification
     let _ = stream_interval; // TODO: wire to streaming interval
     let _ = enable_lora; // TODO: wire to global LoRA enable
-    // max_loras: wired to SchedulerConfig.max_loras_per_batch below
+                         // max_loras: wired to SchedulerConfig.max_loras_per_batch below
     let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
     let _ = &lora_dtype; // TODO: wire to LoRA weight dtype
     let _ = max_cpu_loras; // TODO: wire to CPU LoRA cache limit
@@ -1293,7 +1282,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         if offload_gb > 0.0 {
             // Estimate max_cpu_blocks from GiB budget
             let bytes = (offload_gb * 1024.0 * 1024.0 * 1024.0) as usize;
-            let bytes_per_block = 2 * files.config.num_hidden_layers
+            let bytes_per_block = 2
+                * files.config.num_hidden_layers
                 * files.config.num_key_value_heads
                 * files.config.head_dim
                 * block_size
@@ -1411,8 +1401,10 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let engine_builder: Arc<ProductionEngineBuilder> = Arc::new(ProductionEngineBuilder);
 
     // max_model_len: CLI override > model's max_position_embeddings > blocks * block_size
-    let default_max_model_len =
-        std::cmp::min(num_blocks * block_size, files.config.max_position_embeddings);
+    let default_max_model_len = std::cmp::min(
+        num_blocks * block_size,
+        files.config.max_position_embeddings,
+    );
     let max_model_len = max_model_len_override.unwrap_or(default_max_model_len);
     let state = AppState::new(
         atomic_engine.clone(),

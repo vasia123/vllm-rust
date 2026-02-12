@@ -113,19 +113,13 @@ impl RelativePositionBias {
     /// Compute the relative position bias tensor.
     ///
     /// Returns `[1, num_heads, query_len, key_len]`.
-    fn compute_bias(
-        &self,
-        query_len: usize,
-        key_len: usize,
-        device: &Device,
-    ) -> Result<Tensor> {
+    fn compute_bias(&self, query_len: usize, key_len: usize, device: &Device) -> Result<Tensor> {
         // Build bucket indices: [query_len, key_len]
         let mut bucket_indices = vec![0u32; query_len * key_len];
         for qi in 0..query_len {
             for ki in 0..key_len {
                 let rel_pos = ki as i64 - qi as i64;
-                bucket_indices[qi * key_len + ki] =
-                    self.relative_position_bucket(rel_pos) as u32;
+                bucket_indices[qi * key_len + ki] = self.relative_position_bucket(rel_pos) as u32;
             }
         }
 
@@ -368,9 +362,9 @@ impl T5CrossAttention {
 /// - Standard: wi → relu/gelu → wo
 /// - Gated (T5 v1.1+): wi_0 (gate) → silu, wi_1 (up), gate * up → wo
 struct T5Ffn {
-    wi: Option<Linear>,     // Standard FFN
-    wi_0: Option<Linear>,   // Gated FFN gate projection
-    wi_1: Option<Linear>,   // Gated FFN up projection
+    wi: Option<Linear>,   // Standard FFN
+    wi_0: Option<Linear>, // Gated FFN gate projection
+    wi_1: Option<Linear>, // Gated FFN up projection
     wo: Linear,
     is_gated: bool,
 }
@@ -414,12 +408,24 @@ impl T5Ffn {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         if self.is_gated {
             let gate = candle_nn::ops::silu(
-                &self.wi_0.as_ref().expect("gated FFN requires wi_0").forward(xs)?,
+                &self
+                    .wi_0
+                    .as_ref()
+                    .expect("gated FFN requires wi_0")
+                    .forward(xs)?,
             )?;
-            let up = self.wi_1.as_ref().expect("gated FFN requires wi_1").forward(xs)?;
+            let up = self
+                .wi_1
+                .as_ref()
+                .expect("gated FFN requires wi_1")
+                .forward(xs)?;
             self.wo.forward(&(gate * up)?)
         } else {
-            let hidden = self.wi.as_ref().expect("standard FFN requires wi").forward(xs)?;
+            let hidden = self
+                .wi
+                .as_ref()
+                .expect("standard FFN requires wi")
+                .forward(xs)?;
             let hidden = hidden.relu()?;
             self.wo.forward(&hidden)
         }
@@ -437,11 +443,23 @@ struct T5EncoderLayer {
 
 impl T5EncoderLayer {
     fn new(cfg: &ModelConfig, has_relative_bias: bool, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let self_attention =
-            T5SelfAttention::new(cfg, has_relative_bias, true, vb.pp("layer").pp("0").pp("SelfAttention"))?;
-        let norm1 = T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("layer").pp("0").pp("layer_norm"))?;
+        let self_attention = T5SelfAttention::new(
+            cfg,
+            has_relative_bias,
+            true,
+            vb.pp("layer").pp("0").pp("SelfAttention"),
+        )?;
+        let norm1 = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("layer").pp("0").pp("layer_norm"),
+        )?;
         let ffn = T5Ffn::new(cfg, vb.pp("layer").pp("1").pp("DenseReluDense"))?;
-        let norm2 = T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("layer").pp("1").pp("layer_norm"))?;
+        let norm2 = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("layer").pp("1").pp("layer_norm"),
+        )?;
         Ok(Self {
             self_attention,
             norm1,
@@ -482,16 +500,32 @@ struct T5DecoderLayer {
 
 impl T5DecoderLayer {
     fn new(cfg: &ModelConfig, has_relative_bias: bool, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let self_attention =
-            T5SelfAttention::new(cfg, has_relative_bias, false, vb.pp("layer").pp("0").pp("SelfAttention"))?;
-        let norm1 = T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("layer").pp("0").pp("layer_norm"))?;
+        let self_attention = T5SelfAttention::new(
+            cfg,
+            has_relative_bias,
+            false,
+            vb.pp("layer").pp("0").pp("SelfAttention"),
+        )?;
+        let norm1 = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("layer").pp("0").pp("layer_norm"),
+        )?;
 
         let cross_attention =
             T5CrossAttention::new(cfg, vb.pp("layer").pp("1").pp("EncDecAttention"))?;
-        let norm2 = T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("layer").pp("1").pp("layer_norm"))?;
+        let norm2 = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("layer").pp("1").pp("layer_norm"),
+        )?;
 
         let ffn = T5Ffn::new(cfg, vb.pp("layer").pp("2").pp("DenseReluDense"))?;
-        let norm3 = T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("layer").pp("2").pp("layer_norm"))?;
+        let norm3 = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("layer").pp("2").pp("layer_norm"),
+        )?;
 
         Ok(Self {
             self_attention,
@@ -515,13 +549,15 @@ impl T5DecoderLayer {
         // Pre-norm self-attention with causal mask
         let normed = self.norm1.forward(xs)?;
         let (attn_output, bias) =
-            self.self_attention.forward(&normed, causal_mask, self_attn_bias)?;
+            self.self_attention
+                .forward(&normed, causal_mask, self_attn_bias)?;
         let xs = (xs + attn_output)?;
 
         // Pre-norm cross-attention
         let normed = self.norm2.forward(&xs)?;
         let (cross_output, cross_k, cross_v) =
-            self.cross_attention.forward(&normed, encoder_hidden, cached_cross_kv)?;
+            self.cross_attention
+                .forward(&normed, encoder_hidden, cached_cross_kv)?;
         let xs = (xs + cross_output)?;
 
         // Pre-norm FFN
@@ -574,8 +610,7 @@ impl T5ForConditionalGeneration {
             .unwrap_or(0) as u32;
 
         // Shared embeddings
-        let shared_embeddings =
-            embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("shared"))?;
+        let shared_embeddings = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("shared"))?;
 
         // Encoder
         let mut encoder_layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -588,8 +623,11 @@ impl T5ForConditionalGeneration {
                 vb.pp("encoder").pp(format!("block.{i}")),
             )?);
         }
-        let encoder_final_norm =
-            T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("encoder").pp("final_layer_norm"))?;
+        let encoder_final_norm = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("encoder").pp("final_layer_norm"),
+        )?;
 
         // Decoder
         let mut decoder_layers = Vec::with_capacity(num_decoder_layers);
@@ -602,8 +640,11 @@ impl T5ForConditionalGeneration {
                 vb.pp("decoder").pp(format!("block.{i}")),
             )?);
         }
-        let decoder_final_norm =
-            T5LayerNorm::new(cfg.hidden_size, eps, vb.pp("decoder").pp("final_layer_norm"))?;
+        let decoder_final_norm = T5LayerNorm::new(
+            cfg.hidden_size,
+            eps,
+            vb.pp("decoder").pp("final_layer_norm"),
+        )?;
 
         // LM head (often tied to shared embeddings)
         let lm_head = if cfg.tie_word_embeddings {
@@ -645,11 +686,7 @@ impl T5ForConditionalGeneration {
     }
 
     /// Run the decoder stack with cross-attention to encoder output.
-    fn run_decoder(
-        &self,
-        decoder_input_ids: &Tensor,
-        encoder_hidden: &Tensor,
-    ) -> Result<Tensor> {
+    fn run_decoder(&self, decoder_input_ids: &Tensor, encoder_hidden: &Tensor) -> Result<Tensor> {
         let (_, tgt_len) = decoder_input_ids.dims2()?;
 
         let mut hidden = self.shared_embeddings.forward(decoder_input_ids)?;
@@ -734,10 +771,7 @@ mod tests {
 
     fn tiny_t5_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();
-        extra.insert(
-            "layer_norm_epsilon".to_string(),
-            serde_json::json!(1e-6),
-        );
+        extra.insert("layer_norm_epsilon".to_string(), serde_json::json!(1e-6));
         extra.insert("d_kv".to_string(), serde_json::json!(32));
         extra.insert("d_ff".to_string(), serde_json::json!(128));
         extra.insert(
@@ -790,11 +824,7 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let model = T5ForConditionalGeneration::new(&cfg, vb);
-        assert!(
-            model.is_ok(),
-            "T5 should construct: {:?}",
-            model.err()
-        );
+        assert!(model.is_ok(), "T5 should construct: {:?}", model.err());
 
         let model = model.unwrap();
         assert_eq!(model.encoder_layers.len(), 2);
@@ -825,11 +855,17 @@ mod tests {
 
         // Small positive should be in upper half
         let bucket = bias.relative_position_bucket(1);
-        assert!(bucket >= 16, "positive should be in upper half, got {bucket}");
+        assert!(
+            bucket >= 16,
+            "positive should be in upper half, got {bucket}"
+        );
 
         // Small negative should be in lower half
         let bucket = bias.relative_position_bucket(-1);
-        assert!(bucket < 16, "negative should be in lower half, got {bucket}");
+        assert!(
+            bucket < 16,
+            "negative should be in lower half, got {bucket}"
+        );
     }
 
     #[test]
@@ -979,7 +1015,14 @@ mod tests {
 
         let decoder_ids = Tensor::zeros((1, 1), DType::U32, &device).unwrap();
         let logits = model
-            .decode(&decoder_ids, &encoder_output, 0, &mut kv_cache_mgr, &block_table, &[])
+            .decode(
+                &decoder_ids,
+                &encoder_output,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &[],
+            )
             .unwrap();
 
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
@@ -1092,7 +1135,10 @@ mod tests {
         let model = T5ForConditionalGeneration::new(&cfg, vb).unwrap();
 
         // With tied embeddings, lm_head weight should be shared
-        assert_eq!(model.lm_head.weight().dims(), &[cfg.vocab_size, cfg.hidden_size]);
+        assert_eq!(
+            model.lm_head.weight().dims(),
+            &[cfg.vocab_size, cfg.hidden_size]
+        );
     }
 
     #[test]
@@ -1116,11 +1162,17 @@ mod tests {
         let model = T5ForConditionalGeneration::new(&cfg, vb).unwrap();
 
         assert!(
-            model.encoder_layers[0].self_attention.relative_bias.is_some(),
+            model.encoder_layers[0]
+                .self_attention
+                .relative_bias
+                .is_some(),
             "first encoder layer should have relative bias"
         );
         assert!(
-            model.encoder_layers[1].self_attention.relative_bias.is_none(),
+            model.encoder_layers[1]
+                .self_attention
+                .relative_bias
+                .is_none(),
             "second encoder layer should NOT have relative bias"
         );
     }
@@ -1133,11 +1185,17 @@ mod tests {
         let model = T5ForConditionalGeneration::new(&cfg, vb).unwrap();
 
         assert!(
-            model.decoder_layers[0].self_attention.relative_bias.is_some(),
+            model.decoder_layers[0]
+                .self_attention
+                .relative_bias
+                .is_some(),
             "first decoder layer should have relative bias"
         );
         assert!(
-            model.decoder_layers[1].self_attention.relative_bias.is_none(),
+            model.decoder_layers[1]
+                .self_attention
+                .relative_bias
+                .is_none(),
             "second decoder layer should NOT have relative bias"
         );
     }

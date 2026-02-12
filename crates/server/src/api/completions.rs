@@ -232,20 +232,18 @@ pub async fn create_completion(
                 Vec::with_capacity(best_of);
 
             // First candidate — serial to populate prefix cache
-            let first_result =
-                state
-                    .engine
-                    .get()
-                    .generate(build_gen_req())
-                    .await
-                    .map_err(|e| {
-                        prometheus::inc_requests_error();
-                        ApiError::EngineError(e.to_string())
-                    })?;
-            if let Err(e) = validate_response_format(
-                &first_result.generated_text,
-                req.response_format.as_ref(),
-            ) {
+            let first_result = state
+                .engine
+                .get()
+                .generate(build_gen_req())
+                .await
+                .map_err(|e| {
+                    prometheus::inc_requests_error();
+                    ApiError::EngineError(e.to_string())
+                })?;
+            if let Err(e) =
+                validate_response_format(&first_result.generated_text, req.response_format.as_ref())
+            {
                 prometheus::inc_requests_error();
                 return Err(ApiError::InvalidRequest(e.to_string()));
             }

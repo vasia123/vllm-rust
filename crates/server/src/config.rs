@@ -154,7 +154,6 @@ pub struct ServerConfig {
     pub response_role: Option<String>,
 
     // ─── KV Cache / Memory ──────────────────────────────────────────────
-
     /// KV cache block size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_size: Option<usize>,
@@ -180,7 +179,6 @@ pub struct ServerConfig {
     pub enforce_eager: Option<bool>,
 
     // ─── Model Loading ──────────────────────────────────────────────────
-
     /// Weight loading format (auto, safetensors, pt, npcache, dummy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_format: Option<String>,
@@ -206,7 +204,6 @@ pub struct ServerConfig {
     pub max_parallel_loading_workers: Option<usize>,
 
     // ─── Scheduler Tuning ───────────────────────────────────────────────
-
     /// Maximum concurrent sequences (alias for max_requests).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_num_seqs: Option<usize>,
@@ -228,7 +225,6 @@ pub struct ServerConfig {
     pub stream_interval: Option<usize>,
 
     // ─── LoRA Configuration ─────────────────────────────────────────────
-
     /// Enable LoRA support globally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_lora: Option<bool>,
@@ -250,7 +246,6 @@ pub struct ServerConfig {
     pub max_cpu_loras: Option<usize>,
 
     // ─── Speculative Decoding ───────────────────────────────────────────
-
     /// Speculative acceptance method.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_decoding_acceptance_method: Option<String>,
@@ -264,7 +259,6 @@ pub struct ServerConfig {
     pub ngram_prompt_lookup_min: Option<usize>,
 
     // ─── Observability ──────────────────────────────────────────────────
-
     /// Suppress periodic stats logging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_log_stats: Option<bool>,
@@ -282,7 +276,6 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
 
     // ─── Multimodal ─────────────────────────────────────────────────────
-
     /// Multimodal items limit per prompt (JSON).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_mm_per_prompt: Option<String>,
@@ -292,13 +285,11 @@ pub struct ServerConfig {
     pub disable_mm_preprocessor_cache: Option<bool>,
 
     // ─── Pipeline Parallelism ───────────────────────────────────────────
-
     /// Pipeline parallel size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_parallel_size: Option<usize>,
 
     // ─── Generation Defaults ────────────────────────────────────────────
-
     /// Guided decoding backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_decoding_backend: Option<String>,
@@ -533,8 +524,7 @@ impl ServerConfig {
         }
         // Speculative Decoding
         if other.spec_decoding_acceptance_method.is_some() {
-            self.spec_decoding_acceptance_method =
-                other.spec_decoding_acceptance_method.clone();
+            self.spec_decoding_acceptance_method = other.spec_decoding_acceptance_method.clone();
         }
         if other.ngram_prompt_lookup_max.is_some() {
             self.ngram_prompt_lookup_max = other.ngram_prompt_lookup_max;

@@ -218,7 +218,10 @@ mod tests {
 
         // With zero weights, tanh(0) = 0, so out_proj(0) = 0
         let vals: Vec<Vec<f32>> = scores.to_vec2().expect("to_vec2");
-        assert!((vals[0][0]).abs() < 1e-6, "zero weights should produce zero scores");
+        assert!(
+            (vals[0][0]).abs() < 1e-6,
+            "zero weights should produce zero scores"
+        );
     }
 
     #[test]

@@ -285,10 +285,9 @@ pub async fn create_chat_completion(
                     prometheus::inc_requests_error();
                     ApiError::EngineError(e.to_string())
                 })?;
-                if let Err(e) = validate_response_format(
-                    &result.generated_text,
-                    req.response_format.as_ref(),
-                ) {
+                if let Err(e) =
+                    validate_response_format(&result.generated_text, req.response_format.as_ref())
+                {
                     prometheus::inc_requests_error();
                     return Err(ApiError::InvalidRequest(e.to_string()));
                 }

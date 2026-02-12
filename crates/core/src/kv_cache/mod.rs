@@ -520,11 +520,7 @@ impl KVCacheManager {
     /// When prefix caching is disabled, the fork shares block IDs directly
     /// (safe because prompt KV data is read-only during decode) but the caller
     /// must ensure the source outlives the fork or manage lifetimes externally.
-    pub fn fork_block_table(
-        &mut self,
-        source: &BlockTable,
-        prompt_tokens: &[u32],
-    ) -> BlockTable {
+    pub fn fork_block_table(&mut self, source: &BlockTable, prompt_tokens: &[u32]) -> BlockTable {
         // Increment ref counts on cached prefix blocks so they survive eviction
         if self.prefix_cache.is_some() {
             let _ = self.match_prefix(prompt_tokens);

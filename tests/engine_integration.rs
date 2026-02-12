@@ -6,9 +6,7 @@
 
 use candle_core::{Device, Tensor};
 use vllm_core::{
-    engine::{
-        start_engine, EngineConfig, GenerationRequest, ModelForward, StreamEvent,
-    },
+    engine::{start_engine, EngineConfig, GenerationRequest, ModelForward, StreamEvent},
     kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager},
     sampling::SamplingParams,
     scheduler::{SchedulerConfig, SchedulingPolicy},

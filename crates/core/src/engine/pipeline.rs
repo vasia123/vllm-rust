@@ -93,8 +93,7 @@ pub trait PipelineForward: Send + 'static {
         let mut outputs = Vec::with_capacity(batch_size);
         for (i, seq) in sequences.iter().enumerate() {
             let hs = hidden_states.narrow(0, i, 1)?;
-            let block_table =
-                BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
+            let block_table = BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
             let out = self.forward_layers(
                 &hs,
                 seq.seqlen_offset,
@@ -202,17 +201,17 @@ impl<M: PipelineForward> PipelineStagedModel<M> {
     /// Receive hidden states from the previous pipeline stage.
     fn recv_from_prev(&self, shape: &[usize], dtype: DType) -> candle_core::Result<Tensor> {
         let prev_rank = self.stage_config.stage_id - 1;
-        self.comm
-            .recv(shape, dtype, prev_rank)
-            .map_err(|e| candle_core::Error::Msg(format!("pipeline recv from rank {prev_rank}: {e}")))
+        self.comm.recv(shape, dtype, prev_rank).map_err(|e| {
+            candle_core::Error::Msg(format!("pipeline recv from rank {prev_rank}: {e}"))
+        })
     }
 
     /// Receive logits from the last pipeline stage.
     fn recv_logits(&self, shape: &[usize], dtype: DType) -> candle_core::Result<Tensor> {
         let last_rank = self.last_rank();
-        self.comm
-            .recv(shape, dtype, last_rank)
-            .map_err(|e| candle_core::Error::Msg(format!("pipeline recv logits from rank {last_rank}: {e}")))
+        self.comm.recv(shape, dtype, last_rank).map_err(|e| {
+            candle_core::Error::Msg(format!("pipeline recv logits from rank {last_rank}: {e}"))
+        })
     }
 
     /// Send logits back to rank 0 (called by last stage only).
@@ -253,16 +252,17 @@ impl<M: PipelineForward> ModelForward for PipelineStagedModel<M> {
             // Non-first stage: receive hidden states from previous stage
             let batch_size = input_ids.dim(0)?;
             let seq_len = input_ids.dim(1)?;
-            self.recv_from_prev(
-                &[batch_size, seq_len, self.model.hidden_size()],
-                DType::F32,
-            )?
+            self.recv_from_prev(&[batch_size, seq_len, self.model.hidden_size()], DType::F32)?
         };
 
         // Forward through this stage's layers
-        let hidden =
-            self.model
-                .forward_layers(&hidden, seqlen_offset, kv_cache_mgr, block_table, slot_mapping)?;
+        let hidden = self.model.forward_layers(
+            &hidden,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )?;
 
         if self.stage_config.is_last {
             // Last stage: produce logits
@@ -427,7 +427,10 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
         let seq_len = signal_vec[2] as usize;
 
         if signal_type == SIGNAL_SHUTDOWN {
-            tracing::info!(stage = stage_config.stage_id, "Worker received shutdown signal");
+            tracing::info!(
+                stage = stage_config.stage_id,
+                "Worker received shutdown signal"
+            );
             break;
         }
 
@@ -436,11 +439,7 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
         }
 
         // 2. Receive hidden states from previous stage
-        let hidden = match comm.recv(
-            &[batch_size, seq_len, hidden_size],
-            DType::F32,
-            prev_rank,
-        ) {
+        let hidden = match comm.recv(&[batch_size, seq_len, hidden_size], DType::F32, prev_rank) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = %e, stage = stage_config.stage_id, "Worker recv failed");
@@ -578,8 +577,7 @@ mod tests {
             _slot_mapping: &[usize],
         ) -> candle_core::Result<Tensor> {
             // Simulate layer processing: multiply by 2
-            (hidden_states * 2.0)?
-                .contiguous()
+            (hidden_states * 2.0)?.contiguous()
         }
 
         fn lm_head(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
@@ -594,11 +592,7 @@ mod tests {
                     logits_data[idx] = 100.0;
                 }
             }
-            Tensor::from_vec(
-                logits_data,
-                (batch, seq_len, self.vocab_size),
-                &self.device,
-            )
+            Tensor::from_vec(logits_data, (batch, seq_len, self.vocab_size), &self.device)
         }
 
         fn device(&self) -> &Device {
@@ -1004,7 +998,9 @@ mod tests {
 
         // Decode
         let decode_input = Tensor::zeros((1, 1), DType::U32, &Device::Cpu).unwrap();
-        let logits = staged.forward(&decode_input, 10, &mut kv, &bt, &[]).unwrap();
+        let logits = staged
+            .forward(&decode_input, 10, &mut kv, &bt, &[])
+            .unwrap();
         assert_eq!(logits.dims(), &[1, 1, 100]);
     }
 

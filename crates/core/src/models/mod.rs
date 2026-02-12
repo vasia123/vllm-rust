@@ -68,8 +68,8 @@ pub mod qwen3_moe;
 pub mod qwen3_quantized;
 pub mod registry;
 pub mod starcoder2;
-pub mod t5;
 pub mod step3p5;
+pub mod t5;
 pub mod tp_layers;
 pub mod voyage;
 pub mod yi;
@@ -147,8 +147,8 @@ pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
 pub use starcoder2::StarCoder2ForCausalLM;
-pub use t5::T5ForConditionalGeneration;
 pub use step3p5::Step3p5ForCausalLM;
+pub use t5::T5ForConditionalGeneration;
 pub use voyage::VoyageForEmbedding;
 pub use yi::YiForCausalLM;
 
