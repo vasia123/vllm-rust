@@ -6,7 +6,6 @@ use std::sync::Arc;
 use crate::kv_cache::BlockTable;
 use crate::request::{RequestId, SequenceState};
 use crate::sampling::BeamSearchState;
-use crate::scheduler::Scheduler;
 
 use super::cuda_graph::CudaGraphDispatcher;
 use super::types::{EngineConfig, ResponseChannel};
@@ -38,30 +37,34 @@ pub(crate) struct ActiveRequest {
 
 /// Owned execution state for strategies.
 ///
+/// The `Scheduler` is intentionally NOT stored here — it lives in the async
+/// engine loop so that optimistic pre-scheduling can run before `spawn_blocking`
+/// moves this struct into the blocking thread pool.
+///
 /// Prefix caching is managed by `KVCacheManager` (not stored here) so that
 /// all prefix operations (match, register, release, eviction) are coordinated
 /// through the manager's block pool.
 pub(crate) struct OwnedExecutionState {
-    pub scheduler: Scheduler,
     pub requests: HashMap<RequestId, ActiveRequest>,
     pub next_id: RequestId,
     /// CUDA Graph dispatcher for graph capture/replay
     pub cuda_graph_dispatcher: Arc<std::sync::RwLock<CudaGraphDispatcher>>,
+    /// Request IDs that errored during strategy execution and need deferred
+    /// `scheduler.remove_request()` after the blocking task returns.
+    pub errored_ids: Vec<RequestId>,
 }
 
 impl OwnedExecutionState {
     pub fn new(config: &EngineConfig) -> Self {
-        let scheduler = Scheduler::new(config.scheduler_config);
-
         let cuda_graph_dispatcher = Arc::new(std::sync::RwLock::new(CudaGraphDispatcher::new(
             config.cuda_graph_config.clone(),
         )));
 
         Self {
-            scheduler,
             requests: HashMap::new(),
             next_id: 0,
             cuda_graph_dispatcher,
+            errored_ids: Vec::new(),
         }
     }
 

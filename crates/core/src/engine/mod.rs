@@ -87,8 +87,8 @@ pub fn start_engine<M: ModelForward>(
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let state = OwnedExecutionState::new(&config);
-    let strategy = StandardExecution::new(model)
-        .with_sliding_window(config.sliding_window, config.block_size);
+    let strategy =
+        StandardExecution::new(model).with_sliding_window(config.sliding_window, config.block_size);
 
     tokio::spawn(strategy::run_engine_loop(
         strategy,
@@ -187,8 +187,8 @@ pub fn start_engine_with_warmup<M: ModelForward>(
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let state = OwnedExecutionState::new(&config);
-    let mut strategy = StandardExecution::new(model)
-        .with_sliding_window(config.sliding_window, config.block_size);
+    let mut strategy =
+        StandardExecution::new(model).with_sliding_window(config.sliding_window, config.block_size);
 
     // Synchronous warmup before starting loop
     let warmup_config = WarmupConfig::from(&config.cuda_graph_config);
@@ -495,20 +495,16 @@ mod tests {
     }
 
     fn test_engine_config() -> EngineConfig {
-        EngineConfig {
-            scheduler_config: SchedulerConfig {
+        EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: None,
-            multi_step_count: 1,
-            enable_prefix_caching: false,
-            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
-            sliding_window: None,
-        }
+            None,
+        )
+        .build()
     }
 
     async fn run_engine_with_pretokenized<M: ModelForward>(
@@ -647,20 +643,16 @@ mod tests {
     }
 
     fn chunked_engine_config(max_tokens_per_step: usize) -> EngineConfig {
-        EngineConfig {
-            scheduler_config: SchedulerConfig {
+        EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 8,
                 max_tokens_per_step,
                 enable_chunked_prefill: true,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: None,
-            multi_step_count: 1,
-            enable_prefix_caching: false,
-            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
-            sliding_window: None,
-        }
+            None,
+        )
+        .build()
     }
 
     #[tokio::test]
@@ -1124,20 +1116,17 @@ mod tests {
     }
 
     fn prefix_cache_engine_config() -> EngineConfig {
-        EngineConfig {
-            scheduler_config: SchedulerConfig {
+        EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: None,
-            multi_step_count: 1,
-            enable_prefix_caching: true,
-            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
-            sliding_window: None,
-        }
+            None,
+        )
+        .enable_prefix_caching(true)
+        .build()
     }
 
     #[tokio::test]
@@ -1237,20 +1226,18 @@ mod tests {
         };
         let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
         let model = MockModel::new(42, 1000);
-        let config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 4,
-            speculative_config: None,
-            multi_step_count: 1,
-            enable_prefix_caching: true,
-            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+            None,
+        )
+        .block_size(4)
+        .enable_prefix_caching(true)
+        .build();
 
         // First request: 8 tokens (2 blocks of 4) + 1 generated token (needs 1 more block) = 3 blocks
         let prompt1: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1268,20 +1255,18 @@ mod tests {
         // Second request: different prompt, needs 6 blocks for prompt + 1 for decode = 7
         // We have 6 free + 2 evictable = 8 total available. Should succeed via eviction.
         let model = MockModel::new(42, 1000);
-        let config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 4,
-            speculative_config: None,
-            multi_step_count: 1,
-            enable_prefix_caching: true,
-            cuda_graph_config: cuda_graph::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+            None,
+        )
+        .block_size(4)
+        .enable_prefix_caching(true)
+        .build();
         let prompt2: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
         let (results, _kv_cache_mgr) =
             run_engine_with_prefix_caching(model, kv_cache_mgr, config, vec![(prompt2, 1, 999)])
@@ -1918,5 +1903,312 @@ mod tests {
         assert_eq!(result.generated_token_ids, vec![42, 42]);
 
         handle.shutdown().await.unwrap();
+    }
+
+    // ─── Optimistic Scheduling Tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn optimistic_scheduling_produces_same_output_as_disabled() {
+        // Run identical requests through two real engine loops: one with
+        // optimistic scheduling enabled, one disabled. Outputs must match.
+        let prompts = vec![
+            ("t1 t2 t3", 5),
+            ("t1 t2", 3),
+            ("t1 t2 t3 t4 t5", 4),
+        ];
+
+        let mut results_on = Vec::new();
+        let mut results_off = Vec::new();
+
+        for enable in [true, false] {
+            let cache_config = test_cache_config();
+            let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+            let model = MockModel::new(42, 1000);
+            let tokenizer = TokenizerWrapper::for_testing(1000);
+            let config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: 4,
+                    max_tokens_per_step: 512,
+                    enable_chunked_prefill: false,
+                    scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                },
+                None,
+            )
+            .enable_optimistic_scheduling(enable)
+            .build();
+
+            let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+            let mut handles = Vec::new();
+            for &(prompt, max_tokens) in &prompts {
+                let req = GenerationRequest {
+                    prompt: prompt.to_string(),
+                    max_new_tokens: max_tokens,
+                    eos_token_id: 999,
+                    ..Default::default()
+                };
+                let h = handle.clone();
+                handles.push(tokio::spawn(async move { h.generate(req).await }));
+            }
+
+            let mut batch_results = Vec::new();
+            for jh in handles {
+                batch_results.push(jh.await.unwrap().unwrap());
+            }
+
+            handle.shutdown().await.unwrap();
+
+            if enable {
+                results_on = batch_results;
+            } else {
+                results_off = batch_results;
+            }
+        }
+
+        // Sort by request_id for deterministic comparison
+        results_on.sort_by_key(|r| r.request_id);
+        results_off.sort_by_key(|r| r.request_id);
+
+        assert_eq!(results_on.len(), results_off.len());
+        for (on, off) in results_on.iter().zip(results_off.iter()) {
+            assert_eq!(on.generated_token_ids, off.generated_token_ids);
+            assert_eq!(on.finish_reason, off.finish_reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn optimistic_scheduling_short_and_long_requests_concurrent() {
+        // Short requests complete during execution of longer ones, invalidating
+        // pre-schedules. The engine must handle this gracefully.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = EngineConfig::builder(
+            SchedulerConfig {
+                max_running_requests: 8,
+                max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            None,
+        )
+        .enable_optimistic_scheduling(true)
+        .build();
+
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Mix of short (1-2 tokens) and long (10-20 tokens) requests.
+        // Short ones will complete quickly, invalidating pre-schedules.
+        let requests: Vec<(&str, usize)> = vec![
+            ("t1 t2 t3", 1),       // short
+            ("t1 t2 t3 t4 t5", 15), // long
+            ("t1 t2", 2),          // short
+            ("t1 t2 t3", 20),      // long
+            ("t1 t2 t3 t4", 1),    // short
+            ("t1 t2 t3", 10),      // long
+        ];
+
+        let mut join_handles = Vec::new();
+        for (prompt, max_tokens) in &requests {
+            let req = GenerationRequest {
+                prompt: prompt.to_string(),
+                max_new_tokens: *max_tokens,
+                eos_token_id: 999,
+                ..Default::default()
+            };
+            let h = handle.clone();
+            join_handles.push(tokio::spawn(async move { h.generate(req).await }));
+        }
+
+        for (i, jh) in join_handles.into_iter().enumerate() {
+            let result = jh.await.unwrap().unwrap();
+            let expected_len = requests[i].1;
+            assert_eq!(
+                result.generated_token_ids.len(),
+                expected_len,
+                "request {i} should generate {expected_len} tokens"
+            );
+            assert!(
+                result.generated_token_ids.iter().all(|&t| t == 42),
+                "all tokens should be 42 from MockModel"
+            );
+        }
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // ─── Scheduling Overlap Benchmark ────────────────────────────────
+
+    /// Mock model that performs real GPU matmuls to simulate forward pass cost.
+    /// Each forward call runs `num_matmuls` random matrix multiplications of
+    /// shape `[matmul_dim, matmul_dim]` on the GPU device, producing realistic
+    /// compute load for benchmarking async scheduling overlap.
+    struct GpuMockModel {
+        output_token: u32,
+        vocab_size: usize,
+        device: Device,
+        /// Number of matmul ops per forward call (controls GPU time).
+        num_matmuls: usize,
+        /// Size of each square matmul (NxN).
+        matmul_dim: usize,
+    }
+
+    impl GpuMockModel {
+        fn new(
+            output_token: u32,
+            vocab_size: usize,
+            device: Device,
+            num_matmuls: usize,
+            matmul_dim: usize,
+        ) -> Self {
+            Self {
+                output_token,
+                vocab_size,
+                device,
+                num_matmuls,
+                matmul_dim,
+            }
+        }
+    }
+
+    impl ModelForward for GpuMockModel {
+        fn forward(
+            &self,
+            input_ids: &candle_core::Tensor,
+            _seqlen_offset: usize,
+            _kv_cache_mgr: &mut KVCacheManager,
+            _block_table: &BlockTable,
+            _slot_mapping: &[usize],
+        ) -> candle_core::Result<candle_core::Tensor> {
+            // Burn GPU cycles with matmuls
+            let n = self.matmul_dim;
+            let mut acc =
+                candle_core::Tensor::randn(0f32, 1.0, (n, n), &self.device)?;
+            for _ in 0..self.num_matmuls {
+                let b = candle_core::Tensor::randn(0f32, 1.0, (n, n), &self.device)?;
+                acc = acc.matmul(&b)?;
+            }
+            // Force sync so GPU work completes before returning
+            let _sync = acc.to_vec2::<f32>()?;
+
+            // Build logits on CPU (like real decode output)
+            let seq_len = input_ids.dims()[1];
+            let mut logits_vec = vec![-100.0f32; seq_len * self.vocab_size];
+            for pos in 0..seq_len {
+                logits_vec[pos * self.vocab_size + self.output_token as usize] = 100.0;
+            }
+            candle_core::Tensor::from_vec(logits_vec, (1, seq_len, self.vocab_size), &Device::Cpu)
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+    }
+
+    #[tokio::test]
+    /// Benchmark: optimistic scheduling overlap with GPU matmuls.
+    ///
+    /// Run with CUDA:
+    /// ```sh
+    /// cargo test -p vllm-core --lib --features cuda bench_scheduling_overlap -- --ignored --nocapture
+    /// ```
+    ///
+    /// Baseline results (RTX 4060 Laptop, 8GB, debug build, 2026-02-12):
+    ///   8 requests × 20 tokens, 4 matmuls 512×512 per forward
+    ///   optimistic=ON:  114ms  (1400 tok/s)
+    ///   optimistic=OFF: 123ms  (1303 tok/s)
+    ///   Speedup: 7.0%
+    #[ignore]
+    async fn bench_scheduling_overlap() {
+        use std::time::Instant;
+
+        let gpu_device = Device::cuda_if_available(0).expect("GPU required for this benchmark");
+        let is_gpu = gpu_device.is_cuda();
+        eprintln!(
+            "Device: {} ({})",
+            if is_gpu { "CUDA" } else { "CPU" },
+            if is_gpu { "GPU matmuls" } else { "CPU fallback" }
+        );
+
+        let num_requests = 8;
+        let tokens_per_request = 20;
+        // Tuned for ~5-15ms per forward on RTX 4060: 4 matmuls of 512x512
+        let num_matmuls = 4;
+        let matmul_dim = 512;
+
+        let mut timings = Vec::new();
+
+        for (label, enable) in [("optimistic=ON", true), ("optimistic=OFF", false)] {
+            let cache_config = test_cache_config();
+            let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+            let model = GpuMockModel::new(
+                42,
+                1000,
+                gpu_device.clone(),
+                num_matmuls,
+                matmul_dim,
+            );
+            let tokenizer = TokenizerWrapper::for_testing(1000);
+            let config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: num_requests,
+                    max_tokens_per_step: 512,
+                    enable_chunked_prefill: false,
+                    scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+                },
+                None,
+            )
+            .enable_optimistic_scheduling(enable)
+            .build();
+
+            let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+            // Warmup: 2 requests to JIT-compile CUDA kernels
+            for _ in 0..2 {
+                let req = GenerationRequest {
+                    prompt: "warmup".to_string(),
+                    max_new_tokens: 3,
+                    eos_token_id: 999,
+                    ..Default::default()
+                };
+                let _ = handle.generate(req).await;
+            }
+
+            let start = Instant::now();
+
+            let mut join_handles = Vec::new();
+            for i in 0..num_requests {
+                let prompt = format!("t{i}");
+                let req = GenerationRequest {
+                    prompt,
+                    max_new_tokens: tokens_per_request,
+                    eos_token_id: 999,
+                    ..Default::default()
+                };
+                let h = handle.clone();
+                join_handles.push(tokio::spawn(async move { h.generate(req).await }));
+            }
+
+            for jh in join_handles {
+                let result = jh.await.unwrap().unwrap();
+                assert_eq!(result.generated_token_ids.len(), tokens_per_request);
+            }
+
+            let elapsed = start.elapsed();
+            handle.shutdown().await.unwrap();
+
+            let total_tokens = num_requests * tokens_per_request;
+            eprintln!(
+                "{label}: {elapsed:?} ({total_tokens} tokens, {:.0} tok/s)",
+                total_tokens as f64 / elapsed.as_secs_f64()
+            );
+            timings.push((label, elapsed));
+        }
+
+        let on = timings[0].1;
+        let off = timings[1].1;
+        let speedup = (1.0 - on.as_secs_f64() / off.as_secs_f64()) * 100.0;
+        eprintln!("Speedup: {speedup:.1}% ({:?} → {:?})", off, on);
     }
 }

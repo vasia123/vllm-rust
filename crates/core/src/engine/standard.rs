@@ -14,7 +14,7 @@ use super::cuda_graph::CudaGraphDispatcher;
 use super::cuda_graph_runner::CudaGraphRunner;
 use super::helpers::{
     execute_batched_decode_with_graph, execute_beam_decode, execute_prefill,
-    finish_request_with_error, is_beam_request, reclaim_sliding_window_blocks,
+    finish_request_with_error_deferred, is_beam_request, reclaim_sliding_window_blocks,
 };
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
@@ -254,7 +254,10 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 &mut state.requests,
                 tokenizer,
             ) {
-                finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
+                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                {
+                    state.errored_ids.push(id);
+                }
             }
         }
     }
@@ -295,7 +298,10 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 &mut state.requests,
                 _tokenizer,
             ) {
-                finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
+                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                {
+                    state.errored_ids.push(id);
+                }
             }
         }
 
@@ -329,12 +335,13 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
 
                 for req_id in failed {
                     active_decode_ids.retain(|&id| id != req_id);
-                    finish_request_with_error(
+                    if let Some(id) = finish_request_with_error_deferred(
                         req_id,
                         EngineError::Model("batched decode failed".to_string()),
-                        &mut state.scheduler,
                         &mut state.requests,
-                    );
+                    ) {
+                        state.errored_ids.push(id);
+                    }
                 }
 
                 // Remove sequences that finished mid-step

@@ -351,6 +351,19 @@ pub struct SchedulerOutput {
     pub preempted_requests: Vec<RequestId>,
 }
 
+/// The result of `compute_schedule`: a scheduling decision that can be
+/// inspected without mutating the scheduler, then applied via `apply_schedule`.
+///
+/// This split enables optimistic pre-scheduling: the engine can compute the
+/// next step's schedule before GPU execution finishes, then validate and
+/// optionally discard the decision.
+#[derive(Debug)]
+pub struct ScheduleDecision {
+    pub output: SchedulerOutput,
+    /// Requests that should be moved from waiting → running.
+    pub newly_admitted: Vec<RequestId>,
+}
+
 /// Metadata for requests tracked by the scheduler.
 #[derive(Debug, Clone, Copy)]
 struct RequestMetadata {
@@ -427,26 +440,35 @@ impl Scheduler {
         self.config.scheduling_policy
     }
 
-    /// Core scheduling logic. Called once per engine iteration.
+    /// Compute a scheduling decision without mutating scheduler state.
+    ///
+    /// This is the pure read-only half of the scheduling logic. The returned
+    /// [`ScheduleDecision`] can be inspected, validated, and optionally
+    /// discarded before committing via [`apply_schedule`].
     ///
     /// `states` provides access to per-request state for budget checks.
     /// `num_free_blocks` is the current number of free blocks in the cache.
-    pub fn schedule(
-        &mut self,
+    pub fn compute_schedule(
+        &self,
         states: &HashMap<RequestId, &SequenceState>,
         num_free_blocks: usize,
-    ) -> SchedulerOutput {
+    ) -> ScheduleDecision {
         let mut output = SchedulerOutput::default();
         let mut budget = self.config.max_tokens_per_step;
         let mut free_blocks = num_free_blocks;
 
         // Step 1: Schedule running requests for decode or continued prefill
         let mut running_snapshot: Vec<RequestId> = self.running_set.iter().copied().collect();
-        running_snapshot.sort_by_key(|id| states[id].arrival_order);
+        running_snapshot.sort_by_key(|id| {
+            // Defensive: skip missing requests instead of panicking
+            states.get(id).map(|s| s.arrival_order).unwrap_or(u64::MAX)
+        });
         let mut to_preempt: Vec<RequestId> = Vec::new();
 
         for req_id in &running_snapshot {
-            let state = &states[req_id];
+            let Some(state) = states.get(req_id) else {
+                continue;
+            };
 
             if state.status == RequestStatus::Prefilling {
                 // Continued prefill chunk (chunked prefill only)
@@ -483,68 +505,50 @@ impl Scheduler {
             }
         }
 
-        // Step 2: Preempt according to policy
-        // - FCFS: newest-first (minimizes wasted compute on older requests)
-        // - Priority: lowest-priority-first (protects high-priority requests)
-        to_preempt.sort_by(|a, b| {
-            match self.config.scheduling_policy {
-                SchedulingPolicy::Fcfs => {
-                    // Newest first: higher arrival_order = newer = preempt first
-                    let order_a = states[a].arrival_order;
-                    let order_b = states[b].arrival_order;
-                    order_b.cmp(&order_a)
-                }
-                SchedulingPolicy::Priority => {
-                    // Lowest priority first: higher priority value = lower priority = preempt first
-                    // Ties broken by arrival order (newer first)
-                    let meta_a = self.request_metadata.get(a);
-                    let meta_b = self.request_metadata.get(b);
-                    match (meta_a, meta_b) {
-                        (Some(ma), Some(mb)) => {
-                            // Higher priority value = lower priority = should be preempted first
-                            match mb.priority.cmp(&ma.priority) {
-                                Ordering::Equal => {
-                                    // Tie-breaker: newer requests preempted first
-                                    mb.arrival_time.cmp(&ma.arrival_time)
-                                }
-                                other => other,
-                            }
-                        }
-                        // Fallback to arrival order if metadata missing
-                        _ => {
-                            let order_a = states[a].arrival_order;
-                            let order_b = states[b].arrival_order;
-                            order_b.cmp(&order_a)
-                        }
+        // Step 2: Determine preemption order
+        to_preempt.sort_by(|a, b| match self.config.scheduling_policy {
+            SchedulingPolicy::Fcfs => {
+                let order_a = states.get(a).map(|s| s.arrival_order).unwrap_or(0);
+                let order_b = states.get(b).map(|s| s.arrival_order).unwrap_or(0);
+                order_b.cmp(&order_a)
+            }
+            SchedulingPolicy::Priority => {
+                let meta_a = self.request_metadata.get(a);
+                let meta_b = self.request_metadata.get(b);
+                match (meta_a, meta_b) {
+                    (Some(ma), Some(mb)) => match mb.priority.cmp(&ma.priority) {
+                        Ordering::Equal => mb.arrival_time.cmp(&ma.arrival_time),
+                        other => other,
+                    },
+                    _ => {
+                        let order_a = states.get(a).map(|s| s.arrival_order).unwrap_or(0);
+                        let order_b = states.get(b).map(|s| s.arrival_order).unwrap_or(0);
+                        order_b.cmp(&order_a)
                     }
                 }
             }
         });
-        for req_id in to_preempt {
-            let state = &states[&req_id];
-            free_blocks += state.num_blocks();
-            self.running_set.remove(&req_id);
-            // Re-add to waiting queue with original metadata.
-            if let Some(metadata) = self.request_metadata.get(&req_id) {
-                self.waiting_queue
-                    .prepend(req_id, metadata.priority, metadata.arrival_time);
+        for &req_id in &to_preempt {
+            if let Some(state) = states.get(&req_id) {
+                free_blocks += state.num_blocks();
             }
             output.preempted_requests.push(req_id);
         }
 
-        // Step 3: Admit waiting requests according to scheduling policy
+        // Step 3: Determine which waiting requests to admit
         let preempted_set: HashSet<RequestId> = output.preempted_requests.iter().copied().collect();
         let mut newly_admitted = Vec::new();
 
-        // Collect candidates in scheduling order.
+        // Simulate running_set size after preemptions
+        let running_count = self.running_set.len() - to_preempt.len();
+
         let candidates: Vec<RequestId> = self.waiting_queue.iter_in_order();
 
         for req_id in candidates {
-            if self.running_set.len() + newly_admitted.len() >= self.config.max_running_requests {
+            if running_count + newly_admitted.len() >= self.config.max_running_requests {
                 break;
             }
             if preempted_set.contains(&req_id) {
-                // Don't re-admit preempted requests in the same step.
                 break;
             }
             let Some(state) = states.get(&req_id) else {
@@ -553,11 +557,9 @@ impl Scheduler {
             let remaining = state.prompt_token_ids.len() - state.num_computed_tokens;
 
             if remaining == 0 {
-                // Full prefix cached — admit directly for decode.
                 if budget > 0 {
                     let blocks_needed = state.blocks_needed_for_step();
                     if blocks_needed <= free_blocks {
-                        self.waiting_queue.remove(req_id);
                         newly_admitted.push(req_id);
                         free_blocks -= blocks_needed;
                         budget -= 1;
@@ -583,7 +585,6 @@ impl Scheduler {
 
             let blocks_needed = state.block_table.blocks_needed(chunk_size);
             if blocks_needed <= free_blocks && chunk_size <= budget {
-                self.waiting_queue.remove(req_id);
                 newly_admitted.push(req_id);
                 free_blocks -= blocks_needed;
                 budget -= chunk_size;
@@ -596,11 +597,42 @@ impl Scheduler {
             }
         }
 
-        for req_id in newly_admitted {
-            self.running_set.insert(req_id);
+        ScheduleDecision {
+            output,
+            newly_admitted,
+        }
+    }
+
+    /// Apply a previously computed schedule decision, mutating the scheduler.
+    ///
+    /// Moves preempted requests from running → waiting and newly admitted
+    /// requests from waiting → running.
+    pub fn apply_schedule(&mut self, decision: &ScheduleDecision) {
+        // Move preempted requests back to waiting queue
+        for &req_id in &decision.output.preempted_requests {
+            self.running_set.remove(&req_id);
+            if let Some(metadata) = self.request_metadata.get(&req_id) {
+                self.waiting_queue
+                    .prepend(req_id, metadata.priority, metadata.arrival_time);
+            }
         }
 
-        output
+        // Move newly admitted requests from waiting to running
+        for &req_id in &decision.newly_admitted {
+            self.waiting_queue.remove(req_id);
+            self.running_set.insert(req_id);
+        }
+    }
+
+    /// Convenience: compute + apply in one call (backward compatible).
+    pub fn schedule(
+        &mut self,
+        states: &HashMap<RequestId, &SequenceState>,
+        num_free_blocks: usize,
+    ) -> SchedulerOutput {
+        let decision = self.compute_schedule(states, num_free_blocks);
+        self.apply_schedule(&decision);
+        decision.output
     }
 
     /// Provides direct access to the running set for tests.
@@ -1407,5 +1439,190 @@ mod tests {
         // Newer request should be preempted when priorities are equal
         assert_eq!(output.preempted_requests[0], 1); // Newer
         assert_eq!(output.decode_requests[0], 0); // Older survives
+    }
+
+    // ==================== compute_schedule / apply_schedule Tests ====================
+
+    #[test]
+    fn compute_schedule_does_not_mutate_scheduler() {
+        let config = fcfs_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        // Add 2 waiting requests
+        scheduler.add_request(0);
+        scheduler.add_request(1);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_state(0, 8, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 8, RequestStatus::Waiting, 16, 1));
+
+        // Snapshot scheduler state before
+        let waiting_before = scheduler.num_waiting();
+        let running_before = scheduler.num_running();
+
+        // compute_schedule takes &self — should not mutate
+        let _decision = scheduler.compute_schedule(&refs(&states), 100);
+
+        // Verify state is identical
+        assert_eq!(scheduler.num_waiting(), waiting_before);
+        assert_eq!(scheduler.num_running(), running_before);
+    }
+
+    #[test]
+    fn apply_schedule_moves_requests_correctly() {
+        let config = fcfs_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        // Add 2 waiting requests
+        scheduler.add_request(0);
+        scheduler.add_request(1);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_state(0, 8, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 8, RequestStatus::Waiting, 16, 1));
+
+        assert_eq!(scheduler.num_waiting(), 2);
+        assert_eq!(scheduler.num_running(), 0);
+
+        let decision = scheduler.compute_schedule(&refs(&states), 100);
+
+        // Both should be admitted
+        assert_eq!(decision.newly_admitted.len(), 2);
+
+        // After apply, waiting should be 0 and running should be 2
+        scheduler.apply_schedule(&decision);
+        assert_eq!(scheduler.num_waiting(), 0);
+        assert_eq!(scheduler.num_running(), 2);
+    }
+
+    #[test]
+    fn apply_schedule_handles_preemptions() {
+        let config = fcfs_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        // Two running requests, very tight block budget
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0));
+        states.insert(1, make_decoding_state(1, 16, 0, 16, 1));
+
+        scheduler.running_set_mut().insert(0);
+        scheduler.running_set_mut().insert(1);
+        scheduler.insert_metadata(0, DEFAULT_PRIORITY, 0);
+        scheduler.insert_metadata(1, DEFAULT_PRIORITY, 1);
+
+        assert_eq!(scheduler.num_running(), 2);
+        assert_eq!(scheduler.num_waiting(), 0);
+
+        // Only 1 block: request 1 (newest) should be preempted
+        let decision = scheduler.compute_schedule(&refs(&states), 1);
+        assert_eq!(decision.output.preempted_requests.len(), 1);
+        assert_eq!(decision.output.preempted_requests[0], 1);
+
+        scheduler.apply_schedule(&decision);
+
+        // Preempted request should be back in waiting
+        assert_eq!(scheduler.num_running(), 1);
+        assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    #[test]
+    fn compute_then_apply_equals_schedule() {
+        // Property test: compute + apply must produce identical SchedulerOutput
+        // compared to the convenience schedule() method.
+        let config = fcfs_config(4, 512, false);
+
+        // Create two identical schedulers
+        let mut scheduler_a = Scheduler::new(config.clone());
+        let mut scheduler_b = Scheduler::new(config);
+
+        // Add identical waiting requests
+        scheduler_a.add_request(0);
+        scheduler_a.add_request(1);
+        scheduler_a.add_request(2);
+        scheduler_b.add_request(0);
+        scheduler_b.add_request(1);
+        scheduler_b.add_request(2);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_state(0, 8, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 8, RequestStatus::Waiting, 16, 1));
+        states.insert(2, make_state(2, 16, RequestStatus::Waiting, 16, 2));
+
+        // Method A: compute + apply
+        let decision = scheduler_a.compute_schedule(&refs(&states), 10);
+        scheduler_a.apply_schedule(&decision);
+        let output_a = decision.output;
+
+        // Method B: convenience schedule()
+        let output_b = scheduler_b.schedule(&refs(&states), 10);
+
+        // Outputs must be identical
+        assert_eq!(prefill_ids(&output_a), prefill_ids(&output_b));
+        assert_eq!(output_a.decode_requests, output_b.decode_requests);
+        assert_eq!(output_a.preempted_requests, output_b.preempted_requests);
+
+        // Scheduler state must be identical
+        assert_eq!(scheduler_a.num_waiting(), scheduler_b.num_waiting());
+        assert_eq!(scheduler_a.num_running(), scheduler_b.num_running());
+    }
+
+    #[test]
+    fn compute_then_apply_equals_schedule_with_preemptions() {
+        // Same property test but with running requests that get preempted
+        let config = fcfs_config(4, 512, false);
+
+        let mut scheduler_a = Scheduler::new(config.clone());
+        let mut scheduler_b = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0));
+        states.insert(1, make_decoding_state(1, 16, 0, 16, 1));
+        states.insert(2, make_decoding_state(2, 16, 0, 16, 2));
+
+        // Same running set in both
+        for sched in [&mut scheduler_a, &mut scheduler_b] {
+            sched.running_set_mut().insert(0);
+            sched.running_set_mut().insert(1);
+            sched.running_set_mut().insert(2);
+            sched.insert_metadata(0, DEFAULT_PRIORITY, 0);
+            sched.insert_metadata(1, DEFAULT_PRIORITY, 1);
+            sched.insert_metadata(2, DEFAULT_PRIORITY, 2);
+        }
+
+        // Tight budget: only 2 blocks available
+        let decision = scheduler_a.compute_schedule(&refs(&states), 2);
+        scheduler_a.apply_schedule(&decision);
+        let output_a = decision.output;
+
+        let output_b = scheduler_b.schedule(&refs(&states), 2);
+
+        assert_eq!(output_a.decode_requests, output_b.decode_requests);
+        assert_eq!(output_a.preempted_requests, output_b.preempted_requests);
+        assert_eq!(scheduler_a.num_waiting(), scheduler_b.num_waiting());
+        assert_eq!(scheduler_a.num_running(), scheduler_b.num_running());
+    }
+
+    #[test]
+    fn compute_schedule_tolerates_missing_requests_in_states() {
+        // Scheduler has requests that are not in the states map (window between
+        // completion and scheduler.remove_request). Should skip, not panic.
+        let config = fcfs_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+
+        scheduler.running_set_mut().insert(0);
+        scheduler.running_set_mut().insert(1);
+        scheduler.insert_metadata(0, DEFAULT_PRIORITY, 0);
+        scheduler.insert_metadata(1, DEFAULT_PRIORITY, 1);
+
+        // Only provide state for request 0 — request 1 is "missing"
+        let mut states = HashMap::new();
+        states.insert(0, make_decoding_state(0, 16, 0, 16, 0));
+
+        // Should not panic
+        let decision = scheduler.compute_schedule(&refs(&states), 100);
+
+        // Request 0 should still be scheduled for decode
+        assert_eq!(decision.output.decode_requests.len(), 1);
+        assert_eq!(decision.output.decode_requests[0], 0);
     }
 }

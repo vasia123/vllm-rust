@@ -985,15 +985,21 @@ pub(crate) fn sample_token(
     Ok(result.token_id)
 }
 
-pub(crate) fn finish_request_with_error(
+/// Finish a request with an error, deferring scheduler cleanup.
+///
+/// Removes the request from the map and sends the error to the caller.
+/// Returns `Some(req_id)` if the request was found (so the caller can
+/// collect errored IDs for deferred `scheduler.remove_request()`).
+pub(crate) fn finish_request_with_error_deferred(
     req_id: RequestId,
     error: EngineError,
-    scheduler: &mut Scheduler,
     requests: &mut HashMap<RequestId, ActiveRequest>,
-) {
+) -> Option<RequestId> {
     if let Some(req) = requests.remove(&req_id) {
-        scheduler.remove_request(req_id);
         send_error(req.response, error);
+        Some(req_id)
+    } else {
+        None
     }
 }
 
@@ -1470,14 +1476,8 @@ mod tests {
         use crate::engine::types::ResponseChannel;
         use crate::kv_cache::BlockTable;
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let mut state = crate::request::SequenceState::new(
-            1,
-            vec![0; num_tokens],
-            100,
-            0,
-            block_size,
-            0,
-        );
+        let mut state =
+            crate::request::SequenceState::new(1, vec![0; num_tokens], 100, 0, block_size, 0);
         state.block_table = {
             let mut bt = BlockTable::new(block_size);
             bt.append_blocks(block_ids);
@@ -1496,14 +1496,19 @@ mod tests {
 
     #[test]
     fn test_reclaim_sliding_window_none_is_noop() {
-        use candle_core::{DType, Device};
         use crate::kv_cache::config::CacheConfig;
         use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device};
 
         let config = CacheConfig {
-            block_size: 4, num_blocks: 16, num_layers: 1,
-            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
-            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            block_size: 4,
+            num_blocks: 16,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         };
         let mut mgr = KVCacheManager::new(&config).unwrap();
@@ -1518,14 +1523,19 @@ mod tests {
 
     #[test]
     fn test_reclaim_sliding_window_reclaims_blocks() {
-        use candle_core::{DType, Device};
         use crate::kv_cache::config::CacheConfig;
         use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device};
 
         let config = CacheConfig {
-            block_size: 4, num_blocks: 16, num_layers: 1,
-            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
-            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            block_size: 4,
+            num_blocks: 16,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         };
         let mut mgr = KVCacheManager::new(&config).unwrap();
@@ -1553,14 +1563,19 @@ mod tests {
 
     #[test]
     fn test_reclaim_sliding_window_within_window_is_noop() {
-        use candle_core::{DType, Device};
         use crate::kv_cache::config::CacheConfig;
         use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device};
 
         let config = CacheConfig {
-            block_size: 4, num_blocks: 16, num_layers: 1,
-            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
-            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            block_size: 4,
+            num_blocks: 16,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         };
         let mut mgr = KVCacheManager::new(&config).unwrap();
@@ -1575,14 +1590,19 @@ mod tests {
 
     #[test]
     fn test_reclaim_sliding_window_partial_block() {
-        use candle_core::{DType, Device};
         use crate::kv_cache::config::CacheConfig;
         use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device};
 
         let config = CacheConfig {
-            block_size: 4, num_blocks: 16, num_layers: 1,
-            num_kv_heads: 1, head_dim: 8, dtype: DType::F32,
-            device: Device::Cpu, kv_cache_dtype: KVCacheDtype::Auto,
+            block_size: 4,
+            num_blocks: 16,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         };
         let mut mgr = KVCacheManager::new(&config).unwrap();

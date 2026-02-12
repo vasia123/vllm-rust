@@ -145,9 +145,7 @@ pub fn create_tool_call_parser(name: &str) -> Arc<dyn ToolCallParser> {
         "minimax_m2" => Arc::new(MinimaxM2ToolParser::new()),
         "deepseek_v32" => Arc::new(DeepSeekV32ToolParser::new()),
         "step3" | "step-3" => Arc::new(Step3ToolParser::new()),
-        "step3p5" | "step-3.5" | "qwen3_xml" | "qwen3xml" => {
-            Arc::new(Qwen3CoderToolParser::new())
-        }
+        "step3p5" | "step-3.5" | "qwen3_xml" | "qwen3xml" => Arc::new(Qwen3CoderToolParser::new()),
         "qwen3coder" | "qwen3_coder" => Arc::new(Qwen3CoderToolParser::new()),
         unknown => {
             tracing::warn!("Unknown tool call parser '{unknown}', defaulting to hermes");
@@ -705,20 +703,16 @@ mod tests {
             device: Device::Cpu,
         };
         let tokenizer = TokenizerWrapper::for_testing(1000);
-        let engine_config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let engine_config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 4,
                 max_tokens_per_step: 512,
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: None,
-            multi_step_count: 1,
-            enable_prefix_caching: false,
-            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+            None,
+        )
+        .build();
         let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
         let (atomic_handle, _controller) = AtomicEngineHandle::new(handle);
 

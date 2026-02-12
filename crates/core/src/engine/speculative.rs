@@ -15,7 +15,9 @@ use crate::scheduler::SchedulerOutput;
 use crate::tokenizer::TokenizerWrapper;
 
 use super::context::{ActiveRequest, OwnedExecutionState};
-use super::helpers::{execute_decode, execute_prefill, finish_request_with_error, greedy_sample};
+use super::helpers::{
+    execute_decode, execute_prefill, finish_request_with_error_deferred, greedy_sample,
+};
 use super::model_forward::ModelForward;
 use super::spec_decode::DraftProposer;
 use super::strategy::ExecutionStrategy;
@@ -332,8 +334,7 @@ impl<M: ModelForward> SpeculativeExecution<M> {
 
             if is_greedy {
                 // Greedy: accept if target argmax matches draft
-                let target_token =
-                    sample_speculative(&pos_logits, &mut req.state, tokenizer)?;
+                let target_token = sample_speculative(&pos_logits, &mut req.state, tokenizer)?;
                 if target_token == draft_token {
                     accepted += 1;
                     req.state.generated_token_ids.push(draft_token);
@@ -343,11 +344,7 @@ impl<M: ModelForward> SpeculativeExecution<M> {
                 }
             } else {
                 // Random: probability-based acceptance/rejection
-                let target_probs = compute_target_probs(
-                    &pos_logits,
-                    &mut req.state,
-                    tokenizer,
-                )?;
+                let target_probs = compute_target_probs(&pos_logits, &mut req.state, tokenizer)?;
                 let target_prob_of_draft = target_probs
                     .get(draft_token as usize)
                     .copied()
@@ -360,11 +357,8 @@ impl<M: ModelForward> SpeculativeExecution<M> {
                     req.state.generated_token_ids.push(draft_token);
                 } else {
                     // Reject: sample recovered token from adjusted distribution
-                    let recovered = sample_recovered_token(
-                        &target_probs,
-                        draft_token,
-                        &mut req.state,
-                    );
+                    let recovered =
+                        sample_recovered_token(&target_probs, draft_token, &mut req.state);
                     req.state.generated_token_ids.push(recovered);
                     break;
                 }
@@ -433,7 +427,10 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 &mut state.requests,
                 tokenizer,
             ) {
-                finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
+                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                {
+                    state.errored_ids.push(id);
+                }
                 continue;
             }
 
@@ -443,7 +440,10 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 None => continue,
             };
             if let Err(e) = self.proposer.init_request(req_id, &prompt_tokens) {
-                finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
+                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                {
+                    state.errored_ids.push(id);
+                }
                 continue;
             }
         }
@@ -479,7 +479,10 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 )
             };
             if let Err(e) = result {
-                finish_request_with_error(req_id, e, &mut state.scheduler, &mut state.requests);
+                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                {
+                    state.errored_ids.push(id);
+                }
             }
         }
     }
@@ -658,12 +661,10 @@ mod tests {
         // This is a property test: with deterministic logits, greedy sampling is predictable
         let logits_data = vec![
             // Position 0: argmax at token 5
-            0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0,
-            // Position 1: argmax at token 3
+            0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, // Position 1: argmax at token 3
             0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0,
         ];
-        let logits =
-            Tensor::from_vec(logits_data, (1, 2, 8), &candle_core::Device::Cpu).unwrap();
+        let logits = Tensor::from_vec(logits_data, (1, 2, 8), &candle_core::Device::Cpu).unwrap();
 
         // Draft tokens match exactly
         let draft_tokens = vec![5u32, 3];
@@ -685,12 +686,10 @@ mod tests {
     fn test_rejection_greedy_mismatch_stops() {
         let logits_data = vec![
             // Position 0: argmax at token 5
-            0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0,
-            // Position 1: argmax at token 3
+            0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, // Position 1: argmax at token 3
             0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0,
         ];
-        let logits =
-            Tensor::from_vec(logits_data, (1, 2, 8), &candle_core::Device::Cpu).unwrap();
+        let logits = Tensor::from_vec(logits_data, (1, 2, 8), &candle_core::Device::Cpu).unwrap();
 
         // Draft tokens: first matches, second doesn't
         let draft_tokens = vec![5u32, 7];
@@ -712,8 +711,7 @@ mod tests {
     fn test_rejection_random_high_prob_accept() {
         // If target prob for draft token is very high (0.99), almost all seeds accept
         let logits_data = vec![10.0f32, -10.0, -10.0, -10.0]; // softmax ≈ [0.999, ~0, ~0, ~0]
-        let logits =
-            Tensor::from_vec(logits_data, (1, 1, 4), &candle_core::Device::Cpu).unwrap();
+        let logits = Tensor::from_vec(logits_data, (1, 1, 4), &candle_core::Device::Cpu).unwrap();
         let tokenizer = TokenizerWrapper::for_testing(4);
 
         let mut accept_count = 0;
@@ -737,8 +735,7 @@ mod tests {
     fn test_rejection_random_low_prob_reject() {
         // If target prob for draft token is very low (~0.0), almost all seeds reject
         let logits_data = vec![-10.0f32, 10.0, -10.0, -10.0]; // softmax ≈ [~0, 0.999, ~0, ~0]
-        let logits =
-            Tensor::from_vec(logits_data, (1, 1, 4), &candle_core::Device::Cpu).unwrap();
+        let logits = Tensor::from_vec(logits_data, (1, 1, 4), &candle_core::Device::Cpu).unwrap();
         let tokenizer = TokenizerWrapper::for_testing(4);
 
         let mut reject_count = 0;

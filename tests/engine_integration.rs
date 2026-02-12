@@ -126,20 +126,16 @@ fn test_cache_config() -> CacheConfig {
 }
 
 fn test_engine_config() -> EngineConfig {
-    EngineConfig {
-        scheduler_config: SchedulerConfig {
+    EngineConfig::builder(
+        SchedulerConfig {
             max_running_requests: 4,
             max_tokens_per_step: 512,
             enable_chunked_prefill: false,
             scheduling_policy: SchedulingPolicy::Fcfs,
         },
-        block_size: 16,
-        speculative_config: None,
-        multi_step_count: 1,
-        enable_prefix_caching: false,
-        cuda_graph_config: CudaGraphConfig::default(),
-        sliding_window: None,
-    }
+        None,
+    )
+    .build()
 }
 
 fn make_request(prompt: &str, max_new_tokens: usize, eos_token_id: u32) -> GenerationRequest {

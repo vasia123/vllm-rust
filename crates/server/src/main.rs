@@ -451,22 +451,19 @@ async fn run_server(
         );
         let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
 
-        let engine_config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let engine_config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: Some(SpeculativeConfig {
+            Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
-            multi_step_count: 1,
-            enable_prefix_caching,
-            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+        )
+        .enable_prefix_caching(enable_prefix_caching)
+        .build();
 
         eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
         start_engine_with_draft(
@@ -478,20 +475,18 @@ async fn run_server(
             engine_config,
         )
     } else {
-        let engine_config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let engine_config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: max_requests,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: None,
-            multi_step_count,
-            enable_prefix_caching,
-            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+            None,
+        )
+        .multi_step_count(multi_step_count)
+        .enable_prefix_caching(enable_prefix_caching)
+        .build();
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
         start_engine(model, engine_tokenizer, kv_cache_mgr, engine_config)
@@ -572,9 +567,8 @@ async fn run_server(
             let shutdown_handle = handle.clone();
             tokio::spawn(async move {
                 shutdown_signal().await;
-                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(
-                    shutdown_timeout,
-                )));
+                shutdown_handle
+                    .graceful_shutdown(Some(std::time::Duration::from_secs(shutdown_timeout)));
             });
 
             axum_server::bind_rustls(socket_addr, tls_config)
@@ -703,22 +697,18 @@ async fn run_generate(
         );
         let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
 
-        let engine_config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let engine_config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: Some(SpeculativeConfig {
+            Some(SpeculativeConfig {
                 num_speculative_tokens,
             }),
-            multi_step_count: 1,
-            enable_prefix_caching: false,
-            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+        )
+        .build();
 
         eprintln!(
             "Starting engine ({} prompts, max {} tokens each, speculative K={})...",
@@ -735,20 +725,17 @@ async fn run_generate(
             engine_config,
         )
     } else {
-        let engine_config = EngineConfig {
-            scheduler_config: SchedulerConfig {
+        let engine_config = EngineConfig::builder(
+            SchedulerConfig {
                 max_running_requests: 8,
                 max_tokens_per_step: 2048,
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
             },
-            block_size: 16,
-            speculative_config: None,
-            multi_step_count,
-            enable_prefix_caching: false,
-            cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-            sliding_window: None,
-        };
+            None,
+        )
+        .multi_step_count(multi_step_count)
+        .build();
 
         eprintln!(
             "Starting engine ({} prompts, max {} tokens each, multi-step={})...",

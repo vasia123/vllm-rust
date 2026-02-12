@@ -141,22 +141,20 @@ impl EngineBuilder for ProductionEngineBuilder {
             );
             let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
 
-            let engine_config = EngineConfig {
-                scheduler_config: SchedulerConfig {
+            let engine_config = EngineConfig::builder(
+                SchedulerConfig {
                     max_running_requests: config.max_requests,
                     max_tokens_per_step: config.max_tokens_per_step,
                     enable_chunked_prefill: config.enable_chunked_prefill,
                     scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                 },
-                block_size: config.block_size,
-                speculative_config: Some(SpeculativeConfig {
+                Some(SpeculativeConfig {
                     num_speculative_tokens: config.num_speculative_tokens,
                 }),
-                multi_step_count: 1,
-                enable_prefix_caching: config.enable_prefix_caching,
-                cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-                sliding_window: None,
-            };
+            )
+            .block_size(config.block_size)
+            .enable_prefix_caching(config.enable_prefix_caching)
+            .build();
 
             eprintln!(
                 "Starting engine (speculative, K={})...",
@@ -171,20 +169,19 @@ impl EngineBuilder for ProductionEngineBuilder {
                 engine_config,
             )
         } else {
-            let engine_config = EngineConfig {
-                scheduler_config: SchedulerConfig {
+            let engine_config = EngineConfig::builder(
+                SchedulerConfig {
                     max_running_requests: config.max_requests,
                     max_tokens_per_step: config.max_tokens_per_step,
                     enable_chunked_prefill: config.enable_chunked_prefill,
                     scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                 },
-                block_size: config.block_size,
-                speculative_config: None,
-                multi_step_count: config.multi_step_count,
-                enable_prefix_caching: config.enable_prefix_caching,
-                cuda_graph_config: vllm_core::engine::CudaGraphConfig::default(),
-                sliding_window: None,
-            };
+                None,
+            )
+            .block_size(config.block_size)
+            .multi_step_count(config.multi_step_count)
+            .enable_prefix_caching(config.enable_prefix_caching)
+            .build();
 
             eprintln!(
                 "Starting engine (multi-step={})...",

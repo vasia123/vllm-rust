@@ -106,19 +106,8 @@ execution future. After it completes, the next iteration's `try_recv()` returns
 - Zero overhead for command-only iterations (frozen, idle)
 - Foundation for future optimistic scheduling overlap (see ADR notes below)
 
-## Future: Optimistic Scheduling Overlap
+## Follow-up: Optimistic Scheduling Overlap
 
-The current implementation buffers commands but does not overlap scheduling with
-execution. A future enhancement could:
-
-1. Snapshot scheduling-relevant state before execution
-2. Run scheduling concurrently using the snapshot + optimistic free block count
-3. When execution returns, validate and swap in the pre-computed schedule
-
-The optimistic free block count formula:
-```
-optimistic_free = pre_execution_free - blocks_allocated_by_current_schedule
-```
-
-This is always a conservative estimate (execution may free more blocks via
-completions), so it cannot cause OOM. This is left as a separate follow-up.
+Implemented in ADR-0008. The scheduler was extracted from `OwnedExecutionState`,
+`schedule()` was split into `compute_schedule` + `apply_schedule`, and the engine
+loop now pre-computes the next step's schedule before GPU execution finishes.

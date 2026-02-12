@@ -126,6 +126,89 @@ pub struct EngineConfig {
     /// Sliding window size for attention. When set, blocks entirely outside
     /// the window are reclaimed during decode to reduce memory usage.
     pub sliding_window: Option<usize>,
+    /// When true, the engine pre-computes the next step's schedule before
+    /// GPU execution finishes. The pre-schedule is validated on return and
+    /// discarded if invalidated by completions or new commands.
+    /// Cost of invalidation: one extra `compute_schedule` call (same as
+    /// without the optimization). Never worse than disabled.
+    pub enable_optimistic_scheduling: bool,
+}
+
+impl EngineConfig {
+    /// Start building an `EngineConfig` with the two required fields.
+    /// All other fields use sensible defaults and can be overridden via
+    /// builder methods.
+    pub fn builder(
+        scheduler_config: crate::scheduler::SchedulerConfig,
+        speculative_config: Option<SpeculativeConfig>,
+    ) -> EngineConfigBuilder {
+        EngineConfigBuilder {
+            scheduler_config,
+            speculative_config,
+            block_size: 16,
+            multi_step_count: 1,
+            enable_prefix_caching: false,
+            cuda_graph_config: super::cuda_graph::CudaGraphConfig::default(),
+            sliding_window: None,
+            enable_optimistic_scheduling: true,
+        }
+    }
+}
+
+pub struct EngineConfigBuilder {
+    scheduler_config: crate::scheduler::SchedulerConfig,
+    speculative_config: Option<SpeculativeConfig>,
+    block_size: usize,
+    multi_step_count: usize,
+    enable_prefix_caching: bool,
+    cuda_graph_config: super::cuda_graph::CudaGraphConfig,
+    sliding_window: Option<usize>,
+    enable_optimistic_scheduling: bool,
+}
+
+impl EngineConfigBuilder {
+    pub fn block_size(mut self, block_size: usize) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    pub fn multi_step_count(mut self, count: usize) -> Self {
+        self.multi_step_count = count;
+        self
+    }
+
+    pub fn enable_prefix_caching(mut self, enabled: bool) -> Self {
+        self.enable_prefix_caching = enabled;
+        self
+    }
+
+    pub fn cuda_graph_config(mut self, config: super::cuda_graph::CudaGraphConfig) -> Self {
+        self.cuda_graph_config = config;
+        self
+    }
+
+    pub fn sliding_window(mut self, window: Option<usize>) -> Self {
+        self.sliding_window = window;
+        self
+    }
+
+    pub fn enable_optimistic_scheduling(mut self, enabled: bool) -> Self {
+        self.enable_optimistic_scheduling = enabled;
+        self
+    }
+
+    pub fn build(self) -> EngineConfig {
+        EngineConfig {
+            scheduler_config: self.scheduler_config,
+            block_size: self.block_size,
+            speculative_config: self.speculative_config,
+            multi_step_count: self.multi_step_count,
+            enable_prefix_caching: self.enable_prefix_caching,
+            cuda_graph_config: self.cuda_graph_config,
+            sliding_window: self.sliding_window,
+            enable_optimistic_scheduling: self.enable_optimistic_scheduling,
+        }
+    }
 }
 
 // ─── Pause mode ──────────────────────────────────────────────────────────
@@ -185,7 +268,11 @@ impl SpecDecodingStats {
         self.num_drafts += 1;
         self.num_draft_tokens += num_draft_tokens as u64;
         self.num_accepted_tokens += num_accepted_tokens as u64;
-        for pos in self.num_accepted_tokens_per_pos.iter_mut().take(num_accepted_tokens) {
+        for pos in self
+            .num_accepted_tokens_per_pos
+            .iter_mut()
+            .take(num_accepted_tokens)
+        {
             *pos += 1;
         }
     }
@@ -413,7 +500,10 @@ mod tests {
         assert_eq!(json["num_drafts"], 1);
         assert_eq!(json["num_draft_tokens"], 2);
         assert_eq!(json["num_accepted_tokens"], 1);
-        assert_eq!(json["num_accepted_tokens_per_pos"], serde_json::json!([1, 0]));
+        assert_eq!(
+            json["num_accepted_tokens_per_pos"],
+            serde_json::json!([1, 0])
+        );
     }
 
     #[test]
@@ -456,6 +546,55 @@ mod tests {
         let sd = json.get("spec_decode_stats").unwrap();
         assert_eq!(sd["num_drafts"], 1);
         assert_eq!(sd["num_accepted_tokens"], 2);
+    }
+
+    #[test]
+    fn engine_config_builder_defaults() {
+        let config = EngineConfig::builder(
+            crate::scheduler::SchedulerConfig {
+                max_running_requests: 4,
+                max_tokens_per_step: 512,
+                enable_chunked_prefill: false,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            None,
+        )
+        .build();
+
+        assert_eq!(config.block_size, 16);
+        assert_eq!(config.multi_step_count, 1);
+        assert!(!config.enable_prefix_caching);
+        assert!(config.sliding_window.is_none());
+        assert!(config.speculative_config.is_none());
+        assert!(config.enable_optimistic_scheduling);
+    }
+
+    #[test]
+    fn engine_config_builder_overrides() {
+        let config = EngineConfig::builder(
+            crate::scheduler::SchedulerConfig {
+                max_running_requests: 8,
+                max_tokens_per_step: 2048,
+                enable_chunked_prefill: true,
+                scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            },
+            Some(SpeculativeConfig {
+                num_speculative_tokens: 5,
+            }),
+        )
+        .block_size(4)
+        .multi_step_count(3)
+        .enable_prefix_caching(true)
+        .sliding_window(Some(256))
+        .enable_optimistic_scheduling(false)
+        .build();
+
+        assert_eq!(config.block_size, 4);
+        assert_eq!(config.multi_step_count, 3);
+        assert!(config.enable_prefix_caching);
+        assert_eq!(config.sliding_window, Some(256));
+        assert_eq!(config.speculative_config.unwrap().num_speculative_tokens, 5);
+        assert!(!config.enable_optimistic_scheduling);
     }
 
     #[test]

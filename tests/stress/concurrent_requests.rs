@@ -92,20 +92,16 @@ fn stress_cache_config(num_blocks: usize) -> CacheConfig {
 }
 
 fn stress_engine_config(max_running: usize) -> EngineConfig {
-    EngineConfig {
-        scheduler_config: SchedulerConfig {
+    EngineConfig::builder(
+        SchedulerConfig {
             max_running_requests: max_running,
             max_tokens_per_step: 2048,
             enable_chunked_prefill: false,
             scheduling_policy: SchedulingPolicy::Fcfs,
         },
-        block_size: 16,
-        speculative_config: None,
-        multi_step_count: 1,
-        enable_prefix_caching: false,
-        cuda_graph_config: CudaGraphConfig::default(),
-        sliding_window: None,
-    }
+        None,
+    )
+    .build()
 }
 
 fn make_stress_request(id: usize, max_tokens: usize, eos_token: u32) -> GenerationRequest {
