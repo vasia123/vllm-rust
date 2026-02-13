@@ -1,0 +1,13 @@
+#!/bin/bash
+# Pre-commit hook: ensure code passes fmt + clippy before committing.
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+echo "==> Running cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "==> Running cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "==> Pre-commit checks passed."
