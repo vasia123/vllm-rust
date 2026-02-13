@@ -51,15 +51,13 @@ impl HunYuanConfig {
             .extra
             .get("num_experts")
             .and_then(|v| {
-                v.as_u64()
-                    .map(|n| vec![n as usize])
-                    .or_else(|| {
-                        v.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|e| e.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
+                v.as_u64().map(|n| vec![n as usize]).or_else(|| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.as_u64().map(|n| n as usize))
+                            .collect()
                     })
+                })
             })
             .unwrap_or_default();
 
@@ -78,15 +76,13 @@ impl HunYuanConfig {
             .extra
             .get("moe_topk")
             .and_then(|v| {
-                v.as_u64()
-                    .map(|n| vec![n as usize])
-                    .or_else(|| {
-                        v.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|e| e.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
+                v.as_u64().map(|n| vec![n as usize]).or_else(|| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.as_u64().map(|n| n as usize))
+                            .collect()
                     })
+                })
             })
             .unwrap_or_else(|| vec![2]);
 
@@ -95,15 +91,13 @@ impl HunYuanConfig {
             .extra
             .get("moe_intermediate_size")
             .and_then(|v| {
-                v.as_u64()
-                    .map(|n| vec![n as usize])
-                    .or_else(|| {
-                        v.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|e| e.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
+                v.as_u64().map(|n| vec![n as usize]).or_else(|| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.as_u64().map(|n| n as usize))
+                            .collect()
                     })
+                })
             })
             .unwrap_or_else(|| vec![cfg.intermediate_size]);
 
@@ -119,15 +113,13 @@ impl HunYuanConfig {
             .extra
             .get("num_shared_expert")
             .and_then(|v| {
-                v.as_u64()
-                    .map(|n| vec![n as usize])
-                    .or_else(|| {
-                        v.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|e| e.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
+                v.as_u64().map(|n| vec![n as usize]).or_else(|| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.as_u64().map(|n| n as usize))
+                            .collect()
                     })
+                })
             })
             .unwrap_or_else(|| vec![1]);
 

@@ -15,8 +15,7 @@ use candle_core::{DType, Device, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
 use super::marlin::{
-    check_marlin_supports_shape, MarlinConfig, MarlinLinear,
-    MARLIN_SUPPORTED_GROUP_SIZES,
+    check_marlin_supports_shape, MarlinConfig, MarlinLinear, MARLIN_SUPPORTED_GROUP_SIZES,
 };
 
 #[cfg(feature = "cuda-kernels")]
@@ -421,8 +420,8 @@ impl QuantizedLinear for AwqLinear {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::marlin::MarlinScalarType;
+    use super::*;
 
     #[test]
     fn test_awq_config_int4() {
@@ -593,10 +592,7 @@ mod tests {
 
         // Explicit Marlin format flag
         let mut raw = HashMap::new();
-        raw.insert(
-            "is_marlin_format".to_string(),
-            serde_json::json!(true),
-        );
+        raw.insert("is_marlin_format".to_string(), serde_json::json!(true));
         let config = AwqConfig::from_detected(Some(4), Some(128), &raw);
         assert!(config.use_marlin);
     }

@@ -16,8 +16,8 @@ use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding, SwiGluMlp};
-use crate::moe::MoELayerConfig;
 use crate::moe::MoELayer;
+use crate::moe::MoELayerConfig;
 
 // ─── Arctic Config ──────────────────────────────────────────────────────────
 
@@ -261,19 +261,23 @@ impl ArcticDecoderLayer {
             ArcticFeedForward::Dense(mlp)
         };
 
-        let input_layernorm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
+        let input_layernorm =
+            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = rms_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
 
         // Residual MLP only on MoE layers when use_residual is true
         let (residual_layernorm, residual_mlp) = if is_moe && arctic_cfg.use_residual {
-            let rln = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("residual_layernorm"))?;
-            // Residual MLP uses hidden_size as intermediate (smaller parallel path)
-            let rmlp = SwiGluMlp::new(
+            let rln = rms_norm(
                 cfg.hidden_size,
-                cfg.hidden_size,
-                vb.pp("residual_mlp"),
+                cfg.rms_norm_eps,
+                vb.pp("residual_layernorm"),
             )?;
+            // Residual MLP uses hidden_size as intermediate (smaller parallel path)
+            let rmlp = SwiGluMlp::new(cfg.hidden_size, cfg.hidden_size, vb.pp("residual_mlp"))?;
             (Some(rln), Some(rmlp))
         } else {
             (None, None)
@@ -313,7 +317,9 @@ impl ArcticDecoderLayer {
         )?;
         let residual_attn = (residual_input + &hidden)?;
 
-        if let (Some(ref res_ln), Some(ref res_mlp)) = (&self.residual_layernorm, &self.residual_mlp) {
+        if let (Some(ref res_ln), Some(ref res_mlp)) =
+            (&self.residual_layernorm, &self.residual_mlp)
+        {
             // MoE layer with residual path:
             // residual_mlp runs on post-attention hidden states
             // MoE runs on pre-attention residual (residual_input)
@@ -348,7 +354,9 @@ impl ArcticDecoderLayer {
         )?;
         let residual_attn = (residual_input + &hidden)?;
 
-        if let (Some(ref res_ln), Some(ref res_mlp)) = (&self.residual_layernorm, &self.residual_mlp) {
+        if let (Some(ref res_ln), Some(ref res_mlp)) =
+            (&self.residual_layernorm, &self.residual_mlp)
+        {
             let res_hidden = res_ln.forward(&residual_attn)?;
             let residual_mlp_out = res_mlp.forward(&res_hidden)?;
             let moe_input = self.post_attention_layernorm.forward(residual_input)?;

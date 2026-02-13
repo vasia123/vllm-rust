@@ -413,8 +413,7 @@ impl KimiDecoderLayer {
             // For now, fall through to standard MLA attention.
         }
 
-        let self_attn =
-            KimiAttention::new_with_tp(cfg, extra_cfg, vb.pp("self_attn"), pg)?;
+        let self_attn = KimiAttention::new_with_tp(cfg, extra_cfg, vb.pp("self_attn"), pg)?;
 
         let mlp = if extra_cfg.is_moe_layer(layer_idx) {
             let moe_cfg = MoELayerConfig {
@@ -880,8 +879,7 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 3;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)

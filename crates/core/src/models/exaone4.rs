@@ -294,11 +294,8 @@ pub struct Exaone4ForCausalLM {
 impl Exaone4ForCausalLM {
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let embed_tokens = candle_nn::embedding(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            vb_m.pp("embed_tokens"),
-        )?;
+        let embed_tokens =
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");

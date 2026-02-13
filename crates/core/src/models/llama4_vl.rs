@@ -92,13 +92,15 @@ impl Llama4VisionConfig {
 
     /// Number of output tokens after pixel shuffle.
     pub fn num_output_tokens(&self) -> usize {
-        let ds_ratio = (1.0 / (self.pixel_shuffle_ratio * self.pixel_shuffle_ratio)).round() as usize;
+        let ds_ratio =
+            (1.0 / (self.pixel_shuffle_ratio * self.pixel_shuffle_ratio)).round() as usize;
         self.num_patches() / ds_ratio
     }
 
     /// Hidden dimension after pixel shuffle (before MLP).
     pub fn shuffled_hidden_dim(&self) -> usize {
-        let ds_ratio = (1.0 / (self.pixel_shuffle_ratio * self.pixel_shuffle_ratio)).round() as usize;
+        let ds_ratio =
+            (1.0 / (self.pixel_shuffle_ratio * self.pixel_shuffle_ratio)).round() as usize;
         self.hidden_size * ds_ratio
     }
 }
@@ -121,19 +123,18 @@ impl Llama4VLConfig {
                 .get("hidden_size")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(defaults.hidden_size as u64) as usize;
-            let intermediate_size = vc
-                .get("intermediate_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.intermediate_size as u64) as usize;
-            let num_attention_heads = vc
-                .get("num_attention_heads")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.num_attention_heads as u64)
-                as usize;
-            let num_hidden_layers = vc
-                .get("num_hidden_layers")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.num_hidden_layers as u64) as usize;
+            let intermediate_size =
+                vc.get("intermediate_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.intermediate_size as u64) as usize;
+            let num_attention_heads =
+                vc.get("num_attention_heads")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.num_attention_heads as u64) as usize;
+            let num_hidden_layers =
+                vc.get("num_hidden_layers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.num_hidden_layers as u64) as usize;
             let image_size = vc
                 .get("image_size")
                 .and_then(|v| v.as_u64())
@@ -150,14 +151,14 @@ impl Llama4VLConfig {
                 .get("pixel_shuffle_ratio")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(defaults.pixel_shuffle_ratio);
-            let projector_input_dim = vc
-                .get("projector_input_dim")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.projector_input_dim as u64) as usize;
-            let projector_output_dim = vc
-                .get("projector_output_dim")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(defaults.projector_output_dim as u64) as usize;
+            let projector_input_dim =
+                vc.get("projector_input_dim")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.projector_input_dim as u64) as usize;
+            let projector_output_dim =
+                vc.get("projector_output_dim")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(defaults.projector_output_dim as u64) as usize;
             let multi_modal_projector_bias = vc
                 .get("multi_modal_projector_bias")
                 .and_then(|v| v.as_bool())
@@ -278,7 +279,11 @@ impl Llama4VisionAttention {
 
         // Split into Q, K, V
         let q = qkv.narrow(2, 0, self.num_heads * self.head_dim)?;
-        let k = qkv.narrow(2, self.num_heads * self.head_dim, self.num_heads * self.head_dim)?;
+        let k = qkv.narrow(
+            2,
+            self.num_heads * self.head_dim,
+            self.num_heads * self.head_dim,
+        )?;
         let v = qkv.narrow(
             2,
             2 * self.num_heads * self.head_dim,
@@ -328,7 +333,8 @@ impl Llama4VisionEncoderLayer {
         layer_norm_eps: f64,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let self_attn = Llama4VisionAttention::new(hidden_size, num_attention_heads, vb.pp("self_attn"))?;
+        let self_attn =
+            Llama4VisionAttention::new(hidden_size, num_attention_heads, vb.pp("self_attn"))?;
         let mlp = Llama4VisionMLP::new(
             hidden_size,
             intermediate_size,
@@ -337,10 +343,12 @@ impl Llama4VisionEncoderLayer {
             false, // no output activation
             vb.pp("mlp"),
         )?;
-        let input_layernorm =
-            layer_norm(hidden_size, layer_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm =
-            layer_norm(hidden_size, layer_norm_eps, vb.pp("post_attention_layernorm"))?;
+        let input_layernorm = layer_norm(hidden_size, layer_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = layer_norm(
+            hidden_size,
+            layer_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
 
         Ok(Self {
             self_attn,
@@ -410,7 +418,11 @@ impl Llama4UnfoldConvolution {
         // -> [B, ph, pw, C, P, P]
         let xs = xs.permute([0, 2, 4, 1, 3, 5])?;
         // -> [B, ph*pw, C*P*P]
-        let xs = xs.reshape((batch, ph * pw, self.num_channels * self.patch_size * self.patch_size))?;
+        let xs = xs.reshape((
+            batch,
+            ph * pw,
+            self.num_channels * self.patch_size * self.patch_size,
+        ))?;
         let xs = xs.contiguous()?;
 
         self.linear.forward(&xs)
@@ -620,8 +632,7 @@ pub struct Llama4VLForConditionalGeneration {
 impl Llama4VLForConditionalGeneration {
     /// Create a new Llama4 VL model.
     pub fn new(cfg: &Llama4VLConfig, vb: VarBuilder) -> Result<Self> {
-        let vision_model =
-            Llama4VisionModel::new(&cfg.vision_config, vb.pp("vision_model"))?;
+        let vision_model = Llama4VisionModel::new(&cfg.vision_config, vb.pp("vision_model"))?;
 
         let multi_modal_projector = Llama4MultiModalProjector::new(
             cfg.vision_config.projector_output_dim,
@@ -629,8 +640,7 @@ impl Llama4VLForConditionalGeneration {
             vb.pp("multi_modal_projector"),
         )?;
 
-        let language_model =
-            Llama4ForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
+        let language_model = Llama4ForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
 
         Ok(Self {
             vision_model,
@@ -716,8 +726,11 @@ impl crate::engine::ModelForward for Llama4VLForConditionalGeneration {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let embeddings = self.language_model.embed_text(input_ids)?;
-        self.language_model
-            .forward_decode_batch_with_embeddings(&embeddings, sequences, kv_cache_mgr)
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
     }
 
     fn supports_multimodal(&self) -> bool {
@@ -1133,7 +1146,11 @@ mod tests {
         // Output: [1, 1, 64] (1 token, projected to text_hidden=64)
         assert_eq!(
             encoded.dims(),
-            &[1, cfg.vision_config.num_output_tokens(), cfg.model_config.hidden_size]
+            &[
+                1,
+                cfg.vision_config.num_output_tokens(),
+                cfg.model_config.hidden_size
+            ]
         );
     }
 

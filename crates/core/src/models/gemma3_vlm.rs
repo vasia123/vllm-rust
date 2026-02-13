@@ -68,15 +68,18 @@ impl Gemma3VLMConfig {
                 intermediate_size: vc
                     .get("intermediate_size")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.intermediate_size as u64) as usize,
+                    .unwrap_or(defaults.intermediate_size as u64)
+                    as usize,
                 num_attention_heads: vc
                     .get("num_attention_heads")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.num_attention_heads as u64) as usize,
+                    .unwrap_or(defaults.num_attention_heads as u64)
+                    as usize,
                 num_hidden_layers: vc
                     .get("num_hidden_layers")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.num_hidden_layers as u64) as usize,
+                    .unwrap_or(defaults.num_hidden_layers as u64)
+                    as usize,
                 image_size: vc
                     .get("image_size")
                     .and_then(|v| v.as_u64())
@@ -251,8 +254,7 @@ impl Gemma3ForConditionalGeneration {
             vb.pp("multi_modal_projector"),
         )?;
 
-        let language_model =
-            Gemma3ForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
+        let language_model = Gemma3ForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
 
         Ok(Self {
             vision_tower,
@@ -335,8 +337,11 @@ impl crate::engine::ModelForward for Gemma3ForConditionalGeneration {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let embeddings = self.language_model.embed_text(input_ids)?;
-        self.language_model
-            .forward_decode_batch_with_embeddings(&embeddings, sequences, kv_cache_mgr)
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
     }
 
     fn supports_multimodal(&self) -> bool {
@@ -505,7 +510,11 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let model = Gemma3ForConditionalGeneration::new(&cfg, vb);
-        assert!(model.is_ok(), "Gemma3 VLM should construct: {:?}", model.err());
+        assert!(
+            model.is_ok(),
+            "Gemma3 VLM should construct: {:?}",
+            model.err()
+        );
 
         let model = model.unwrap();
         assert!(model.supports_multimodal());
@@ -518,7 +527,11 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let model = Gemma3ForConditionalGeneration::from_model_config(&model_cfg, vb);
-        assert!(model.is_ok(), "from_model_config should work: {:?}", model.err());
+        assert!(
+            model.is_ok(),
+            "from_model_config should work: {:?}",
+            model.err()
+        );
     }
 
     // ── Projector Tests ──────────────────────────────────────────────────
@@ -529,9 +542,7 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         // patches_per_image=2, kernel=1
-        let projector = Gemma3MultiModalProjector::new(
-            32, 64, 2, 1, 1e-6, vb,
-        ).unwrap();
+        let projector = Gemma3MultiModalProjector::new(32, 64, 2, 1, 1e-6, vb).unwrap();
 
         // Input: [1, 4, 32] (4 patches = 2×2, 32 vision_hidden)
         let input = Tensor::randn(0f32, 1.0, (1, 4, 32), &device).unwrap();
@@ -547,9 +558,7 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         // patches_per_image=4, kernel=2 → reduces 16 patches to 4
-        let projector = Gemma3MultiModalProjector::new(
-            32, 64, 4, 2, 1e-6, vb,
-        ).unwrap();
+        let projector = Gemma3MultiModalProjector::new(32, 64, 4, 2, 1e-6, vb).unwrap();
 
         // Input: [1, 16, 32] (16 patches = 4×4)
         let input = Tensor::randn(0f32, 1.0, (1, 16, 32), &device).unwrap();
@@ -563,9 +572,7 @@ mod tests {
     fn test_avg_pool_2d() {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
-        let projector = Gemma3MultiModalProjector::new(
-            1, 1, 4, 2, 1e-6, vb,
-        ).unwrap();
+        let projector = Gemma3MultiModalProjector::new(1, 1, 4, 2, 1e-6, vb).unwrap();
 
         // [1, 1, 4, 4] with known values
         let values: Vec<f32> = (0..16).map(|i| i as f32).collect();
@@ -621,7 +628,12 @@ mod tests {
         let input_ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device).unwrap();
         let logits = model
             .forward_multimodal(
-                &input_ids, None, 0, &mut kv_cache, &block_table, &slot_mapping,
+                &input_ids,
+                None,
+                0,
+                &mut kv_cache,
+                &block_table,
+                &slot_mapping,
             )
             .unwrap();
 

@@ -169,8 +169,7 @@ impl OPTMLP {
             .extra
             .get("ffn_dim")
             .and_then(|v| v.as_u64())
-            .unwrap_or(cfg.intermediate_size as u64)
-            as usize;
+            .unwrap_or(cfg.intermediate_size as u64) as usize;
         let enable_bias = cfg
             .extra
             .get("enable_bias")
@@ -224,8 +223,7 @@ impl OPTDecoderLayer {
 
         let self_attn = OPTAttention::new(cfg, vb.pp("self_attn"))?;
         let mlp = OPTMLP::new(cfg, vb.pp("mlp"))?;
-        let self_attn_layer_norm =
-            layer_norm(cfg.hidden_size, eps, vb.pp("self_attn_layer_norm"))?;
+        let self_attn_layer_norm = layer_norm(cfg.hidden_size, eps, vb.pp("self_attn_layer_norm"))?;
         let final_layer_norm = layer_norm(cfg.hidden_size, eps, vb.pp("final_layer_norm"))?;
 
         Ok(Self {

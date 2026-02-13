@@ -41,11 +41,7 @@ impl Llama4Config {
             .extra
             .get("no_rope_layers")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| v.as_u64().unwrap_or(0) == 1)
-                    .collect()
-            })
+            .map(|arr| arr.iter().map(|v| v.as_u64().unwrap_or(0) == 1).collect())
             .unwrap_or_default();
 
         Self {
@@ -387,12 +383,11 @@ impl Llama4DecoderLayer {
             };
             Llama4FeedForward::Moe(MoELayerWithShared::new(moe_config, vb.pp("feed_forward"))?)
         } else {
-            let mlp_intermediate = cfg
-                .extra
-                .get("intermediate_size_mlp")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(cfg.intermediate_size as u64)
-                as usize;
+            let mlp_intermediate =
+                cfg.extra
+                    .get("intermediate_size_mlp")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(cfg.intermediate_size as u64) as usize;
             Llama4FeedForward::Dense(TpSwiGluMlp::new(
                 cfg.hidden_size,
                 mlp_intermediate,
@@ -507,7 +502,11 @@ impl Llama4ForCausalLM {
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(Llama4DecoderLayer::new_with_tp(
-                cfg, &l4_cfg, i, vb_l.pp(i), pg,
+                cfg,
+                &l4_cfg,
+                i,
+                vb_l.pp(i),
+                pg,
             )?);
         }
 
@@ -696,10 +695,7 @@ mod tests {
                 "interleave_moe_layer_step".into(),
                 serde_json::Value::from(2),
             );
-            extra.insert(
-                "no_rope_layers".into(),
-                serde_json::json!([0, 1, 0, 0]),
-            );
+            extra.insert("no_rope_layers".into(), serde_json::json!([0, 1, 0, 0]));
         }
 
         ModelConfig {

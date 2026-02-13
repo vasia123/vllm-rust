@@ -96,9 +96,7 @@ impl ChatGLMAttention {
                     "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
                 )));
             }
-            if total_num_kv_heads >= world_size
-                && !total_num_kv_heads.is_multiple_of(world_size)
-            {
+            if total_num_kv_heads >= world_size && !total_num_kv_heads.is_multiple_of(world_size) {
                 return Err(candle_core::Error::Msg(format!(
                     "num_kv_heads ({total_num_kv_heads}) must be divisible by world_size ({world_size})"
                 )));
@@ -461,8 +459,7 @@ impl ChatGLMBlock {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let self_attention =
-            ChatGLMAttention::new_with_tp(cfg, vb.pp("self_attention"), pg)?;
+        let self_attention = ChatGLMAttention::new_with_tp(cfg, vb.pp("self_attention"), pg)?;
         let mlp = ChatGLMMlp::new_with_tp(cfg, vb.pp("mlp"), pg)?;
 
         let input_layernorm =
@@ -784,24 +781,15 @@ mod tests {
             "multi_query_attention".into(),
             serde_json::Value::Bool(true),
         );
-        extra.insert(
-            "padded_vocab_size".into(),
-            serde_json::Value::from(256u64),
-        );
+        extra.insert("padded_vocab_size".into(), serde_json::Value::from(256u64));
         extra.insert(
             "apply_residual_connection_post_layernorm".into(),
             serde_json::Value::Bool(false),
         );
         extra.insert("post_layer_norm".into(), serde_json::Value::Bool(true));
         extra.insert("rmsnorm".into(), serde_json::Value::Bool(true));
-        extra.insert(
-            "layernorm_epsilon".into(),
-            serde_json::Value::from(1e-5),
-        );
-        extra.insert(
-            "ffn_hidden_size".into(),
-            serde_json::Value::from(128u64),
-        );
+        extra.insert("layernorm_epsilon".into(), serde_json::Value::from(1e-5));
+        extra.insert("ffn_hidden_size".into(), serde_json::Value::from(128u64));
 
         ModelConfig {
             architectures: vec!["ChatGLMForCausalLM".to_string()],
@@ -904,10 +892,8 @@ mod tests {
     #[test]
     fn test_chatglm_no_post_layer_norm() {
         let mut cfg = test_config();
-        cfg.extra.insert(
-            "post_layer_norm".into(),
-            serde_json::Value::Bool(false),
-        );
+        cfg.extra
+            .insert("post_layer_norm".into(), serde_json::Value::Bool(false));
 
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
@@ -955,7 +941,13 @@ mod tests {
             .expect("allocate");
         let slot_mapping = block_table.slot_mapping(0, 3);
 
-        let result = model.forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping);
+        let result = model.forward(
+            &input_ids,
+            0,
+            &mut kv_cache_mgr,
+            &block_table,
+            &slot_mapping,
+        );
         assert!(
             result.is_ok(),
             "forward with post_layernorm residual: {:?}",
@@ -1005,7 +997,13 @@ mod tests {
         let slot_mapping = block_table.slot_mapping(0, 3);
 
         let logits = model
-            .forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward in MHA mode");
 
         let vocab_size = cfg

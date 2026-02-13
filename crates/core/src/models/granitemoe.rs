@@ -320,8 +320,7 @@ impl GraniteMoeDecoderLayer {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        let self_attn =
-            GraniteMoeAttention::new_with_tp(cfg, gmoe_cfg, vb.pp("self_attn"), pg)?;
+        let self_attn = GraniteMoeAttention::new_with_tp(cfg, gmoe_cfg, vb.pp("self_attn"), pg)?;
 
         let moe_config = MoELayerConfig {
             hidden_size: cfg.hidden_size,
@@ -596,10 +595,7 @@ mod tests {
             "residual_multiplier".into(),
             serde_json::Value::from(0.22360679774997896),
         );
-        extra.insert(
-            "embedding_multiplier".into(),
-            serde_json::Value::from(12.0),
-        );
+        extra.insert("embedding_multiplier".into(), serde_json::Value::from(12.0));
         extra.insert("logits_scaling".into(), serde_json::Value::from(13.0));
         extra.insert("num_local_experts".into(), serde_json::Value::from(4));
         extra.insert("num_experts_per_tok".into(), serde_json::Value::from(2));

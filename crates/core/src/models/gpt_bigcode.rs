@@ -80,16 +80,8 @@ impl GPTBigCodeMLP {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        let c_fc = TpLinear::column_parallel(
-            hidden_size,
-            n_inner,
-            true,
-            false,
-            vb.pp("c_fc"),
-            pg,
-        )?;
-        let c_proj =
-            TpLinear::row_parallel(n_inner, hidden_size, true, true, vb.pp("c_proj"), pg)?;
+        let c_fc = TpLinear::column_parallel(hidden_size, n_inner, true, false, vb.pp("c_fc"), pg)?;
+        let c_proj = TpLinear::row_parallel(n_inner, hidden_size, true, true, vb.pp("c_proj"), pg)?;
 
         Ok(Self {
             c_fc,
@@ -652,10 +644,7 @@ mod tests {
     fn test_config_mqa() -> ModelConfig {
         let mut extra = serde_json::Map::new();
         extra.insert("multi_query".into(), serde_json::Value::Bool(true));
-        extra.insert(
-            "layer_norm_epsilon".into(),
-            serde_json::Value::from(1e-5),
-        );
+        extra.insert("layer_norm_epsilon".into(), serde_json::Value::from(1e-5));
         extra.insert(
             "activation_function".into(),
             serde_json::Value::String("gelu_new".into()),
@@ -687,10 +676,7 @@ mod tests {
     fn test_config_mha() -> ModelConfig {
         let mut extra = serde_json::Map::new();
         extra.insert("multi_query".into(), serde_json::Value::Bool(false));
-        extra.insert(
-            "layer_norm_epsilon".into(),
-            serde_json::Value::from(1e-5),
-        );
+        extra.insert("layer_norm_epsilon".into(), serde_json::Value::from(1e-5));
 
         ModelConfig {
             architectures: vec!["GPTBigCodeForCausalLM".to_string()],
@@ -991,7 +977,10 @@ mod tests {
             bigcode_cfg.activation,
             candle_nn::Activation::NewGelu
         ));
-        assert!(bigcode_cfg.multi_query, "multi_query should default to true");
+        assert!(
+            bigcode_cfg.multi_query,
+            "multi_query should default to true"
+        );
     }
 
     #[test]
@@ -1009,10 +998,8 @@ mod tests {
             "activation_function".to_string(),
             serde_json::Value::String("gelu".to_string()),
         );
-        cfg.extra.insert(
-            "multi_query".to_string(),
-            serde_json::Value::Bool(false),
-        );
+        cfg.extra
+            .insert("multi_query".to_string(), serde_json::Value::Bool(false));
 
         let bigcode_cfg = GPTBigCodeConfig::from_model_config(&cfg);
 

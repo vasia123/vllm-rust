@@ -98,8 +98,7 @@ impl Dots1Config {
     }
 
     fn is_moe_layer(&self, layer_idx: usize) -> bool {
-        layer_idx >= self.first_k_dense_replace
-            && layer_idx.is_multiple_of(self.moe_layer_freq)
+        layer_idx >= self.first_k_dense_replace && layer_idx.is_multiple_of(self.moe_layer_freq)
     }
 }
 
@@ -562,10 +561,7 @@ mod tests {
         extra.insert("topk_group".to_string(), serde_json::json!(1));
         extra.insert("norm_topk_prob".to_string(), serde_json::json!(true));
         extra.insert("scoring_func".to_string(), serde_json::json!("softmax"));
-        extra.insert(
-            "routed_scaling_factor".to_string(),
-            serde_json::json!(1.0),
-        );
+        extra.insert("routed_scaling_factor".to_string(), serde_json::json!(1.0));
 
         ModelConfig {
             architectures: vec!["Dots1ForCausalLM".to_string()],
@@ -703,10 +699,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.extra.remove("n_routed_experts");
         // Set first_k_dense_replace above num_hidden_layers so all layers are dense
-        cfg.extra.insert(
-            "first_k_dense_replace".to_string(),
-            serde_json::json!(100),
-        );
+        cfg.extra
+            .insert("first_k_dense_replace".to_string(), serde_json::json!(100));
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
@@ -758,8 +752,7 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 3;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)
@@ -908,10 +901,8 @@ mod tests {
     #[test]
     fn test_dots1_with_routed_scaling() {
         let mut cfg = test_config();
-        cfg.extra.insert(
-            "routed_scaling_factor".to_string(),
-            serde_json::json!(2.5),
-        );
+        cfg.extra
+            .insert("routed_scaling_factor".to_string(), serde_json::json!(2.5));
         let dots1_cfg = Dots1Config::from_model_config(&cfg);
         assert!((dots1_cfg.routed_scaling_factor - 2.5).abs() < 1e-9);
     }

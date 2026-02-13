@@ -664,12 +664,7 @@ fn norm_eps_for_type(cfg: &ModelConfig, norm_type: NormType) -> f64 {
     }
 }
 
-fn make_norm(
-    norm_type: NormType,
-    size: usize,
-    eps: f64,
-    vb: VarBuilder,
-) -> Result<NormLayer> {
+fn make_norm(norm_type: NormType, size: usize, eps: f64, vb: VarBuilder) -> Result<NormLayer> {
     match norm_type {
         NormType::LayerNorm => NormLayer::layer_norm(size, eps, vb),
         NormType::RmsNorm => NormLayer::rms_norm(size, eps, vb),
@@ -1234,13 +1229,14 @@ mod tests {
     #[test]
     fn test_norm_eps_layernorm_from_extra() {
         let mut cfg = test_config();
-        cfg.extra.insert(
-            "layer_norm_eps".to_string(),
-            serde_json::Value::from(1e-5),
-        );
+        cfg.extra
+            .insert("layer_norm_eps".to_string(), serde_json::Value::from(1e-5));
 
         let eps = norm_eps_for_type(&cfg, NormType::LayerNorm);
-        assert!((eps - 1e-5).abs() < 1e-12, "should use layer_norm_eps from extra");
+        assert!(
+            (eps - 1e-5).abs() < 1e-12,
+            "should use layer_norm_eps from extra"
+        );
     }
 
     #[test]

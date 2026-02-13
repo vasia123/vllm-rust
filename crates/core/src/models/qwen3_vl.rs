@@ -580,8 +580,7 @@ impl Qwen3VLAttention {
             cfg.num_key_value_heads * cfg.head_dim,
             vb.pp("v_proj"),
         )?;
-        let o_proj =
-            candle_nn::linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("o_proj"))?;
+        let o_proj = candle_nn::linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("o_proj"))?;
 
         // Qwen3-specific: per-head RMSNorm
         let q_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
@@ -1618,9 +1617,7 @@ mod tests {
 
         // Prefill with 3 tokens
         let prompt = Tensor::zeros((1, 3), DType::U32, &device).unwrap();
-        kv_cache
-            .allocate_for_request(&mut block_table, 3)
-            .unwrap();
+        kv_cache.allocate_for_request(&mut block_table, 3).unwrap();
         let slot_mapping = block_table.slot_mapping(0, 3);
 
         let logits = model
@@ -1630,20 +1627,12 @@ mod tests {
         block_table.advance(3);
 
         // Decode step with seqlen_offset=3
-        kv_cache
-            .allocate_for_request(&mut block_table, 1)
-            .unwrap();
+        kv_cache.allocate_for_request(&mut block_table, 1).unwrap();
         let slot_mapping = block_table.slot_mapping(3, 1);
         let next_token = Tensor::zeros((1, 1), DType::U32, &device).unwrap();
 
         let logits = model
-            .forward(
-                &next_token,
-                3,
-                &mut kv_cache,
-                &block_table,
-                &slot_mapping,
-            )
+            .forward(&next_token, 3, &mut kv_cache, &block_table, &slot_mapping)
             .unwrap();
         assert_eq!(logits.dims(), &[1, 1, cfg.model_config.vocab_size]);
     }

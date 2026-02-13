@@ -63,11 +63,7 @@ struct PhiMoeAttention {
 }
 
 impl PhiMoeAttention {
-    fn new_with_tp(
-        cfg: &ModelConfig,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -612,8 +608,7 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 5;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)

@@ -124,9 +124,8 @@ impl MiniCPMMlp {
             MiniCPMActivation::Silu => (candle_nn::ops::silu(&gate)? * up)?,
             MiniCPMActivation::FatRelu(threshold) => {
                 // FatReLU: zero out values below threshold, then gate with up
-                let threshold_t =
-                    Tensor::full(*threshold as f32, gate.shape(), gate.device())?
-                        .to_dtype(gate.dtype())?;
+                let threshold_t = Tensor::full(*threshold as f32, gate.shape(), gate.device())?
+                    .to_dtype(gate.dtype())?;
                 let mask = gate.ge(&threshold_t)?;
                 let dtype = gate.dtype();
                 let gated = (gate * mask.to_dtype(dtype)?)?;
@@ -304,11 +303,7 @@ struct MiniCPMDecoderLayer {
 }
 
 impl MiniCPMDecoderLayer {
-    fn new(
-        cfg: &ModelConfig,
-        mini_cfg: &MiniCPMConfig,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(cfg: &ModelConfig, mini_cfg: &MiniCPMConfig, vb: VarBuilder) -> Result<Self> {
         let self_attn = MiniCPMAttention::new(cfg, vb.pp("self_attn"))?;
 
         let feed_forward = if mini_cfg.num_experts > 0 {

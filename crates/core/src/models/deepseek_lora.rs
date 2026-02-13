@@ -141,11 +141,7 @@ impl MLAAttentionWithLora {
             let q_b = linear_no_bias(q_rank, num_heads * qk_head_dim, vb.pp("q_b_proj"))?;
             (Some(q_a), Some(q_a_ln), Some(q_b), None)
         } else {
-            let q = linear_no_bias(
-                cfg.hidden_size,
-                num_heads * qk_head_dim,
-                vb.pp("q_proj"),
-            )?;
+            let q = linear_no_bias(cfg.hidden_size, num_heads * qk_head_dim, vb.pp("q_proj"))?;
             (None, None, None, Some(q))
         };
 
@@ -163,16 +159,12 @@ impl MLAAttentionWithLora {
         )?;
 
         // Standard o_proj for MLA, plus LoRA wrapper
-        let o_proj_for_mla = linear_no_bias(
-            num_heads * v_head_dim,
-            cfg.hidden_size,
-            vb.pp("o_proj"),
-        )?;
+        let o_proj_for_mla =
+            linear_no_bias(num_heads * v_head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
 
         // LoRA wrapper around o_proj
-        let o_proj_lora = LinearWithLora::from_linear(
-            Linear::new(o_proj_for_mla.weight().clone(), None),
-        );
+        let o_proj_lora =
+            LinearWithLora::from_linear(Linear::new(o_proj_for_mla.weight().clone(), None));
 
         // RoPE
         let rotary_emb = RotaryEmbedding::new(
@@ -208,8 +200,7 @@ impl MLAAttentionWithLora {
 
         // Build MLA with a dummy o_proj (we handle o_proj via LoRA wrapper)
         // Use the same weight but through the MLA struct for cache logic
-        let o_proj_mla =
-            linear_no_bias(num_heads * v_head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+        let o_proj_mla = linear_no_bias(num_heads * v_head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
 
         let mla = MLAAttention::new(
             q_a_proj,
@@ -229,10 +220,7 @@ impl MLAAttentionWithLora {
             q_scale,
         );
 
-        Ok(Self {
-            mla,
-            o_proj_lora,
-        })
+        Ok(Self { mla, o_proj_lora })
     }
 
     fn register_lora(&mut self, adapter_name: &str, lora_model: &LoraModel, prefix: &str) {
@@ -352,11 +340,11 @@ impl DeepSeekDecoderLayerWithLora {
                 .get("num_experts_per_tok")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(2) as usize;
-            let moe_intermediate = cfg
-                .extra
-                .get("moe_intermediate_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(cfg.intermediate_size as u64) as usize;
+            let moe_intermediate =
+                cfg.extra
+                    .get("moe_intermediate_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(cfg.intermediate_size as u64) as usize;
 
             let layer_cfg = MoELayerConfig {
                 hidden_size: cfg.hidden_size,
@@ -381,11 +369,8 @@ impl DeepSeekDecoderLayerWithLora {
 
             (None, Some(moe_layer), shared)
         } else {
-            let mlp = DeepSeekMlpWithLora::new(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                vb.pp("mlp"),
-            )?;
+            let mlp =
+                DeepSeekMlpWithLora::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
             (Some(mlp), None, None)
         };
 
@@ -456,6 +441,7 @@ impl DeepSeekDecoderLayerWithLora {
         residual + x
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_decode(
         &self,
         x: &Tensor,
@@ -764,9 +750,9 @@ impl crate::models::ModelForwardWithLora for DeepSeekWithLora {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
     use crate::kv_cache::mla_cache_config::MLACacheConfig;
     use crate::lora::LoraAdapter;
+    use candle_core::DType;
 
     fn test_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();

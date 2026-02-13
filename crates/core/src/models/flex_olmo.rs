@@ -824,8 +824,7 @@ mod tests {
         let tp_size = 2;
         let pg = LocalProcessGroup::with_rank(0, tp_size);
         let tp_ctx = TpContext::mock_multi_gpu(0, tp_size);
-        let model =
-            FlexOlmoForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx).expect("build model");
+        let model = FlexOlmoForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx).expect("build model");
 
         let local_kv_heads = cfg.num_key_value_heads / tp_size;
         let cache_config = CacheConfig {

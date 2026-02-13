@@ -321,8 +321,7 @@ impl EagleLlamaForCausalLM {
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let eagle_cfg = Eagle1Config::from_model_config(cfg);
 
-        let embed_tokens =
-            embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
@@ -331,11 +330,7 @@ impl EagleLlamaForCausalLM {
         }
 
         // FC: cat(embed, hidden) = 2*hidden_size → hidden_size
-        let fc = linear_no_bias(
-            2 * cfg.hidden_size,
-            cfg.hidden_size,
-            vb.pp("model.fc"),
-        )?;
+        let fc = linear_no_bias(2 * cfg.hidden_size, cfg.hidden_size, vb.pp("model.fc"))?;
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
 
@@ -427,8 +422,8 @@ impl Eagle1DraftModel for EagleLlamaForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use candle_core::DType;
 
     fn test_config() -> ModelConfig {
         ModelConfig {
@@ -479,8 +474,10 @@ mod tests {
     #[test]
     fn test_eagle1_config_custom() {
         let mut cfg = test_config();
-        cfg.extra.insert("draft_vocab_size".to_string(), serde_json::json!(128));
-        cfg.extra.insert("logit_scale".to_string(), serde_json::json!(2.0));
+        cfg.extra
+            .insert("draft_vocab_size".to_string(), serde_json::json!(128));
+        cfg.extra
+            .insert("logit_scale".to_string(), serde_json::json!(2.0));
         cfg.attention_bias = Some(true);
 
         let eagle_cfg = Eagle1Config::from_model_config(&cfg);
@@ -496,7 +493,11 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let model = EagleLlamaForCausalLM::new(&cfg, vb);
-        assert!(model.is_ok(), "Eagle1 Llama should construct: {:?}", model.err());
+        assert!(
+            model.is_ok(),
+            "Eagle1 Llama should construct: {:?}",
+            model.err()
+        );
 
         let model = model.unwrap();
         assert_eq!(model.layers.len(), 2);
@@ -514,14 +515,23 @@ mod tests {
         let mut block_table = BlockTable::new(cache_cfg.block_size);
 
         let seq_len = 3;
-        kv_cache.allocate_for_request(&mut block_table, seq_len).unwrap();
+        kv_cache
+            .allocate_for_request(&mut block_table, seq_len)
+            .unwrap();
         let slot_mapping = block_table.slot_mapping(0, seq_len);
 
         let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).unwrap();
         let hidden_states = Tensor::randn(0f32, 1.0, (1, seq_len, 64), &device).unwrap();
 
         let (postnorm, prenorm) = model
-            .forward(&input_ids, &hidden_states, 0, &mut kv_cache, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                &hidden_states,
+                0,
+                &mut kv_cache,
+                &block_table,
+                &slot_mapping,
+            )
             .unwrap();
 
         assert_eq!(postnorm.dims(), &[1, seq_len, 64]);
@@ -560,7 +570,14 @@ mod tests {
         let hidden_states = Tensor::randn(0f32, 1.0, (1, 1, 64), &device).unwrap();
 
         let (postnorm, _) = model
-            .forward(&input_ids, &hidden_states, 0, &mut kv_cache, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                &hidden_states,
+                0,
+                &mut kv_cache,
+                &block_table,
+                &slot_mapping,
+            )
             .unwrap();
 
         assert_eq!(postnorm.dims(), &[1, 1, 64]);
@@ -598,7 +615,14 @@ mod tests {
         let hidden_states = Tensor::randn(0f32, 1.0, (1, 3, 64), &device).unwrap();
 
         let (postnorm, _) = model
-            .forward(&input_ids, &hidden_states, 0, &mut kv_cache, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                &hidden_states,
+                0,
+                &mut kv_cache,
+                &block_table,
+                &slot_mapping,
+            )
             .unwrap();
         assert_eq!(postnorm.dims(), &[1, 3, 64]);
         block_table.advance(3);
@@ -611,7 +635,14 @@ mod tests {
         let hidden_states = Tensor::randn(0f32, 1.0, (1, 1, 64), &device).unwrap();
 
         let (postnorm, _) = model
-            .forward(&input_ids, &hidden_states, 3, &mut kv_cache, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                &hidden_states,
+                3,
+                &mut kv_cache,
+                &block_table,
+                &slot_mapping,
+            )
             .unwrap();
         assert_eq!(postnorm.dims(), &[1, 1, 64]);
     }

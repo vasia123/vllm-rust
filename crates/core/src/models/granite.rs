@@ -314,14 +314,8 @@ impl GraniteDecoderLayer {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        let self_attn =
-            GraniteAttention::new_with_tp(cfg, granite_cfg, vb.pp("self_attn"), pg)?;
-        let mlp = TpSwiGluMlp::new(
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            vb.pp("mlp"),
-            pg,
-        )?;
+        let self_attn = GraniteAttention::new_with_tp(cfg, granite_cfg, vb.pp("self_attn"), pg)?;
+        let mlp = TpSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -604,10 +598,7 @@ mod tests {
             "residual_multiplier".into(),
             serde_json::Value::from(0.22360679774997896),
         );
-        extra.insert(
-            "embedding_multiplier".into(),
-            serde_json::Value::from(12.0),
-        );
+        extra.insert("embedding_multiplier".into(), serde_json::Value::from(12.0));
         extra.insert("logits_scaling".into(), serde_json::Value::from(13.0));
 
         ModelConfig {
@@ -685,7 +676,13 @@ mod tests {
 
         let slot_mapping: Vec<usize> = (0..seq_len).collect();
         let logits = model
-            .forward(&input_ids, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
             .expect("forward pass");
 
         assert_eq!(logits.dims(), &[batch_size, seq_len, cfg.vocab_size]);

@@ -49,11 +49,7 @@ impl Grok1Config {
             .extra
             .get("num_experts")
             .and_then(|v| v.as_u64())
-            .or_else(|| {
-                cfg.extra
-                    .get("num_local_experts")
-                    .and_then(|v| v.as_u64())
-            })
+            .or_else(|| cfg.extra.get("num_local_experts").and_then(|v| v.as_u64()))
             .unwrap_or(8) as usize;
 
         let num_experts_per_tok = cfg
@@ -126,11 +122,7 @@ struct Grok1MoEExpert {
 }
 
 impl Grok1MoEExpert {
-    fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
         // Grok1 checkpoint names: linear (gate/w1), linear_v (up/w3), linear_1 (down/w2)
         let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("linear"))?;
         let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("linear_v"))?;
@@ -223,11 +215,9 @@ impl Grok1MoE {
                 .to_vec1()?;
 
             // Top-k expert selection
-            let mut indexed: Vec<(usize, f32)> =
-                token_probs.iter().copied().enumerate().collect();
+            let mut indexed: Vec<(usize, f32)> = token_probs.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top_k_experts: Vec<(usize, f32)> =
-                indexed.into_iter().take(self.top_k).collect();
+            let top_k_experts: Vec<(usize, f32)> = indexed.into_iter().take(self.top_k).collect();
 
             // Renormalize top-k weights
             let weight_sum: f32 = top_k_experts.iter().map(|(_, w)| w).sum();
@@ -551,14 +541,10 @@ impl Grok1DecoderLayer {
             vb.pp("moe_block"),
         )?;
 
-        let pre_attn_norm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_attn_norm"))?;
-        let post_attn_norm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attn_norm"))?;
-        let pre_moe_norm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_moe_norm"))?;
-        let post_moe_norm =
-            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_moe_norm"))?;
+        let pre_attn_norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_attn_norm"))?;
+        let post_attn_norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attn_norm"))?;
+        let pre_moe_norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_moe_norm"))?;
+        let post_moe_norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_moe_norm"))?;
 
         Ok(Self {
             attn,
@@ -749,8 +735,8 @@ impl Grok1ForCausalLM {
         };
 
         // Embedding with multiplier scaling
-        let mut xs =
-            (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * self.embedding_multiplier_scale)?;
+        let mut xs = (self.embed_tokens.forward(input_ids, &self.tp_ctx)?
+            * self.embedding_multiplier_scale)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
@@ -814,8 +800,8 @@ impl crate::engine::ModelForward for Grok1ForCausalLM {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         // Embedding with multiplier scaling
-        let mut xs =
-            (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * self.embedding_multiplier_scale)?;
+        let mut xs = (self.embed_tokens.forward(input_ids, &self.tp_ctx)?
+            * self.embedding_multiplier_scale)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch(
@@ -911,9 +897,7 @@ mod tests {
         assert_eq!(grok_cfg.num_experts, 4);
         assert_eq!(grok_cfg.num_experts_per_tok, 2);
         assert!((grok_cfg.attn_output_multiplier - DEFAULT_ATTN_OUTPUT_MULTIPLIER).abs() < 1e-10);
-        assert!(
-            (grok_cfg.output_multiplier_scale - DEFAULT_OUTPUT_MULTIPLIER_SCALE).abs() < 1e-10
-        );
+        assert!((grok_cfg.output_multiplier_scale - DEFAULT_OUTPUT_MULTIPLIER_SCALE).abs() < 1e-10);
         assert!(
             (grok_cfg.embedding_multiplier_scale - DEFAULT_EMBEDDING_MULTIPLIER_SCALE).abs()
                 < 1e-10
@@ -953,11 +937,7 @@ mod tests {
         // tanh(100/30)*30 should be close to 30 (tanh saturates)
         assert!(values[0] > 29.0 && values[0] <= 30.0, "got {}", values[0]);
         // tanh(-100/30)*30 should be close to -30
-        assert!(
-            values[1] < -29.0 && values[1] >= -30.0,
-            "got {}",
-            values[1]
-        );
+        assert!(values[1] < -29.0 && values[1] >= -30.0, "got {}", values[1]);
         // tanh(0)*30 = 0
         assert!(values[2].abs() < 1e-6, "got {}", values[2]);
         // tanh(15/30)*30 = tanh(0.5)*30 ~ 13.86
@@ -1063,9 +1043,7 @@ mod tests {
         assert!(
             (model.embedding_multiplier_scale - DEFAULT_EMBEDDING_MULTIPLIER_SCALE).abs() < 1e-10
         );
-        assert!(
-            (model.output_multiplier_scale - DEFAULT_OUTPUT_MULTIPLIER_SCALE).abs() < 1e-10
-        );
+        assert!((model.output_multiplier_scale - DEFAULT_OUTPUT_MULTIPLIER_SCALE).abs() < 1e-10);
     }
 
     // ─── Forward Tests ──────────────────────────────────────────────────────────
@@ -1189,11 +1167,7 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
         let model = Grok1ForCausalLM::new(&cfg, vb);
-        assert!(
-            model.is_ok(),
-            "tied embeddings: {:?}",
-            model.err()
-        );
+        assert!(model.is_ok(), "tied embeddings: {:?}", model.err());
     }
 
     // ─── Embedding Multiplier Test ──────────────────────────────────────────────

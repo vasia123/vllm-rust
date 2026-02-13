@@ -539,11 +539,8 @@ impl Qwen3NextDecoderLayer {
             )?)
         };
 
-        let input_layernorm = Qwen3NextRmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("input_layernorm"),
-        )?;
+        let input_layernorm =
+            Qwen3NextRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = Qwen3NextRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -752,8 +749,7 @@ impl Qwen3NextForCausalLM {
             )?);
         }
 
-        let norm =
-            Qwen3NextRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = Qwen3NextRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         let lm_head = if cfg.tie_word_embeddings && world_size == 1 {
             let emb_weights = embed_tokens
@@ -926,19 +922,15 @@ mod tests {
 
     fn test_config_with_gate() -> ModelConfig {
         let mut cfg = test_config();
-        cfg.extra.insert(
-            "attn_output_gate".to_string(),
-            serde_json::json!(true),
-        );
+        cfg.extra
+            .insert("attn_output_gate".to_string(), serde_json::json!(true));
         cfg
     }
 
     fn test_config_with_layer_scale() -> ModelConfig {
         let mut cfg = test_config();
-        cfg.extra.insert(
-            "layer_scale".to_string(),
-            serde_json::json!(true),
-        );
+        cfg.extra
+            .insert("layer_scale".to_string(), serde_json::json!(true));
         cfg
     }
 
@@ -1076,8 +1068,7 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 3;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)

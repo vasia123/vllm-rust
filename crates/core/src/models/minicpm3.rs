@@ -170,9 +170,8 @@ impl MiniCPM3Mlp {
         let activated = match &self.activation {
             MiniCPM3Activation::Silu => (candle_nn::ops::silu(&gate)? * up)?,
             MiniCPM3Activation::FatRelu(threshold) => {
-                let threshold_t =
-                    Tensor::full(*threshold as f32, gate.shape(), gate.device())?
-                        .to_dtype(gate.dtype())?;
+                let threshold_t = Tensor::full(*threshold as f32, gate.shape(), gate.device())?
+                    .to_dtype(gate.dtype())?;
                 let mask = gate.ge(&threshold_t)?;
                 let dtype = gate.dtype();
                 let gated = (gate * mask.to_dtype(dtype)?)?;
@@ -237,11 +236,7 @@ impl MiniCPM3Attention {
         // Low-rank query
         let q_a_proj = linear_no_bias(cfg.hidden_size, q_lora_rank, vb.pp("q_a_proj"))?;
         let q_a_layernorm = rms_norm(q_lora_rank, cfg.rms_norm_eps, vb.pp("q_a_layernorm"))?;
-        let q_b_proj = linear_no_bias(
-            q_lora_rank,
-            num_heads * qk_head_dim,
-            vb.pp("q_b_proj"),
-        )?;
+        let q_b_proj = linear_no_bias(q_lora_rank, num_heads * qk_head_dim, vb.pp("q_b_proj"))?;
 
         // Latent KV
         let kv_a_proj_with_mqa = linear_no_bias(
@@ -249,8 +244,7 @@ impl MiniCPM3Attention {
             kv_lora_rank + qk_rope_head_dim,
             vb.pp("kv_a_proj_with_mqa"),
         )?;
-        let kv_a_layernorm =
-            rms_norm(kv_lora_rank, cfg.rms_norm_eps, vb.pp("kv_a_layernorm"))?;
+        let kv_a_layernorm = rms_norm(kv_lora_rank, cfg.rms_norm_eps, vb.pp("kv_a_layernorm"))?;
         let kv_b_proj = linear_no_bias(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
@@ -293,11 +287,7 @@ impl MiniCPM3Attention {
     /// - q: [b, num_heads, seq, qk_head_dim]
     /// - k: [b, num_heads, seq, qk_head_dim]
     /// - v: [b, num_heads, seq, qk_head_dim] (zero-padded from v_head_dim)
-    fn project_qkv(
-        &self,
-        xs: &Tensor,
-        seqlen_offset: usize,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
+    fn project_qkv(&self, xs: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
         // Query: low-rank path
@@ -315,8 +305,7 @@ impl MiniCPM3Attention {
         let latent_cache = self.kv_a_proj_with_mqa.forward(xs)?;
         // Split: [b, seq, kv_lora_rank] and [b, seq, qk_rope_head_dim]
         let kv_a = latent_cache.narrow(2, 0, self.kv_lora_rank)?;
-        let k_pe_raw =
-            latent_cache.narrow(2, self.kv_lora_rank, self.qk_rope_head_dim)?;
+        let k_pe_raw = latent_cache.narrow(2, self.kv_lora_rank, self.qk_rope_head_dim)?;
 
         // Normalize latent
         let kv_a = self.kv_a_layernorm.forward(&kv_a.contiguous()?)?;
@@ -336,11 +325,12 @@ impl MiniCPM3Attention {
         // Apply RoPE to the rope portions of Q and K
         // RoPE expects [b, heads, seq, head_dim] layout
         let q_pe_rope = q_pe.transpose(1, 2)?; // [b, num_heads, seq, rope_dim]
-        // k_pe is shared across heads (MQA-style): [b, 1, seq, rope_dim]
+                                               // k_pe is shared across heads (MQA-style): [b, 1, seq, rope_dim]
         let k_pe_rope = k_pe_raw.reshape((b_sz, 1, q_len, self.qk_rope_head_dim))?;
 
         let (q_pe_rotated, k_pe_rotated) =
-            self.rotary_emb.apply(&q_pe_rope, &k_pe_rope, seqlen_offset)?;
+            self.rotary_emb
+                .apply(&q_pe_rope, &k_pe_rope, seqlen_offset)?;
 
         // Back to [b, seq, heads, dim]
         let q_pe = q_pe_rotated.transpose(1, 2)?;
@@ -465,11 +455,7 @@ struct MiniCPM3DecoderLayer {
 }
 
 impl MiniCPM3DecoderLayer {
-    fn new(
-        cfg: &ModelConfig,
-        mini_cfg: &MiniCPM3Config,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(cfg: &ModelConfig, mini_cfg: &MiniCPM3Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = MiniCPM3Attention::new(cfg, mini_cfg, vb.pp("self_attn"))?;
 
         let feed_forward = if mini_cfg.num_experts > 0 {
@@ -871,8 +857,7 @@ mod tests {
             slot_mapping: vec![seq_len],
         }];
 
-        let decode_out =
-            model.forward_decode_batch(&decode_input, &sequences, &mut kv_cache_mgr);
+        let decode_out = model.forward_decode_batch(&decode_input, &sequences, &mut kv_cache_mgr);
         assert!(
             decode_out.is_ok(),
             "Decode should succeed: {:?}",

@@ -80,15 +80,18 @@ impl DeepSeekVLV2Config {
                 intermediate_size: vc
                     .get("intermediate_size")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.intermediate_size as u64) as usize,
+                    .unwrap_or(defaults.intermediate_size as u64)
+                    as usize,
                 num_attention_heads: vc
                     .get("num_attention_heads")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.num_attention_heads as u64) as usize,
+                    .unwrap_or(defaults.num_attention_heads as u64)
+                    as usize,
                 num_hidden_layers: vc
                     .get("num_hidden_layers")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.num_hidden_layers as u64) as usize,
+                    .unwrap_or(defaults.num_hidden_layers as u64)
+                    as usize,
                 image_size: vc
                     .get("image_size")
                     .and_then(|v| v.as_u64())
@@ -116,11 +119,7 @@ impl DeepSeekVLV2Config {
         let downsample_ratio = projector_cfg
             .and_then(|pc| pc.get("downsample_ratio"))
             .and_then(|v| v.as_u64())
-            .or_else(|| {
-                cfg.extra
-                    .get("downsample_ratio")
-                    .and_then(|v| v.as_u64())
-            })
+            .or_else(|| cfg.extra.get("downsample_ratio").and_then(|v| v.as_u64()))
             .unwrap_or(2) as usize;
 
         let mlp_ratio = projector_cfg
@@ -160,7 +159,7 @@ impl DeepSeekVLV2Config {
     /// Number of output tokens per side after downsampling.
     pub fn tokens_per_side(&self) -> usize {
         // Ceiling division in case of non-divisible sizes
-        (self.patches_per_side() + self.downsample_ratio - 1) / self.downsample_ratio
+        self.patches_per_side().div_ceil(self.downsample_ratio)
     }
 
     /// Total number of output tokens per image (single tile) after downsampling.
@@ -226,7 +225,11 @@ impl DownsampleMlpProjector {
             // Last layer: intermediate -> output
             // GELU at index (weight_idx), then Linear at (weight_idx + 1)
             weight_idx += 1;
-            layers.push(linear(intermediate_dim, output_dim, vb_layers.pp(weight_idx))?);
+            layers.push(linear(
+                intermediate_dim,
+                output_dim,
+                vb_layers.pp(weight_idx),
+            )?);
         }
 
         // Extract downsample_ratio from input_dim / output_dim relationship
@@ -252,7 +255,7 @@ impl DownsampleMlpProjector {
         let w = h;
 
         // Compute padding if needed
-        let pad = if h % self.downsample_ratio != 0 {
+        let pad = if !h.is_multiple_of(self.downsample_ratio) {
             self.downsample_ratio - h % self.downsample_ratio
         } else {
             0
@@ -266,13 +269,15 @@ impl DownsampleMlpProjector {
             let padded_h = h + pad;
 
             // Pad height by concatenating zero rows
-            let zero_rows =
-                Tensor::zeros((batch_size, pad, w, input_dim), x.dtype(), x.device())?;
+            let zero_rows = Tensor::zeros((batch_size, pad, w, input_dim), x.dtype(), x.device())?;
             let x = Tensor::cat(&[&x, &zero_rows], 1)?;
 
             // Pad width by concatenating zero columns
-            let zero_cols =
-                Tensor::zeros((batch_size, padded_h, pad, input_dim), x.dtype(), x.device())?;
+            let zero_cols = Tensor::zeros(
+                (batch_size, padded_h, pad, input_dim),
+                x.dtype(),
+                x.device(),
+            )?;
             Tensor::cat(&[&x, &zero_cols], 2)?
         } else {
             x
@@ -348,8 +353,7 @@ impl DeepSeekVLV2ForConditionalGeneration {
         )?
         .with_downsample_ratio(cfg.downsample_ratio);
 
-        let language_model =
-            DeepSeekForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
+        let language_model = DeepSeekForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
 
         // Learned special token embeddings
         let image_newline = vb.get(output_dim, "image_newline")?;
@@ -460,8 +464,11 @@ impl crate::engine::ModelForward for DeepSeekVLV2ForConditionalGeneration {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let embeddings = self.language_model.embed_text(input_ids)?;
-        self.language_model
-            .forward_decode_batch_with_embeddings(&embeddings, sequences, kv_cache_mgr)
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
     }
 
     fn supports_multimodal(&self) -> bool {
@@ -747,13 +754,7 @@ mod tests {
 
         let input_ids = Tensor::zeros((1, 4), DType::U32, &device).unwrap();
         let logits = model
-            .forward(
-                &input_ids,
-                0,
-                &mut kv_cache,
-                &block_table,
-                &slot_mapping,
-            )
+            .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
             .unwrap();
 
         assert_eq!(logits.dims(), &[1, 4, cfg.model_config.vocab_size]);
@@ -808,12 +809,10 @@ mod tests {
         // Image embedding: 4 patches (2x2), vision_hidden=32
         // After projection this becomes 1 token of dim=128, but we supply raw vision patches
         let num_vision_patches = 4;
-        let img_embedding =
-            Tensor::randn(0f32, 1.0, (num_vision_patches, 32), &device).unwrap();
+        let img_embedding = Tensor::randn(0f32, 1.0, (num_vision_patches, 32), &device).unwrap();
         let processed = ProcessedImage::new(img_embedding, cfg.num_image_tokens());
 
-        let mm_inputs =
-            MultimodalInputs::with_images(vec![0u32; seq_len], vec![(0, processed)]);
+        let mm_inputs = MultimodalInputs::with_images(vec![0u32; seq_len], vec![(0, processed)]);
 
         let logits = model
             .forward_multimodal(
@@ -878,13 +877,7 @@ mod tests {
 
         let prompt = Tensor::zeros((1, 3), DType::U32, &device).unwrap();
         let logits = model
-            .forward(
-                &prompt,
-                0,
-                &mut kv_cache,
-                &block_table,
-                &slot_mapping,
-            )
+            .forward(&prompt, 0, &mut kv_cache, &block_table, &slot_mapping)
             .unwrap();
         assert_eq!(logits.dims(), &[1, 3, cfg.model_config.vocab_size]);
         block_table.advance(3);

@@ -122,14 +122,7 @@ impl JAISMLP {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        let c_fc = TpLinear::column_parallel(
-            hidden_size,
-            n_inner,
-            true,
-            false,
-            vb.pp("c_fc"),
-            pg,
-        )?;
+        let c_fc = TpLinear::column_parallel(hidden_size, n_inner, true, false, vb.pp("c_fc"), pg)?;
 
         let c_fc2 = if use_swiglu {
             Some(TpLinear::column_parallel(
@@ -144,14 +137,7 @@ impl JAISMLP {
             None
         };
 
-        let c_proj = TpLinear::row_parallel(
-            n_inner,
-            hidden_size,
-            true,
-            true,
-            vb.pp("c_proj"),
-            pg,
-        )?;
+        let c_proj = TpLinear::row_parallel(n_inner, hidden_size, true, true, vb.pp("c_proj"), pg)?;
 
         Ok(Self {
             c_fc,
@@ -476,17 +462,9 @@ impl JAISBlock {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        let ln_1 = layer_norm(
-            cfg.hidden_size,
-            jais_cfg.layer_norm_epsilon,
-            vb.pp("ln_1"),
-        )?;
+        let ln_1 = layer_norm(cfg.hidden_size, jais_cfg.layer_norm_epsilon, vb.pp("ln_1"))?;
         let attn = JAISAttention::new_with_tp(cfg, jais_cfg, vb.pp("attn"), pg)?;
-        let ln_2 = layer_norm(
-            cfg.hidden_size,
-            jais_cfg.layer_norm_epsilon,
-            vb.pp("ln_2"),
-        )?;
+        let ln_2 = layer_norm(cfg.hidden_size, jais_cfg.layer_norm_epsilon, vb.pp("ln_2"))?;
         let mlp = JAISMLP::new(
             cfg.hidden_size,
             jais_cfg.n_inner,
@@ -1083,8 +1061,13 @@ mod tests {
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let pg = LocalProcessGroup::new();
-        let attn = JAISAttention::new_with_tp(&cfg, &jais_cfg, vb.pp("transformer").pp("h").pp(0).pp("attn"), &pg)
-            .expect("build attention");
+        let attn = JAISAttention::new_with_tp(
+            &cfg,
+            &jais_cfg,
+            vb.pp("transformer").pp("h").pp(0).pp("attn"),
+            &pg,
+        )
+        .expect("build attention");
 
         assert!(
             (attn.attn_scale - expected_scale).abs() < 1e-10,
@@ -1111,8 +1094,13 @@ mod tests {
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let pg = LocalProcessGroup::new();
-        let attn = JAISAttention::new_with_tp(&cfg, &jais_cfg, vb.pp("transformer").pp("h").pp(0).pp("attn"), &pg)
-            .expect("build attention");
+        let attn = JAISAttention::new_with_tp(
+            &cfg,
+            &jais_cfg,
+            vb.pp("transformer").pp("h").pp(0).pp("attn"),
+            &pg,
+        )
+        .expect("build attention");
 
         assert!(
             (attn.attn_scale - expected_scale).abs() < 1e-10,

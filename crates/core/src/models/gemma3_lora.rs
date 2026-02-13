@@ -359,9 +359,10 @@ impl Gemma3AttentionWithLora {
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v_full)?;
 
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
 
         self.o_proj.forward_with_lora(&attn_output, adapter)
     }
@@ -425,23 +426,18 @@ impl Gemma3AttentionWithLora {
             }
 
             if let Some(window_size) = self.sliding_window {
-                let mask = sliding_window_mask(
-                    1,
-                    kv_len,
-                    seq.seqlen_offset,
-                    window_size,
-                    dtype,
-                    device,
-                )?;
+                let mask =
+                    sliding_window_mask(1, kv_len, seq.seqlen_offset, window_size, dtype, device)?;
                 attn_weights = attn_weights.broadcast_add(&mask)?;
             }
 
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             let attn_output = attn_weights.matmul(&v_full)?;
 
-            let attn_output = attn_output
-                .transpose(1, 2)?
-                .reshape((1, 1, self.num_heads * self.head_dim))?;
+            let attn_output =
+                attn_output
+                    .transpose(1, 2)?
+                    .reshape((1, 1, self.num_heads * self.head_dim))?;
 
             outputs.push(attn_output);
         }

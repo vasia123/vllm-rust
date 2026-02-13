@@ -359,9 +359,7 @@ impl Gemma3nAltUp {
         let all_coefs = self.prediction_coefs.forward(&modalities)?;
 
         // Reshape to [total_tokens, n, n] then transpose last two dims
-        let all_coefs_t = all_coefs
-            .reshape((total_tokens, n, n))?
-            .transpose(1, 2)?;
+        let all_coefs_t = all_coefs.reshape((total_tokens, n, n))?.transpose(1, 2)?;
 
         // Stack hidden_states: [total_tokens, hidden_size, n]
         let stacked = Tensor::stack(&flat_states, 2)?;
@@ -661,9 +659,10 @@ impl Gemma3nAttention {
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         let attn_output = attn_weights.matmul(&v_full)?;
 
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
 
         self.o_proj.forward(&attn_output, tp_ctx)
     }
@@ -728,22 +727,17 @@ impl Gemma3nAttention {
             }
 
             if let Some(window_size) = self.sliding_window {
-                let mask = sliding_window_mask(
-                    1,
-                    kv_len,
-                    seq.seqlen_offset,
-                    window_size,
-                    dtype,
-                    device,
-                )?;
+                let mask =
+                    sliding_window_mask(1, kv_len, seq.seqlen_offset, window_size, dtype, device)?;
                 attn_weights = attn_weights.broadcast_add(&mask)?;
             }
 
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             let attn_output = attn_weights.matmul(&v_full)?;
-            let attn_output = attn_output
-                .transpose(1, 2)?
-                .reshape((1, 1, self.num_heads * self.head_dim))?;
+            let attn_output =
+                attn_output
+                    .transpose(1, 2)?
+                    .reshape((1, 1, self.num_heads * self.head_dim))?;
             outputs.push(attn_output);
         }
 
@@ -1022,11 +1016,8 @@ impl Gemma3nForCausalLM {
         let mut altup_projections = Vec::new();
         let vb_altup_proj = vb_m.pp("self_decoder").pp("altup_projections");
         for i in 0..(extra_cfg.altup_num_inputs - 1) {
-            let proj = candle_nn::linear_no_bias(
-                cfg.hidden_size,
-                cfg.hidden_size,
-                vb_altup_proj.pp(i),
-            )?;
+            let proj =
+                candle_nn::linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb_altup_proj.pp(i))?;
             altup_projections.push(proj);
         }
 
@@ -1111,10 +1102,7 @@ impl Gemma3nForCausalLM {
         let mut hidden_states = vec![hidden_states_0.clone(); n];
 
         // Target magnitude from first (active) sub-expert
-        let target_magnitude = hidden_states_0
-            .sqr()?
-            .mean_keepdim(D::Minus1)?
-            .sqrt()?;
+        let target_magnitude = hidden_states_0.sqr()?.mean_keepdim(D::Minus1)?.sqrt()?;
 
         let eps = Tensor::new(&[f32::MIN_POSITIVE], hidden_states_0.device())?
             .to_dtype(hidden_states_0.dtype())?;
@@ -1122,10 +1110,7 @@ impl Gemma3nForCausalLM {
         #[allow(clippy::needless_range_loop)]
         for i in 1..n {
             hidden_states[i] = self.altup_projections[i - 1].forward(&hidden_states[i])?;
-            let new_magnitude = hidden_states[i]
-                .sqr()?
-                .mean_keepdim(D::Minus1)?
-                .sqrt()?;
+            let new_magnitude = hidden_states[i].sqr()?.mean_keepdim(D::Minus1)?.sqrt()?;
             let scale = target_magnitude.broadcast_div(&new_magnitude.broadcast_maximum(&eps)?)?;
             hidden_states[i] = hidden_states[i].broadcast_mul(&scale)?;
         }
@@ -1137,10 +1122,7 @@ impl Gemma3nForCausalLM {
     fn altup_unembed(&self, hidden_states: &mut [Tensor]) -> Result<Tensor> {
         let n = self.altup_num_inputs;
 
-        let target_magnitude = hidden_states[0]
-            .sqr()?
-            .mean_keepdim(D::Minus1)?
-            .sqrt()?;
+        let target_magnitude = hidden_states[0].sqr()?.mean_keepdim(D::Minus1)?.sqrt()?;
 
         let eps = Tensor::new(&[f32::MIN_POSITIVE], hidden_states[0].device())?
             .to_dtype(hidden_states[0].dtype())?;
@@ -1148,10 +1130,7 @@ impl Gemma3nForCausalLM {
         #[allow(clippy::needless_range_loop)]
         for i in 1..n {
             hidden_states[i] = self.altup_unembed_projections[i - 1].forward(&hidden_states[i])?;
-            let new_magnitude = hidden_states[i]
-                .sqr()?
-                .mean_keepdim(D::Minus1)?
-                .sqrt()?;
+            let new_magnitude = hidden_states[i].sqr()?.mean_keepdim(D::Minus1)?.sqrt()?;
             let scale = target_magnitude.broadcast_div(&new_magnitude.broadcast_maximum(&eps)?)?;
             hidden_states[i] = hidden_states[i].broadcast_mul(&scale)?;
         }
@@ -1194,8 +1173,7 @@ impl Gemma3nForCausalLM {
     ) -> Result<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
         let normalizer = (self.hidden_size as f64).sqrt();
-        let hidden_states_0 =
-            (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
+        let hidden_states_0 = (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
 
         // Get per-layer inputs
         let per_layer_inputs = self.get_per_layer_inputs(&hidden_states_0)?;
@@ -1279,8 +1257,7 @@ impl crate::engine::ModelForward for Gemma3nForCausalLM {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let normalizer = (self.hidden_size as f64).sqrt();
-        let hidden_states_0 =
-            (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
+        let hidden_states_0 = (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
 
         let per_layer_inputs = self.get_per_layer_inputs(&hidden_states_0)?;
         let mut hidden_states = self.altup_embed(&hidden_states_0)?;
@@ -1398,7 +1375,11 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
         let model = Gemma3nForCausalLM::new(&cfg, vb);
-        assert!(model.is_ok(), "Gemma3nForCausalLM should construct: {:?}", model.err());
+        assert!(
+            model.is_ok(),
+            "Gemma3nForCausalLM should construct: {:?}",
+            model.err()
+        );
 
         let model = model.unwrap();
         assert_eq!(model.layers.len(), cfg.num_hidden_layers);
@@ -1420,8 +1401,7 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 3;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)

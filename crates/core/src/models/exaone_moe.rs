@@ -84,10 +84,7 @@ impl ExaoneMoeConfig {
     }
 
     fn is_moe_layer(&self, layer_idx: usize) -> bool {
-        self.is_moe_layer
-            .get(layer_idx)
-            .copied()
-            .unwrap_or(false)
+        self.is_moe_layer.get(layer_idx).copied().unwrap_or(false)
     }
 }
 
@@ -113,10 +110,8 @@ impl ExaoneMoeAttention {
         let head_dim = cfg.head_dim;
 
         let q_proj = linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj =
-            linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj =
-            linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+        let k_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
+        let v_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
 
         let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
@@ -526,15 +521,9 @@ mod tests {
         extra.insert("n_group".to_string(), serde_json::json!(2));
         extra.insert("topk_group".to_string(), serde_json::json!(1));
         extra.insert("norm_topk_prob".to_string(), serde_json::json!(true));
-        extra.insert(
-            "routed_scaling_factor".to_string(),
-            serde_json::json!(1.0),
-        );
+        extra.insert("routed_scaling_factor".to_string(), serde_json::json!(1.0));
         // Layer 0 = dense, Layer 1 = MoE
-        extra.insert(
-            "is_moe_layer".to_string(),
-            serde_json::json!([false, true]),
-        );
+        extra.insert("is_moe_layer".to_string(), serde_json::json!([false, true]));
         extra.insert("rope_theta".to_string(), serde_json::json!(1_000_000.0));
 
         ModelConfig {
@@ -645,10 +634,8 @@ mod tests {
     #[test]
     fn test_exaone_moe_all_moe() {
         let mut cfg = test_config();
-        cfg.extra.insert(
-            "is_moe_layer".to_string(),
-            serde_json::json!([true, true]),
-        );
+        cfg.extra
+            .insert("is_moe_layer".to_string(), serde_json::json!([true, true]));
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
@@ -729,8 +716,7 @@ mod tests {
 
         let batch_size = 1;
         let seq_len = 5;
-        let input_ids =
-            Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
+        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
 
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)

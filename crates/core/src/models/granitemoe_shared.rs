@@ -94,11 +94,7 @@ struct GraniteMoeSharedMLP {
 }
 
 impl GraniteMoeSharedMLP {
-    fn new(
-        hidden_size: usize,
-        shared_intermediate_size: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    fn new(hidden_size: usize, shared_intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
         let gate_proj = linear_no_bias(
             hidden_size,
             shared_intermediate_size,
@@ -710,10 +706,7 @@ mod tests {
             "residual_multiplier".into(),
             serde_json::Value::from(0.22360679774997896),
         );
-        extra.insert(
-            "embedding_multiplier".into(),
-            serde_json::Value::from(12.0),
-        );
+        extra.insert("embedding_multiplier".into(), serde_json::Value::from(12.0));
         extra.insert("logits_scaling".into(), serde_json::Value::from(13.0));
         extra.insert("num_local_experts".into(), serde_json::Value::from(4));
         extra.insert("num_experts_per_tok".into(), serde_json::Value::from(2));

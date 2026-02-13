@@ -32,13 +32,13 @@ pub mod falcon_h1;
 pub mod flex_olmo;
 pub mod gemma;
 pub mod gemma2;
+pub mod gemma2_lora;
 pub mod gemma2_quantized;
 pub mod gemma3;
 pub mod gemma3_lora;
 pub mod gemma3_quantized;
-pub mod gemma3n;
 pub mod gemma3_vlm;
-pub mod gemma2_lora;
+pub mod gemma3n;
 pub mod gemma_lora;
 pub mod gemma_quantized;
 pub mod glm;
@@ -127,8 +127,8 @@ pub mod qwen3_vl;
 pub mod registry;
 pub mod starcoder2;
 pub mod step1;
-pub mod step3p5;
 pub mod step3_text;
+pub mod step3p5;
 pub mod t5;
 pub mod tp_layers;
 pub mod voyage;
@@ -169,13 +169,13 @@ pub use falcon_h1::FalconH1ForCausalLM;
 pub use flex_olmo::FlexOlmoForCausalLM;
 pub use gemma::GemmaForCausalLM;
 pub use gemma2::Gemma2ForCausalLM;
+pub use gemma2_lora::Gemma2WithLora;
 pub use gemma2_quantized::QuantizedGemma2ForCausalLM;
 pub use gemma3::Gemma3ForCausalLM;
 pub use gemma3_lora::Gemma3WithLora;
 pub use gemma3_quantized::QuantizedGemma3ForCausalLM;
-pub use gemma3n::Gemma3nForCausalLM;
 pub use gemma3_vlm::Gemma3ForConditionalGeneration;
-pub use gemma2_lora::Gemma2WithLora;
+pub use gemma3n::Gemma3nForCausalLM;
 pub use gemma_lora::GemmaWithLora;
 pub use gemma_quantized::QuantizedGemmaForCausalLM;
 pub use glm::GlmForCausalLM;
@@ -266,8 +266,8 @@ pub use registry::{
 };
 pub use starcoder2::StarCoder2ForCausalLM;
 pub use step1::Step1ForCausalLM;
-pub use step3p5::Step3p5ForCausalLM;
 pub use step3_text::Step3TextForCausalLM;
+pub use step3p5::Step3p5ForCausalLM;
 pub use t5::T5ForConditionalGeneration;
 pub use voyage::VoyageForEmbedding;
 pub use yi::YiForCausalLM;
@@ -317,9 +317,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "MistralLarge3ForCausalLM" => Ok(Box::new(DeepSeekForCausalLM::new(cfg, vb)?)),
         "GemmaForCausalLM" => Ok(Box::new(GemmaForCausalLM::new(cfg, vb)?)),
         "Gemma2ForCausalLM" => Ok(Box::new(Gemma2ForCausalLM::new(cfg, vb)?)),
-        "Gemma3ForCausalLM" | "Gemma3TextModel" => {
-            Ok(Box::new(Gemma3ForCausalLM::new(cfg, vb)?))
-        }
+        "Gemma3ForCausalLM" | "Gemma3TextModel" => Ok(Box::new(Gemma3ForCausalLM::new(cfg, vb)?)),
         "JambaForCausalLM" => Ok(Box::new(JambaForCausalLM::new(cfg, vb)?)),
         "LlamaForCausalLM"
         | "LlamaModel"
@@ -347,9 +345,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen3MoeForCausalLM" => Ok(Box::new(Qwen3MoeForCausalLM::new(cfg, vb)?)),
         "Phi3ForCausalLM" => Ok(Box::new(Phi3ForCausalLM::new(cfg, vb)?)),
         "Phi3VForCausalLM" => Ok(Box::new(Phi3VForCausalLM::new(cfg, vb)?)),
-        "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => {
-            Ok(Box::new(Olmo2ForCausalLM::new(cfg, vb)?))
-        }
+        "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => Ok(Box::new(Olmo2ForCausalLM::new(cfg, vb)?)),
         "GPT2LMHeadModel" => Ok(Box::new(GPT2LMHeadModel::new(cfg, vb)?)),
         "GlmForCausalLM" => Ok(Box::new(GlmForCausalLM::new(cfg, vb)?)),
         "Glm4ForCausalLM" => Ok(Box::new(Glm4ForCausalLM::new(cfg, vb)?)),
@@ -496,9 +492,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "PanguEmbeddedForCausalLM" => Ok(Box::new(PanguEmbeddedForCausalLM::new(cfg, vb)?)),
         "PanguProMoEV2ForCausalLM" => Ok(Box::new(PanguProMoEV2ForCausalLM::new(cfg, vb)?)),
         "PanguUltraMoEForCausalLM" => Ok(Box::new(PanguUltraMoEForCausalLM::new(cfg, vb)?)),
-        "PhiMoEForCausalLM" | "PhiMoeForCausalLM" => {
-            Ok(Box::new(PhiMoeForCausalLM::new(cfg, vb)?))
-        }
+        "PhiMoEForCausalLM" | "PhiMoeForCausalLM" => Ok(Box::new(PhiMoeForCausalLM::new(cfg, vb)?)),
         "QWenLMHeadModel" => Ok(Box::new(QWenLMHeadModel::new(cfg, vb)?)),
         "Qwen3NextForCausalLM" => Ok(Box::new(Qwen3NextForCausalLM::new(cfg, vb)?)),
         "Step1ForCausalLM" => Ok(Box::new(Step1ForCausalLM::new(cfg, vb)?)),
@@ -847,38 +841,36 @@ pub fn from_config_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "Phi3ForCausalLM" => Ok(Box::new(Phi3ForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),
-        "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => Ok(Box::new(
-            Olmo2ForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
+        "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => Ok(Box::new(Olmo2ForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
         "BaichuanForCausalLM" | "BaiChuanForCausalLM" => Ok(Box::new(
             BaichuanForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
         )),
         "InternLM2ForCausalLM" => Ok(Box::new(InternLM2ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "CohereForCausalLM" | "Cohere2ForCausalLM" => Ok(Box::new(
-            CohereForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
+        "CohereForCausalLM" | "Cohere2ForCausalLM" => Ok(Box::new(CohereForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
+        "GPTNeoXForCausalLM" | "StableLMEpochForCausalLM" | "StableLmForCausalLM" => Ok(Box::new(
+            GPTNeoXForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
         )),
-        "GPTNeoXForCausalLM" | "StableLMEpochForCausalLM" | "StableLmForCausalLM" => {
-            Ok(Box::new(GPTNeoXForCausalLM::new_with_tp(
-                cfg, vb, pg, tp_ctx,
-            )?))
-        }
         "Starcoder2ForCausalLM" => Ok(Box::new(StarCoder2ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "BloomForCausalLM" => Ok(Box::new(BloomForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "FalconForCausalLM" | "RWForCausalLM" => Ok(Box::new(
-            FalconForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
+        "FalconForCausalLM" | "RWForCausalLM" => Ok(Box::new(FalconForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
         "PhiForCausalLM" => Ok(Box::new(PhiForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "YiForCausalLM" => Ok(Box::new(YiForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "GPT2LMHeadModel" => Ok(Box::new(GPT2LMHeadModel::new_with_tp(cfg, vb, pg, tp_ctx)?)),
-        "Gemma3ForCausalLM" | "Gemma3TextModel" => Ok(Box::new(
-            Gemma3ForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
+        "Gemma3ForCausalLM" | "Gemma3TextModel" => Ok(Box::new(Gemma3ForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
         "ExaoneForCausalLM" => Ok(Box::new(ExaoneForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -893,9 +885,9 @@ pub fn from_config_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "ArceeForCausalLM" => Ok(Box::new(arcee::new_arcee_with_tp(cfg, vb, pg, tp_ctx)?)),
-        "ChatGLMModel" | "ChatGLMForCausalLM" | "ChatGLMForConditionalGeneration" => Ok(
-            Box::new(ChatGLMForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?),
-        ),
+        "ChatGLMModel" | "ChatGLMForCausalLM" | "ChatGLMForConditionalGeneration" => Ok(Box::new(
+            ChatGLMForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
+        )),
         "FlexOlmoForCausalLM" => Ok(Box::new(FlexOlmoForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -905,9 +897,7 @@ pub fn from_config_with_tp(
         "GPTBigCodeForCausalLM" => Ok(Box::new(GPTBigCodeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "GPTJForCausalLM" => Ok(Box::new(GPTJForCausalLM::new_with_tp(
-            cfg, vb, pg, tp_ctx,
-        )?)),
+        "GPTJForCausalLM" => Ok(Box::new(GPTJForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "GptOssForCausalLM" => Ok(Box::new(GptOssForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -917,9 +907,9 @@ pub fn from_config_with_tp(
         "GraniteMoeForCausalLM" => Ok(Box::new(GraniteMoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "GraniteMoeSharedForCausalLM" => Ok(Box::new(
-            GraniteMoeSharedForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
+        "GraniteMoeSharedForCausalLM" => Ok(Box::new(GraniteMoeSharedForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
         "Grok1ForCausalLM" | "Grok1ModelForCausalLM" => Ok(Box::new(
             Grok1ForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
         )),
@@ -929,18 +919,14 @@ pub fn from_config_with_tp(
         "HunYuanMoEV1ForCausalLM" => Ok(Box::new(HunYuanMoEV1ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "JAISLMHeadModel" => Ok(Box::new(JAISLMHeadModel::new_with_tp(
-            cfg, vb, pg, tp_ctx,
-        )?)),
+        "JAISLMHeadModel" => Ok(Box::new(JAISLMHeadModel::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "Jais2ForCausalLM" => Ok(Box::new(Jais2ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "KimiLinearForCausalLM" => Ok(Box::new(KimiLinearForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "Lfm2ForCausalLM" => Ok(Box::new(Lfm2ForCausalLM::new_with_tp(
-            cfg, vb, pg, tp_ctx,
-        )?)),
+        "Lfm2ForCausalLM" => Ok(Box::new(Lfm2ForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "Lfm2MoeForCausalLM" => Ok(Box::new(Lfm2MoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -953,9 +939,7 @@ pub fn from_config_with_tp(
         "OlmoeForCausalLM" => Ok(Box::new(OlmoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "OuroForCausalLM" => Ok(Box::new(OuroForCausalLM::new_with_tp(
-            cfg, vb, pg, tp_ctx,
-        )?)),
+        "OuroForCausalLM" => Ok(Box::new(OuroForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "PanguEmbeddedForCausalLM" => Ok(Box::new(PanguEmbeddedForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -965,12 +949,10 @@ pub fn from_config_with_tp(
         "PanguUltraMoEForCausalLM" => Ok(Box::new(PanguUltraMoEForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "PhiMoEForCausalLM" | "PhiMoeForCausalLM" => Ok(Box::new(
-            PhiMoeForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
-        "QWenLMHeadModel" => Ok(Box::new(QWenLMHeadModel::new_with_tp(
+        "PhiMoEForCausalLM" | "PhiMoeForCausalLM" => Ok(Box::new(PhiMoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
+        "QWenLMHeadModel" => Ok(Box::new(QWenLMHeadModel::new_with_tp(cfg, vb, pg, tp_ctx)?)),
         "Qwen3NextForCausalLM" => Ok(Box::new(Qwen3NextForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -1029,8 +1011,12 @@ pub fn from_config_with_lora(
         "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => {
             Ok(LoraEnabledModel::Olmo2(Olmo2WithLora::new(cfg, vb)?))
         }
-        "DeepseekV2ForCausalLM" | "DeepseekV3ForCausalLM" | "DeepseekV32ForCausalLM"
-        | "DeepseekForCausalLM" | "GlmMoeDsaForCausalLM" | "MistralLarge3ForCausalLM" => {
+        "DeepseekV2ForCausalLM"
+        | "DeepseekV3ForCausalLM"
+        | "DeepseekV32ForCausalLM"
+        | "DeepseekForCausalLM"
+        | "GlmMoeDsaForCausalLM"
+        | "MistralLarge3ForCausalLM" => {
             Ok(LoraEnabledModel::DeepSeek(DeepSeekWithLora::new(cfg, vb)?))
         }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),

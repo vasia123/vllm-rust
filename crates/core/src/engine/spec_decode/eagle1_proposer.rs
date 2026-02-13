@@ -189,8 +189,7 @@ impl DraftProposer for Eagle1DraftProposer {
                 self.kv_cache
                     .allocate_for_request(&mut req.block_table, 1)
                     .map_err(|e| EngineError::Cache(e.to_string()))?;
-                let slot_mapping =
-                    req.block_table.slot_mapping(req.seqlen_offset + step, 1);
+                let slot_mapping = req.block_table.slot_mapping(req.seqlen_offset + step, 1);
 
                 let token_tensor = Tensor::new(&[[token]], &device)
                     .map_err(|e| EngineError::Model(e.to_string()))?;
@@ -219,10 +218,13 @@ impl DraftProposer for Eagle1DraftProposer {
                 self.kv_cache
                     .allocate_for_request(&mut req.block_table, 1)
                     .map_err(|e| EngineError::Cache(e.to_string()))?;
-                let slot_mapping =
-                    req.block_table.slot_mapping(req.seqlen_offset + step, 1);
+                let slot_mapping = req.block_table.slot_mapping(req.seqlen_offset + step, 1);
 
-                let token_to_use = if step == 0 { last_token } else { draft_tokens[step - 1] };
+                let token_to_use = if step == 0 {
+                    last_token
+                } else {
+                    draft_tokens[step - 1]
+                };
                 let token_tensor = Tensor::new(&[[token_to_use]], &device)
                     .map_err(|e| EngineError::Model(e.to_string()))?;
 
