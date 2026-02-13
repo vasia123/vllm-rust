@@ -14,6 +14,10 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
+use super::marlin::{
+    check_marlin_supports_shape, MarlinConfig, MarlinLinear, MarlinScalarType,
+    MARLIN_SUPPORTED_GROUP_SIZES,
+};
 
 #[cfg(feature = "cuda-kernels")]
 use super::gptq_cuda;
@@ -29,6 +33,8 @@ pub struct AwqConfig {
     pub zero_point: bool,
     /// AWQ kernel version ("GEMM" or "GEMV")
     pub version: AwqVersion,
+    /// Whether to use Marlin kernels (2-4x faster on Ampere+)
+    pub use_marlin: bool,
 }
 
 /// AWQ kernel version.
@@ -49,6 +55,7 @@ impl AwqConfig {
             group_size,
             zero_point: true,
             version: AwqVersion::Gemm,
+            use_marlin: true, // Auto-enable Marlin for 4-bit
         }
     }
 
@@ -71,17 +78,30 @@ impl AwqConfig {
             _ => AwqVersion::Gemm,
         };
 
+        // Auto-enable Marlin for 4-bit AWQ
+        let is_marlin = raw_config
+            .get("is_marlin_format")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Self {
             bits,
             group_size,
             zero_point,
             version,
+            use_marlin: is_marlin || bits == 4,
         }
     }
 
     /// Set the kernel version.
     pub fn with_version(mut self, version: AwqVersion) -> Self {
         self.version = version;
+        self
+    }
+
+    /// Enable/disable Marlin kernels.
+    pub fn with_marlin(mut self, enabled: bool) -> Self {
+        self.use_marlin = enabled;
         self
     }
 
@@ -92,6 +112,36 @@ impl AwqConfig {
         } else {
             in_features.div_ceil(self.group_size as usize)
         }
+    }
+
+    /// Check if Marlin kernel can be used for this config.
+    ///
+    /// AWQ uses Marlin's Uint4 path (4-bit with runtime zero points).
+    /// Requires:
+    /// - 4-bit quantization
+    /// - Group size in [-1, 32, 64, 128]
+    /// - GPU compute capability >= 8.0 (Ampere)
+    pub fn can_use_marlin(&self) -> bool {
+        if self.bits != 4 {
+            return false;
+        }
+        MARLIN_SUPPORTED_GROUP_SIZES.contains(&(self.group_size as i32))
+    }
+
+    /// Check if Marlin supports a specific layer shape.
+    pub fn can_use_marlin_for_shape(&self, in_features: usize, out_features: usize) -> bool {
+        if !self.can_use_marlin() {
+            return false;
+        }
+        check_marlin_supports_shape(out_features, in_features, self.group_size as i32).is_ok()
+    }
+
+    /// Convert to MarlinConfig for AWQ (asymmetric with zero points).
+    pub fn to_marlin_config(&self) -> Option<MarlinConfig> {
+        if !self.can_use_marlin() {
+            return None;
+        }
+        Some(MarlinConfig::awq_int4(self.group_size as i32))
     }
 }
 
@@ -111,7 +161,11 @@ impl QuantizationConfig for AwqConfig {
     }
 
     fn min_capability(&self) -> u32 {
-        70 // Volta
+        if self.use_marlin {
+            80 // Ampere required for Marlin
+        } else {
+            70 // Volta for basic AWQ
+        }
     }
 
     fn is_layer_skipped(&self, _layer_name: &str) -> bool {
@@ -125,6 +179,20 @@ impl QuantizationConfig for AwqConfig {
         bias: bool,
         device: &Device,
     ) -> Result<Box<dyn QuantizedLinear>> {
+        // Try to use Marlin if conditions are met
+        if self.use_marlin && self.can_use_marlin_for_shape(in_features, out_features) {
+            if let Some(marlin_config) = self.to_marlin_config() {
+                return Ok(Box::new(MarlinLinear::new(
+                    in_features,
+                    out_features,
+                    bias,
+                    marlin_config,
+                    device,
+                )?));
+            }
+        }
+
+        // Fallback to standard AWQ
         Ok(Box::new(AwqLinear::new(
             in_features,
             out_features,
@@ -367,8 +435,13 @@ mod tests {
 
     #[test]
     fn test_awq_config_min_capability() {
+        // Default 4-bit AWQ auto-enables Marlin → requires Ampere
         let config = AwqConfig::default();
-        assert_eq!(config.min_capability(), 70);
+        assert_eq!(config.min_capability(), 80);
+
+        // Disabling Marlin falls back to Volta requirement
+        let config_no_marlin = AwqConfig::int4(128).with_marlin(false);
+        assert_eq!(config_no_marlin.min_capability(), 70);
     }
 
     #[test]
@@ -446,6 +519,94 @@ mod tests {
     fn test_awq_config_with_version() {
         let config = AwqConfig::int4(128).with_version(AwqVersion::Gemv);
         assert_eq!(config.version, AwqVersion::Gemv);
+    }
+
+    #[test]
+    fn test_awq_can_use_marlin() {
+        // 4-bit with supported group size → can use Marlin
+        let config = AwqConfig::int4(128);
+        assert!(config.can_use_marlin());
+        assert!(config.use_marlin);
+
+        // 4-bit with per-channel (group_size=-1) → can use Marlin
+        let config = AwqConfig::int4(-1);
+        assert!(config.can_use_marlin());
+
+        // Unsupported group size
+        let mut config = AwqConfig::int4(100);
+        config.group_size = 100;
+        assert!(!config.can_use_marlin());
+    }
+
+    #[test]
+    fn test_awq_can_use_marlin_for_shape() {
+        let config = AwqConfig::int4(128);
+
+        // Valid shapes (divisible by 64/128)
+        assert!(config.can_use_marlin_for_shape(4096, 4096));
+
+        // Invalid N dimension (not divisible by 64)
+        assert!(!config.can_use_marlin_for_shape(100, 4096));
+
+        // Invalid K dimension (not divisible by 128)
+        assert!(!config.can_use_marlin_for_shape(4096, 100));
+    }
+
+    #[test]
+    fn test_awq_to_marlin_config() {
+        let config = AwqConfig::int4(128);
+        let marlin_config = config.to_marlin_config();
+        assert!(marlin_config.is_some());
+
+        let mc = marlin_config.unwrap();
+        assert_eq!(mc.bits, 4);
+        assert_eq!(mc.group_size, 128);
+        assert_eq!(mc.scalar_type, MarlinScalarType::Uint4);
+        assert!(!mc.is_sym); // AWQ is asymmetric
+    }
+
+    #[test]
+    fn test_awq_marlin_routing_in_create_linear() {
+        // With valid Marlin shape, should create MarlinLinear
+        let config = AwqConfig::int4(128);
+        let linear = config
+            .create_linear(4096, 4096, false, &Device::Cpu)
+            .unwrap();
+        assert_eq!(linear.in_features(), 4096);
+        assert_eq!(linear.out_features(), 4096);
+
+        // With invalid shape, should fall back to AwqLinear
+        let config = AwqConfig::int4(128).with_marlin(false);
+        let linear = config
+            .create_linear(4096, 4096, false, &Device::Cpu)
+            .unwrap();
+        assert_eq!(linear.in_features(), 4096);
+    }
+
+    #[test]
+    fn test_awq_from_detected_marlin_auto_enable() {
+        // 4-bit auto-enables Marlin
+        let raw = HashMap::new();
+        let config = AwqConfig::from_detected(Some(4), Some(128), &raw);
+        assert!(config.use_marlin);
+
+        // Explicit Marlin format flag
+        let mut raw = HashMap::new();
+        raw.insert(
+            "is_marlin_format".to_string(),
+            serde_json::json!(true),
+        );
+        let config = AwqConfig::from_detected(Some(4), Some(128), &raw);
+        assert!(config.use_marlin);
+    }
+
+    #[test]
+    fn test_awq_with_marlin_toggle() {
+        let config = AwqConfig::int4(128);
+        assert!(config.use_marlin);
+
+        let config = config.with_marlin(false);
+        assert!(!config.use_marlin);
     }
 
     #[cfg(feature = "cuda-kernels")]

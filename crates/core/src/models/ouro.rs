@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn test_ouro_cache_layer_indexing() {
         let cfg = test_config();
-        let ouro_cfg = OuroConfig::from_model_config(&cfg);
+        let _ouro_cfg = OuroConfig::from_model_config(&cfg);
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = OuroForCausalLM::new(&cfg, vb).unwrap();
