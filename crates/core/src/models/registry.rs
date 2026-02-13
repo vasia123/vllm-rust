@@ -115,6 +115,14 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
+        arch_names: &[
+            "DeepSeekVLV2ForCausalLM",
+            "DeepseekVLV2ForConditionalGeneration",
+        ],
+        display_name: "DeepSeek VL V2",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["FalconForCausalLM", "RWForCausalLM"],
         display_name: "Falcon",
         capabilities: ModelCapabilities::new().with_tp(),
@@ -148,6 +156,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["Gemma3ForCausalLM", "Gemma3TextModel"],
         display_name: "Gemma 3",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Gemma3ForConditionalGeneration"],
+        display_name: "Gemma 3 VLM",
+        capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &["InternLM2ForCausalLM"],
@@ -498,6 +511,14 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
     ArchitectureInfo {
+        arch_names: &[
+            "Llama4VLForConditionalGeneration",
+            "MLlama4ForConditionalGeneration",
+        ],
+        display_name: "Llama 4 VL",
+        capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
+    },
+    ArchitectureInfo {
         arch_names: &["Exaone4ForCausalLM"],
         display_name: "Exaone 4",
         capabilities: ModelCapabilities::new().with_tp(),
@@ -842,6 +863,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["Qwen3VLForConditionalGeneration"],
+        display_name: "Qwen3-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["JinaVLForRanking"],
         display_name: "Jina VL",
         capabilities: ModelCapabilities::new()
@@ -958,6 +984,9 @@ mod tests {
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            // DeepSeek VL V2
+            "DeepSeekVLV2ForCausalLM",
+            "DeepseekVLV2ForConditionalGeneration",
             // Falcon
             "FalconForCausalLM",
             "RWForCausalLM",
@@ -989,6 +1018,8 @@ mod tests {
             "IQuestCoderForCausalLM",
             "XverseForCausalLM",
             "Llama4ForCausalLM",
+            "Llama4VLForConditionalGeneration",
+            "MLlama4ForConditionalGeneration",
             // LLaVA
             "LlavaForConditionalGeneration",
             "LlavaNextForConditionalGeneration",

@@ -5,7 +5,7 @@
 //! gate/up/down projections. MoE expert layers are left unmodified (too many
 //! parameters for adapter injection).
 
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle_core::{Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::config::ModelConfig;
@@ -764,6 +764,7 @@ impl crate::models::ModelForwardWithLora for DeepSeekWithLora {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::DType;
     use crate::kv_cache::mla_cache_config::MLACacheConfig;
     use crate::lora::LoraAdapter;
 

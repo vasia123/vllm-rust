@@ -17,10 +17,12 @@ pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_lora;
 pub mod deepseek_quantized;
+pub mod deepseek_vl2;
 pub mod dots1;
 pub mod e5_mistral;
 pub mod eagle3;
 pub mod eagle3_mistral_large3;
+pub mod eagle_llama;
 pub mod ernie45_moe;
 pub mod exaone;
 pub mod exaone4;
@@ -35,6 +37,7 @@ pub mod gemma3;
 pub mod gemma3_lora;
 pub mod gemma3_quantized;
 pub mod gemma3n;
+pub mod gemma3_vlm;
 pub mod gemma2_lora;
 pub mod gemma_lora;
 pub mod gemma_quantized;
@@ -66,6 +69,7 @@ pub mod kimi_linear;
 pub mod lfm2;
 pub mod llama;
 pub mod llama4;
+pub mod llama4_vl;
 pub mod llama_lora;
 pub mod llama_quantized;
 pub mod llava;
@@ -119,6 +123,7 @@ pub mod qwen3_lora;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod qwen3_quantized;
+pub mod qwen3_vl;
 pub mod registry;
 pub mod starcoder2;
 pub mod step1;
@@ -149,10 +154,12 @@ pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_lora::DeepSeekWithLora;
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
+pub use deepseek_vl2::DeepSeekVLV2ForConditionalGeneration;
 pub use dots1::Dots1ForCausalLM;
 pub use e5_mistral::E5MistralForEmbedding;
 pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
+pub use eagle_llama::{Eagle1DraftModel, EagleLlamaForCausalLM};
 pub use ernie45_moe::Ernie45MoeForCausalLM;
 pub use exaone::ExaoneForCausalLM;
 pub use exaone4::Exaone4ForCausalLM;
@@ -167,6 +174,7 @@ pub use gemma3::Gemma3ForCausalLM;
 pub use gemma3_lora::Gemma3WithLora;
 pub use gemma3_quantized::QuantizedGemma3ForCausalLM;
 pub use gemma3n::Gemma3nForCausalLM;
+pub use gemma3_vlm::Gemma3ForConditionalGeneration;
 pub use gemma2_lora::Gemma2WithLora;
 pub use gemma_lora::GemmaWithLora;
 pub use gemma_quantized::QuantizedGemmaForCausalLM;
@@ -198,6 +206,7 @@ pub use kimi_linear::KimiLinearForCausalLM;
 pub use lfm2::{Lfm2ForCausalLM, Lfm2MoeForCausalLM};
 pub use llama::LlamaForCausalLM;
 pub use llama4::Llama4ForCausalLM;
+pub use llama4_vl::Llama4VLForConditionalGeneration;
 pub use llama_lora::LlamaWithLora;
 pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use llava::LLaVAForConditionalGeneration;
@@ -251,6 +260,7 @@ pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_moe::Qwen3MoeForCausalLM;
 pub use qwen3_next::Qwen3NextForCausalLM;
 pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
+pub use qwen3_vl::Qwen3VLForConditionalGeneration;
 pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
@@ -389,6 +399,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2_5_VLForConditionalGeneration" | "Qwen25VLForConditionalGeneration" => {
             Ok(Box::new(Qwen25VLForConditionalGeneration::new(cfg, vb)?))
         }
+        "Qwen3VLForConditionalGeneration" => Ok(Box::new(
+            Qwen3VLForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
         "PixtralForConditionalGeneration" => {
             Ok(Box::new(PixtralForConditionalGeneration::new(cfg, vb)?))
         }
@@ -397,6 +410,12 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "PaliGemmaForConditionalGeneration" => Ok(Box::new(
             PaliGemmaForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
+        "Gemma3ForConditionalGeneration" => Ok(Box::new(
+            Gemma3ForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
+        "DeepSeekVLV2ForCausalLM" | "DeepseekVLV2ForConditionalGeneration" => Ok(Box::new(
+            DeepSeekVLV2ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "InternVLChatModel" => Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?)),
         "MolmoForCausalLM" => Ok(Box::new(MolmoForCausalLM::from_model_config(cfg, vb)?)),
@@ -462,6 +481,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Lfm2ForCausalLM" => Ok(Box::new(Lfm2ForCausalLM::new(cfg, vb)?)),
         "Lfm2MoeForCausalLM" => Ok(Box::new(Lfm2MoeForCausalLM::new(cfg, vb)?)),
         "Llama4ForCausalLM" => Ok(Box::new(Llama4ForCausalLM::new(cfg, vb)?)),
+        "Llama4VLForConditionalGeneration" | "MLlama4ForConditionalGeneration" => Ok(Box::new(
+            Llama4VLForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
         "MiniCPMForCausalLM" => Ok(Box::new(MiniCPMForCausalLM::new(cfg, vb)?)),
         "MiniCPM3ForCausalLM" => Ok(Box::new(MiniCPM3ForCausalLM::new(cfg, vb)?)),
         "NemotronForCausalLM" => Ok(Box::new(NemotronForCausalLM::new(cfg, vb)?)),

@@ -15,7 +15,7 @@ use candle_core::{DType, Device, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
 use super::marlin::{
-    check_marlin_supports_shape, MarlinConfig, MarlinLinear, MarlinScalarType,
+    check_marlin_supports_shape, MarlinConfig, MarlinLinear,
     MARLIN_SUPPORTED_GROUP_SIZES,
 };
 
@@ -422,6 +422,7 @@ impl QuantizedLinear for AwqLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::marlin::MarlinScalarType;
 
     #[test]
     fn test_awq_config_int4() {

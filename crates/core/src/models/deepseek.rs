@@ -419,6 +419,81 @@ impl DeepSeekForCausalLM {
             dtype: vb.dtype(),
         })
     }
+
+    /// Embed text tokens (for VLM use — embed only, no layers).
+    pub fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    /// Forward with pre-computed embeddings (for VLM use — skips embedding layer).
+    pub fn forward_with_embeddings(
+        &self,
+        embeddings: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let seq_len = embeddings.dim(1)?;
+        let mask = if seq_len > 1 {
+            Some(causal_mask(
+                seq_len,
+                seqlen_offset,
+                embeddings.dtype(),
+                &self.device,
+            )?)
+        } else {
+            None
+        };
+
+        let mut xs = embeddings.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward(
+                &xs,
+                mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table.block_ids(),
+                slot_mapping,
+            )?;
+        }
+
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs)
+    }
+
+    /// Forward decode batch with pre-computed embeddings (for VLM use).
+    pub fn forward_decode_batch_with_embeddings(
+        &self,
+        embeddings: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Tensor> {
+        let batch_size = sequences.len();
+        let mut outputs = Vec::with_capacity(batch_size);
+
+        for (seq_idx, seq) in sequences.iter().enumerate() {
+            let mut xs = embeddings.i(seq_idx)?.unsqueeze(0)?;
+
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                xs = layer.forward_decode(
+                    &xs,
+                    seq.seqlen_offset,
+                    kv_cache_mgr,
+                    layer_idx,
+                    &seq.block_ids,
+                    &seq.slot_mapping,
+                )?;
+            }
+
+            let xs = self.norm.forward(&xs)?;
+            let logits = self.lm_head.forward(&xs)?;
+            outputs.push(logits.squeeze(0)?);
+        }
+
+        Tensor::stack(&outputs, 0)
+    }
 }
 
 impl crate::engine::ModelForward for DeepSeekForCausalLM {

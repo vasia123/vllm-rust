@@ -11,6 +11,7 @@
 //!
 //! `DraftProposer` implementations:
 //! - [`DraftModelDraftProposer`]: GPU-based draft model with KV cache lifecycle
+//! - [`Eagle1DraftProposer`]: Eagle-1 draft model requiring target hidden states
 //! - [`Eagle3DraftProposer`]: Eagle-3 draft model requiring target hidden states
 //! - [`NGramProposer`]: CPU-based n-gram suffix matching (zero VRAM, stateless)
 //! - [`SuffixArrayProposer`]: CPU-based suffix array matching (zero VRAM, stateless)
@@ -25,6 +26,7 @@
 mod draft_model;
 mod draft_proposer;
 pub mod eagle;
+mod eagle1_proposer;
 mod eagle3_proposer;
 pub mod medusa;
 mod ngram;
@@ -34,6 +36,7 @@ pub mod tree_attention;
 pub use draft_model::DraftModelProposer;
 pub use draft_proposer::DraftModelDraftProposer;
 pub use eagle::{EagleConfig, EagleProposer};
+pub use eagle1_proposer::Eagle1DraftProposer;
 pub use eagle3_proposer::Eagle3DraftProposer;
 pub use medusa::{MedusaHead, MedusaProposer};
 pub use ngram::{NGramConfig, NGramProposer};
