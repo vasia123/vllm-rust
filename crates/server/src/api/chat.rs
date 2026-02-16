@@ -8,6 +8,7 @@ use axum::Json;
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
 use vllm_core::multimodal::{ContentPart, ImageData};
+use vllm_core::sampling::grammar::{GrammarCompiler, VocabularyIndex};
 use vllm_core::sampling::{
     BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
 };
@@ -84,9 +85,15 @@ pub async fn create_chat_completion(
         None
     };
 
-    // Create constraint from response_format
-    let constraint =
-        create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+    // Create constraint: structured_outputs takes precedence over response_format
+    let constraint = if req.structured_outputs.is_some() {
+        create_constraint_from_structured_outputs(
+            req.structured_outputs.as_ref(),
+            &state.tokenizer,
+        )?
+    } else {
+        create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+    };
 
     // Convert logit_bias once, before branching on stream vs non-stream
     let logit_bias = req.logit_bias.as_ref().map(|bias| {
@@ -213,10 +220,19 @@ pub async fn create_chat_completion(
         // requests run concurrently — they get prefix cache hits and skip most
         // of the prefill, saving significant GPU time for long prompts.
         let build_gen_req = |req: &ChatCompletionRequest| -> GenerationRequest {
-            let constraint = create_constraint_from_response_format(
-                req.response_format.as_ref(),
-                &state.tokenizer,
-            );
+            let constraint = if req.structured_outputs.is_some() {
+                create_constraint_from_structured_outputs(
+                    req.structured_outputs.as_ref(),
+                    &state.tokenizer,
+                )
+                .ok()
+                .flatten()
+            } else {
+                create_constraint_from_response_format(
+                    req.response_format.as_ref(),
+                    &state.tokenizer,
+                )
+            };
             let beam = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
             GenerationRequest {
                 prompt: prompt.clone(),
@@ -492,7 +508,12 @@ fn build_chat_logprobs(result: &GenerationResult, tokenizer: &TokenizerWrapper) 
     ChatLogProbs { content }
 }
 
-/// Create a sampling constraint from response_format.
+/// Create a sampling constraint from response_format and/or structured_outputs.
+///
+/// `structured_outputs` takes precedence over `response_format` when present.
+/// Grammar-based constraints (regex, grammar, json schema via structured_outputs)
+/// use DFA-compiled bitmasks for O(vocab_size/32) masking. Falls back to the
+/// legacy text-based constraints for response_format-only requests.
 pub(crate) fn create_constraint_from_response_format(
     response_format: Option<&ResponseFormat>,
     tokenizer: &Arc<TokenizerWrapper>,
@@ -511,6 +532,84 @@ pub(crate) fn create_constraint_from_response_format(
             JsonSchemaConstraint::new(json_schema.schema.clone(), tokenizer.clone()),
         )),
     }
+}
+
+/// Create a sampling constraint from `StructuredOutputs` using the grammar system.
+///
+/// Returns `Ok(None)` if no constraint is specified. Returns `Err` if
+/// compilation fails (e.g., invalid regex or grammar syntax).
+pub(crate) fn create_constraint_from_structured_outputs(
+    structured_outputs: Option<&super::types::StructuredOutputs>,
+    tokenizer: &Arc<TokenizerWrapper>,
+) -> Result<Option<Box<dyn SamplingConstraint>>, super::error::ApiError> {
+    use vllm_core::sampling::grammar::compiler::StructuredOutputOption;
+    use vllm_core::sampling::grammar::GrammarConstraintAdapter;
+
+    let so = match structured_outputs {
+        Some(so) => so,
+        None => return Ok(None),
+    };
+
+    let vocab_index = Arc::new(VocabularyIndex::from_tokenizer_arc(tokenizer));
+    let compiler = GrammarCompiler::new(vocab_index.clone());
+
+    if let Some(ref regex_pattern) = so.regex {
+        let grammar = compiler
+            .compile_sync(&StructuredOutputOption::Regex, regex_pattern)
+            .map_err(|e| {
+                super::error::ApiError::InvalidRequest(format!("invalid regex pattern: {e}"))
+            })?;
+        let vocab_size = tokenizer.vocab_size();
+        return Ok(Some(Box::new(GrammarConstraintAdapter::new(
+            grammar, vocab_size,
+        ))));
+    }
+
+    if let Some(ref grammar_str) = so.grammar {
+        let grammar = compiler
+            .compile_sync(&StructuredOutputOption::Grammar, grammar_str)
+            .map_err(|e| super::error::ApiError::InvalidRequest(format!("invalid grammar: {e}")))?;
+        let vocab_size = tokenizer.vocab_size();
+        return Ok(Some(Box::new(GrammarConstraintAdapter::new(
+            grammar, vocab_size,
+        ))));
+    }
+
+    if let Some(ref json_schema) = so.json {
+        let spec = serde_json::to_string(json_schema).map_err(|e| {
+            super::error::ApiError::InvalidRequest(format!("invalid JSON schema: {e}"))
+        })?;
+        let grammar = compiler
+            .compile_sync(&StructuredOutputOption::JsonSchema, &spec)
+            .map_err(|e| {
+                super::error::ApiError::InvalidRequest(format!(
+                    "JSON schema compilation failed: {e}"
+                ))
+            })?;
+        let vocab_size = tokenizer.vocab_size();
+        return Ok(Some(Box::new(GrammarConstraintAdapter::new(
+            grammar, vocab_size,
+        ))));
+    }
+
+    if so.json_object == Some(true) {
+        let schema = serde_json::json!({"type": "object"});
+        return Ok(Some(Box::new(JsonSchemaConstraint::new(
+            schema,
+            tokenizer.clone(),
+        ))));
+    }
+
+    // choice is still handled by ChoiceConstraint (token-based, no grammar needed)
+    if let Some(ref choices) = so.choice {
+        let constraint =
+            vllm_core::sampling::ChoiceConstraint::new(choices, tokenizer).map_err(|e| {
+                super::error::ApiError::InvalidRequest(format!("invalid choice constraint: {e}"))
+            })?;
+        return Ok(Some(Box::new(constraint)));
+    }
+
+    Ok(None)
 }
 
 /// Extract image inputs from chat messages with multimodal content.

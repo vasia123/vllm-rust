@@ -45,6 +45,8 @@ rand.workspace = true
 libloading.workspace = true
 tracing.workspace = true
 regex.workspace = true
+regex-automata = "0.4"
+nom = "7"
 uuid.workspace = true
 
 [dev-dependencies]

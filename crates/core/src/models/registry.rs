@@ -176,6 +176,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &[
             "LlavaForConditionalGeneration",
             "LlavaNextForConditionalGeneration",
+            "MantisForConditionalGeneration",
         ],
         display_name: "LLaVA",
         capabilities: ModelCapabilities::new().with_multimodal(),
@@ -461,9 +462,17 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
     },
     ArchitectureInfo {
-        arch_names: &["MistralModel", "Gemma2Model"],
-        display_name: "Mistral/Gemma2 (base)",
+        arch_names: &["MistralModel", "E5MistralModel"],
+        display_name: "Mistral (base)",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Gemma2Model"],
+        display_name: "Gemma 2 (base)",
+        capabilities: ModelCapabilities::new()
+            .with_tp()
+            .with_quantization()
+            .with_encoder_only(),
     },
     ArchitectureInfo {
         arch_names: &["Qwen2Model"],
@@ -779,6 +788,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             "GteNewModel",
             "NomicBertModel",
             "GteNewForSequenceClassification",
+            "SnowflakeGteNewModel",
         ],
         display_name: "GTE/Nomic",
         capabilities: ModelCapabilities::new().with_encoder_only(),
@@ -858,14 +868,80 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["Qwen2VLForConditionalGeneration"],
+        arch_names: &[
+            "Qwen2VLForConditionalGeneration",
+            "Tarsier2ForConditionalGeneration",
+        ],
         display_name: "Qwen2-VL",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen25VLForConditionalGeneration",
+        ],
+        display_name: "Qwen2.5-VL",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &["Qwen3VLForConditionalGeneration"],
         display_name: "Qwen3-VL",
         capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen3VLMoeForConditionalGeneration"],
+        display_name: "Qwen3-VL-MoE",
+        capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["PixtralForConditionalGeneration"],
+        display_name: "Pixtral",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Mistral3ForConditionalGeneration"],
+        display_name: "Mistral3",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Idefics3ForConditionalGeneration"],
+        display_name: "Idefics3",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["SmolVLMForConditionalGeneration"],
+        display_name: "SmolVLM",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Blip2ForConditionalGeneration"],
+        display_name: "BLIP-2",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Eagle2_5_VLForConditionalGeneration"],
+        display_name: "Eagle 2.5 VL",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ChameleonForConditionalGeneration"],
+        display_name: "Chameleon",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Phi4MMForCausalLM"],
+        display_name: "Phi-4 Multimodal",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Gemma3nForConditionalGeneration"],
+        display_name: "Gemma 3n VLM",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Molmo2ForConditionalGeneration"],
+        display_name: "Molmo 2",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &["JinaVLForRanking"],
@@ -1023,6 +1099,7 @@ mod tests {
             // LLaVA
             "LlavaForConditionalGeneration",
             "LlavaNextForConditionalGeneration",
+            "MantisForConditionalGeneration",
             // Mamba
             "MambaForCausalLM",
             "FalconMambaForCausalLM",
@@ -1119,6 +1196,7 @@ mod tests {
             "PersimmonForCausalLM",
             "DbrxForCausalLM",
             "MistralModel",
+            "E5MistralModel",
             "Gemma2Model",
             // New architectures (2025-02 sync)
             "ArcticForCausalLM",
@@ -1186,6 +1264,7 @@ mod tests {
             "GteNewModel",
             "NomicBertModel",
             "GteNewForSequenceClassification",
+            "SnowflakeGteNewModel",
             "LlamaBidirectionalModel",
             "LlamaBidirectionalForSequenceClassification",
             "InternLM2ForRewardModel",
@@ -1202,6 +1281,34 @@ mod tests {
             "GLM4VForCausalLM",
             "Glm4VForConditionalGeneration",
             "Qwen2VLForConditionalGeneration",
+            "Tarsier2ForConditionalGeneration",
+            // Qwen2.5-VL
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen25VLForConditionalGeneration",
+            // Qwen3-VL
+            "Qwen3VLForConditionalGeneration",
+            // Qwen3-VL-MoE
+            "Qwen3VLMoeForConditionalGeneration",
+            // Pixtral
+            "PixtralForConditionalGeneration",
+            // Mistral3
+            "Mistral3ForConditionalGeneration",
+            // Idefics3
+            "Idefics3ForConditionalGeneration",
+            // SmolVLM
+            "SmolVLMForConditionalGeneration",
+            // BLIP-2
+            "Blip2ForConditionalGeneration",
+            // Eagle 2.5 VL
+            "Eagle2_5_VLForConditionalGeneration",
+            // Chameleon
+            "ChameleonForConditionalGeneration",
+            // Phi-4 Multimodal
+            "Phi4MMForCausalLM",
+            // Gemma3n VLM
+            "Gemma3nForConditionalGeneration",
+            // Molmo2
+            "Molmo2ForConditionalGeneration",
             "JinaVLForRanking",
             "PrithviGeoSpatialMAE",
             "Terratorch",
@@ -1328,9 +1435,11 @@ mod tests {
             "GteModel",
             "GteNewModel",
             "NomicBertModel",
+            "SnowflakeGteNewModel",
             "LlamaBidirectionalModel",
             "InternLM2ForRewardModel",
             "Qwen2ForRewardModel",
+            "Gemma2Model",
         ];
         for name in &encoder_only_archs {
             let info = find_architecture(name).unwrap_or_else(|| panic!("should find {name}"));
@@ -1339,5 +1448,64 @@ mod tests {
                 "{name} should be encoder_only"
             );
         }
+    }
+
+    #[test]
+    fn tarsier2_is_alias_for_qwen2_vl() {
+        let qwen2vl = find_architecture("Qwen2VLForConditionalGeneration").unwrap();
+        let tarsier2 = find_architecture("Tarsier2ForConditionalGeneration").unwrap();
+        assert_eq!(qwen2vl.display_name, tarsier2.display_name);
+        assert!(tarsier2.capabilities.supports_multimodal);
+    }
+
+    #[test]
+    fn mantis_is_alias_for_llava() {
+        let llava = find_architecture("LlavaForConditionalGeneration").unwrap();
+        let mantis = find_architecture("MantisForConditionalGeneration").unwrap();
+        assert_eq!(llava.display_name, mantis.display_name);
+        assert!(mantis.capabilities.supports_multimodal);
+    }
+
+    #[test]
+    fn qwen25_vl_in_registry() {
+        let info = find_architecture("Qwen2_5_VLForConditionalGeneration")
+            .expect("should find Qwen2.5-VL");
+        assert_eq!(info.display_name, "Qwen2.5-VL");
+        assert!(info.capabilities.supports_multimodal);
+
+        let alias = find_architecture("Qwen25VLForConditionalGeneration").unwrap();
+        assert_eq!(info.display_name, alias.display_name);
+    }
+
+    #[test]
+    fn pixtral_in_registry() {
+        let info =
+            find_architecture("PixtralForConditionalGeneration").expect("should find Pixtral");
+        assert_eq!(info.display_name, "Pixtral");
+        assert!(info.capabilities.supports_multimodal);
+    }
+
+    #[test]
+    fn snowflake_gte_resolves_to_gte_nomic() {
+        let gte = find_architecture("GteNewModel").unwrap();
+        let snowflake = find_architecture("SnowflakeGteNewModel").unwrap();
+        assert_eq!(gte.display_name, snowflake.display_name);
+        assert!(snowflake.capabilities.is_encoder_only);
+    }
+
+    #[test]
+    fn gemma2_model_separate_from_mistral() {
+        let mistral = find_architecture("MistralModel").unwrap();
+        let gemma2 = find_architecture("Gemma2Model").unwrap();
+        // They should be in separate entries
+        assert_ne!(mistral.display_name, gemma2.display_name);
+        assert!(gemma2.capabilities.is_encoder_only);
+    }
+
+    #[test]
+    fn e5_mistral_grouped_with_mistral_base() {
+        let mistral = find_architecture("MistralModel").unwrap();
+        let e5 = find_architecture("E5MistralModel").unwrap();
+        assert_eq!(mistral.display_name, e5.display_name);
     }
 }

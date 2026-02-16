@@ -35,16 +35,16 @@ use super::tp_layers::{TpEmbedding, TpLinear};
 /// Pixtral vision encoder configuration.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct PixtralVisionConfig {
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_channels: usize,
-    image_size: usize,
-    patch_size: usize,
-    rope_theta: f64,
-    adapter_bias: bool,
+pub(crate) struct PixtralVisionConfig {
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_channels: usize,
+    pub(crate) image_size: usize,
+    pub(crate) patch_size: usize,
+    pub(crate) rope_theta: f64,
+    pub(crate) adapter_bias: bool,
 }
 
 impl Default for PixtralVisionConfig {
@@ -72,7 +72,7 @@ impl PixtralVisionConfig {
         self.image_size / self.patch_size
     }
 
-    fn from_json(json: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(json: &serde_json::Value) -> Self {
         let defaults = Self::default();
         Self {
             hidden_size: json
@@ -493,7 +493,7 @@ fn position_meshgrid(patch_grid_sizes: &[(usize, usize)]) -> Vec<(usize, usize)>
 /// Processes images through Conv2D patch embedding, RMSNorm, and transformer
 /// blocks with 2D RoPE and block-diagonal attention masks.
 #[allow(dead_code)]
-struct PixtralVisionTransformer {
+pub(crate) struct PixtralVisionTransformer {
     patch_conv: candle_nn::Conv2d,
     ln_pre: RmsNorm,
     layers: Vec<PixtralVisionBlock>,
@@ -504,7 +504,7 @@ struct PixtralVisionTransformer {
 
 #[allow(dead_code)]
 impl PixtralVisionTransformer {
-    fn new(cfg: &PixtralVisionConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &PixtralVisionConfig, vb: VarBuilder) -> Result<Self> {
         let conv_cfg = Conv2dConfig {
             stride: cfg.patch_size,
             ..Default::default()
@@ -547,7 +547,7 @@ impl PixtralVisionTransformer {
     ///
     /// Each image is (C, H, W) with potentially different sizes.
     /// Returns a list of (num_patches, hidden_size) tensors, one per image.
-    fn forward(&self, images: &[Tensor]) -> Result<Vec<Tensor>> {
+    pub(crate) fn forward(&self, images: &[Tensor]) -> Result<Vec<Tensor>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -615,14 +615,19 @@ impl PixtralVisionTransformer {
 
 /// Two-layer GELU MLP that projects vision embeddings to LLM hidden dimension.
 #[allow(dead_code)]
-struct PixtralAdapter {
+pub(crate) struct PixtralAdapter {
     w_in: Linear,
     w_out: Linear,
 }
 
 #[allow(dead_code)]
 impl PixtralAdapter {
-    fn new(vision_dim: usize, llm_dim: usize, bias: bool, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(
+        vision_dim: usize,
+        llm_dim: usize,
+        bias: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let w_in = if bias {
             linear(vision_dim, llm_dim, vb.pp("w_in"))?
         } else {
@@ -636,7 +641,7 @@ impl PixtralAdapter {
         Ok(Self { w_in, w_out })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.w_in.forward(x)?;
         let x = candle_nn::Activation::Gelu.forward(&x)?;
         self.w_out.forward(&x)

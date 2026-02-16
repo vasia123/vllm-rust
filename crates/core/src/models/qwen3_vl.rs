@@ -435,7 +435,7 @@ impl Qwen3VLPatchMerger {
 /// Processes images into embeddings compatible with the language model.
 /// Uses SiLU activation in the MLP blocks (unlike Qwen2-VL's QuickGELU).
 #[allow(dead_code)]
-struct Qwen3VisionTransformer {
+pub struct Qwen3VisionTransformer {
     patch_embed: Qwen3VLPatchEmbed,
     rotary_emb: RotaryEmbedding,
     blocks: Vec<Qwen3VLVisionBlock>,
@@ -445,7 +445,7 @@ struct Qwen3VisionTransformer {
 
 #[allow(dead_code)]
 impl Qwen3VisionTransformer {
-    fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_embed = Qwen3VLPatchEmbed::new(cfg, vb.pp("patch_embed"))?;
 
         // 2D RoPE for vision: partial_rotary_factor=0.5, neox style
@@ -484,7 +484,7 @@ impl Qwen3VisionTransformer {
     ///
     /// # Returns
     /// [num_merged_tokens, out_hidden_size]
-    fn forward(&self, patches: &Tensor, grid_h: usize, grid_w: usize) -> Result<Tensor> {
+    pub fn forward(&self, patches: &Tensor, grid_h: usize, grid_w: usize) -> Result<Tensor> {
         // Patch embedding
         let mut x = self.patch_embed.forward(patches)?;
 

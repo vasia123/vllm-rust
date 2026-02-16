@@ -1222,6 +1222,68 @@ impl Gemma3nForCausalLM {
         Ok(logits)
     }
 
+    /// Forward from pre-computed hidden states (for VLM multimodal injection).
+    ///
+    /// Takes hidden_states_0 (already scaled by sqrt(hidden_size)) instead of input_ids.
+    /// This allows VLM wrappers to inject vision embeddings before the AltUp pipeline.
+    pub(crate) fn forward_from_hidden(
+        &self,
+        hidden_states_0: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let seq_len = hidden_states_0.dim(1)?;
+
+        let per_layer_inputs = self.get_per_layer_inputs(hidden_states_0)?;
+        let mut hidden_states = self.altup_embed(hidden_states_0)?;
+
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let pli = per_layer_inputs.narrow(per_layer_inputs.dims().len() - 2, layer_idx, 1)?;
+            let pli = pli.squeeze(per_layer_inputs.dims().len() - 2)?;
+
+            hidden_states = layer.forward(
+                &hidden_states,
+                &pli,
+                attention_mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+                &self.tp_ctx,
+            )?;
+        }
+
+        let hidden_states = self.altup_unembed(&mut hidden_states)?;
+        let hidden_states = self.norm.forward(&hidden_states)?;
+
+        let mut logits = self.lm_head.forward(&hidden_states, &self.tp_ctx)?;
+        if let Some(cap) = self.final_logit_softcap {
+            logits = soft_cap(&logits, cap)?;
+        }
+
+        Ok(logits)
+    }
+
+    /// Embed input_ids using the model's token embedding and scaling.
+    pub(crate) fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let normalizer = (self.hidden_size as f64).sqrt();
+        self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

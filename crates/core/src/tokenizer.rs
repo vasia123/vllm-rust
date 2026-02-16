@@ -70,6 +70,19 @@ impl TokenizerWrapper {
     pub fn max_chars_per_token(&self) -> usize {
         self.max_chars_per_token
     }
+
+    /// Number of tokens in the vocabulary.
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
+    /// Get the raw vocabulary mapping (token string → token ID).
+    ///
+    /// Used by `VocabularyIndex` to build token-to-bytes mappings for
+    /// grammar-based constrained generation.
+    pub fn get_vocab(&self) -> std::collections::HashMap<String, u32> {
+        self.inner.get_vocab(true)
+    }
 }
 
 // ─── Chat Template ────────────────────────────────────────────────────────

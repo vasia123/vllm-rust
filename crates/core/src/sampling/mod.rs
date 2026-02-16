@@ -8,6 +8,7 @@
 mod beam;
 mod constraint;
 pub mod gpu;
+pub mod grammar;
 pub mod logits_processor;
 
 pub use beam::{beam_search_top_k, BeamHypothesis, BeamSearchConfig, BeamSearchState};

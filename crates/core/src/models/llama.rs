@@ -275,7 +275,7 @@ impl LlamaAttention {
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
 
-struct LlamaDecoderLayer {
+pub(crate) struct LlamaDecoderLayer {
     self_attn: LlamaAttention,
     mlp: TpSwiGluMlp,
     input_layernorm: RmsNorm,
@@ -283,7 +283,11 @@ struct LlamaDecoderLayer {
 }
 
 impl LlamaDecoderLayer {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let self_attn = LlamaAttention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
         let mlp = TpSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
@@ -302,7 +306,7 @@ impl LlamaDecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -332,7 +336,7 @@ impl LlamaDecoderLayer {
         residual + xs
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],

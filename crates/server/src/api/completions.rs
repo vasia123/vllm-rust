@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 
+use super::chat::create_constraint_from_structured_outputs;
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
 use vllm_core::sampling::{
@@ -81,9 +82,15 @@ pub async fn create_completion(
         // Convert lora_name to LoraRequest (references a pre-loaded adapter by name)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
-        // Create constraint from response_format
-        let constraint =
-            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer);
+        // Create constraint: structured_outputs takes precedence over response_format
+        let constraint = if req.structured_outputs.is_some() {
+            create_constraint_from_structured_outputs(
+                req.structured_outputs.as_ref(),
+                &state.tokenizer,
+            )?
+        } else {
+            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+        };
 
         let beam_search = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
 
@@ -169,11 +176,13 @@ pub async fn create_completion(
         // Convert lora_name to LoraRequest (for batch requests, same adapter for all)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
 
-        // Check if response_format requires constraints (used to decide whether
-        // to recreate per-iteration)
-        let has_constraint =
-            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
-                .is_some();
+        // Check if response_format or structured_outputs requires constraints
+        let has_constraint = req.structured_outputs.is_some()
+            || create_constraint_from_response_format(
+                req.response_format.as_ref(),
+                &state.tokenizer,
+            )
+            .is_some();
 
         for input in inputs {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input, req.max_tokens)?;
@@ -184,10 +193,19 @@ pub async fn create_completion(
             // requests run concurrently for KV cache reuse on shared prompts.
             let build_gen_req = || -> GenerationRequest {
                 let constraint = if has_constraint {
-                    create_constraint_from_response_format(
-                        req.response_format.as_ref(),
-                        &state.tokenizer,
-                    )
+                    if req.structured_outputs.is_some() {
+                        create_constraint_from_structured_outputs(
+                            req.structured_outputs.as_ref(),
+                            &state.tokenizer,
+                        )
+                        .ok()
+                        .flatten()
+                    } else {
+                        create_constraint_from_response_format(
+                            req.response_format.as_ref(),
+                            &state.tokenizer,
+                        )
+                    }
                 } else {
                     None
                 };
