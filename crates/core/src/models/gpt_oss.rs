@@ -7,8 +7,9 @@
 //! - Alternating sliding window attention (even layers use sliding window)
 //! - Standard pre-norm transformer with RMSNorm (eps=1e-5)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear, rms_norm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

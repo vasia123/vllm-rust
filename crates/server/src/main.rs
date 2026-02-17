@@ -110,6 +110,14 @@ enum Command {
         #[arg(long, default_value = "hermes")]
         tool_call_parser: String,
 
+        /// Reasoning parser for extracting chain-of-thought content from model output.
+        /// Supported: deepseek_r1, deepseek_v3, qwen3, mistral, step3, step3p5,
+        /// ernie45, granite, olmo3, seed_oss, minimax_m2, hunyuan_a13b,
+        /// glm45, holo2, kimi_k2, identity.
+        /// Empty string or "identity" disables reasoning extraction.
+        #[arg(long, default_value = "")]
+        reasoning_parser: String,
+
         /// Model name returned by /v1/models and echoed in responses.
         /// Defaults to the model identifier.
         #[arg(long)]
@@ -415,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_headers,
             max_body_size_mb,
             tool_call_parser,
+            reasoning_parser,
             served_model_name,
             ssl_certfile,
             ssl_keyfile,
@@ -847,6 +856,7 @@ async fn main() -> anyhow::Result<()> {
                 cors_config,
                 max_body_size_mb,
                 tool_call_parser,
+                reasoning_parser,
                 served_model_name,
                 ssl_certfile,
                 ssl_keyfile,
@@ -944,6 +954,7 @@ struct ServerLaunchConfig {
     cors_config: api::CorsConfig,
     max_body_size_mb: usize,
     tool_call_parser: String,
+    reasoning_parser: String,
     served_model_name: String,
     ssl_certfile: Option<String>,
     ssl_keyfile: Option<String>,
@@ -1025,6 +1036,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         cors_config,
         max_body_size_mb,
         tool_call_parser,
+        reasoning_parser,
         served_model_name,
         ssl_certfile,
         ssl_keyfile,
@@ -1414,6 +1426,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eos_token_id,
         max_model_len,
         api::create_tool_call_parser(&tool_call_parser),
+        api::create_reasoning_parser_arc(&reasoning_parser),
         accepting.clone(),
     );
 

@@ -13,6 +13,7 @@ pub mod moe;
 pub mod multimodal;
 pub mod prompt_adapter;
 pub mod quantization;
+pub mod reasoning;
 pub mod request;
 pub mod sampling;
 pub mod scheduler;

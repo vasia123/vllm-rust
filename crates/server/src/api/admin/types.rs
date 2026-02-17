@@ -145,3 +145,29 @@ pub struct PauseResponse {
 pub struct IsPausedResponse {
     pub paused: bool,
 }
+
+/// Response for POST /admin/cache/reset.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheResetResponse {
+    /// Number of blocks evicted from the prefix cache.
+    pub num_evicted_blocks: usize,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Response for GET /admin/cache/stats.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheStatsResponse {
+    /// Number of free KV cache blocks.
+    pub num_free_blocks: usize,
+    /// Total number of KV cache blocks.
+    pub num_total_blocks: usize,
+    /// Block size in tokens.
+    pub block_size: usize,
+    /// Prefix cache statistics (present when prefix caching enabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache: Option<PrefixCacheStats>,
+    /// Detailed prefix cache lifetime stats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_detailed: Option<vllm_core::kv_cache::PrefixCacheStatsSnapshot>,
+}

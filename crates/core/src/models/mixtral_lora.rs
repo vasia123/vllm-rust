@@ -6,8 +6,9 @@
 //! 3 projections = 24 adapters per layer). The MoE routing and expert weights
 //! are left unchanged.
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

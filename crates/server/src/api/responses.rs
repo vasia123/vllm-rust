@@ -23,6 +23,7 @@ use super::admin::prometheus;
 use super::error::ApiError;
 use super::response_format::inject_json_system_prompt;
 use super::responses_types::*;
+use super::streaming;
 use super::types::{convert_logit_bias, timestamp_now};
 use super::AppState;
 
@@ -112,6 +113,7 @@ pub async fn create_response(
             prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
+            skip_prefix_cache: false,
         };
 
         let include_usage = req
@@ -128,16 +130,13 @@ pub async fn create_response(
             0
         };
 
-        let rx = state
-            .engine
-            .get()
-            .generate_stream(gen_req)
-            .await
-            .map_err(|e| {
-                prometheus::inc_requests_error();
-                ApiError::EngineError(e.to_string())
-            })?;
+        let engine = state.engine.get().clone();
+        let (engine_request_id, rx) = engine.generate_stream(gen_req).await.map_err(|e| {
+            prometheus::inc_requests_error();
+            ApiError::EngineError(e.to_string())
+        })?;
 
+        let abort_handle = streaming::AbortHandle::new(engine, engine_request_id);
         let metadata = req.metadata;
         Ok(responses_sse_stream(
             response_id,
@@ -147,6 +146,7 @@ pub async fn create_response(
             include_usage,
             prompt_tokens,
             metadata,
+            abort_handle,
         )
         .into_response())
     } else {
@@ -188,6 +188,7 @@ pub async fn create_response(
             prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
+            skip_prefix_cache: false,
         };
 
         let result = state.engine.get().generate(gen_req).await.map_err(|e| {
@@ -331,6 +332,7 @@ fn build_output_items(
 }
 
 /// Build an SSE stream for the Responses API.
+#[allow(clippy::too_many_arguments)]
 fn responses_sse_stream(
     response_id: String,
     model: String,
@@ -339,6 +341,7 @@ fn responses_sse_stream(
     include_usage: bool,
     prompt_tokens: usize,
     metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+    abort_handle: streaming::AbortHandle,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let builder = StreamingResponseBuilder {
         id: response_id.into(),
@@ -348,6 +351,7 @@ fn responses_sse_stream(
     };
 
     let output_stream = async_stream::stream! {
+        let mut _abort_guard = Some(streaming::AbortGuard::new(abort_handle));
         let item_id = generate_item_id();
         let mut completion_tokens: usize = 0;
         let mut full_text = String::new();
@@ -401,8 +405,14 @@ fn responses_sse_stream(
                 }
                 StreamEvent::Done { finish_reason, .. } => {
                     finish_reason_val = finish_reason;
+                    if let Some(ref mut guard) = _abort_guard {
+                        guard.defuse();
+                    }
                 }
                 StreamEvent::Error { error } => {
+                    if let Some(ref mut guard) = _abort_guard {
+                        guard.defuse();
+                    }
                     yield Ok(Event::default().data(format!("{{\"error\":\"{error}\"}}")));
                 }
             }

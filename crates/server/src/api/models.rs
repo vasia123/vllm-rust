@@ -1,4 +1,6 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 
 use super::types::{timestamp_now, ModelObject, ModelPermission, ModelsResponse};
@@ -32,6 +34,83 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> 
             }],
         }],
     })
+}
+
+/// GET /v1/models/{model_id} — retrieve a single model by ID.
+///
+/// Returns the model info if the requested ID matches the loaded model,
+/// otherwise returns 404.
+pub async fn retrieve_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> impl IntoResponse {
+    if model_id == state.model_id {
+        let created = timestamp_now();
+        let resp = ModelObject {
+            id: model_id.clone(),
+            object: "model",
+            created,
+            owned_by: "vllm-rust".to_string(),
+            root: model_id,
+            parent: None,
+            permission: vec![ModelPermission {
+                id: format!("modelperm-{}", uuid::Uuid::new_v4()),
+                object: "model_permission",
+                created,
+                allow_create_engine: true,
+                allow_sampling: true,
+                allow_logprobs: true,
+                allow_search_indices: true,
+                allow_view: true,
+                allow_fine_tuning: true,
+                organization: "*".to_string(),
+                group: None,
+                is_blocking: false,
+            }],
+        };
+        (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+    } else {
+        // Check LoRA adapters
+        let adapters = state.lora_adapters.read().await;
+        if adapters.contains_key(&model_id) {
+            let created = timestamp_now();
+            let resp = ModelObject {
+                id: model_id.clone(),
+                object: "model",
+                created,
+                owned_by: "vllm-rust".to_string(),
+                root: state.model_id.clone(),
+                parent: Some(state.model_id.clone()),
+                permission: vec![ModelPermission {
+                    id: format!("modelperm-{}", uuid::Uuid::new_v4()),
+                    object: "model_permission",
+                    created,
+                    allow_create_engine: true,
+                    allow_sampling: true,
+                    allow_logprobs: true,
+                    allow_search_indices: true,
+                    allow_view: true,
+                    allow_fine_tuning: true,
+                    organization: "*".to_string(),
+                    group: None,
+                    is_blocking: false,
+                }],
+            };
+            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("The model '{model_id}' does not exist"),
+                        "type": "invalid_request_error",
+                        "code": "model_not_found"
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +181,40 @@ mod tests {
 
         // parent is None, so skip_serializing_if omits it
         assert!(json.get("parent").is_none());
+    }
+
+    #[test]
+    fn lora_model_has_parent() {
+        let model = ModelObject {
+            id: "my-lora-adapter".to_string(),
+            object: "model",
+            created: 1_700_000_000,
+            owned_by: "vllm-rust".to_string(),
+            root: "meta-llama/Llama-3-8B".to_string(),
+            parent: Some("meta-llama/Llama-3-8B".to_string()),
+            permission: vec![],
+        };
+        let json = serde_json::to_value(&model).unwrap();
+
+        assert_eq!(json["parent"], "meta-llama/Llama-3-8B");
+        assert_eq!(json["root"], "meta-llama/Llama-3-8B");
+        assert_ne!(json["id"], json["root"]);
+    }
+
+    #[test]
+    fn model_not_found_error_format() {
+        let error = serde_json::json!({
+            "error": {
+                "message": "The model 'nonexistent' does not exist",
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        });
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["code"], "model_not_found");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nonexistent"));
     }
 }

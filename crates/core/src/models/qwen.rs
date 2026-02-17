@@ -10,8 +10,9 @@
 //! - Uses `layer_norm_epsilon` (not rms_norm_eps) from config
 //! - RoPE applied to Q and K after splitting fused QKV
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

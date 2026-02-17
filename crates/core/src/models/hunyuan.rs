@@ -16,8 +16,9 @@
 //! - `use_mixed_mlp_moe`: int (0 = no shared expert, >0 = shared expert)
 //! - `num_shared_expert`: int or list (shared expert count multiplier)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

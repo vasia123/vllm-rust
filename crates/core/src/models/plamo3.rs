@@ -16,8 +16,9 @@
 //!   pre_mixer_norm -> Attention -> post_mixer_norm -> pre_mlp_norm -> MLP -> post_mlp_norm
 //! ```
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

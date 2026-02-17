@@ -79,6 +79,11 @@ pub struct ArchitectureInfo {
 
 static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
+        arch_names: &["BagelForConditionalGeneration"],
+        display_name: "Bagel",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["BaichuanForCausalLM", "BaiChuanForCausalLM"],
         display_name: "Baichuan",
         capabilities: ModelCapabilities::new().with_tp(),
@@ -117,6 +122,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
         arch_names: &[
             "DeepSeekVLV2ForCausalLM",
+            "DeepseekVLV2ForCausalLM",
             "DeepseekVLV2ForConditionalGeneration",
         ],
         display_name: "DeepSeek VL V2",
@@ -168,8 +174,13 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["InternVLChatModel"],
+        arch_names: &["InternVLChatModel", "H2OVLChatModel", "SkyworkR1VChatModel"],
         display_name: "InternVL2",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["NVLM_D_Model", "NVLM_D"],
+        display_name: "NVLM-D",
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
@@ -422,7 +433,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
-        arch_names: &["ChatGLMModel", "ChatGLMForConditionalGeneration"],
+        arch_names: &[
+            "ChatGLMModel",
+            "ChatGLMForConditionalGeneration",
+            "ChatGLMForCausalLM",
+        ],
         display_name: "ChatGLM",
         capabilities: ModelCapabilities::new().with_tp(),
     },
@@ -430,6 +445,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["Gemma3nForCausalLM"],
         display_name: "Gemma 3n",
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
+    },
+    ArchitectureInfo {
+        arch_names: &["FuyuForCausalLM"],
+        display_name: "Fuyu",
+        capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &["GPTBigCodeForCausalLM"],
@@ -457,7 +477,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["PhiMoEForCausalLM"],
+        arch_names: &["PhiMoEForCausalLM", "PhiMoeForCausalLM"],
         display_name: "Phi-MoE",
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
     },
@@ -523,6 +543,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &[
             "Llama4VLForConditionalGeneration",
             "MLlama4ForConditionalGeneration",
+            "Llama4ForConditionalGeneration",
         ],
         display_name: "Llama 4 VL",
         capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
@@ -548,6 +569,16 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
+        arch_names: &["Exaone4ForCausalLM"],
+        display_name: "Exaone 4",
+        capabilities: ModelCapabilities::new(),
+    },
+    ArchitectureInfo {
+        arch_names: &["ExaoneMoeForCausalLM", "ExaoneMoEForCausalLM"],
+        display_name: "Exaone MoE",
+        capabilities: ModelCapabilities::new().with_moe(),
+    },
+    ArchitectureInfo {
         arch_names: &["DbrxForCausalLM"],
         display_name: "DBRX",
         capabilities: ModelCapabilities::new().with_moe(),
@@ -556,6 +587,14 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["ArcticForCausalLM"],
         display_name: "Arctic",
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "AyaVisionForConditionalGeneration",
+            "Cohere2VisionForConditionalGeneration",
+        ],
+        display_name: "AyaVision / Cohere2 Vision",
+        capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &["BailingMoeForCausalLM", "BailingMoeV2ForCausalLM"],
@@ -573,7 +612,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["Ernie4_5_MoeForCausalLM"],
+        arch_names: &[
+            "Ernie4_5_MoeForCausalLM",
+            "Ernie45MoeForCausalLM",
+            "Ernie4_5MoeForCausalLM",
+        ],
         display_name: "ERNIE 4.5 MoE",
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
     },
@@ -762,8 +805,10 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             "RobertaForMaskedLM",
             "RobertaModel",
             "XLMRobertaModel",
+            "JinaRobertaModel",
             "RobertaForSequenceClassification",
             "XLMRobertaForSequenceClassification",
+            "BgeRerankerModel",
         ],
         display_name: "RoBERTa",
         capabilities: ModelCapabilities::new().with_encoder_only(),
@@ -848,7 +893,12 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["LlavaOnevisionForConditionalGeneration"],
+        arch_names: &[
+            "LlavaOnevisionForConditionalGeneration",
+            "LlavaNextVideoForConditionalGeneration",
+            "RForConditionalGeneration",
+            "BeeForConditionalGeneration",
+        ],
         display_name: "LLaVA-OneVision",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
@@ -879,6 +929,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &[
             "Qwen2_5_VLForConditionalGeneration",
             "Qwen25VLForConditionalGeneration",
+            "OpenCUAForConditionalGeneration",
         ],
         display_name: "Qwen2.5-VL",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
@@ -1040,6 +1091,8 @@ mod tests {
     #[test]
     fn catalog_covers_all_expected_architectures() {
         let expected = [
+            // Bagel
+            "BagelForConditionalGeneration",
             // Baichuan
             "BaichuanForCausalLM",
             "BaiChuanForCausalLM",
@@ -1062,6 +1115,7 @@ mod tests {
             "DeepseekV32ForCausalLM",
             // DeepSeek VL V2
             "DeepSeekVLV2ForCausalLM",
+            "DeepseekVLV2ForCausalLM",
             "DeepseekVLV2ForConditionalGeneration",
             // Falcon
             "FalconForCausalLM",
@@ -1096,6 +1150,7 @@ mod tests {
             "Llama4ForCausalLM",
             "Llama4VLForConditionalGeneration",
             "MLlama4ForConditionalGeneration",
+            "Llama4ForConditionalGeneration",
             // LLaVA
             "LlavaForConditionalGeneration",
             "LlavaNextForConditionalGeneration",
@@ -1128,6 +1183,7 @@ mod tests {
             "PhiForCausalLM",
             "Phi3ForCausalLM",
             "PhiMoEForCausalLM",
+            "PhiMoeForCausalLM",
             // Qwen
             "Qwen2ForCausalLM",
             "Qwen2Model",
@@ -1143,6 +1199,7 @@ mod tests {
             "Glm4MoeLiteForCausalLM",
             "ChatGLMModel",
             "ChatGLMForConditionalGeneration",
+            "ChatGLMForCausalLM",
             // Granite
             "GraniteForCausalLM",
             "GraniteMoeForCausalLM",
@@ -1191,6 +1248,7 @@ mod tests {
             // Exaone
             "ExaoneForCausalLM",
             "Exaone4ForCausalLM",
+            "ExaoneMoeForCausalLM",
             "ExaoneMoEForCausalLM",
             // Other
             "PersimmonForCausalLM",
@@ -1200,12 +1258,17 @@ mod tests {
             "Gemma2Model",
             // New architectures (2025-02 sync)
             "ArcticForCausalLM",
+            "AyaVisionForConditionalGeneration",
+            "Cohere2VisionForConditionalGeneration",
             "BailingMoeForCausalLM",
             "BailingMoeV2ForCausalLM",
             "BambaForCausalLM",
             "Ernie4_5ForCausalLM",
             "Ernie4_5_MoeForCausalLM",
+            "Ernie45MoeForCausalLM",
+            "Ernie4_5MoeForCausalLM",
             "FalconH1ForCausalLM",
+            "FuyuForCausalLM",
             "Grok1ModelForCausalLM",
             "Grok1ForCausalLM",
             "HunYuanMoEV1ForCausalLM",
@@ -1254,8 +1317,10 @@ mod tests {
             "RobertaForMaskedLM",
             "RobertaModel",
             "XLMRobertaModel",
+            "JinaRobertaModel",
             "RobertaForSequenceClassification",
             "XLMRobertaForSequenceClassification",
+            "BgeRerankerModel",
             "BgeM3EmbeddingModel",
             "ModernBertModel",
             "ModernBertForSequenceClassification",
@@ -1277,14 +1342,18 @@ mod tests {
             "Phi3VForCausalLM",
             "PaliGemmaForConditionalGeneration",
             "LlavaOnevisionForConditionalGeneration",
+            "LlavaNextVideoForConditionalGeneration",
+            "RForConditionalGeneration",
+            "BeeForConditionalGeneration",
             "MolmoForCausalLM",
             "GLM4VForCausalLM",
             "Glm4VForConditionalGeneration",
             "Qwen2VLForConditionalGeneration",
             "Tarsier2ForConditionalGeneration",
-            // Qwen2.5-VL
+            // Qwen2.5-VL / OpenCUA
             "Qwen2_5_VLForConditionalGeneration",
             "Qwen25VLForConditionalGeneration",
+            "OpenCUAForConditionalGeneration",
             // Qwen3-VL
             "Qwen3VLForConditionalGeneration",
             // Qwen3-VL-MoE
@@ -1353,6 +1422,7 @@ mod tests {
             "XLMRobertaModel",
             "RobertaForSequenceClassification",
             "XLMRobertaForSequenceClassification",
+            "BgeRerankerModel",
         ];
         for name in &names {
             let info = find_architecture(name).unwrap_or_else(|| panic!("should find {name}"));

@@ -14,8 +14,9 @@
 //! - Embeddings stay as-is (not quantized)
 //! - YaRN RoPE scaling for long contexts
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

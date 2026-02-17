@@ -11,8 +11,9 @@
 //! - Llama-style SwiGLU MLP
 //! - Llama-style RMSNorm, RoPE, GQA
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear, rms_norm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

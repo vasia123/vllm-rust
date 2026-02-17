@@ -4,8 +4,9 @@
 //! sliding window attention support. This implementation shares the same
 //! structure as LLaMA but supports the sliding_window config parameter.
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

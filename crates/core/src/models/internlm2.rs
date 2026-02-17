@@ -6,8 +6,9 @@
 //! - Uses `attention.wqkv` combined projection (split in this implementation for compatibility)
 //! - MLP uses `feed_forward.w1` (gate), `feed_forward.w3` (up), `feed_forward.w2` (down)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
@@ -22,14 +23,14 @@ use super::tp_layers::{TpEmbedding, TpLinear};
 //
 // InternLM2 uses w1 (gate), w3 (up), w2 (down) under `feed_forward`.
 
-struct InternLM2SwiGluMlp {
+pub(crate) struct InternLM2SwiGluMlp {
     w1: TpLinear, // gate_proj
     w3: TpLinear, // up_proj
     w2: TpLinear, // down_proj
 }
 
 impl InternLM2SwiGluMlp {
-    fn new(
+    pub(crate) fn new(
         hidden_size: usize,
         intermediate_size: usize,
         vb: VarBuilder,
@@ -57,7 +58,7 @@ impl InternLM2SwiGluMlp {
         Ok(Self { w1, w3, w2 })
     }
 
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
         let gate = self.w1.forward(xs, tp_ctx)?;
         let up = self.w3.forward(xs, tp_ctx)?;
         let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
@@ -67,7 +68,7 @@ impl InternLM2SwiGluMlp {
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
-struct InternLM2Attention {
+pub(crate) struct InternLM2Attention {
     q_proj: TpLinear,
     k_proj: TpLinear,
     v_proj: TpLinear,
@@ -79,7 +80,11 @@ struct InternLM2Attention {
 }
 
 impl InternLM2Attention {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -159,7 +164,7 @@ impl InternLM2Attention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -204,7 +209,7 @@ impl InternLM2Attention {
         self.o_proj.forward(&attn_output, tp_ctx)
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
@@ -319,7 +324,7 @@ impl InternLM2Attention {
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
 
-struct InternLM2DecoderLayer {
+pub(crate) struct InternLM2DecoderLayer {
     self_attn: InternLM2Attention,
     mlp: InternLM2SwiGluMlp,
     input_layernorm: RmsNorm,
@@ -327,7 +332,11 @@ struct InternLM2DecoderLayer {
 }
 
 impl InternLM2DecoderLayer {
-    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+    pub(crate) fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let self_attn = InternLM2Attention::new_with_tp(cfg, vb.pp("attention"), pg)?;
         let mlp = InternLM2SwiGluMlp::new(
             cfg.hidden_size,
@@ -347,7 +356,7 @@ impl InternLM2DecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -377,7 +386,7 @@ impl InternLM2DecoderLayer {
         residual + xs
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],

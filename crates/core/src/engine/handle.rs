@@ -31,16 +31,26 @@ impl EngineHandle {
     }
 
     /// Submit a generation request and receive a stream of tokens.
+    ///
+    /// Returns the engine-internal request ID alongside the token stream.
+    /// The caller can use this ID with [`abort`] to cancel the request
+    /// early (e.g., when a client disconnects from an SSE stream).
     pub async fn generate_stream(
         &self,
         request: GenerationRequest,
-    ) -> Result<mpsc::Receiver<StreamEvent>, EngineError> {
+    ) -> Result<(crate::request::RequestId, mpsc::Receiver<StreamEvent>), EngineError> {
         let (stream_tx, stream_rx) = mpsc::channel(64);
+        let (id_tx, id_rx) = oneshot::channel();
         self.cmd_tx
-            .send(EngineCommand::GenerateStream { request, stream_tx })
+            .send(EngineCommand::GenerateStream {
+                request,
+                stream_tx,
+                request_id_tx: id_tx,
+            })
             .await
             .map_err(|_| EngineError::Shutdown)?;
-        Ok(stream_rx)
+        let request_id = id_rx.await.map_err(|_| EngineError::Shutdown)?;
+        Ok((request_id, stream_rx))
     }
 
     /// Abort a running request, freeing its GPU resources.
@@ -115,5 +125,20 @@ impl EngineHandle {
             .await
             .map_err(|_| EngineError::Shutdown)?;
         resp_rx.await.map_err(|_| EngineError::Shutdown)
+    }
+
+    /// Reset (clear) the prefix cache, returning the number of evicted blocks.
+    ///
+    /// Evicted blocks are returned to the free pool. Returns 0 if prefix
+    /// caching is not enabled.
+    pub async fn reset_prefix_cache(&self) -> Result<usize, EngineError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::ResetPrefixCache {
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+        resp_rx.await.map_err(|_| EngineError::Shutdown)?
     }
 }

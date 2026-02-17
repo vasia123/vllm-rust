@@ -5,8 +5,9 @@
 //! gate/up/down projections. MoE expert layers are left unmodified (too many
 //! parameters for adapter injection).
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{Device, IndexOp, Module, Result, Tensor};
-use candle_nn::{linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

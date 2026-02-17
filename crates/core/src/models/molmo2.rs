@@ -10,8 +10,9 @@
 //!
 //! Reference: reference/vllm/vllm/model_executor/models/molmo2.py
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

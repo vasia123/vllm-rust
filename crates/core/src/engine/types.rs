@@ -73,6 +73,9 @@ pub struct GenerationRequest {
     /// Image inputs for multimodal models (e.g. LLaVA).
     /// Extracted from chat message content parts and decoded from data URIs.
     pub image_inputs: Vec<ImageData>,
+    /// When true, skip reading from the prefix cache for this request.
+    /// Useful when prompt_logprobs are requested (cached blocks have no logits).
+    pub skip_prefix_cache: bool,
 }
 
 impl Default for GenerationRequest {
@@ -92,6 +95,7 @@ impl Default for GenerationRequest {
             prompt_adapter_request: None,
             constraint: None,
             image_inputs: Vec::new(),
+            skip_prefix_cache: false,
         }
     }
 }
@@ -345,6 +349,10 @@ pub(crate) enum EngineCommand {
     GenerateStream {
         request: GenerationRequest,
         stream_tx: mpsc::Sender<StreamEvent>,
+        /// Channel to report the assigned engine-internal request ID back
+        /// to the caller. Used for abort-on-disconnect: the server can call
+        /// `EngineHandle::abort(request_id)` when the client disconnects.
+        request_id_tx: oneshot::Sender<RequestId>,
     },
     /// Abort a running request, freeing its GPU resources.
     Abort {
@@ -365,6 +373,10 @@ pub(crate) enum EngineCommand {
     /// Query whether the engine is currently paused.
     IsPaused {
         response_tx: oneshot::Sender<bool>,
+    },
+    /// Reset (clear) the prefix cache, returning the number of evicted blocks.
+    ResetPrefixCache {
+        response_tx: oneshot::Sender<Result<usize, EngineError>>,
     },
     Shutdown,
 }

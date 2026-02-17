@@ -1,7 +1,7 @@
 //! Common attention operations shared across backends.
 
+use crate::layers::RmsNorm;
 use candle_core::{Result, Tensor};
-use candle_nn::RmsNorm;
 
 /// Repeat KV heads for Grouped Query Attention.
 ///
@@ -210,7 +210,7 @@ mod tests {
 
         // Create RmsNorm
         let vb = VarBuilder::zeros(DType::F32, &device);
-        let norm = candle_nn::rms_norm(d, 1e-6, vb).expect("Failed to create RmsNorm");
+        let norm = crate::layers::rms_norm(d, 1e-6, vb).expect("Failed to create RmsNorm");
 
         let x = Tensor::randn(0.0f32, 1.0, (b, h, s, d), &device).expect("Failed to create tensor");
 
@@ -229,7 +229,7 @@ mod tests {
         let d = 32;
 
         let vb = VarBuilder::zeros(DType::F32, &device);
-        let norm = candle_nn::rms_norm(d, 1e-6, vb).expect("Failed to create RmsNorm");
+        let norm = crate::layers::rms_norm(d, 1e-6, vb).expect("Failed to create RmsNorm");
 
         // Create input with varying magnitudes
         let x = Tensor::randn(0.0f32, 5.0, (b, h, s, d), &device).expect("Failed to create tensor");
@@ -253,7 +253,7 @@ mod tests {
 
         for (b, h, s, d) in test_cases {
             let vb = VarBuilder::zeros(DType::F32, &device);
-            let norm = candle_nn::rms_norm(d, 1e-6, vb).expect("Failed to create RmsNorm");
+            let norm = crate::layers::rms_norm(d, 1e-6, vb).expect("Failed to create RmsNorm");
 
             let x =
                 Tensor::randn(0.0f32, 1.0, (b, h, s, d), &device).expect("Failed to create tensor");

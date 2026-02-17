@@ -12,8 +12,9 @@
 //! - RoPE positional encoding
 //! - GQA (Grouped Query Attention)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, rms_norm, Embedding, RmsNorm, VarBuilder};
+use candle_nn::{embedding, Embedding, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

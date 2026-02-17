@@ -8,8 +8,9 @@
 //!
 //! Reference: reference/vllm/vllm/model_executor/models/blip2.py
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{layer_norm, linear, rms_norm, LayerNorm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

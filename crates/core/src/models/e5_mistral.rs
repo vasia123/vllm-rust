@@ -16,24 +16,7 @@ use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::engine::{ModelForEmbedding, PoolingStrategy};
 use crate::kv_cache::{BlockTable, KVCacheManager};
-use crate::layers::RotaryEmbedding;
-
-// ─── RMS Norm ────────────────────────────────────────────────────────────────
-
-struct RmsNorm {
-    inner: candle_nn::RmsNorm,
-}
-
-impl RmsNorm {
-    fn new(hidden_size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let inner = candle_nn::rms_norm(hidden_size, eps, vb)?;
-        Ok(Self { inner })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.inner.forward(xs)
-    }
-}
+use crate::layers::{rms_norm, RmsNorm, RotaryEmbedding};
 
 // ─── Attention (no KV cache, causal mask for encoding) ──────────────────────
 
@@ -179,8 +162,8 @@ impl E5MistralLayer {
         let self_attn = E5MistralAttention::new(cfg, vb.pp("self_attn"))?;
         let mlp = E5MistralMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
         let input_layernorm =
-            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = RmsNorm::new(
+            rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -232,7 +215,7 @@ impl E5MistralForEmbedding {
             layers.push(E5MistralLayer::new(cfg, vb_m.pp(format!("layers.{i}")))?);
         }
 
-        let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         Ok(Self {
             embed_tokens,

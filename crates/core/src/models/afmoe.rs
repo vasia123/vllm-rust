@@ -10,8 +10,9 @@
 //! - Optional muP input scaling
 //! - Four-norm residual pattern (pre/post attention + pre/post MLP)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

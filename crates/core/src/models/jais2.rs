@@ -1,5 +1,6 @@
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{layer_norm, rms_norm, LayerNorm, RmsNorm, VarBuilder};
+use candle_nn::{layer_norm, LayerNorm, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

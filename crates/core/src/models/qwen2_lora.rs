@@ -4,8 +4,9 @@
 //! LoRA is applied to: q_proj, k_proj, v_proj (with bias), o_proj (no bias),
 //! and MLP projections (gate_proj, up_proj, down_proj).
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

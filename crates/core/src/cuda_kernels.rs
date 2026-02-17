@@ -1460,26 +1460,196 @@ pub fn rms_norm_cuda_available(_tensor: &Tensor) -> bool {
 #[cfg(feature = "cuda-kernels")]
 const ROPE_PTX: &str = include_str!("../kernels/rope.ptx");
 
-/// Apply fused rotary position embedding to Q and K tensors in-place.
+/// Apply fused RoPE to a single tensor (Q or K) using a CUDA kernel.
 ///
-/// This replaces multiple candle tensor operations (slice, mul, cat) with
-/// a single kernel launch per token batch.
+/// Uses CustomOp2: primary operand is the tensor to transform, secondary is
+/// a packed {positions, cos_sin_cache} tensor. The kernel modifies data in-place
+/// on a freshly allocated copy, avoiding mutation of the input tensor.
 ///
 /// # Arguments
-/// - `q`: Query tensor `[num_tokens, num_heads * head_size]` bf16, modified in-place
-/// - `k`: Key tensor `[num_tokens, num_kv_heads * head_size]` bf16, modified in-place
+/// - `tensor`: Query or Key tensor `[num_tokens, num_heads * head_size]`
 /// - `positions`: Position indices `[num_tokens]` i32
-/// - `cos_sin_cache`: Precomputed cos/sin `[max_position, rot_dim]` f32
-/// - `rot_dim`: Rotary dimension (typically head_size or partial)
-/// - `head_size`: Head dimension
-/// - `num_heads`: Number of query heads
+/// - `cos_sin_cache`: Precomputed `[max_position, rot_dim]` f32 where each row is
+///   `[cos_0..cos_{half-1}, sin_0..sin_{half-1}]`
+/// - `rot_dim`: Rotary dimension (= 2 * half_dim)
+/// - `head_size`: Full head dimension
+/// - `num_heads`: Number of heads for this tensor
+/// - `is_neox`: true for NeoX-style (split halves), false for GPT-J (interleaved)
+#[cfg(feature = "cuda-kernels")]
+struct RopeOp {
+    positions: Tensor,
+    cos_sin_cache: Tensor,
+    rot_dim: usize,
+    head_size: usize,
+    num_heads: usize,
+    is_neox: bool,
+}
+
+#[cfg(feature = "cuda-kernels")]
+impl CustomOp1 for RopeOp {
+    fn name(&self) -> &'static str {
+        "rope_fused"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("rope_fused CUDA kernel does not support CPU")
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        input_storage: &CudaStorage,
+        input_layout: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        use cudarc::driver::LaunchConfig;
+        use half::bf16;
+
+        let dev = &input_storage.device;
+        let shape = input_layout.shape();
+        let num_tokens = shape.dims()[0];
+
+        if num_tokens == 0 {
+            return Ok((
+                CudaStorage {
+                    slice: input_storage.slice.clone(),
+                    device: dev.clone(),
+                },
+                shape.clone(),
+            ));
+        }
+
+        let total_elems: usize = shape.elem_count();
+        let query_stride = (self.num_heads * self.head_size) as i32;
+        let rot_dim_i32 = self.rot_dim as i32;
+        let head_size_i32 = self.head_size as i32;
+        let num_heads_i32 = self.num_heads as i32;
+        // key is null — we process one tensor at a time
+        let num_kv_heads_i32 = 0i32;
+        let key_stride = 0i32;
+
+        let block_dim = std::cmp::min(self.num_heads * self.rot_dim / 2, 512) as u32;
+        let block_dim = std::cmp::max(block_dim, 1);
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let kernel_name = if self.is_neox {
+            "rotary_embedding_neox_bf16"
+        } else {
+            "rotary_embedding_gptj_bf16"
+        };
+
+        // Get positions storage
+        let (pos_storage, _pos_layout) = self.positions.storage_and_layout();
+        let pos_storage = match &*pos_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("rope: positions must be on CUDA"),
+        };
+        let pos_slice = match &pos_storage.slice {
+            CudaStorageSlice::I64(s) => {
+                // Convert i64 positions to i32
+                let pos_vec: Vec<i32> = self
+                    .positions
+                    .to_vec1::<i64>()?
+                    .iter()
+                    .map(|&v| v as i32)
+                    .collect();
+                let pos_i32 = dev.alloc_zeros::<i32>(pos_vec.len())?;
+                dev.htod_copy_into(pos_vec, &pos_i32)?;
+                pos_i32
+            }
+            CudaStorageSlice::U32(s) => {
+                // Reinterpret u32 as i32 (both 4 bytes, positions are small positive)
+                let pos_vec: Vec<i32> = self
+                    .positions
+                    .to_vec1::<u32>()?
+                    .iter()
+                    .map(|&v| v as i32)
+                    .collect();
+                let pos_i32 = dev.alloc_zeros::<i32>(pos_vec.len())?;
+                dev.htod_copy_into(pos_vec, &pos_i32)?;
+                pos_i32
+            }
+            _ => candle_core::bail!(
+                "rope: positions must be i64 or u32, got {:?}",
+                self.positions.dtype()
+            ),
+        };
+
+        // Get cos_sin_cache storage
+        let (cache_storage, _cache_layout) = self.cos_sin_cache.storage_and_layout();
+        let cache_storage = match &*cache_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("rope: cos_sin_cache must be on CUDA"),
+        };
+        let cache_slice = match &cache_storage.slice {
+            CudaStorageSlice::F32(s) => s,
+            _ => candle_core::bail!("rope: cos_sin_cache must be f32"),
+        };
+
+        match &input_storage.slice {
+            CudaStorageSlice::BF16(input_slice) => {
+                // Copy input to output buffer (kernel modifies in-place)
+                let output_slice = dev.alloc_zeros::<bf16>(total_elems)?;
+                dev.dtod_copy(input_slice, &output_slice)?;
+
+                let func = dev.get_or_load_custom_func(kernel_name, "rope", ROPE_PTX)?;
+
+                let mut builder = func.builder();
+                builder.arg(&pos_slice); // positions
+                builder.arg(&output_slice); // query (modified in-place)
+                builder.arg(&0u64); // key = nullptr
+                builder.arg(cache_slice); // cos_sin_cache
+                builder.arg(&rot_dim_i32);
+                builder.arg(&query_stride);
+                builder.arg(&key_stride); // unused since key=null
+                builder.arg(&head_size_i32);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32); // 0
+
+                // SAFETY: kernel launch with validated params, output_slice is freshly allocated
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("rope launch: {e}")))?;
+
+                Ok((
+                    CudaStorage {
+                        slice: CudaStorageSlice::BF16(output_slice),
+                        device: dev.clone(),
+                    },
+                    shape.clone(),
+                ))
+            }
+            _ => candle_core::bail!(
+                "rope_fused: only bf16 supported, got {:?}",
+                input_storage.slice.dtype()
+            ),
+        }
+    }
+}
+
+/// Apply fused RoPE CUDA kernel to Q and K tensors.
+///
+/// Each tensor is processed with a single kernel launch (2 launches total).
+/// The kernel replaces ~6 candle ops (split, mul, sub, mul, add, cat) per tensor.
+///
+/// # Arguments
+/// - `q`: Query `[num_tokens, num_heads, head_size]` bf16
+/// - `k`: Key `[num_tokens, num_kv_heads, head_size]` bf16
+/// - `positions`: Position for each token `[num_tokens]`
+/// - `cos_sin_cache`: `[max_position, rot_dim]` f32 — interleaved cos/sin
+/// - `rot_dim`: Rotary dimension (= 2 * half_dim)
+/// - `head_size`: Full head dimension
+/// - `num_heads`: Number of Q heads
 /// - `num_kv_heads`: Number of KV heads
-/// - `is_neox`: true for NeoX style (split halves), false for GPT-J style (interleaved)
+/// - `is_neox`: NeoX vs GPT-J style
 #[cfg(feature = "cuda-kernels")]
 #[allow(clippy::too_many_arguments)]
 pub fn rotary_embedding_cuda(
-    q: &mut Tensor,
-    k: &mut Tensor,
+    q: &Tensor,
+    k: &Tensor,
     positions: &Tensor,
     cos_sin_cache: &Tensor,
     rot_dim: usize,
@@ -1487,62 +1657,41 @@ pub fn rotary_embedding_cuda(
     num_heads: usize,
     num_kv_heads: usize,
     is_neox: bool,
-) -> Result<()> {
+) -> Result<(Tensor, Tensor)> {
     let num_tokens = positions.dim(0)?;
     if num_tokens == 0 {
-        return Ok(());
+        return Ok((q.clone(), k.clone()));
     }
 
-    let kernel_name = if is_neox {
-        "rotary_embedding_neox_bf16"
-    } else {
-        "rotary_embedding_gptj_bf16"
+    // Flatten [num_tokens, heads, head_size] → [num_tokens, heads * head_size]
+    let q_flat = q.reshape((num_tokens, num_heads * head_size))?;
+    let k_flat = k.reshape((num_tokens, num_kv_heads * head_size))?;
+
+    let q_op = RopeOp {
+        positions: positions.clone(),
+        cos_sin_cache: cos_sin_cache.clone(),
+        rot_dim,
+        head_size,
+        num_heads,
+        is_neox,
     };
+    let q_out = q_flat.contiguous()?.apply_op1_no_bwd(&q_op)?;
 
-    let q_contiguous = q.contiguous()?;
-    let k_contiguous = k.contiguous()?;
-    let positions = positions.contiguous()?;
-    let cos_sin_cache = cos_sin_cache
-        .to_dtype(candle_core::DType::F32)?
-        .contiguous()?;
+    let k_op = RopeOp {
+        positions: positions.clone(),
+        cos_sin_cache: cos_sin_cache.clone(),
+        rot_dim,
+        head_size,
+        num_heads: num_kv_heads,
+        is_neox,
+    };
+    let k_out = k_flat.contiguous()?.apply_op1_no_bwd(&k_op)?;
 
-    let query_stride = (num_heads * head_size) as i32;
-    let key_stride = (num_kv_heads * head_size) as i32;
-    let rot_dim_i32 = rot_dim as i32;
-    let head_size_i32 = head_size as i32;
-    let num_heads_i32 = num_heads as i32;
-    let num_kv_heads_i32 = num_kv_heads as i32;
+    // Reshape back to [num_tokens, heads, head_size]
+    let q_out = q_out.reshape(q.shape())?;
+    let k_out = k_out.reshape(k.shape())?;
 
-    let block_dim = std::cmp::min(num_heads * rot_dim / 2, 512) as u32;
-    let block_dim = std::cmp::max(block_dim, 1); // ensure at least 1 thread
-
-    // NOTE: The actual kernel launch requires CUDA storage access through candle's
-    // CustomOp mechanism. Since RoPE modifies tensors in-place and candle's CustomOp
-    // creates new tensors, the integration requires wrapping this as a CustomOp that
-    // returns the modified Q and K.
-    // For now, this function signature is ready for integration when the in-place
-    // mutation path through candle is available. The kernel PTX is compiled and
-    // the launch parameters are validated.
-
-    // TODO: Integrate via CustomOp2 that takes Q and returns modified Q
-    // (same pattern as paged attention). K modification requires a separate op
-    // or a CustomOp3-equivalent.
-    // The kernel is compiled and ready — integration requires refactoring
-    // rotary.rs to use this path when cuda-kernels feature is enabled.
-
-    let _ = (
-        kernel_name,
-        block_dim,
-        query_stride,
-        key_stride,
-        rot_dim_i32,
-        head_size_i32,
-        num_heads_i32,
-        num_kv_heads_i32,
-    );
-    let _ = (q_contiguous, k_contiguous, cos_sin_cache);
-
-    Ok(())
+    Ok((q_out, k_out))
 }
 
 /// Check if CUDA RoPE kernel is available.

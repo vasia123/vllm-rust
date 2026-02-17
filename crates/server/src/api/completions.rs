@@ -17,7 +17,7 @@ use vllm_core::tokenizer::TokenizerWrapper;
 use super::admin::prometheus;
 use super::error::ApiError;
 use super::response_format::validate_response_format;
-use super::streaming::{completion_sse_stream, StreamingOptions};
+use super::streaming::{self, completion_sse_stream, StreamingOptions};
 use super::types::{
     finish_reason_str, system_fingerprint, timestamp_now, CompletionChoice, CompletionLogProbs,
     CompletionRequest, CompletionResponse, PromptInput, ResponseFormat, Usage,
@@ -126,11 +126,12 @@ pub async fn create_completion(
             prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
+            skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
+                || req.prompt_logprobs.is_some(),
         };
 
-        let rx = state
-            .engine
-            .get()
+        let engine = state.engine.get();
+        let (engine_request_id, rx) = engine
             .generate_stream(gen_req)
             .await
             .map_err(|e| ApiError::EngineError(e.to_string()))?;
@@ -148,6 +149,8 @@ pub async fn create_completion(
                 None
             },
             return_token_ids: req.return_tokens_as_token_ids.unwrap_or(false),
+            reasoning_parser: None,
+            abort_handle: Some(streaming::AbortHandle::new(engine, engine_request_id)),
         };
         Ok(
             completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)
@@ -243,6 +246,8 @@ pub async fn create_completion(
                     prompt_adapter_request: None,
                     constraint,
                     image_inputs: Vec::new(),
+                    skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
+                        || req.prompt_logprobs.is_some(),
                 }
             };
 

@@ -11,8 +11,9 @@
 //! PanguProMoEV2 and PanguUltraMoE are MoE variants (layers >= first_k_dense_replace
 //! use MoE instead of dense MLP).
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

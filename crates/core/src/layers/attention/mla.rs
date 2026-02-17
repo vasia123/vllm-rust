@@ -18,8 +18,9 @@
 //! - Prefill: Expand latent to full K/V for compute efficiency
 //! - Decode: Can operate in latent space for memory efficiency
 
+use crate::layers::RmsNorm;
 use candle_core::{Module, Result, Tensor, D};
-use candle_nn::{Linear, RmsNorm};
+use candle_nn::Linear;
 
 use crate::kv_cache::mla_cache_engine::MLACacheEngine;
 use crate::kv_cache::BlockId;
@@ -646,7 +647,7 @@ mod tests {
         let kv_a =
             candle_nn::linear_no_bias(hidden_size, kv_lora_rank + qk_rope_head_dim, vb.pp("kv_a"))
                 .unwrap();
-        let kv_a_ln = candle_nn::rms_norm(kv_lora_rank, 1e-5, vb.pp("kv_a_ln")).unwrap();
+        let kv_a_ln = crate::layers::rms_norm(kv_lora_rank, 1e-5, vb.pp("kv_a_ln")).unwrap();
         let kv_b = candle_nn::linear_no_bias(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
@@ -960,7 +961,7 @@ mod tests {
 
         let q_proj = candle_nn::linear_no_bias(64, 4 * 12, vb.pp("q")).unwrap();
         let kv_a = candle_nn::linear_no_bias(64, 16 + 4, vb.pp("kv_a")).unwrap();
-        let kv_a_ln = candle_nn::rms_norm(16, 1e-5, vb.pp("kv_a_ln")).unwrap();
+        let kv_a_ln = crate::layers::rms_norm(16, 1e-5, vb.pp("kv_a_ln")).unwrap();
         let kv_b = candle_nn::linear_no_bias(16, 4 * (8 + 8), vb.pp("kv_b")).unwrap();
         let o_proj = candle_nn::linear_no_bias(4 * 8, 64, vb.pp("o")).unwrap();
         let rotary =

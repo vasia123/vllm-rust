@@ -17,7 +17,7 @@ use vllm_core::tokenizer::{MessageContent, TokenizerWrapper};
 use super::admin::prometheus;
 use super::error::ApiError;
 use super::response_format::{inject_json_system_prompt, validate_response_format};
-use super::streaming::{chat_completion_sse_stream, StreamingOptions};
+use super::streaming::{self, chat_completion_sse_stream, StreamingOptions};
 use super::types::{
     finish_reason_str, system_fingerprint, timestamp_now, ChatCompletionChoice,
     ChatCompletionRequest, ChatCompletionResponse, ChatLogProbToken, ChatLogProbs,
@@ -151,6 +151,8 @@ pub async fn create_chat_completion(
             prompt_adapter_request: None,
             constraint,
             image_inputs,
+            skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
+                || req.prompt_logprobs.is_some(),
         };
 
         // Compute prompt tokens for streaming usage reporting
@@ -168,15 +170,11 @@ pub async fn create_chat_completion(
             0
         };
 
-        let rx = state
-            .engine
-            .get()
-            .generate_stream(gen_req)
-            .await
-            .map_err(|e| {
-                prometheus::inc_requests_error();
-                ApiError::EngineError(e.to_string())
-            })?;
+        let engine = state.engine.get();
+        let (engine_request_id, rx) = engine.generate_stream(gen_req).await.map_err(|e| {
+            prometheus::inc_requests_error();
+            ApiError::EngineError(e.to_string())
+        })?;
 
         let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
         let include_logprobs = logprobs_count.is_some();
@@ -191,6 +189,12 @@ pub async fn create_chat_completion(
                 None
             },
             return_token_ids: req.return_tokens_as_token_ids.unwrap_or(false),
+            reasoning_parser: if req.include_reasoning {
+                state.reasoning_parser.clone()
+            } else {
+                None
+            },
+            abort_handle: Some(streaming::AbortHandle::new(engine, engine_request_id)),
         };
         Ok(
             chat_completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)
@@ -266,6 +270,8 @@ pub async fn create_chat_completion(
                 prompt_adapter_request: None,
                 constraint,
                 image_inputs: image_inputs.clone(),
+                skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
+                    || req.prompt_logprobs.is_some(),
             }
         };
 
@@ -320,30 +326,44 @@ pub async fn create_chat_completion(
         for (i, result) in selected.into_iter().enumerate() {
             total_completion_tokens += result.generated_token_ids.len();
 
+            // Extract reasoning content if a reasoning parser is configured
+            let (reasoning, reasoning_content, effective_text) = if req.include_reasoning {
+                if let Some(ref rp) = state.reasoning_parser {
+                    let ro = rp.extract_reasoning(&result.generated_text);
+                    let r = ro.reasoning.clone();
+                    let text = ro.content.unwrap_or_default();
+                    (r.clone(), r, text)
+                } else {
+                    (None, None, result.generated_text.clone())
+                }
+            } else {
+                (None, None, result.generated_text.clone())
+            };
+
             // Parse tool calls if tools were provided
             let (content, tool_calls, finish_reason) = if has_tools {
                 let parser = &state.tool_call_parser;
-                if let Ok(calls) = parser.parse(&result.generated_text) {
+                if let Ok(calls) = parser.parse(&effective_text) {
                     if !calls.is_empty() {
-                        let content = parser.extract_content(&result.generated_text);
+                        let content = parser.extract_content(&effective_text);
                         (content, Some(calls), "tool_calls".to_string())
                     } else {
                         (
-                            Some(result.generated_text.clone()),
+                            Some(effective_text),
                             None,
                             finish_reason_str(&result.finish_reason),
                         )
                     }
                 } else {
                     (
-                        Some(result.generated_text.clone()),
+                        Some(effective_text),
                         None,
                         finish_reason_str(&result.finish_reason),
                     )
                 }
             } else {
                 (
-                    Some(result.generated_text.clone()),
+                    Some(effective_text),
                     None,
                     finish_reason_str(&result.finish_reason),
                 )
@@ -361,8 +381,8 @@ pub async fn create_chat_completion(
                     role: "assistant".to_string(),
                     content,
                     refusal: None,
-                    reasoning: None,
-                    reasoning_content: None,
+                    reasoning,
+                    reasoning_content,
                     tool_calls,
                     annotations: None,
                     audio: None,

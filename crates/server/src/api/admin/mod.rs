@@ -22,8 +22,8 @@ use self::restart::{
     RestartCoordinator, RestartState,
 };
 use self::types::{
-    ConfigSaveRequest, ConfigSaveResponse, HealthResponse, HealthStatus, IsPausedResponse,
-    PauseRequest, PauseResponse, RuntimeConfig,
+    CacheResetResponse, CacheStatsResponse, ConfigSaveRequest, ConfigSaveResponse, HealthResponse,
+    HealthStatus, IsPausedResponse, PauseRequest, PauseResponse, PrefixCacheStats, RuntimeConfig,
 };
 use crate::api::error::ApiError;
 use crate::config::ServerConfig;
@@ -110,6 +110,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/pause", post(pause_engine))
         .route("/resume", post(resume_engine))
         .route("/is_paused", get(is_engine_paused))
+        .route("/cache/reset", post(reset_cache))
+        .route("/cache/stats", get(cache_stats))
         .with_state(state)
         .route("/restart", post(restart_handler))
         .route("/restart/status", get(restart_status_stream))
@@ -238,6 +240,50 @@ async fn is_engine_paused(State(state): State<AdminState>) -> Result<impl IntoRe
         .map_err(|e| ApiError::EngineError(e.to_string()))?;
 
     Ok(Json(IsPausedResponse { paused }))
+}
+
+/// POST /admin/cache/reset - Reset the prefix cache.
+async fn reset_cache(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
+    let num_evicted = state
+        .engine
+        .get()
+        .reset_prefix_cache()
+        .await
+        .map_err(|e| ApiError::EngineError(e.to_string()))?;
+
+    Ok(Json(CacheResetResponse {
+        num_evicted_blocks: num_evicted,
+        message: if num_evicted > 0 {
+            format!("Prefix cache reset: {num_evicted} blocks evicted")
+        } else {
+            "Prefix cache reset (no blocks to evict or caching not enabled)".to_string()
+        },
+    }))
+}
+
+/// GET /admin/cache/stats - Get cache statistics.
+async fn cache_stats(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
+    let stats = state
+        .engine
+        .get()
+        .get_stats()
+        .await
+        .map_err(|e| ApiError::EngineError(e.to_string()))?;
+
+    let prefix_cache = stats
+        .prefix_cache_stats
+        .map(|(cached, evictable)| PrefixCacheStats {
+            cached_blocks: cached,
+            evictable_blocks: evictable,
+        });
+
+    Ok(Json(CacheStatsResponse {
+        num_free_blocks: stats.num_free_blocks,
+        num_total_blocks: stats.num_total_blocks,
+        block_size: stats.block_size,
+        prefix_cache,
+        prefix_cache_detailed: stats.prefix_cache_detailed_stats,
+    }))
 }
 
 /// POST /admin/config - Save configuration to file.

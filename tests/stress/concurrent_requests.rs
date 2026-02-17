@@ -121,6 +121,7 @@ fn make_stress_request(id: usize, max_tokens: usize, eos_token: u32) -> Generati
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        skip_prefix_cache: false,
     }
 }
 
@@ -376,7 +377,7 @@ async fn test_streaming_no_leak() {
 
     for i in 0..NUM_ITERATIONS {
         let request = make_stress_request(i, 5, EOS_TOKEN);
-        let mut rx = handle.generate_stream(request).await.unwrap();
+        let (_req_id, mut rx) = handle.generate_stream(request).await.unwrap();
 
         let mut token_count = 0;
         while let Some(event) = rx.recv().await {

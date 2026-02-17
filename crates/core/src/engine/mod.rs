@@ -1829,7 +1829,7 @@ mod tests {
             eos_token_id: 999,
             ..Default::default()
         };
-        let mut stream_rx = handle.generate_stream(request).await.unwrap();
+        let (_req_id, mut stream_rx) = handle.generate_stream(request).await.unwrap();
 
         // Give it a moment to start processing
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1941,6 +1941,119 @@ mod tests {
         };
         let result = handle.generate(request).await.unwrap();
         assert_eq!(result.generated_token_ids, vec![42, 42]);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    // ─── Stream Abort Tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn generate_stream_returns_request_id() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 3,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let (request_id, mut rx) = handle.generate_stream(request).await.unwrap();
+
+        // RequestId should be a valid non-negative number (first request = 0)
+        assert_eq!(request_id, 0);
+
+        // Stream should produce tokens and complete normally
+        let mut tokens = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Token { token_id, .. } => tokens.push(token_id),
+                StreamEvent::Done { .. } => break,
+                StreamEvent::Error { error } => panic!("unexpected error: {error}"),
+            }
+        }
+        assert_eq!(tokens, vec![42, 42, 42]);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_frees_resources_on_client_disconnect() {
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        // Submit a long-running streaming request
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 1000,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let (request_id, rx) = handle.generate_stream(request).await.unwrap();
+
+        // Give the engine a moment to start processing
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Explicitly abort using the request ID
+        handle.abort(request_id).await.unwrap();
+
+        // Drop the receiver
+        drop(rx);
+
+        // Give the engine a moment to process the abort
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Engine should have no active requests
+        let stats = handle.get_stats().await.unwrap();
+        assert_eq!(
+            stats.num_running_requests, 0,
+            "aborted request should be removed"
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_receiver_triggers_engine_abort() {
+        // When the receiver is dropped (simulating client disconnect),
+        // the engine should detect it and abort the request automatically.
+        let cache_config = test_cache_config();
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let config = test_engine_config();
+        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+
+        let request = GenerationRequest {
+            prompt: "t1 t2 t3".to_string(),
+            max_new_tokens: 1000,
+            eos_token_id: 999,
+            ..Default::default()
+        };
+        let (_request_id, rx) = handle.generate_stream(request).await.unwrap();
+
+        // Give the engine time to start processing
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drop the receiver — engine should detect on next send_stream_token
+        drop(rx);
+
+        // Give the engine time to detect and abort
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let stats = handle.get_stats().await.unwrap();
+        assert_eq!(
+            stats.num_running_requests, 0,
+            "engine should auto-abort on receiver drop"
+        );
 
         handle.shutdown().await.unwrap();
     }

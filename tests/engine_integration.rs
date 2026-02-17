@@ -153,6 +153,7 @@ fn make_request(prompt: &str, max_new_tokens: usize, eos_token_id: u32) -> Gener
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        skip_prefix_cache: false,
     }
 }
 
@@ -260,7 +261,7 @@ async fn test_engine_streaming_tokens_arrive_in_order() {
     let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
     let request = make_request("t1 t2", 3, 999);
 
-    let mut rx = handle.generate_stream(request).await.unwrap();
+    let (_req_id, mut rx) = handle.generate_stream(request).await.unwrap();
 
     let mut token_events = Vec::new();
     let mut done_event = None;
@@ -315,6 +316,7 @@ async fn test_engine_generation_stops_at_stop_token() {
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        skip_prefix_cache: false,
     };
 
     let result = handle.generate(request).await.unwrap();
@@ -369,6 +371,7 @@ async fn test_engine_generation_stops_at_stop_string() {
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        skip_prefix_cache: false,
     };
 
     let result = handle.generate(request).await.unwrap();

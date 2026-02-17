@@ -7,7 +7,9 @@ use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use vllm_core::engine::StreamEvent;
+use vllm_core::engine::{EngineHandle, StreamEvent};
+use vllm_core::reasoning::ReasoningParser;
+use vllm_core::request::RequestId;
 use vllm_core::tokenizer::TokenizerWrapper;
 
 use super::types::{
@@ -31,6 +33,65 @@ pub struct StreamingOptions {
     pub tokenizer: Option<Arc<TokenizerWrapper>>,
     /// If true, include token IDs in each streaming chunk choice.
     pub return_token_ids: bool,
+    /// Reasoning parser for extracting chain-of-thought content.
+    pub reasoning_parser: Option<Arc<dyn ReasoningParser>>,
+    /// Engine handle for abort-on-disconnect. When the SSE stream is dropped
+    /// (client disconnects), the guard sends an abort command to reclaim GPU
+    /// resources immediately rather than waiting for the next engine step.
+    pub abort_handle: Option<AbortHandle>,
+}
+
+/// Handle for aborting an engine request on client disconnect.
+///
+/// When the SSE stream is dropped (client disconnects), the `AbortGuard`
+/// spawns a task to send an abort command to the engine. If the request
+/// completes normally, `defuse()` prevents the abort.
+#[derive(Clone)]
+pub struct AbortHandle {
+    engine: EngineHandle,
+    engine_request_id: RequestId,
+}
+
+impl AbortHandle {
+    pub fn new(engine: EngineHandle, engine_request_id: RequestId) -> Self {
+        Self {
+            engine,
+            engine_request_id,
+        }
+    }
+}
+
+/// RAII guard that aborts an engine request when dropped (client disconnect).
+///
+/// Created when an SSE stream starts; defused when the stream completes
+/// normally. If the guard is dropped without being defused (e.g., axum drops
+/// the response body because the client closed the connection), it spawns
+/// a task to call `engine.abort()`.
+pub(super) struct AbortGuard {
+    handle: Option<AbortHandle>,
+}
+
+impl AbortGuard {
+    pub(super) fn new(handle: AbortHandle) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Disarm the guard — the request completed normally, no abort needed.
+    pub(super) fn defuse(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            tokio::spawn(async move {
+                let _ = h.engine.abort(h.engine_request_id).await;
+            });
+        }
+    }
 }
 
 /// Build a single `CompletionLogProbs` entry for one streaming token.
@@ -106,6 +167,7 @@ pub fn completion_sse_stream(
     let model: Arc<str> = model.into();
 
     let output_stream = async_stream::stream! {
+        let mut _abort_guard = options.abort_handle.as_ref().map(|h| AbortGuard::new(h.clone()));
         let mut completion_tokens: usize = 0;
         let mut text_offset: usize = 0;
         let mut rx_stream = ReceiverStream::new(rx);
@@ -158,6 +220,10 @@ pub fn completion_sse_stream(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
                 StreamEvent::Done { finish_reason, stop_reason, .. } => {
+                    // Request completed normally — defuse the abort guard
+                    if let Some(ref mut guard) = _abort_guard {
+                        guard.defuse();
+                    }
                     let usage = if options.continuous_usage_stats {
                         Some(Usage::new(options.prompt_tokens, completion_tokens))
                     } else {
@@ -182,6 +248,10 @@ pub fn completion_sse_stream(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
                 StreamEvent::Error { error } => {
+                    // Error also means done — defuse the abort guard
+                    if let Some(ref mut guard) = _abort_guard {
+                        guard.defuse();
+                    }
                     Event::default().data(format!("{{\"error\":\"{error}\"}}"))
                 }
             };
@@ -220,8 +290,10 @@ pub fn chat_completion_sse_stream(
     let model: Arc<str> = model.into();
 
     let output_stream = async_stream::stream! {
+        let mut _abort_guard = options.abort_handle.as_ref().map(|h| AbortGuard::new(h.clone()));
         let mut first = true;
         let mut completion_tokens: usize = 0;
+        let mut accumulated_text = String::new();
         let mut rx_stream = ReceiverStream::new(rx);
 
         while let Some(event) = rx_stream.next().await {
@@ -246,14 +318,35 @@ pub fn chat_completion_sse_stream(
 
                     let token_ids = if options.return_token_ids { Some(vec![token_id]) } else { None };
 
+                    // Apply reasoning parser to split reasoning/content in streaming mode
+                    let (delta_content, delta_reasoning) =
+                        if let Some(ref rp) = options.reasoning_parser {
+                            let rd = rp.extract_reasoning_streaming(
+                                &accumulated_text,
+                                &token_text,
+                            );
+                            accumulated_text.push_str(&token_text);
+                            (rd.content, rd.reasoning)
+                        } else {
+                            accumulated_text.push_str(&token_text);
+                            (Some(token_text), None)
+                        };
+
+                    let reasoning_content = delta_reasoning.clone();
+
+                    // Skip empty deltas (e.g., tag tokens consumed by parser)
+                    if delta_content.is_none() && delta_reasoning.is_none() {
+                        continue;
+                    }
+
                     let choices = if first {
                         first = false;
                         vec![ChatCompletionChunkChoice {
                             delta: ChatDelta {
                                 role: Some("assistant".to_string()),
-                                content: Some(token_text),
-                                reasoning: None,
-                                reasoning_content: None,
+                                content: delta_content,
+                                reasoning: delta_reasoning,
+                                reasoning_content,
                             },
                             index: 0,
                             finish_reason: None,
@@ -265,9 +358,9 @@ pub fn chat_completion_sse_stream(
                         vec![ChatCompletionChunkChoice {
                             delta: ChatDelta {
                                 role: None,
-                                content: Some(token_text),
-                                reasoning: None,
-                                reasoning_content: None,
+                                content: delta_content,
+                                reasoning: delta_reasoning,
+                                reasoning_content,
                             },
                             index: 0,
                             finish_reason: None,
@@ -293,6 +386,10 @@ pub fn chat_completion_sse_stream(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
                 StreamEvent::Done { finish_reason, stop_reason, .. } => {
+                    // Request completed normally — defuse the abort guard
+                    if let Some(ref mut guard) = _abort_guard {
+                        guard.defuse();
+                    }
                     let usage = if options.continuous_usage_stats {
                         Some(Usage::new(options.prompt_tokens, completion_tokens))
                     } else {
@@ -322,6 +419,10 @@ pub fn chat_completion_sse_stream(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 }
                 StreamEvent::Error { error } => {
+                    // Error also means done — defuse the abort guard
+                    if let Some(ref mut guard) = _abort_guard {
+                        guard.defuse();
+                    }
                     Event::default().data(format!("{{\"error\":\"{error}\"}}"))
                 }
             };

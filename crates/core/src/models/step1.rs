@@ -10,8 +10,9 @@
 //!   bias[h, i, j] = slope[h] * (-sqrt(i - j))  for j <= i (causal)
 //! instead of the standard ALiBi's linear distance.
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

@@ -68,13 +68,19 @@ pub(crate) fn handle_command(
             );
             false
         }
-        EngineCommand::GenerateStream { request, stream_tx } => {
+        EngineCommand::GenerateStream {
+            request,
+            stream_tx,
+            request_id_tx,
+        } => {
             if *paused {
                 let _ = stream_tx.try_send(StreamEvent::Error {
                     error: EngineError::Paused.to_string(),
                 });
                 return false;
             }
+            // Peek at the ID that will be assigned before admit_request increments it
+            let assigned_id = *next_id;
             admit_request(
                 request,
                 ResponseChannel::Stream(stream_tx),
@@ -85,6 +91,8 @@ pub(crate) fn handle_command(
                 block_size,
                 kv_cache_mgr,
             );
+            // Report the assigned ID back so the server can abort on disconnect
+            let _ = request_id_tx.send(assigned_id);
             false
         }
         EngineCommand::GetStats { response_tx } => {
@@ -178,6 +186,21 @@ pub(crate) fn handle_command(
             let _ = response_tx.send(*paused);
             false
         }
+        EngineCommand::ResetPrefixCache { response_tx } => {
+            // Clear the prefix cache and collect evicted block IDs.
+            // Two-phase to avoid overlapping &mut borrows on kv_cache_mgr.
+            let evicted = kv_cache_mgr
+                .prefix_cache_mut()
+                .map(|cache| cache.clear())
+                .unwrap_or_default();
+            let num_evicted = evicted.len();
+            if !evicted.is_empty() {
+                let _ = kv_cache_mgr.free_blocks(&evicted);
+            }
+            tracing::info!(num_evicted, "Prefix cache reset");
+            let _ = response_tx.send(Ok(num_evicted));
+            false
+        }
         EngineCommand::Shutdown => true,
     }
 }
@@ -225,7 +248,7 @@ fn admit_request(
     state.constraint = request.constraint;
 
     // Check prefix cache for reusable blocks via the KVCacheManager
-    if kv_cache_mgr.has_prefix_cache() {
+    if kv_cache_mgr.has_prefix_cache() && !request.skip_prefix_cache {
         let (cached_blocks, _) = kv_cache_mgr.match_prefix(&state.prompt_token_ids);
         if !cached_blocks.is_empty() {
             // Don't cache the entire prompt - leave at least 1 token for prefill
@@ -1063,21 +1086,31 @@ pub(crate) fn finish_request_with_error_deferred(
 }
 
 /// Send streaming token events for a request.
+///
+/// Returns `true` if the stream receiver is still alive, `false` if
+/// it has been dropped (client disconnected). When `false`, the caller
+/// should abort the request to reclaim GPU resources.
 pub(crate) fn send_stream_token(
     req_id: RequestId,
     tokenizer: &TokenizerWrapper,
     requests: &mut HashMap<RequestId, ActiveRequest>,
-) {
+) -> bool {
     let Some(req) = requests.get_mut(&req_id) else {
-        return;
+        return true;
     };
     let ResponseChannel::Stream(ref tx) = req.response else {
-        return;
+        return true;
     };
+
+    // Early check: if the receiver has been dropped, signal disconnect
+    if tx.is_closed() {
+        return false;
+    }
+
     let start = req.num_streamed_tokens;
     let end = req.state.generated_token_ids.len();
     if start >= end {
-        return;
+        return true;
     }
     for i in start..end {
         let token_id = req.state.generated_token_ids[i];
@@ -1099,14 +1132,19 @@ pub(crate) fn send_stream_token(
             None
         };
 
-        let _ = tx.try_send(StreamEvent::Token {
-            token_id,
-            token_text,
-            logprob,
-            top_logprobs,
-        });
+        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+            tx.try_send(StreamEvent::Token {
+                token_id,
+                token_text,
+                logprob,
+                top_logprobs,
+            })
+        {
+            return false;
+        }
     }
     req.num_streamed_tokens = end;
+    true
 }
 
 /// Build a GenerationResult from sequence state.
@@ -1525,6 +1563,101 @@ mod tests {
         assert_eq!(check.stop_reason, Some(42));
     }
 
+    // ---- Stream disconnect detection tests ----
+
+    #[test]
+    fn send_stream_token_returns_true_for_complete_channel() {
+        // Complete (oneshot) requests are not stream requests — always returns true
+        let mut requests = HashMap::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut state = make_state(99, 100);
+        state.generated_token_ids.push(42);
+        requests.insert(
+            0,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let tok = dummy_tokenizer();
+        assert!(send_stream_token(0, &tok, &mut requests));
+    }
+
+    #[test]
+    fn send_stream_token_returns_true_when_stream_alive() {
+        let mut requests = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = make_state(99, 100);
+        state.generated_token_ids.push(42);
+        requests.insert(
+            0,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Stream(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let tok = dummy_tokenizer();
+        assert!(send_stream_token(0, &tok, &mut requests));
+    }
+
+    #[test]
+    fn send_stream_token_returns_false_when_receiver_dropped() {
+        let mut requests = HashMap::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // Drop the receiver to simulate client disconnect
+        drop(rx);
+
+        let mut state = make_state(99, 100);
+        state.generated_token_ids.push(42);
+        requests.insert(
+            0,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Stream(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let tok = dummy_tokenizer();
+        // Should detect the dropped receiver
+        assert!(!send_stream_token(0, &tok, &mut requests));
+    }
+
+    #[test]
+    fn send_stream_token_returns_true_for_unknown_request() {
+        let mut requests: HashMap<RequestId, ActiveRequest> = HashMap::new();
+        let tok = dummy_tokenizer();
+        // Request 99 doesn't exist — should return true (not disconnected)
+        assert!(send_stream_token(99, &tok, &mut requests));
+    }
+
+    #[test]
+    fn send_stream_token_returns_true_when_no_new_tokens() {
+        let mut requests = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let state = make_state(99, 100);
+        // No generated tokens — nothing to send
+        requests.insert(
+            0,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Stream(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let tok = dummy_tokenizer();
+        assert!(send_stream_token(0, &tok, &mut requests));
+    }
+
     // ---- Sliding window reclamation tests ----
 
     fn make_active_request_with_blocks(
@@ -1902,5 +2035,65 @@ mod tests {
         // All base → all 1.0
         let row0: Vec<f32> = logits.i(0).unwrap().to_vec2::<f32>().unwrap()[0].clone();
         assert!(row0.iter().all(|&v| v == 1.0));
+    }
+
+    // ---- ResetPrefixCache command tests ----
+
+    #[test]
+    fn handle_reset_prefix_cache_no_cache() {
+        use crate::kv_cache::config::CacheConfig;
+        use crate::kv_cache::KVCacheDtype;
+        use candle_core::{DType, Device};
+
+        let config = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&config).unwrap();
+        let tokenizer = dummy_tokenizer();
+        let mut scheduler = Scheduler::new(crate::scheduler::SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 512,
+            enable_chunked_prefill: false,
+            scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
+        });
+        let mut requests = HashMap::new();
+        let mut next_id = 0;
+        let mut paused = false;
+        let mut frozen = false;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let shutdown = handle_command(
+            EngineCommand::ResetPrefixCache { response_tx: tx },
+            &mut next_id,
+            &tokenizer,
+            &mut scheduler,
+            &mut requests,
+            16,
+            &mut mgr,
+            &mut paused,
+            &mut frozen,
+            None,
+        );
+        assert!(!shutdown);
+        // No prefix cache → 0 blocks evicted
+        let result = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(result, 0);
+    }
+
+    // ---- skip_prefix_cache tests ----
+
+    #[test]
+    fn generation_request_default_skip_prefix_cache_false() {
+        let req = GenerationRequest::default();
+        assert!(!req.skip_prefix_cache);
     }
 }

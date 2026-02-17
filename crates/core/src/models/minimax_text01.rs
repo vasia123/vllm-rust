@@ -31,8 +31,9 @@
 //! - `layernorm_mlp_alpha`, `layernorm_mlp_beta`: scaling for MLP output
 //! - `postnorm`: whether to use post-norm (default false)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

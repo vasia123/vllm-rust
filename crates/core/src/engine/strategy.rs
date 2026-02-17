@@ -131,19 +131,35 @@ fn execute_engine_step<S: ExecutionStrategy>(
     // Execute prefills
     strategy.execute_prefills(output, state, kv_cache_mgr, tokenizer);
 
-    // Send stream tokens after prefill
+    // Send stream tokens after prefill — detect disconnected clients
+    let mut disconnected = Vec::new();
     for schedule in &output.prefill_requests {
-        send_stream_token(schedule.request_id, tokenizer, &mut state.requests);
+        if !send_stream_token(schedule.request_id, tokenizer, &mut state.requests) {
+            disconnected.push(schedule.request_id);
+        }
     }
 
     // Execute decodes — collect errored request IDs
     strategy.execute_decodes(output, state, kv_cache_mgr, multi_step_count, tokenizer);
 
-    // Send stream tokens after decode
+    // Send stream tokens after decode — detect disconnected clients
     for &req_id in &output.decode_requests {
-        if state.requests.contains_key(&req_id) {
-            send_stream_token(req_id, tokenizer, &mut state.requests);
+        if state.requests.contains_key(&req_id)
+            && !send_stream_token(req_id, tokenizer, &mut state.requests)
+        {
+            disconnected.push(req_id);
         }
+    }
+
+    // Abort requests whose stream receivers have been dropped (client disconnect).
+    // Free KV cache blocks immediately; scheduler removal is deferred to the
+    // async loop via step_result.errored.
+    for &req_id in &disconnected {
+        if let Some(mut active) = state.requests.remove(&req_id) {
+            let _ = kv_cache_mgr.free_request(&mut active.state.block_table);
+            tracing::debug!(request_id = req_id, "Client disconnected, request aborted");
+        }
+        step_result.errored.push(req_id);
     }
 
     // Check completion

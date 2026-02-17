@@ -11,8 +11,9 @@
 //! - MLP: mlp.c_fc_0 (gate), mlp.c_fc_1 (up), mlp.c_proj (down)
 //! - Layer norms: attn.ln_1 (pre-attention), ln_2 (pre-MLP)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{rms_norm, RmsNorm, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

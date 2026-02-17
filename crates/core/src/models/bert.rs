@@ -19,7 +19,7 @@ use crate::kv_cache::{BlockTable, KVCacheManager};
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
 
-struct BertEmbeddings {
+pub(crate) struct BertEmbeddings {
     word_embeddings: Embedding,
     position_embeddings: Embedding,
     token_type_embeddings: Embedding,
@@ -27,7 +27,7 @@ struct BertEmbeddings {
 }
 
 impl BertEmbeddings {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let vocab_size = cfg.vocab_size;
         let max_position_embeddings = cfg.max_position_embeddings;
@@ -62,7 +62,7 @@ impl BertEmbeddings {
         })
     }
 
-    fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
 
         let word_emb = self.word_embeddings.forward(input_ids)?;
@@ -277,12 +277,12 @@ impl BertLayer {
 
 // ─── Encoder ────────────────────────────────────────────────────────────────
 
-struct BertEncoder {
+pub(crate) struct BertEncoder {
     layers: Vec<BertLayer>,
 }
 
 impl BertEncoder {
-    fn new(cfg: &ModelConfig, layer_norm_eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ModelConfig, layer_norm_eps: f64, vb: VarBuilder) -> Result<Self> {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             layers.push(BertLayer::new(
@@ -294,7 +294,7 @@ impl BertEncoder {
         Ok(Self { layers })
     }
 
-    fn forward(&self, mut hidden_states: Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, mut hidden_states: Tensor) -> Result<Tensor> {
         for layer in &self.layers {
             hidden_states = layer.forward(&hidden_states)?;
         }

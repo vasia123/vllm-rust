@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use vllm_core::lora::LoraRequest;
+use vllm_core::reasoning::ReasoningParser;
 use vllm_core::tokenizer::{ChatTemplateEngine, TokenizerWrapper};
 use vllm_core::tool_parser::ToolCallParser;
 
@@ -49,6 +50,8 @@ pub struct AppState {
     pub max_model_len: usize,
     /// Tool call parser for extracting function calls from model output.
     pub tool_call_parser: Arc<dyn ToolCallParser>,
+    /// Reasoning parser for extracting chain-of-thought content from model output.
+    pub reasoning_parser: Option<Arc<dyn ReasoningParser>>,
     /// Whether the server is accepting new requests.
     accepting: Arc<AtomicBool>,
     /// Count of in-flight GPU requests (for /load endpoint).
@@ -73,6 +76,7 @@ impl AppState {
         eos_token_id: u32,
         max_model_len: usize,
         tool_call_parser: Arc<dyn ToolCallParser>,
+        reasoning_parser: Option<Arc<dyn ReasoningParser>>,
         accepting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -83,6 +87,7 @@ impl AppState {
             eos_token_id,
             max_model_len,
             tool_call_parser,
+            reasoning_parser,
             accepting,
             server_load: Arc::new(AtomicUsize::new(0)),
             lora_adapters: Arc::new(RwLock::new(HashMap::new())),
@@ -155,6 +160,20 @@ pub fn create_tool_call_parser(name: &str) -> Arc<dyn ToolCallParser> {
             tracing::warn!("Unknown tool call parser '{unknown}', defaulting to hermes");
             Arc::new(HermesToolParser::new())
         }
+    }
+}
+
+/// Create a reasoning parser wrapped in `Arc`, or `None` if disabled.
+///
+/// An empty name or `"identity"` returns `None` (no reasoning extraction).
+/// Otherwise, creates the named parser via `vllm_core::reasoning::create_reasoning_parser`.
+pub fn create_reasoning_parser_arc(name: &str) -> Option<Arc<dyn ReasoningParser>> {
+    if name.is_empty() || name == "identity" {
+        None
+    } else {
+        Some(Arc::from(vllm_core::reasoning::create_reasoning_parser(
+            name,
+        )))
     }
 }
 
@@ -315,6 +334,101 @@ async fn get_server_load(
     })
 }
 
+/// POST /start_profile — Start performance profiling.
+///
+/// Stub endpoint for API compatibility with Python vLLM.
+/// Returns 200 OK immediately. Actual profiling can be added via
+/// external tools (perf, flamegraph, tokio-console).
+async fn start_profile() -> StatusCode {
+    tracing::info!("Profile start requested (stub)");
+    StatusCode::OK
+}
+
+/// POST /stop_profile — Stop performance profiling.
+///
+/// Stub endpoint for API compatibility with Python vLLM.
+async fn stop_profile() -> StatusCode {
+    tracing::info!("Profile stop requested (stub)");
+    StatusCode::OK
+}
+
+/// GET/POST /ping — Lightweight liveness probe for load balancers.
+///
+/// Always returns 200 OK regardless of server state.
+async fn ping() -> StatusCode {
+    StatusCode::OK
+}
+
+/// POST /reset_prefix_cache — Reset the prefix cache, evicting all cached blocks.
+///
+/// Compatible with vLLM's `/reset_prefix_cache` endpoint.
+/// Returns a JSON object with `{ "success": true }` on success.
+async fn reset_prefix_cache(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<impl axum::response::IntoResponse, error::ApiError> {
+    let num_evicted = state
+        .engine
+        .get()
+        .reset_prefix_cache()
+        .await
+        .map_err(|e| error::ApiError::EngineError(e.to_string()))?;
+
+    tracing::info!("Prefix cache reset: {num_evicted} blocks evicted");
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /sleep — Put the engine to sleep (pause with Keep mode).
+///
+/// Compatible with vLLM's `/sleep` endpoint.
+/// Paused engine keeps existing requests frozen but rejects new ones.
+async fn sleep_engine(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<impl axum::response::IntoResponse, error::ApiError> {
+    state
+        .engine
+        .get()
+        .pause(vllm_core::engine::PauseMode::Keep)
+        .await
+        .map_err(|e| error::ApiError::EngineError(e.to_string()))?;
+
+    tracing::info!("Engine put to sleep");
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /wake_up — Wake the engine from sleep (resume).
+///
+/// Compatible with vLLM's `/wake_up` endpoint.
+async fn wake_up_engine(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<impl axum::response::IntoResponse, error::ApiError> {
+    state
+        .engine
+        .get()
+        .resume()
+        .await
+        .map_err(|e| error::ApiError::EngineError(e.to_string()))?;
+
+    tracing::info!("Engine woken up");
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// GET /is_sleeping — Check if the engine is sleeping (paused).
+///
+/// Compatible with vLLM's `/is_sleeping` endpoint.
+async fn is_sleeping(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<impl axum::response::IntoResponse, error::ApiError> {
+    let paused = state
+        .engine
+        .get()
+        .is_paused()
+        .await
+        .map_err(|e| error::ApiError::EngineError(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "is_sleeping": paused })))
+}
+
 /// Request to load a LoRA adapter dynamically.
 #[derive(Debug, Deserialize)]
 pub struct LoadLoRAAdapterRequest {
@@ -364,6 +478,24 @@ async fn load_lora_adapter(
         "Success: LoRA adapter '{}' added successfully.",
         req.lora_name
     ))
+}
+
+/// GET /v1/lora_adapters — List all loaded LoRA adapters.
+async fn list_lora_adapters(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let adapters = state.lora_adapters.read().await;
+    let list: Vec<serde_json::Value> = adapters
+        .values()
+        .map(|lr| {
+            serde_json::json!({
+                "lora_name": lr.name,
+                "lora_int_id": lr.id,
+                "lora_path": lr.path,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "lora_adapters": list }))
 }
 
 /// POST /v1/unload_lora_adapter — Unload a LoRA adapter.
@@ -502,7 +634,17 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
         .route("/load", get(get_server_load))
         .route("/metrics", get(prometheus_metrics))
         .route("/server_info", get(server_info))
+        .route("/ping", get(ping).post(ping))
+        .route("/reset_prefix_cache", post(reset_prefix_cache))
+        .route("/sleep", post(sleep_engine))
+        .route("/wake_up", post(wake_up_engine))
+        .route("/is_sleeping", get(is_sleeping))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
+        .route("/tokenize", post(tokenize::tokenize))
+        .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
+        .route("/v1/models/{model_id}", get(models::retrieve_model))
         .route("/v1/completions", post(completions::create_completion))
         .route(
             "/v1/completions/render",
@@ -528,6 +670,7 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
         .route("/v1/classify", post(embeddings::classify))
         .route("/v1/load_lora_adapter", post(load_lora_adapter))
         .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
+        .route("/v1/lora_adapters", get(list_lora_adapters))
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))
         .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
@@ -606,7 +749,17 @@ pub fn create_full_router_with_all_options(
         .route("/load", get(get_server_load))
         .route("/metrics", get(prometheus_metrics))
         .route("/server_info", get(server_info))
+        .route("/ping", get(ping).post(ping))
+        .route("/reset_prefix_cache", post(reset_prefix_cache))
+        .route("/sleep", post(sleep_engine))
+        .route("/wake_up", post(wake_up_engine))
+        .route("/is_sleeping", get(is_sleeping))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
+        .route("/tokenize", post(tokenize::tokenize))
+        .route("/detokenize", post(tokenize::detokenize))
         .route("/v1/models", get(models::list_models))
+        .route("/v1/models/{model_id}", get(models::retrieve_model))
         .route("/v1/completions", post(completions::create_completion))
         .route(
             "/v1/completions/render",
@@ -632,6 +785,7 @@ pub fn create_full_router_with_all_options(
         .route("/v1/classify", post(embeddings::classify))
         .route("/v1/load_lora_adapter", post(load_lora_adapter))
         .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
+        .route("/v1/lora_adapters", get(list_lora_adapters))
         .route("/v1/tokenize", post(tokenize::tokenize))
         .route("/v1/detokenize", post(tokenize::detokenize))
         .route("/tokenizer_info", get(tokenize::get_tokenizer_info))
@@ -757,6 +911,7 @@ mod tests {
             999,
             max_model_len,
             create_tool_call_parser("hermes"),
+            None,
             accepting,
         )
     }
@@ -2169,6 +2324,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_lora_adapters_empty() {
+        let state = test_app_state();
+        let router = create_router(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/lora_adapters")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["lora_adapters"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_lora_adapters_returns_loaded() {
+        let state = test_app_state();
+        state.lora_adapters.write().await.insert(
+            "adapter-a".into(),
+            LoraRequest::new("adapter-a", 1, "/path/a"),
+        );
+        state.lora_adapters.write().await.insert(
+            "adapter-b".into(),
+            LoraRequest::new("adapter-b", 2, "/path/b"),
+        );
+        let router = create_router(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/lora_adapters")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let adapters = json["lora_adapters"].as_array().unwrap();
+        assert_eq!(adapters.len(), 2);
+        // Verify adapter data is present (order may vary due to HashMap)
+        let names: Vec<&str> = adapters
+            .iter()
+            .map(|a| a["lora_name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"adapter-a"));
+        assert!(names.contains(&"adapter-b"));
+    }
+
+    #[tokio::test]
     async fn get_response_retrieves_stored_response() {
         let state = test_app_state();
         // Pre-populate the response store
@@ -2322,5 +2529,129 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn ping_get_returns_ok() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let req = Request::get("/ping").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ping_post_returns_ok() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let req = Request::post("/ping").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tokenize_root_alias_exists() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": "hello world"
+        });
+        let req = Request::post("/tokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn detokenize_root_alias_exists() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "tokens": [1, 2, 3]
+        });
+        let req = Request::post("/detokenize")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reset_prefix_cache_returns_success() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let req = Request::post("/reset_prefix_cache")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+    }
+
+    #[tokio::test]
+    async fn sleep_and_wake_endpoints() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        // Sleep the engine
+        let req = Request::post("/sleep").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check it's sleeping
+        let req = Request::get("/is_sleeping").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["is_sleeping"], true);
+
+        // Wake up
+        let req = Request::post("/wake_up").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check it's awake
+        let req = Request::get("/is_sleeping").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["is_sleeping"], false);
+    }
+
+    #[tokio::test]
+    async fn is_sleeping_default_false() {
+        let state = test_app_state();
+        let app = create_router(state);
+
+        let req = Request::get("/is_sleeping").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["is_sleeping"], false);
     }
 }

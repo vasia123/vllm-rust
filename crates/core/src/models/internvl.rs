@@ -175,7 +175,7 @@ impl InternVLConfig {
     }
 
     /// Effective number of vision encoder layers to run.
-    fn effective_depth(&self) -> usize {
+    pub(crate) fn effective_depth(&self) -> usize {
         let total = self.vision_config.num_hidden_layers as i32;
         if self.select_layer < 0 {
             (total + self.select_layer + 1) as usize
@@ -480,14 +480,14 @@ impl InternVisionBlock {
 
 /// InternViT vision encoder.
 #[allow(dead_code)]
-struct InternVisionModel {
+pub(crate) struct InternVisionModel {
     embeddings: InternVisionEmbeddings,
     blocks: Vec<InternVisionBlock>,
 }
 
 #[allow(dead_code)]
 impl InternVisionModel {
-    fn new(cfg: &InternVLVisionConfig, depth: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &InternVLVisionConfig, depth: usize, vb: VarBuilder) -> Result<Self> {
         let embeddings = InternVisionEmbeddings::new(cfg, vb.pp("embeddings"))?;
 
         let mut blocks = Vec::with_capacity(depth);
@@ -518,7 +518,7 @@ impl InternVisionModel {
 /// Input: [B, H*W, C] -> Output: [B, (H*s)*(W*s), C/(s*s)]
 /// where s = downsample_ratio (typically 0.5, meaning spatial halved, channels 4x)
 #[allow(dead_code)]
-fn pixel_shuffle(x: &Tensor, grid_size: usize, downsample_ratio: f64) -> Result<Tensor> {
+pub(crate) fn pixel_shuffle(x: &Tensor, grid_size: usize, downsample_ratio: f64) -> Result<Tensor> {
     let (batch, _seq, channels) = x.dims3()?;
     let h = grid_size;
     let w = grid_size;

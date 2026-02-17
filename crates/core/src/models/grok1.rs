@@ -12,8 +12,9 @@
 //! - `Grok1ForCausalLM`
 //! - `Grok1ModelForCausalLM`
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
-use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};

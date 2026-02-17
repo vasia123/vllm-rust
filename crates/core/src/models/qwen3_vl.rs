@@ -13,8 +13,9 @@
 //!
 //! Reference: Qwen3-VL (https://github.com/QwenLM/Qwen3-VL)
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{layer_norm, rms_norm, LayerNorm, Linear, RmsNorm, VarBuilder};
+use candle_nn::{layer_norm, LayerNorm, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;

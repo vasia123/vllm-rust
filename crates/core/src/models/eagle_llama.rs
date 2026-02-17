@@ -11,8 +11,9 @@
 //!
 //! Reference: `reference/vllm/vllm/model_executor/models/llama_eagle.py`
 
+use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{Device, Module, Result, Tensor};
-use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
