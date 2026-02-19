@@ -774,7 +774,7 @@ impl FfnVariant {
 
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
-struct Step3p5DecoderLayer {
+pub(crate) struct Step3p5DecoderLayer {
     self_attn: Step3p5Attention,
     ffn: FfnVariant,
     input_layernorm: RmsNorm,
@@ -826,8 +826,14 @@ impl Step3p5DecoderLayer {
         })
     }
 
+    pub(crate) fn new_for_mtp(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let step_cfg = Step3p5Config::from_model_config(cfg);
+        let pg = LocalProcessGroup::new();
+        Self::new_with_tp(cfg, &step_cfg, layer_idx, vb, &pg)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

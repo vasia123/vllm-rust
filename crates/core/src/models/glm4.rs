@@ -308,7 +308,7 @@ impl Glm4Attention {
 /// input_layernorm → Attention → post_self_attn_layernorm → residual add
 /// post_attention_layernorm → MLP → post_mlp_layernorm → residual add
 /// ```
-struct Glm4DecoderLayer {
+pub(crate) struct Glm4DecoderLayer {
     self_attn: Glm4Attention,
     mlp: TpSwiGluMlp,
     input_layernorm: RmsNorm,
@@ -350,8 +350,13 @@ impl Glm4DecoderLayer {
         })
     }
 
+    pub(crate) fn new_for_mtp(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let pg = LocalProcessGroup::new();
+        Self::new_with_tp(cfg, vb, &pg)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

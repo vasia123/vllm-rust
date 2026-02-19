@@ -38,13 +38,13 @@ use super::tp_layers::{TpContext, TpEmbedding, TpLinear, TpSwiGluMlp};
 
 // ─── Gemma-style RMSNorm (offset by +1, for Q/K norms) ─────────────────────
 
-struct Qwen3NextRmsNorm {
+pub(crate) struct Qwen3NextRmsNorm {
     weight: Tensor,
     eps: f64,
 }
 
 impl Qwen3NextRmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(size, "weight")?;
         Ok(Self { weight, eps })
     }
@@ -458,7 +458,7 @@ enum Qwen3NextMlp {
 }
 
 #[allow(dead_code)]
-struct Qwen3NextDecoderLayer {
+pub(crate) struct Qwen3NextDecoderLayer {
     self_attn: Option<Qwen3NextAttention>,
     mlp: Qwen3NextMlp,
     input_layernorm: Qwen3NextRmsNorm,
@@ -570,8 +570,14 @@ impl Qwen3NextDecoderLayer {
         })
     }
 
+    pub(crate) fn new_for_mtp(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let extra_cfg = Qwen3NextExtraConfig::from_model_config(cfg);
+        let pg = LocalProcessGroup::new();
+        Self::new_with_tp(cfg, &extra_cfg, layer_idx, vb, &pg)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

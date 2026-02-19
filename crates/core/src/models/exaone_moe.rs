@@ -280,7 +280,7 @@ impl FfnVariant {
 
 // ---- Decoder Layer (Pre-LN) ------------------------------------------------
 
-struct ExaoneMoeDecoderLayer {
+pub(crate) struct ExaoneMoeDecoderLayer {
     self_attn: ExaoneMoeAttention,
     ffn: FfnVariant,
     input_layernorm: RmsNorm,
@@ -344,8 +344,13 @@ impl ExaoneMoeDecoderLayer {
         })
     }
 
+    pub(crate) fn new_for_mtp(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let moe_cfg = ExaoneMoeConfig::from_model_config(cfg);
+        Self::new(cfg, &moe_cfg, layer_idx, vb)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

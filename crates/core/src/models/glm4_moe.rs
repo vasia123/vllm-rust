@@ -550,7 +550,7 @@ impl MlpVariant {
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
 
-struct Glm4MoeDecoderLayer {
+pub(crate) struct Glm4MoeDecoderLayer {
     self_attn: Glm4MoeAttention,
     mlp: MlpVariant,
     input_layernorm: RmsNorm,
@@ -599,8 +599,13 @@ impl Glm4MoeDecoderLayer {
         })
     }
 
+    pub(crate) fn new_for_mtp(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let pg = LocalProcessGroup::new();
+        Self::new_with_tp(cfg, layer_idx, vb, &pg)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

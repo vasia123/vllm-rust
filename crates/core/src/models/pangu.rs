@@ -601,7 +601,7 @@ impl PanguAttention {
 
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
-struct PanguDecoderLayer {
+pub(crate) struct PanguDecoderLayer {
     self_attn: PanguAttention,
     ffn: FfnVariant,
     input_layernorm: RmsNorm,
@@ -666,8 +666,14 @@ impl PanguDecoderLayer {
         })
     }
 
+    pub(crate) fn new_for_mtp(cfg: &ModelConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let pangu_cfg = PanguConfig::from_model_config(cfg);
+        let pg = LocalProcessGroup::new();
+        Self::new_with_tp(cfg, &pangu_cfg, layer_idx, vb, &pg)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

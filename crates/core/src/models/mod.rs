@@ -35,10 +35,12 @@ pub mod eagle3;
 pub mod eagle3_mistral_large3;
 pub mod eagle_llama;
 pub mod ernie45_moe;
+pub mod ernie_mtp;
 pub mod exaone;
 pub mod exaone4;
 pub mod exaone4_quantized;
 pub mod exaone_moe;
+pub mod exaone_moe_mtp;
 pub mod exaone_quantized;
 pub mod falcon;
 pub mod falcon_h1;
@@ -60,8 +62,10 @@ pub mod gemma_quantized;
 pub mod glm;
 pub mod glm4;
 pub mod glm4_moe;
+pub mod glm4_moe_mtp;
 pub mod glm4_quantized;
 pub mod glm4v;
+pub mod glm_ocr_mtp;
 pub mod glm_quantized;
 pub mod gpt2;
 pub mod gpt2_quantized;
@@ -106,8 +110,10 @@ pub mod llama_quantized;
 pub mod llava;
 pub mod llava_onevision;
 pub mod longcat_flash;
+pub mod longcat_flash_mtp;
 pub mod mamba;
 pub mod mamba2;
+pub mod mimo_mtp;
 pub mod mimo_v2_flash;
 pub mod minicpm;
 pub mod minicpm3;
@@ -137,6 +143,7 @@ pub mod olmo2;
 pub mod olmo2_lora;
 pub mod olmo2_quantized;
 pub mod olmoe;
+pub mod openpangu_mtp;
 pub mod opt;
 pub mod opt_quantized;
 pub mod ouro;
@@ -169,6 +176,7 @@ pub mod qwen3;
 pub mod qwen3_lora;
 pub mod qwen3_moe;
 pub mod qwen3_next;
+pub mod qwen3_next_mtp;
 pub mod qwen3_quantized;
 pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
@@ -181,6 +189,7 @@ pub mod step1;
 pub mod step1_quantized;
 pub mod step3_text;
 pub mod step3p5;
+pub mod step3p5_mtp;
 pub mod t5;
 pub mod tp_layers;
 pub mod voyage;
@@ -224,10 +233,12 @@ pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
 pub use eagle_llama::{Eagle1DraftModel, EagleLlamaForCausalLM};
 pub use ernie45_moe::Ernie45MoeForCausalLM;
+pub use ernie_mtp::ErnieMtpModel;
 pub use exaone::ExaoneForCausalLM;
 pub use exaone4::Exaone4ForCausalLM;
 pub use exaone4_quantized::QuantizedExaone4ForCausalLM;
 pub use exaone_moe::ExaoneMoeForCausalLM;
+pub use exaone_moe_mtp::ExaoneMoeMtpModel;
 pub use exaone_quantized::QuantizedExaoneForCausalLM;
 pub use falcon::FalconForCausalLM;
 pub use falcon_h1::FalconH1ForCausalLM;
@@ -249,8 +260,10 @@ pub use gemma_quantized::QuantizedGemmaForCausalLM;
 pub use glm::GlmForCausalLM;
 pub use glm4::Glm4ForCausalLM;
 pub use glm4_moe::Glm4MoeForCausalLM;
+pub use glm4_moe_mtp::Glm4MoeMtpModel;
 pub use glm4_quantized::QuantizedGlm4ForCausalLM;
 pub use glm4v::Glm4VForConditionalGeneration;
+pub use glm_ocr_mtp::GlmOcrMtpModel;
 pub use glm_quantized::QuantizedGlmForCausalLM;
 pub use gpt2::GPT2LMHeadModel;
 pub use gpt2_quantized::QuantizedGPT2LMHeadModel;
@@ -295,8 +308,10 @@ pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use llava::LLaVAForConditionalGeneration;
 pub use llava_onevision::LlavaOnevisionForConditionalGeneration;
 pub use longcat_flash::LongcatFlashForCausalLM;
+pub use longcat_flash_mtp::LongCatFlashMtpModel;
 pub use mamba::MambaForCausalLM;
 pub use mamba2::Mamba2ForCausalLM;
+pub use mimo_mtp::MiMoMtpModel;
 pub use mimo_v2_flash::MiMoV2FlashForCausalLM;
 pub use minicpm::MiniCPMForCausalLM;
 pub use minicpm3::MiniCPM3ForCausalLM;
@@ -326,6 +341,7 @@ pub use olmo2::Olmo2ForCausalLM;
 pub use olmo2_lora::Olmo2WithLora;
 pub use olmo2_quantized::QuantizedOlmo2ForCausalLM;
 pub use olmoe::OlmoeForCausalLM;
+pub use openpangu_mtp::OpenPanguMtpModel;
 pub use opt::OPTForCausalLM;
 pub use opt_quantized::QuantizedOPTForCausalLM;
 pub use ouro::OuroForCausalLM;
@@ -358,6 +374,7 @@ pub use qwen3::Qwen3ForCausalLM;
 pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_moe::Qwen3MoeForCausalLM;
 pub use qwen3_next::Qwen3NextForCausalLM;
+pub use qwen3_next_mtp::Qwen3NextMtpModel;
 pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
 pub use qwen3_vl::Qwen3VLForConditionalGeneration;
 pub use qwen3_vl_moe::Qwen3VLMoeForConditionalGeneration;
@@ -372,6 +389,7 @@ pub use step1::Step1ForCausalLM;
 pub use step1_quantized::QuantizedStep1ForCausalLM;
 pub use step3_text::Step3TextForCausalLM;
 pub use step3p5::Step3p5ForCausalLM;
+pub use step3p5_mtp::Step3p5MtpModel;
 pub use t5::T5ForConditionalGeneration;
 pub use voyage::VoyageForEmbedding;
 pub use yi::YiForCausalLM;
@@ -973,6 +991,31 @@ pub fn from_config_with_quant(
 /// This is useful for checking quantization before loading.
 pub fn detect_quantization(model_dir: &Path) -> DetectedQuantConfig {
     detect_from_directory(model_dir)
+}
+
+/// Construct the appropriate MTP draft model from `cfg.architectures[0]`.
+///
+/// Used by the speculative decoding engine to load the correct MTP model type.
+pub fn mtp_from_config(
+    cfg: &ModelConfig,
+    vb: VarBuilder,
+) -> Result<Box<dyn MtpDraftModel>, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        "DeepSeekMTPModel" | "EagleDeepSeekMTPModel" => {
+            Ok(Box::new(DeepSeekMtpModel::new(cfg, vb)?))
+        }
+        "ErnieMTPModel" => Ok(Box::new(ErnieMtpModel::new(cfg, vb)?)),
+        "ExaoneMoeMTP" => Ok(Box::new(ExaoneMoeMtpModel::new(cfg, vb)?)),
+        "Glm4MoeMTPModel" | "Glm4MoeLiteMTPModel" => Ok(Box::new(Glm4MoeMtpModel::new(cfg, vb)?)),
+        "GlmOcrMTPModel" => Ok(Box::new(GlmOcrMtpModel::new(cfg, vb)?)),
+        "LongCatFlashMTPModel" => Ok(Box::new(LongCatFlashMtpModel::new(cfg, vb)?)),
+        "MiMoMTPModel" => Ok(Box::new(MiMoMtpModel::new(cfg, vb)?)),
+        "OpenPanguMTPModel" => Ok(Box::new(OpenPanguMtpModel::new(cfg, vb)?)),
+        "Qwen3NextMTP" => Ok(Box::new(Qwen3NextMtpModel::new(cfg, vb)?)),
+        "Step3p5MTP" => Ok(Box::new(Step3p5MtpModel::new(cfg, vb)?)),
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
 }
 
 /// Create a KVCacheManager appropriate for the given model configuration.
