@@ -1,18 +1,18 @@
 # Feature Gap Analysis: vLLM-Rust vs Python vLLM
 
-**Date:** 2026-02-19 (updated)
+**Date:** 2026-02-19 (re-verified against codebase)
 **Reference vLLM commit:** `3025b3c` (2026-02-09)
-**Rust model files:** 185 | **Python model files:** 240
+**Rust model files:** 185+ | **Python model files:** 240
 
 ## Summary
 
-vLLM-Rust implements core text generation, sampling, KV cache, speculative decoding, LoRA, MoE, and a full OpenAI-compatible serving layer. The primary remaining gaps are: VLM/audio models (~50+), MTP framework (11 models), distributed inference (PP/DP/CP/EP), and advanced quantization methods.
+vLLM-Rust implements core text generation, sampling, KV cache, speculative decoding, LoRA, MoE, and a full OpenAI-compatible serving layer. The primary remaining gaps are: VLM/audio models (~35+), MTP framework (11 models), distributed inference (PP/DP/CP/EP), and advanced quantization methods.
 
-Many Python model files that appear "missing" by filename are actually handled via architecture aliases in Rust (e.g., Orion/Solar/TeleChat → Llama, Mistral-Large-3 → DeepSeek, ERNIE-4.5 → Ernie45Moe, Bee → LLaVA-OneVision, OpenCUA → Qwen2.5-VL).
+Many Python model files that appear "missing" by filename are actually handled via architecture aliases in Rust (e.g., Orion/Solar/TeleChat → Llama, Mistral-Large-3 → DeepSeek, ERNIE-4.5 → Ernie45Moe, Bee → LLaVA-OneVision, OpenCUA → Qwen2.5-VL, LLaVA-Next → LLaVA, SmolVLM → Idefics3, Tarsier → Qwen2VL, H2O-VL/SkyWork-R1V → InternVL).
 
 | Category | Python | Rust | Coverage |
 |----------|--------|------|----------|
-| Model architectures (unique) | ~160 | ~140 | ~88% |
+| Model architectures (unique) | ~160 | ~150 | ~94% |
 | Quantization methods | 20+ | 10 | 50% |
 | Attention backends (V1) | 20+ | 5 | 25% |
 | Tool call parsers | 31 | 30 | **97%** |
@@ -41,8 +41,8 @@ Many Python model files that appear "missing" by filename are actually handled v
 | **Models** | 185 files: ~140 architectures via aliases + quantized/LoRA variants |
 | **LoRA** | Per-request adapter loading, 11 model families, multi-adapter serving |
 | **MoE** | Fused MoE, expert parallelism, token dispatch, quantized experts, top-k softmax router |
-| **Multimodal** | 13+ VLMs (LLaVA, Qwen2-VL/2.5-VL/3-VL, Gemma3-VLM, InternVL, Pixtral, etc.), CLIP + SigLIP + InternViT vision encoders |
-| **Distributed** | NCCL communicator, process group, TP layers (28 architectures with `new_with_tp`), PP design (not enabled) |
+| **Multimodal** | 23+ VLMs (LLaVA/Next/Next-Video, Qwen2-VL/2.5-VL/3-VL, Gemma3-VLM/MM/n-MM, InternVL, Pixtral, MLLaMA4, AyaVision/Cohere2Vision, Idefics3/SmolVLM, Bagel, NVLM-D, Fuyu, etc.), CLIP + SigLIP + InternViT vision encoders |
+| **Distributed** | NCCL communicator, process group, TP layers (40+ architectures with `new_with_tp`), PP design (not enabled) |
 | **Tool Calling** | 30 parser names → 28 unique parsers (Hermes, Mistral, DeepSeek v3/v3.1/v3.2, LLaMA, Qwen3Coder/XML, GLM4/4.7/MoE, Granite/20b-FC, HunYuan, ERNIE, etc.) |
 | **Reasoning** | 15 parsers (DeepSeek-R1/V3, Qwen3, Mistral, Step3/3.5, ERNIE-4.5, Granite, Olmo3, SeedOSS, MiniMax-M2, HunYuan-A13B, Identity) |
 | **SSM** | Mamba/Mamba2, Zamba2, Bamba state-space models |
@@ -78,7 +78,19 @@ These Python model files have separate `.py` files but map to existing Rust impl
 | `lfm2_moe.py` | `Lfm2MoeForCausalLM` | `lfm2.rs` |
 | `bee.py` | `BeeForConditionalGeneration` | `LlavaOnevisionForConditionalGeneration` |
 | `opencua.py` | `OpenCUAForConditionalGeneration` | `Qwen2_5_VLForConditionalGeneration` |
+| `llava_next.py` | `LlavaNextForConditionalGeneration` | `LLaVAForConditionalGeneration` (`llava.rs`) |
+| `llava_next_video.py` | `LlavaNextVideoForConditionalGeneration` | `LlavaOnevisionForConditionalGeneration` |
+| `gemma3_mm.py` | `Gemma3ForConditionalGeneration` | `gemma3_vlm.rs` (uses standard SigLIP, not SigLIP2-NaViT) |
+| `gemma3n_mm.py` | `Gemma3nForConditionalGeneration` | `gemma3n_vlm.rs` |
+| `mllama4.py` | `MLlama4ForConditionalGeneration` | `llama4_vl.rs` |
+| `cohere2_vision.py` | `Cohere2VisionForConditionalGeneration` | `aya_vision.rs` |
+| `h2ovl.py` | `H2OVLChatModel` | `InternVLChatModel` |
+| `skyworkr1v.py` | `SkyworkR1VChatModel` | `InternVLChatModel` |
+| `tarsier.py` | `Tarsier2ForConditionalGeneration` | `Qwen2VLForConditionalGeneration` |
+| `smolvlm.py` | `SmolVLMForConditionalGeneration` | `idefics3.rs` (SmolVLM is Idefics3 alias) |
 | `qwen2_rm.py` | `Qwen2ForRewardModel` | `qwen2_reward.rs` |
+| `roberta.py` | `RobertaModel`, `RobertaForMaskedLM` | `BertForSequenceEmbedding` (`bert.rs`) |
+| `bert_with_rope.py` | `GteNewModel`, `NomicBertModel`, `SnowflakeGteNewModel` | `GteNewForEmbedding` (`gte.rs`) |
 | `clip.py`, `siglip.py` | Vision encoders | `multimodal/vision.rs` |
 | `intern_vit.py` | InternViT | inline in `internvl.rs` |
 
@@ -93,7 +105,7 @@ These Python model files have separate `.py` files but map to existing Rust impl
 | CLIP | `clip.py` | **DONE** (`multimodal/vision.rs`) |
 | SigLIP | `siglip.py` | **DONE** (`multimodal/vision.rs`) |
 | InternViT | `intern_vit.py` | **DONE** (inline in `internvl.rs`) |
-| SigLIP2-NaViT | `siglip2navit.py` | P1 — needed by Gemma3-MM, LFM2-VL |
+| SigLIP2-NaViT | `siglip2navit.py` | P1 — needed by LFM2-VL (Gemma3-MM uses standard SigLIP — already DONE) |
 | LFM2-SigLIP2 | `lfm2_siglip2.py` | P2 — LFM2-specific SigLIP2 variant |
 | Swin | `swin.py` | P2 |
 | MoonViT | `moonvit.py` | P2 |
@@ -107,33 +119,23 @@ These Python model files have separate `.py` files but map to existing Rust impl
 
 | Model | Python File | Blocked By |
 |-------|------------|------------|
-| LLaVA-Next | `llava_next.py` | Dynamic resolution patch merging |
-| LLaVA-Next-Video | `llava_next_video.py` | Dynamic resolution patch merging |
 | Kimi-VL | `kimi_vl.py` | — |
 | Kimi-K2.5-VL | `kimi_k25.py`, `kimi_k25_vit.py` | — |
-| Gemma3-MM | `gemma3_mm.py` | SigLIP2-NaViT |
-| Gemma3n-MM | `gemma3n_mm.py` | — |
-| MLLaMA4 | `mllama4.py` | — |
 | InternS1 / Pro | `interns1.py`, `interns1_pro.py`, `interns1_vit.py` | — (InternViT done) |
 | ERNIE4.5-VL | `ernie45_vl.py`, `ernie45_vl_moe.py` | ernie45_vl_rope |
 | Step3-VL | `step3_vl.py`, `step_vl.py` | — |
 | Qwen2.5-Omni-Thinker | `qwen2_5_omni_thinker.py` | — |
 | Qwen3-Omni-MoE-Thinker | `qwen3_omni_moe_thinker.py` | — |
-| Cohere2-Vision | `cohere2_vision.py` | — |
 | HyperClovaX-Vision | `hyperclovax_vision.py` | — |
 
 **P2 (established):**
 
 | Model | Python File |
 |-------|------------|
-| H2O-VL | `h2ovl.py` |
 | Ovis / Ovis2.5 | `ovis.py`, `ovis2_5.py` |
 | Isaac | `isaac.py` |
 | Keye / Keye-VL1.5 | `keye.py`, `keye_vl1_5.py` |
 | Kanana-V | `kanana_v.py` |
-| SkyWork-R1V | `skyworkr1v.py` |
-| Tarsier | `tarsier.py` |
-| SmolVLM | `smolvlm.py` |
 | MiniMax-VL-01 | `minimax_vl_01.py` |
 | Nemotron-VL / Nano | `nemotron_vl.py`, `nano_nemotron_vl.py` |
 | Hunyuan-Vision | `hunyuan_vision.py` |
@@ -177,20 +179,22 @@ Most Python text models already work via aliases (see table above). Genuinely mi
 
 ### 1.5 Missing Embedding/Encoder Models
 
-| Model | Python File | Priority |
-|-------|------------|----------|
-| RoBERTa | `roberta.py` | P1 |
-| BERT-with-RoPE (GTE-New, Nomic, Snowflake) | `bert_with_rope.py` | P1 |
+All previously listed P1 gaps are now **DONE** — see alias table above. No remaining P1 gaps in this category.
+
+| Model | Python File | Priority | Status |
+|-------|------------|----------|--------|
+| RoBERTa | `roberta.py` | P1 | **DONE** — `bert.rs` (`BertForSequenceEmbedding` covers `RobertaModel`, `RobertaForMaskedLM`) |
+| BERT-with-RoPE (GTE-New, Nomic, Snowflake) | `bert_with_rope.py` | P1 | **DONE** — `gte.rs` (`GteNewForEmbedding`) |
 
 ### 1.6 Missing Speculative Decode Draft Models
 
 | Model | Python File | Priority | Status |
 |-------|------------|----------|--------|
 | Eagle3-Mistral-Large3 | `mistral_large_3_eagle.py` | P1 | **DONE** (`eagle3_mistral_large3.rs`) |
-| Medusa (model file) | `medusa.py` | P1 | Proposer exists; model loader missing |
+| LLaMA-Eagle | `llama_eagle.py` | P1 | **DONE** (`eagle_llama.rs`, loaded by `eagle1_proposer.rs`) |
+| LLaMA-Eagle3 | `llama_eagle3.py` | P1 | **DONE** (`eagle3.rs`, loaded by `eagle3_proposer.rs`) |
+| Medusa (model file) | `medusa.py` | P1 | Proposer exists; `from_config()` match arm missing |
 | DeepSeek-Eagle | `deepseek_eagle.py` | P1 | — |
-| LLaMA-Eagle | `llama_eagle.py` | P1 | — |
-| LLaMA-Eagle3 | `llama_eagle3.py` | P1 | — |
 | LLaMA4-Eagle | `llama4_eagle.py` | P1 | — |
 | MiniCPM-Eagle | `minicpm_eagle.py` | P2 | — |
 
@@ -347,7 +351,7 @@ MTP is a critical gap — no framework or models exist in Rust yet.
 ### Current State
 - `crates/core/src/distributed/` — ProcessGroup, NCCL communicator, launcher
 - `tp_layers.rs` — TpLinear, TpEmbedding, TpGeGluMlp, TpSwiGluMlp
-- `from_config_with_tp()` — 28 architectures (Llama, Mistral, Mixtral, Qwen2/3/MoE, GLM4/MoE, Gemma/2/3, Phi3, OLMo2, Baichuan, InternLM2, Cohere, GPTNeoX, StarCoder2, Bloom, Falcon, Phi, Yi, GPT2, Exaone, Persimmon, MPT, Dbrx, SeedOss, ERNIE45, HunYuan, Pangu, Lfm2, MiMo)
+- `from_config_with_tp()` — 40+ architectures (Llama, Mistral, Mixtral, Qwen2/3/MoE, GLM4/MoE, Gemma/2/3, Phi3, OLMo2, Baichuan, InternLM2, Cohere, GPTNeoX, StarCoder2, Bloom, Falcon, Phi, Yi, GPT2, Exaone, Persimmon, MPT, Dbrx, SeedOss, ERNIE45, HunYuan, Pangu, Lfm2, MiMo, and more)
 - `crates/core/src/engine/pipeline.rs` — PipelineForward trait, worker loop
 - **PP returns error if world_size > 1.** TP verified for above architectures.
 
@@ -418,23 +422,32 @@ MTP is a critical gap — no framework or models exist in Rust yet.
 4. ~~MRoPE~~ — **DONE** (`qwen2_vl.rs`)
 5. ~~DeepSeek scaling RoPE~~ — **DONE** (`deepseek.rs`)
 6. ~~Eagle3-Mistral-Large3~~ — **DONE** (`eagle3_mistral_large3.rs`)
-7. ~~Tool parsers: OpenAI, Qwen3-XML, Step3p5, HunYuan, GLM4-MoE, Granite-20b-FC~~ — **DONE**
-8. ~~Responses API~~ — **DONE** (`responses.rs`)
+7. ~~LLaMA-Eagle / LLaMA-Eagle3~~ — **DONE** (`eagle_llama.rs`, `eagle3.rs`)
+8. ~~Tool parsers: OpenAI, Qwen3-XML, Step3p5, HunYuan, GLM4-MoE, Granite-20b-FC~~ — **DONE**
+9. ~~Responses API~~ — **DONE** (`responses.rs`)
+10. ~~RoBERTa embedding~~ — **DONE** (`bert.rs`)
+11. ~~BERT-with-RoPE (GTE-New, Nomic, Snowflake)~~ — **DONE** (`gte.rs`)
+12. ~~LLaVA-Next, LLaVA-Next-Video~~ — **DONE** (aliases in `mod.rs`)
+13. ~~Gemma3-MM, Gemma3n-MM~~ — **DONE** (`gemma3_vlm.rs`, `gemma3n_vlm.rs`)
+14. ~~MLLaMA4~~ — **DONE** (`llama4_vl.rs`)
+15. ~~Cohere2-Vision~~ — **DONE** (`aya_vision.rs`)
+16. ~~H2O-VL, SkyWork-R1V~~ — **DONE** (aliases → `InternVLChatModel`)
+17. ~~Tarsier, SmolVLM~~ — **DONE** (aliases → Qwen2VL, Idefics3)
 
 ### Phase 1: MTP + High-Impact Models
 1. **MTP framework** — proposer trait + verification loop in `speculative/`
 2. **DeepSeek-MTP** model — most demanded MTP variant
-3. **RoBERTa + BERT-with-RoPE** — widely used embeddings
-4. **SigLIP2-NaViT** vision encoder → unblocks Gemma3-MM + other VLMs
+3. ~~**RoBERTa + BERT-with-RoPE**~~ — **DONE** (`bert.rs`, `gte.rs`)
+4. **SigLIP2-NaViT** vision encoder → unblocks LFM2-VL (Gemma3-MM already DONE)
 5. **GPT-OSS reasoning parser** — single missing parser
 6. CUDA graphs: end-to-end verification
 7. Resolve P1 TODOs: phi4mm, molmo2, processor video
 
 ### Phase 2: VLM & Audio Expansion
 1. Whisper + audio pipeline → unlocks Qwen2-Audio, Ultravox, Qwen3-ASR
-2. P1 VLMs: LLaVA-Next, Kimi-VL, Gemma3-MM, MLLaMA4, InternS1, ERNIE4.5-VL, Step3-VL
-3. RoPE: ernie45_vl, llama4_vision, mrope_interleaved, fope, xdrope
-4. Spec decode models: DeepSeek-Eagle, LLaMA-Eagle/3, Medusa loader
+2. Remaining P1 VLMs: Kimi-VL, InternS1, ERNIE4.5-VL, Step3-VL, Qwen2.5/3-Omni, HyperClovaX-Vision
+3. RoPE: ernie45_vl, mrope_interleaved, fope, xdrope
+4. Spec decode models: DeepSeek-Eagle, LLaMA4-Eagle, Medusa loader (LLaMA-Eagle/3 DONE)
 
 ### Phase 3: Infrastructure Hardening
 1. Pipeline Parallelism — enable existing code, add tests
