@@ -25,6 +25,7 @@ mod communicator;
 mod context_parallel;
 mod data_parallel;
 mod error;
+mod expert_parallel;
 #[cfg(feature = "cuda")]
 mod launcher;
 #[cfg(feature = "cuda")]
@@ -43,6 +44,7 @@ pub use data_parallel::{
     coordinate_batch_across_dp, request_belongs_to_rank, BatchCoordinationResult, DpContext,
 };
 pub use error::DistributedError;
+pub use expert_parallel::ExpertParallelContext;
 #[cfg(feature = "cuda")]
 pub use launcher::{DistributedConfig, NcclProcessGroup};
 #[cfg(feature = "cuda")]

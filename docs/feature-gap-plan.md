@@ -8,27 +8,50 @@ Bring vLLM-Rust to complete feature parity with Python vLLM `3025b3c`. Tasks ord
 
 ## Tier 1: New Infrastructure (Hardest — Architectural)
 
-### 1.1 Context Parallelism (CP)
-**Difficulty:** ★★★★★ | **Effort:** 4–6 weeks
-- No existing infrastructure; requires ring-attention or sequence-parallel pattern
-- Rewrite attention backends to split seqlen across ranks
-- Heavy interaction with FlashInfer / MLA backends
-- **Files to create:** `crates/core/src/distributed/context_parallel.rs`, extend `crates/core/src/layers/attention/`
-- **Prerequisite for:** long-context models on multi-GPU
+### 1.1 Context Parallelism (CP) ✅ DONE
+**Difficulty:** ★★★★★ | **Effort:** 4–6 weeks | **Status:** COMPLETE — commit `64ca787`
 
-### 1.2 Data Parallelism (DP)
-**Difficulty:** ★★★★☆ | **Effort:** 2–3 weeks
-- No infrastructure. Needs per-request batch-splitting across ranks
-- Integrate with scheduler: dispatch sub-batches to DP ranks
-- **Files to create:** `crates/core/src/distributed/data_parallel.rs`, scheduler integration
-- **Prerequisite for:** multi-GPU serving at request-level scale
+**Completed (2026-02-19):**
+- `crates/core/src/distributed/context_parallel.rs` — `CpContext`, `CpConfig`, interleaved round-robin KV sharding ✅
+- `get_dcp_local_seq_lens` / `get_dcp_local_slot_mapping` — slot filtering helpers ✅
+- `lse_correct_and_reduce` — LSE-based attention output merging across CP ranks ✅
+- `DcpAttentionWrapper` — transparent AttentionBackend wrapper for DCP ✅
+- `AttentionBackend::batched_decode_attention_with_lse` — default trait method ✅
+- `NaiveAttentionBackend` + FlashInfer: LSE output path ✅
+- `decode_context_parallel_size` in `ParallelConfig` ✅
+- 19 unit tests ✅
 
-### 1.3 Expert Parallelism (EP) — full
-**Difficulty:** ★★★★☆ | **Effort:** 2–3 weeks
-- `ParallelConfig.expert_parallel_size` exists, `EPContext` stub in `process_group.rs`
-- Missing: expert→rank assignment, all-to-all dispatch, EPLB load balancing
-- **Files:** `crates/core/src/distributed/expert_parallel.rs`, `crates/core/src/moe/eplb.rs`
-- **Prerequisite for:** MoE models at scale (DeepSeek-V3, Mixtral)
+### 1.2 Data Parallelism (DP) ✅ DONE
+**Difficulty:** ★★★★☆ | **Effort:** 2–3 weeks | **Status:** COMPLETE — commit `be29ab5`
+
+**Completed (2026-02-19):**
+- `crates/core/src/distributed/data_parallel.rs` — `DpContext`, `BatchCoordinationResult` ✅
+- `coordinate_batch_across_dp()` — all_reduce max(num_tokens) before each forward pass ✅
+- `request_belongs_to_rank()` — deterministic modulo routing for server layer ✅
+- `data_parallel_size` in `ParallelConfig`; `world_size()` stays tp×pp ✅
+- `EngineConfig::dp_context` + builder method ✅
+- `run_engine_loop`: batch coordination call in `spawn_blocking` ✅
+- 15 unit tests ✅
+
+### 1.3 Expert Parallelism (EP) ✅ DONE
+**Difficulty:** ★★★★☆ | **Effort:** 2–3 weeks | **Status:** COMPLETE
+
+**Already implemented (prior to this PR):**
+- `EPContext` (rank + ep_size) in `process_group.rs` — value type for model APIs ✅
+- `ExpertPlacement` + `ExpertMap` in `moe/expert_map.rs` — linear/round-robin placement ✅
+- `EPMoEConfig` + `EPMoELayer` in `moe/ep_layer.rs` — full EP MoE forward pass ✅
+- `TokenDispatcher` + `DispatchMetadata` in `moe/token_dispatch.rs` — all-to-all dispatch ✅
+- `Mixtral::new_with_ep()`, `Qwen2Moe::new_with_ep()` — model-level EP wiring ✅
+- `expert_parallel_size` in `ParallelConfig` ✅
+
+**Completed (this PR):**
+- `crates/core/src/distributed/expert_parallel.rs` — `ExpertParallelContext` (EP coordinator with communicator) ✅
+- `crates/core/src/moe/eplb.rs` — `EplbState`, load tracking, rebalance detection ✅
+- `EngineConfig::ep_context` + builder method ✅
+- 22 new unit tests ✅
+
+**Out of scope:** Weight rearrangement (`rearrange_expert_weights_inplace`) — requires
+NCCL weight migration; tracked as TODO in `moe/eplb.rs`.
 
 ### 1.4 MTP Framework + Models ✅ PARTIALLY DONE
 **Difficulty:** ★★★★☆ | **Effort:** 4–5 weeks | **Status:** Framework + DeepSeek-MTP COMPLETE
@@ -221,14 +244,14 @@ MoonViT encoder → Kimi-VL, Kimi-K2.5-VL
 SigLIP2-NaViT → LFM2-VL
 ERNIE4.5-VL RoPE → ERNIE4.5-VL
 Audio Pipeline → Whisper → Qwen2-Audio, Ultravox → Qwen2.5-Omni, Qwen3-Omni
-Data Parallelism → Expert Parallelism → EPLB
+~~Data Parallelism → Expert Parallelism → EPLB~~ ✅ ALL DONE
 Pipeline Parallelism (enable) → no blockers ← can do now
 ```
 
 ## Suggested Starting Point
 
 1. **Now (no blockers):** PP enable, GPT-OSS parser, Medusa loader, phi4mm TODO
-2. **Week 1–4:** ~~MTP framework + DeepSeek-MTP~~ ✅; ~~InternS1~~ ✅; Step3-VL; AWQ-Marlin
-3. **Week 4–8:** Audio pipeline + Whisper; Kimi-VL (after MoonViT); DP infrastructure
-4. **Week 8–16:** Remaining VLMs; CP; remaining Eagle variants; Quant P2
-5. **Week 16+:** EP+EPLB; Quant P3; server audio API; attention backends
+2. **Week 1–4:** ~~MTP framework + DeepSeek-MTP~~ ✅; ~~InternS1~~ ✅; ~~CP~~ ✅; ~~DP~~ ✅; ~~EP+EPLB~~ ✅; Step3-VL; AWQ-Marlin
+3. **Week 4–8:** Audio pipeline + Whisper; Kimi-VL (after MoonViT); remaining VLMs
+4. **Week 8–16:** Remaining VLMs; remaining Eagle variants; Quant P2
+5. **Week 16+:** Quant P3; server audio API; attention backends

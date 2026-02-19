@@ -19,6 +19,7 @@
 //! - `cuda-moe`: Enable CUDA-accelerated top-k softmax routing
 
 mod ep_layer;
+mod eplb;
 mod expert_layer;
 mod expert_map;
 pub mod fused;
@@ -29,6 +30,7 @@ mod token_dispatch;
 pub mod topk_softmax;
 
 pub use ep_layer::{EPMoEConfig, EPMoELayer};
+pub use eplb::{EplbConfig, EplbState, ExpertLoadStats};
 pub use expert_layer::{
     MoEExpert, MoEExpertConfig, MoELayer, MoELayerConfig, MoELayerWithShared,
     MoELayerWithSharedConfig,

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::distributed::DpContext;
+use crate::distributed::{DpContext, ExpertParallelContext};
 use crate::kv_cache::{MetricsSnapshot, PrefixCacheStatsSnapshot, SlidingWindowSnapshot};
 use crate::lora::LoraRequest;
 use crate::multimodal::ImageData;
@@ -143,6 +143,12 @@ pub struct EngineConfig {
     /// multi-rank context when running DP inference to enable pre-forward-pass
     /// batch-size synchronization across all DP ranks.
     pub dp_context: DpContext,
+    /// Expert parallelism context for MoE models.
+    ///
+    /// Default is `ExpertParallelContext::single_gpu()` (no EP overhead). Set to a
+    /// multi-rank context when loading MoE models with EP to provide the rank identity
+    /// and communicator required by `new_with_ep()` model constructors.
+    pub ep_context: ExpertParallelContext,
 }
 
 impl EngineConfig {
@@ -163,6 +169,7 @@ impl EngineConfig {
             sliding_window: None,
             enable_optimistic_scheduling: true,
             dp_context: DpContext::single_gpu(),
+            ep_context: ExpertParallelContext::single_gpu(),
         }
     }
 }
@@ -177,6 +184,7 @@ pub struct EngineConfigBuilder {
     sliding_window: Option<usize>,
     enable_optimistic_scheduling: bool,
     dp_context: DpContext,
+    ep_context: ExpertParallelContext,
 }
 
 impl EngineConfigBuilder {
@@ -219,6 +227,15 @@ impl EngineConfigBuilder {
         self
     }
 
+    /// Set the expert parallelism context for MoE models.
+    ///
+    /// Only needed when loading MoE models with EP enabled.
+    /// The default is `ExpertParallelContext::single_gpu()` (no EP overhead).
+    pub fn ep_context(mut self, ctx: ExpertParallelContext) -> Self {
+        self.ep_context = ctx;
+        self
+    }
+
     pub fn build(self) -> EngineConfig {
         EngineConfig {
             scheduler_config: self.scheduler_config,
@@ -230,6 +247,7 @@ impl EngineConfigBuilder {
             sliding_window: self.sliding_window,
             enable_optimistic_scheduling: self.enable_optimistic_scheduling,
             dp_context: self.dp_context,
+            ep_context: self.ep_context,
         }
     }
 }
