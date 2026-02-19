@@ -112,6 +112,96 @@ impl AttentionBackend for NaiveAttentionBackend {
             head_dim,
         )
     }
+
+    fn batched_decode_attention_with_lse(
+        &self,
+        q: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        cache_engine: &mut CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Tensor, Option<candle_core::Tensor>)> {
+        let batch_size = metadata.kv_lengths.len();
+
+        cache_engine
+            .write_batch(k_new, v_new, metadata.all_slot_mapping)
+            .map_err(|e| candle_core::Error::Msg(format!("cache write_batch: {e}")))?;
+
+        per_seq_decode_with_lse(
+            q,
+            cache_engine,
+            metadata.seq_block_ids,
+            metadata.kv_lengths,
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )
+    }
+}
+
+/// Per-sequence decode returning both output and log-sum-exp softmax statistics.
+///
+/// LSE enables Decode Context Parallelism (DCP) output merging: partial attention
+/// results from different KV shards are combined via exp(lse_local - lse_final) weighting.
+#[allow(clippy::too_many_arguments)]
+fn per_seq_decode_with_lse(
+    q: &Tensor,
+    cache_engine: &mut CacheEngine,
+    seq_block_ids: &[&[crate::kv_cache::BlockId]],
+    kv_lengths: &[usize],
+    batch_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let num_kv_groups = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f64).sqrt();
+
+    let mut outputs = Vec::with_capacity(batch_size);
+    let mut lses = Vec::with_capacity(batch_size);
+
+    for (i, (&kv_len, &block_ids)) in kv_lengths.iter().zip(seq_block_ids.iter()).enumerate() {
+        // q_i: [1, num_heads, head_dim] → [1, num_heads, 1, head_dim]
+        let q_i = q.narrow(0, i, 1)?.unsqueeze(2)?;
+
+        // Read from cache: [1, kv_heads, kv_len, head_dim]
+        let (k_i, v_i) = cache_engine
+            .read(block_ids, kv_len)
+            .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
+
+        let k_i = repeat_kv(k_i, num_kv_groups)?;
+        let v_i = repeat_kv(v_i, num_kv_groups)?;
+
+        // Scaled scores before softmax: [1, num_heads, 1, kv_len]
+        let scores = (q_i.matmul(&k_i.transpose(2, 3)?)? * scale)?;
+
+        // Numerically stable log-sum-exp: lse = max + log(sum(exp(x - max)))
+        // scores: [1, heads, 1, kv_len]
+        let max_score = scores.max_keepdim(3)?; // [1, heads, 1, 1]
+        let exp_shifted = (scores.broadcast_sub(&max_score))?.exp()?; // [1, heads, 1, kv_len]
+        let exp_sum = exp_shifted.sum_keepdim(3)?; // [1, heads, 1, 1]
+        let lse_i = (exp_sum.log()?.broadcast_add(&max_score))?; // [1, heads, 1, 1]
+                                                                 // Squeeze to [num_heads] for stacking later
+        let lse_i = lse_i.squeeze(3)?.squeeze(2)?.squeeze(0)?; // [heads]
+        lses.push(lse_i);
+
+        let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        let attn_out = attn_weights.matmul(&v_i)?;
+        // [1, num_heads, 1, head_dim] → [num_heads, head_dim]
+        let attn_out = attn_out.squeeze(2)?.squeeze(0)?; // [heads, head_dim]
+        outputs.push(attn_out);
+    }
+
+    // Stack across batch: [batch, heads, head_dim]
+    let output = Tensor::stack(&outputs, 0)?;
+    // Stack LSE: [batch, heads]
+    let lse = Tensor::stack(&lses, 0)?;
+
+    Ok((output, Some(lse)))
 }
 
 /// Per-sequence decode: read KV from cache and compute attention individually.

@@ -96,6 +96,46 @@ pub trait AttentionBackend: Send + Sync {
         head_dim: usize,
     ) -> Result<Tensor>;
 
+    /// Execute batched decode attention, also returning log-sum-exp softmax statistics.
+    ///
+    /// Required for Decode Context Parallelism (DCP): each DCP rank computes attention
+    /// over its local KV slice, then ranks exchange LSE to merge partial results correctly.
+    ///
+    /// # Returns
+    /// - `output`: attention result in shape `[batch, num_heads, head_dim]` (3D)
+    /// - `lse`: log-sum-exp values `[batch, num_heads]` (natural log), or `None` if
+    ///   this backend does not expose LSE (DCP correction will be skipped)
+    ///
+    /// # Default Implementation
+    /// Calls `batched_decode_attention` and reshapes output to 3D. Returns `None` for LSE.
+    /// Override in LSE-capable backends (e.g. FlashInfer) for accurate DCP merging.
+    #[allow(clippy::too_many_arguments)]
+    fn batched_decode_attention_with_lse(
+        &self,
+        q: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        cache_engine: &mut CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let out_2d = self.batched_decode_attention(
+            q,
+            k_new,
+            v_new,
+            cache_engine,
+            metadata,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
+        let batch = out_2d.dim(0)?;
+        let out_3d = out_2d.reshape((batch, num_heads, head_dim))?;
+        Ok((out_3d, None))
+    }
+
     /// Check if this backend supports the given configuration.
     fn supports_config(&self, num_heads: usize, num_kv_heads: usize, head_dim: usize) -> bool {
         // Default: support all configurations

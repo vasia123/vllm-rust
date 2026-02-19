@@ -6,7 +6,7 @@
 
 ## Summary
 
-vLLM-Rust implements core text generation, sampling, KV cache, speculative decoding, LoRA, MoE, and a full OpenAI-compatible serving layer. The primary remaining gaps are: VLM/audio models (~35+), MTP framework (11 models), distributed inference (PP/DP/CP/EP), and advanced quantization methods.
+vLLM-Rust implements core text generation, sampling, KV cache, speculative decoding, LoRA, MoE, and a full OpenAI-compatible serving layer. The primary remaining gaps are: VLM/audio models (~35+), MTP models (10 remaining after DeepSeek-MTP), distributed inference (PP/DP/CP/EP), and advanced quantization methods.
 
 Many Python model files that appear "missing" by filename are actually handled via architecture aliases in Rust (e.g., Orion/Solar/TeleChat → Llama, Mistral-Large-3 → DeepSeek, ERNIE-4.5 → Ernie45Moe, Bee → LLaVA-OneVision, OpenCUA → Qwen2.5-VL, LLaVA-Next → LLaVA, SmolVLM → Idefics3, Tarsier → Qwen2VL, H2O-VL/SkyWork-R1V → InternVL).
 
@@ -22,7 +22,7 @@ Many Python model files that appear "missing" by filename are actually handled v
 | MoE infrastructure | 40+ files | ~10 | 25% |
 | SSM/Mamba ops | 16+ | 2 | 12% |
 | Distributed | Full TP/PP/DP/CP/EP | TP only | 20% |
-| MTP models | 11 | 0 | 0% |
+| MTP models | 11 | 1 | 9% |
 
 ---
 
@@ -200,20 +200,21 @@ All previously listed P1 gaps are now **DONE** — see alias table above. No rem
 
 ### 1.7 Missing MTP (Multi-Token Prediction) Models
 
-MTP is a critical gap — no framework or models exist in Rust yet.
+MTP framework **DONE** (`MtpDraftModel` trait + `MtpProposer` + `DeepSeekMtpModel`).
+Remaining: 10 model-specific variants still needed.
 
-| Model | Python File | Priority |
-|-------|------------|----------|
-| DeepSeek-MTP | `deepseek_mtp.py` | **P0** |
-| ERNIE-MTP | `ernie_mtp.py` | P2 |
-| Exaone-MoE-MTP | `exaone_moe_mtp.py` | P2 |
-| GLM4-MoE-MTP / Lite | `glm4_moe_mtp.py`, `glm4_moe_lite_mtp.py` | P2 |
-| Longcat-Flash-MTP | `longcat_flash_mtp.py` | P2 |
-| MIMO-MTP | `mimo_mtp.py` | P2 |
-| OpenPangu-MTP | `openpangu_mtp.py` | P2 |
-| Qwen3-Next-MTP | `qwen3_next_mtp.py` | P2 |
-| Step3p5-MTP | `step3p5_mtp.py` | P2 |
-| GLM-OCR-MTP | `glm_ocr_mtp.py` | P3 |
+| Model | Python File | Priority | Status |
+|-------|------------|----------|--------|
+| DeepSeek-MTP | `deepseek_mtp.py` | **P0** | **DONE** (`deepseek_mtp.rs`) |
+| ERNIE-MTP | `ernie_mtp.py` | P2 | Missing |
+| Exaone-MoE-MTP | `exaone_moe_mtp.py` | P2 | Missing |
+| GLM4-MoE-MTP / Lite | `glm4_moe_mtp.py`, `glm4_moe_lite_mtp.py` | P2 | Missing |
+| Longcat-Flash-MTP | `longcat_flash_mtp.py` | P2 | Missing |
+| MIMO-MTP | `mimo_mtp.py` | P2 | Missing |
+| OpenPangu-MTP | `openpangu_mtp.py` | P2 | Missing |
+| Qwen3-Next-MTP | `qwen3_next_mtp.py` | P2 | Missing |
+| Step3p5-MTP | `step3p5_mtp.py` | P2 | Missing |
+| GLM-OCR-MTP | `glm_ocr_mtp.py` | P3 | Missing |
 
 ---
 

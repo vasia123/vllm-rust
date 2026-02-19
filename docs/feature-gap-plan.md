@@ -1,0 +1,234 @@
+# Full Feature Parity Roadmap: vLLM-Rust
+
+## Context
+
+Bring vLLM-Rust to complete feature parity with Python vLLM `3025b3c`. Tasks ordered from hardest (new infrastructure) to easiest (incremental additions). Each tier builds on the previous.
+
+---
+
+## Tier 1: New Infrastructure (Hardest — Architectural)
+
+### 1.1 Context Parallelism (CP)
+**Difficulty:** ★★★★★ | **Effort:** 4–6 weeks
+- No existing infrastructure; requires ring-attention or sequence-parallel pattern
+- Rewrite attention backends to split seqlen across ranks
+- Heavy interaction with FlashInfer / MLA backends
+- **Files to create:** `crates/core/src/distributed/context_parallel.rs`, extend `crates/core/src/layers/attention/`
+- **Prerequisite for:** long-context models on multi-GPU
+
+### 1.2 Data Parallelism (DP)
+**Difficulty:** ★★★★☆ | **Effort:** 2–3 weeks
+- No infrastructure. Needs per-request batch-splitting across ranks
+- Integrate with scheduler: dispatch sub-batches to DP ranks
+- **Files to create:** `crates/core/src/distributed/data_parallel.rs`, scheduler integration
+- **Prerequisite for:** multi-GPU serving at request-level scale
+
+### 1.3 Expert Parallelism (EP) — full
+**Difficulty:** ★★★★☆ | **Effort:** 2–3 weeks
+- `ParallelConfig.expert_parallel_size` exists, `EPContext` stub in `process_group.rs`
+- Missing: expert→rank assignment, all-to-all dispatch, EPLB load balancing
+- **Files:** `crates/core/src/distributed/expert_parallel.rs`, `crates/core/src/moe/eplb.rs`
+- **Prerequisite for:** MoE models at scale (DeepSeek-V3, Mixtral)
+
+### 1.4 MTP Framework + Models ✅ PARTIALLY DONE
+**Difficulty:** ★★★★☆ | **Effort:** 4–5 weeks | **Status:** Framework + DeepSeek-MTP COMPLETE
+
+**Completed (2026-02-19):**
+- `crates/core/src/models/mtp_base.rs` — `MtpDraftModel` trait ✅
+- `crates/core/src/engine/spec_decode/mtp_proposer.rs` — `MtpProposer: DraftProposer` ✅
+- `crates/core/src/models/deepseek_mtp.rs` — `DeepSeekMtpModel: MtpDraftModel` ✅ (9 tests)
+
+**Architecture:** MTP uses FIXED target hidden states for ALL K draft steps. Each step:
+`enorm(embed(token)) + hnorm(target_hs)` → `eh_proj` → `mtp_block` → `shared_head` → logits.
+Layers cycle via `spec_step_idx % num_mtp_layers`.
+
+**Remaining model files (10 total):**
+- `qwen3_next_mtp.rs` — Qwen3-Next; ColumnParallel fc instead of eh_proj; P2
+- `ernie_mtp.rs` — ERNIE; single-token only; P2
+- `glm4_moe_mtp.rs` / `glm4_moe_lite_mtp.rs` — P2
+- `mimo_mtp.rs` — MiMo; single-token only; P2
+- `exaone_moe_mtp.rs`, `longcat_flash_mtp.rs`, `openpangu_mtp.rs`, `step3p5_mtp.rs` — P2–P3
+- `glm_ocr_mtp.rs` — P3
+- **Reference:** `reference/vllm/model_executor/models/deepseek_mtp.py`, `qwen3_next_mtp.py`
+
+### 1.5 Audio Pipeline + Models
+**Difficulty:** ★★★★☆ | **Effort:** 3–4 weeks
+- `crates/core/src/multimodal/audio.rs` has `AudioData`/`AudioSpec` but NO encoders, NO mel spectrogram, NO file loading
+- Need librosa-equivalent Rust: FFT, mel filterbank, STFT → ~150 LOC DSP
+- Add WAV/MP3 loading (hound + symphonia crates)
+- **Encoder models (12 total):**
+  - `whisper.rs` — P1, gate-keeper for all audio; Conv1D + transformer, ~800 LOC
+  - `qwen2_audio.rs`, `ultravox.rs` — P1
+  - `qwen3_asr.rs`, `granite_speech.rs`, `funaudiochat.rs` — P2
+  - `audioflamingo3.rs`, `glmasr.rs`, `voxtral.rs`, `phi4mm_audio.rs` — P2
+  - `gemma3n_audio.rs`, `musicflamingo.rs` — P3
+- **Files:** extend `multimodal/audio.rs`, new `multimodal/audio_encoder.rs`, per-model files
+
+---
+
+## Tier 2: Model Expansion (Hard — High Volume)
+
+### 2.1 Missing VLMs (~34 models) ✅ InternS1 DONE
+**Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
+- All follow Vision→Projector→LM pattern; 150–300 LOC per model
+- **Blockers to resolve first (new vision encoders):**
+  - `MoonViT` — blocks Kimi-VL, Kimi-K2.5-VL (~300 LOC, `multimodal/vision.rs`)
+  - `SigLIP2-NaViT` — blocks LFM2-VL (~250 LOC, `multimodal/vision.rs`)
+
+**Completed (2026-02-19):**
+- `interns1.rs` — `InternS1ForConditionalGeneration` ✅ (22 tests)
+
+**Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
+InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
+Weight mapping: `model.vision_tower.*` → `vision_tower.*`, `model.multi_modal_projector.*` → `multi_modal_projector.*`.
+
+- **P1 models remaining (in order):**
+  1. `step3_vl.rs` — Step3 backbone + LLaVA projector; ~75% reuse; P1
+  2. `kimi_vl.rs` — after MoonViT; ~200 LOC; P1
+  3. `ernie45_vl.rs` — after ernie45_vl_rope RoPE variant; P1
+  4. `interns1_pro.rs` — Qwen3-VL vision + custom MoE LLM; P2
+  5. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
+- **P2 models (~14 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, GLM-OCR, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
+- **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
+
+### 2.2 MoE Infrastructure: Advanced
+**Difficulty:** ★★★☆☆ | **Effort:** 3–4 weeks
+- **DeepGEMM** — batched GEMM for dynamic expert shapes, 10–20% speedup
+  - `crates/core/src/moe/deep_gemm.rs`, CUDA kernel wrapper
+- **Router variants** — `crates/core/src/moe/router.rs` currently only `TopKRouter`
+  - Add: grouped-topk (partial), renormalized-topk, expert-choice routing
+- **EPLB** — requires EP infrastructure (§1.3 prerequisite)
+  - `crates/core/src/moe/eplb.rs` — expert load balancing across ranks
+- **Batched MoE** — for different token counts per expert
+- **Reference:** `reference/vllm/model_executor/layers/fused_moe/`
+
+### 2.3 Quantization P2 Methods
+**Difficulty:** ★★★☆☆ per method | **Effort:** 3–4 weeks (6 methods)
+- All follow `QuantizationConfig` + `QuantizedLinear` trait in `crates/core/src/quantization/`
+- **In order of priority:**
+  1. `awq_marlin.rs` — route AWQ weights to Marlin kernel; ~150 LOC, quick win
+  2. `fbgemm_fp8.rs` — Meta's FP8 GEMM wrapper; ~300 LOC
+  3. `input_quant_fp8.rs` — FP8 activation quantization; ~200 LOC
+  4. `ptpc_fp8.rs` — per-tensor/per-channel FP8; ~250 LOC
+  5. `mxfp4.rs` — MX floating-point 4-bit; ~400 LOC (new format)
+  6. `modelopt.rs` — NVIDIA ModelOpt format; ~500 LOC
+- **Reference:** `reference/vllm/model_executor/layers/quantization/`
+
+### 2.4 Speculative Decode: Missing Eagle Variants
+**Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
+- Pattern fully established: `eagle_llama.rs` (Eagle-1) and `eagle3.rs` (Eagle-3)
+- **Files to create:**
+  1. `deepseek_eagle.rs` — Eagle-1 for DeepSeek; ~600 LOC, adapt `eagle_llama.rs`
+  2. `llama4_eagle.rs` — Eagle for LLaMA4; ~700 LOC
+  3. `minicpm_eagle.rs` — Eagle for MiniCPM; ~500 LOC
+  4. Medusa model loader — add `MedusaModel` match arm in `from_config()`; ~100 LOC
+- **Proposers:** `crates/core/src/engine/spec_decode/`
+- **Reference:** `reference/vllm/model_executor/models/deepseek_eagle.py`
+
+### 2.5 SSM/Mamba2 Ops
+**Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
+- **`mamba_mixer2`** — Mamba2's updated selective scan with state dimension splitting
+  - `crates/core/src/ssm/mamba_mixer2.rs` (~350 LOC CPU; +600 LOC CUDA kernel)
+- **Causal conv1d refactor** — currently duplicated inline in 8+ model files
+  - Create `crates/core/src/ssm/causal_conv1d.rs` (~100 LOC); remove ~500 LOC of duplication
+- **SSD ops** (6 Python files) — simplified state-space ops; required by future Mamba2 variants
+  - `crates/core/src/ssm/ssd.rs` (~300 LOC)
+- **Gated LayerNorm** — `crates/core/src/ssm/gated_layer_norm.rs` (~80 LOC)
+- **ShortConv** — fix `lfm2.rs:843` TODO; `crates/core/src/ssm/short_conv.rs` (~150 LOC)
+
+---
+
+## Tier 3: Feature Completion (Medium)
+
+### 3.1 Quantization P3 Methods
+**Effort:** 4–6 weeks (8 methods) | Same trait pattern as P2
+- AWQ-Triton, TorchAO, Intel INC, Petit (NvFP4), CPU-WNA16, QUARK (6 files), FP-Quant
+- All in `crates/core/src/quantization/`
+
+### 3.2 Server API — Speech & Realtime
+**Effort:** 2–3 weeks
+- `POST /v1/audio/transcriptions` + `POST /v1/audio/translations` — ~250 LOC handler
+  - Multipart form upload → decode audio → audio encoder → text response
+  - **Requires:** Audio pipeline (§1.5) complete
+  - `crates/server/src/api/audio.rs` (new file)
+- `WebSocket /v1/realtime` — ~500 LOC
+  - Persistent connection, delta-streaming, session state machine
+  - `crates/server/src/api/realtime.rs` (new file)
+  - Add `tokio-tungstenite` dependency
+- `POST /v1/images/generations` — P3, requires diffusion models
+
+### 3.3 Attention Backend Variants
+**Effort:** 2–3 weeks
+- **CPU attention** — naive fallback for non-GPU inference; extend `naive.rs`
+- **Linear attention backend** — for Kimi-Linear, Qwen3-Next GDN layers; new backend file
+- **Mamba1/2 attention backends** — custom selective scan backend variants
+- **FlashAttn-DiffKV** — differential KV (some research models)
+- MLA variants (CUTLASS, sparse) — further optimization of existing MLA backend
+
+---
+
+## Tier 4: Easy Wins (Low Complexity, High Value)
+
+### 4.1 Pipeline Parallelism — Enable
+**Effort:** 2–3 days | **Difficulty:** ★★☆☆☆
+- Framework is 90% designed: `PipelineForward` trait, `PipelineStagedModel`, P2P comms exist
+- Wire `DeviceCommunicator.send()/recv()` calls in `crates/core/src/engine/pipeline.rs`
+- Remove error gate in `crates/server/src/main.rs:815`
+- Add 2-GPU integration test
+- **Reference:** `crates/core/src/distributed/pipeline.rs` + `communicator.rs`
+
+### 4.2 RoPE Variants
+**Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
+- **MRoPE Interleaved** — `mrope_interleaved.py`; ~200 LOC; interleaved frequency layout
+- **FoPE** — `fope.py`; ~200 LOC; factored positional encoding
+- **XDRoPE** — `xdrope.py`; ~250 LOC; cross-dimensional RoPE
+- **ERNIE4.5-VL RoPE** — `ernie45_vl_rope.py`; ~150 LOC; unblocks ERNIE4.5-VL
+
+### 4.3 Resolve P1 Code TODOs
+**Effort:** 3–5 days
+1. `phi4mm.rs:271` — HD transform + 2x2 compression + projection (~150 LOC)
+2. `molmo2.rs:586` — extract vision features for multimodal path (~100 LOC)
+3. `multimodal/processor.rs:146` — video support in processor (~200 LOC)
+4. `mimo_v2_flash.rs:469` — MoE block instead of dense MLP (~50 LOC)
+
+### 4.4 Tool & Reasoning Parsers
+**Effort:** 2–3 days
+- **GPT-OSS reasoning parser** — add to `crates/core/src/reasoning/mod.rs`; ~100 LOC
+- **Qwen-VL tool parser (legacy)** — add to `crates/core/src/tool_parser/`; ~150 LOC
+
+### 4.5 Medusa Model Loader
+**Effort:** 0.5 day
+- Add `MedusaModel` match arm in `from_config()` in `crates/core/src/models/mod.rs`; ~100 LOC
+- Proposer (`medusa_proposer.rs`) already complete
+
+---
+
+## Summary: Effort by Tier
+
+| Tier | Area | Estimated Effort |
+|------|------|-----------------|
+| 1 | Distributed (CP/DP/EP/MTP/Audio) | 16–21 weeks |
+| 2 | Model expansion (VLMs/MoE/Quant/Eagle/SSM) | 14–18 weeks |
+| 3 | Feature completion (Quant P3/API/Attention) | 8–12 weeks |
+| 4 | Easy wins (PP enable/RoPE/Parsers/TODOs) | 2–3 weeks |
+| **Total** | | **~40–54 weeks** |
+
+## Dependency Graph (Critical Path)
+
+```
+MTP Framework → DeepSeek-MTP model
+MoonViT encoder → Kimi-VL, Kimi-K2.5-VL
+SigLIP2-NaViT → LFM2-VL
+ERNIE4.5-VL RoPE → ERNIE4.5-VL
+Audio Pipeline → Whisper → Qwen2-Audio, Ultravox → Qwen2.5-Omni, Qwen3-Omni
+Data Parallelism → Expert Parallelism → EPLB
+Pipeline Parallelism (enable) → no blockers ← can do now
+```
+
+## Suggested Starting Point
+
+1. **Now (no blockers):** PP enable, GPT-OSS parser, Medusa loader, phi4mm TODO
+2. **Week 1–4:** ~~MTP framework + DeepSeek-MTP~~ ✅; ~~InternS1~~ ✅; Step3-VL; AWQ-Marlin
+3. **Week 4–8:** Audio pipeline + Whisper; Kimi-VL (after MoonViT); DP infrastructure
+4. **Week 8–16:** Remaining VLMs; CP; remaining Eagle variants; Quant P2
+5. **Week 16+:** EP+EPLB; Quant P3; server audio API; attention backends

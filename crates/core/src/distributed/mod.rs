@@ -22,6 +22,7 @@
 
 mod attention;
 mod communicator;
+mod context_parallel;
 mod error;
 #[cfg(feature = "cuda")]
 mod launcher;
@@ -33,6 +34,10 @@ mod process_group;
 
 pub use attention::{TensorParallelAttention, TensorParallelMLP};
 pub use communicator::{DeviceCommunicator, MockCommunicator, ReduceOp};
+pub use context_parallel::{
+    get_dcp_local_seq_lens, get_dcp_local_slot_mapping, lse_correct_and_reduce, CpConfig,
+    CpContext, DcpAttentionWrapper,
+};
 pub use error::DistributedError;
 #[cfg(feature = "cuda")]
 pub use launcher::{DistributedConfig, NcclProcessGroup};

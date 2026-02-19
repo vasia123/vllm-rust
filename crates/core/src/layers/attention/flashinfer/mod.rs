@@ -293,6 +293,67 @@ impl FlashInferBackend {
             .reshape((b_sz, q_len, num_heads * head_dim))
     }
 
+    /// Run batched decode attention via FlashInfer, returning LSE alongside output.
+    ///
+    /// Used by Decode Context Parallelism to merge partial attention results.
+    #[cfg(feature = "flashinfer")]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_flashinfer_with_lse(
+        &self,
+        q: &Tensor,
+        cache_engine: &CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = q.device();
+        let batch_size = metadata.kv_lengths.len();
+
+        let fi_metadata = FlashInferMetadata::from_paged_attention(
+            metadata.seq_block_ids,
+            metadata.kv_lengths,
+            self.block_size,
+            device,
+        )?;
+
+        let kv_indptr = fi_metadata.paged_kv_indptr.to_dtype(DType::U32)?;
+        let kv_indices = fi_metadata.paged_kv_indices.to_dtype(DType::U32)?;
+        let kv_last_page_len = fi_metadata.paged_kv_last_page_len.to_dtype(DType::U32)?;
+
+        let config = FlashInferConfig::new(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            self.block_size as u32,
+        )
+        .with_kv_layout(cache_engine.layout());
+        let wrapper = DecodeWrapper::new(config, device)?;
+
+        self.get_or_create_workspace(device)?;
+        let mut ws_guard = self
+            .workspace
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
+        let ws = ws_guard
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("workspace not initialized".to_string()))?;
+
+        // Returns (output [B, H, D], lse [B, H])
+        let (output, lse) = wrapper.run_with_lse(
+            q,
+            cache_engine.k_cache(),
+            cache_engine.v_cache(),
+            ws,
+            &kv_indptr,
+            &kv_indices,
+            &kv_last_page_len,
+            batch_size,
+        )?;
+
+        Ok((output, lse))
+    }
+
     /// Naive batched decode attention implementation (CPU fallback).
     #[allow(clippy::too_many_arguments)]
     fn batched_decode_naive(
@@ -442,6 +503,53 @@ impl AttentionBackend for FlashInferBackend {
 
         // Run FlashInfer decode kernel (reads from paged cache directly)
         self.decode_flashinfer(q, cache_engine, metadata, num_heads, num_kv_heads, head_dim)
+    }
+
+    fn batched_decode_attention_with_lse(
+        &self,
+        q: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        cache_engine: &mut CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let device = q.device();
+
+        // CPU fallback: FlashInfer kernels require CUDA. Return None for LSE since DCP
+        // correction is not applicable outside of a real multi-GPU CUDA environment.
+        if !device.is_cuda() {
+            let out_2d = self.batched_decode_naive(
+                q,
+                k_new,
+                v_new,
+                cache_engine,
+                metadata,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            )?;
+            let batch = out_2d.dim(0)?;
+            return Ok((out_2d.reshape((batch, num_heads, head_dim))?, None));
+        }
+
+        // Write new K/V tokens to cache first
+        cache_engine
+            .write_batch(k_new, v_new, metadata.all_slot_mapping)
+            .map_err(|e| candle_core::Error::Msg(format!("cache write_batch: {e}")))?;
+
+        let (output, lse) = self.decode_flashinfer_with_lse(
+            q,
+            cache_engine,
+            metadata,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
+
+        Ok((output, Some(lse)))
     }
 
     fn supported_dtypes(&self) -> &[DType] {

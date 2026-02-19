@@ -25,6 +25,7 @@ pub mod colbert;
 pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_lora;
+pub mod deepseek_mtp;
 pub mod deepseek_quantized;
 pub mod deepseek_vl2;
 pub mod dots1;
@@ -86,6 +87,7 @@ pub mod internlm2;
 pub mod internlm2_quantized;
 pub mod internlm2_reward;
 pub mod internlm2_ve;
+pub mod interns1;
 pub mod internvl;
 pub mod iquest_loopcoder;
 pub mod jais;
@@ -126,6 +128,7 @@ pub mod molmo;
 pub mod molmo2;
 pub mod mpt;
 pub mod mpt_quantized;
+pub mod mtp_base;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_quantized;
@@ -211,6 +214,7 @@ pub use colbert::ColBERTForRetrieval;
 pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_lora::DeepSeekWithLora;
+pub use deepseek_mtp::DeepSeekMtpModel;
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use deepseek_vl2::DeepSeekVLV2ForConditionalGeneration;
 pub use dots1::Dots1ForCausalLM;
@@ -272,6 +276,7 @@ pub use internlm2::InternLM2ForCausalLM;
 pub use internlm2_quantized::QuantizedInternLM2ForCausalLM;
 pub use internlm2_reward::InternLM2ForRewardModel;
 pub use internlm2_ve::InternLM2VEForCausalLM;
+pub use interns1::InternS1ForConditionalGeneration;
 pub use internvl::InternVLChatModel;
 pub use iquest_loopcoder::IQuestLoopCoderForCausalLM;
 pub use jais::JAISLMHeadModel;
@@ -312,6 +317,7 @@ pub use molmo::MolmoForCausalLM;
 pub use molmo2::Molmo2ForConditionalGeneration;
 pub use mpt::MptForCausalLM;
 pub use mpt_quantized::QuantizedMptForCausalLM;
+pub use mtp_base::MtpDraftModel;
 pub use nemotron::NemotronForCausalLM;
 pub use nemotron_h::NemotronHForCausalLM;
 pub use nemotron_quantized::QuantizedNemotronForCausalLM;
@@ -558,6 +564,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "DeepseekVLV2ForCausalLM"
         | "DeepseekVLV2ForConditionalGeneration" => Ok(Box::new(
             DeepSeekVLV2ForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
+        "InternS1ForConditionalGeneration" => Ok(Box::new(
+            InternS1ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "InternVLChatModel" | "H2OVLChatModel" | "SkyworkR1VChatModel" => {
             Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?))

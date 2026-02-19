@@ -13,6 +13,10 @@ pub struct ParallelConfig {
     /// Number of GPUs for expert parallelism (MoE expert distribution).
     /// Must divide total_experts evenly. When EP > 1, TP is disabled within experts.
     pub expert_parallel_size: usize,
+    /// Number of GPUs for decode context parallelism (splitting KV cache along seq dim).
+    /// DCP ranks share the same physical GPUs as TP — each GPU participates in both a
+    /// TP group and a DCP group. `world_size()` is still `tp * pp`.
+    pub decode_context_parallel_size: usize,
 }
 
 impl ParallelConfig {
@@ -30,6 +34,7 @@ impl ParallelConfig {
             tensor_parallel_size,
             pipeline_parallel_size,
             expert_parallel_size: 1,
+            decode_context_parallel_size: 1,
         }
     }
 
@@ -52,6 +57,36 @@ impl ParallelConfig {
             tensor_parallel_size,
             pipeline_parallel_size,
             expert_parallel_size,
+            decode_context_parallel_size: 1,
+        }
+    }
+
+    /// Create a configuration with decode context parallelism.
+    ///
+    /// DCP splits the KV cache along the sequence dimension across `dcp_size` ranks.
+    /// These ranks share the same physical GPUs as TP ranks.
+    ///
+    /// # Panics
+    /// Panics if any size is 0.
+    pub fn with_dcp(
+        tensor_parallel_size: usize,
+        pipeline_parallel_size: usize,
+        decode_context_parallel_size: usize,
+    ) -> Self {
+        assert!(tensor_parallel_size > 0, "tensor_parallel_size must be > 0");
+        assert!(
+            pipeline_parallel_size > 0,
+            "pipeline_parallel_size must be > 0"
+        );
+        assert!(
+            decode_context_parallel_size > 0,
+            "decode_context_parallel_size must be > 0"
+        );
+        Self {
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            expert_parallel_size: 1,
+            decode_context_parallel_size,
         }
     }
 
@@ -61,6 +96,7 @@ impl ParallelConfig {
             tensor_parallel_size: 1,
             pipeline_parallel_size: 1,
             expert_parallel_size: 1,
+            decode_context_parallel_size: 1,
         }
     }
 
@@ -80,7 +116,13 @@ impl ParallelConfig {
             tensor_parallel_size: 1,
             pipeline_parallel_size: 1,
             expert_parallel_size: size,
+            decode_context_parallel_size: 1,
         }
+    }
+
+    /// Whether decode context parallelism is enabled.
+    pub fn uses_context_parallelism(&self) -> bool {
+        self.decode_context_parallel_size > 1
     }
 
     /// Total number of GPUs required.

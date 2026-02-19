@@ -15,6 +15,7 @@
 //! - [`Eagle3DraftProposer`]: Eagle-3 draft model requiring target hidden states
 //! - [`MedusaDraftProposer`]: Medusa heads requiring target hidden states
 //! - [`MLPSpeculatorDraftProposer`]: MLP Speculator requiring target hidden states
+//! - [`MtpProposer`]: Multi-Token Prediction using fixed target hidden states
 //! - [`NGramProposer`]: CPU-based n-gram suffix matching (zero VRAM, stateless)
 //! - [`SuffixArrayProposer`]: CPU-based suffix array matching (zero VRAM, stateless)
 //!
@@ -33,6 +34,7 @@ mod eagle3_proposer;
 pub mod medusa;
 mod medusa_proposer;
 mod mlp_speculator_proposer;
+mod mtp_proposer;
 mod ngram;
 mod suffix;
 pub mod tree_attention;
@@ -45,6 +47,7 @@ pub use eagle3_proposer::Eagle3DraftProposer;
 pub use medusa::{MedusaHead, MedusaProposer};
 pub use medusa_proposer::MedusaDraftProposer;
 pub use mlp_speculator_proposer::MLPSpeculatorDraftProposer;
+pub use mtp_proposer::MtpProposer;
 pub use ngram::{NGramConfig, NGramProposer};
 pub use suffix::{SuffixArrayConfig, SuffixArrayProposer};
 pub use tree_attention::SpeculationTree;

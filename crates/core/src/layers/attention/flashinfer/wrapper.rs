@@ -362,6 +362,123 @@ impl DecodeWrapper {
 
         Ok(output)
     }
+
+    /// Run batch decode attention, also returning log-sum-exp softmax statistics.
+    ///
+    /// Identical to [`run`] but allocates and populates an LSE tensor alongside the output.
+    /// Required for Decode Context Parallelism (DCP) where partial attention results from
+    /// different KV shards must be merged using the LSE-correction formula.
+    ///
+    /// # Returns
+    /// - `output`: attention result `[batch_size, num_qo_heads, head_dim]`
+    /// - `lse`: log-sum-exp values `[batch_size, num_qo_heads]` in **natural log** (loge)
+    ///
+    /// # LSE Format
+    /// FlashInfer returns LSE as natural-log softmax partition statistics: for each
+    /// (batch, head) position the value is `log(sum_j exp(score_j))`.
+    #[cfg(feature = "flashinfer")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_lse(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        workspace: &mut WorkspaceBuffer,
+        kv_indptr: &Tensor,
+        kv_indices: &Tensor,
+        kv_last_page_len: &Tensor,
+        batch_size: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        use candle_core::DType;
+
+        let q = tensor_bridge::ensure_contiguous(q)?;
+
+        let required_size = estimate_decode_workspace(
+            batch_size,
+            self.config.num_qo_heads as usize,
+            self.config.head_dim as usize,
+        );
+        workspace.ensure_size(required_size)?;
+
+        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
+        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
+        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(kv_indices)? as *const i32;
+        let kv_last_page_len_ptr =
+            tensor_bridge::tensor_to_device_ptr(kv_last_page_len)? as *const i32;
+        let workspace_ptr = workspace.as_ptr()?;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+
+        let kv_indptr_host_u32: Vec<u32> = kv_indptr.to_vec1::<u32>()?;
+        let kv_indptr_host: Vec<i32> = kv_indptr_host_u32.iter().map(|&x| x as i32).collect();
+
+        let output = Tensor::zeros_like(&q)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
+
+        // Allocate LSE output: [batch_size, num_qo_heads] in f32.
+        // FlashInfer writes natural-log partition statistics here.
+        let lse = Tensor::zeros(
+            &[batch_size, self.config.num_qo_heads as usize],
+            DType::F32,
+            &self.device,
+        )?;
+        let lse_ptr = tensor_bridge::tensor_to_device_ptr(&lse)? as *mut f32;
+
+        let dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
+
+        let ws_size = workspace.size();
+        let float_ws_size = ws_size / 2;
+        let int_ws_size = ws_size - float_ws_size;
+        let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
+        let int_ws_ptr = unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
+
+        let mut page_locked_buf: Vec<u8> = vec![0u8; int_ws_size];
+
+        let plan = unsafe {
+            flashinfer_rs::ffi::BatchDecodePlan::new(
+                float_ws_ptr,
+                float_ws_size,
+                int_ws_ptr,
+                int_ws_size,
+                page_locked_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                int_ws_size,
+                kv_indptr_host.as_ptr(),
+                batch_size as i32,
+                self.config.num_qo_heads as i32,
+                self.config.num_kv_heads as i32,
+                self.config.head_dim as i32,
+                self.config.page_size as i32,
+                dtype,
+                flashinfer_rs::ffi::PosEncoding::None,
+                self.config.soft_cap,
+                self.config.window_left,
+                false, // enable_cuda_graph
+                stream_ptr,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode plan failed: {e}")))?
+        };
+
+        unsafe {
+            plan.run(
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                kv_indptr_ptr,
+                kv_indices_ptr,
+                kv_last_page_len_ptr,
+                output_ptr,
+                lse_ptr,
+                self.config.ffi_kv_layout(),
+                stream_ptr,
+            )
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("FlashInfer decode_with_lse forward failed: {e}"))
+            })?;
+        }
+
+        Ok((output, lse))
+    }
 }
 
 /// Configuration for FlashInfer MLA attention operations.
