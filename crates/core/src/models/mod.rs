@@ -35,6 +35,7 @@ pub mod eagle3;
 pub mod eagle3_mistral_large3;
 pub mod eagle_llama;
 pub mod ernie45_moe;
+pub mod ernie45_vl;
 pub mod ernie_mtp;
 pub mod exaone;
 pub mod exaone4;
@@ -234,6 +235,7 @@ pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
 pub use eagle_llama::{Eagle1DraftModel, EagleLlamaForCausalLM};
 pub use ernie45_moe::Ernie45MoeForCausalLM;
+pub use ernie45_vl::Ernie4_5_VLForConditionalGeneration;
 pub use ernie_mtp::ErnieMtpModel;
 pub use exaone::ExaoneForCausalLM;
 pub use exaone4::Exaone4ForCausalLM;
@@ -707,6 +709,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "Ernie4_5MoeForCausalLM"
         | "Ernie4_5_MoeForCausalLM"
         | "Ernie4_5ForCausalLM" => Ok(Box::new(Ernie45MoeForCausalLM::new(cfg, vb)?)),
+        "Ernie4_5_VLMoeForConditionalGeneration" => {
+            Ok(Box::new(Ernie4_5_VLForConditionalGeneration::new(cfg, vb)?))
+        }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

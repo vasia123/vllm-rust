@@ -53,26 +53,21 @@ Bring vLLM-Rust to complete feature parity with Python vLLM `3025b3c`. Tasks ord
 **Out of scope:** Weight rearrangement (`rearrange_expert_weights_inplace`) — requires
 NCCL weight migration; tracked as TODO in `moe/eplb.rs`.
 
-### 1.4 MTP Framework + Models ✅ PARTIALLY DONE
-**Difficulty:** ★★★★☆ | **Effort:** 4–5 weeks | **Status:** Framework + DeepSeek-MTP COMPLETE
+### 1.4 MTP Framework + Models ✅ DONE
+**Difficulty:** ★★★★☆ | **Effort:** 4–5 weeks | **Status:** FULLY COMPLETE — commit `dc0be81`
 
 **Completed (2026-02-19):**
 - `crates/core/src/models/mtp_base.rs` — `MtpDraftModel` trait ✅
 - `crates/core/src/engine/spec_decode/mtp_proposer.rs` — `MtpProposer: DraftProposer` ✅
 - `crates/core/src/models/deepseek_mtp.rs` — `DeepSeekMtpModel: MtpDraftModel` ✅ (9 tests)
+- All 9 remaining MTP model files + `mtp_from_config()` ✅
+  (ernie_mtp, mimo_mtp, longcat_flash_mtp, glm4_moe_mtp, openpangu_mtp, step3p5_mtp,
+   glm_ocr_mtp, qwen3_next_mtp, exaone_moe_mtp)
 
 **Architecture:** MTP uses FIXED target hidden states for ALL K draft steps. Each step:
 `enorm(embed(token)) + hnorm(target_hs)` → `eh_proj` → `mtp_block` → `shared_head` → logits.
 Layers cycle via `spec_step_idx % num_mtp_layers`.
-
-**Remaining model files (10 total):**
-- `qwen3_next_mtp.rs` — Qwen3-Next; ColumnParallel fc instead of eh_proj; P2
-- `ernie_mtp.rs` — ERNIE; single-token only; P2
-- `glm4_moe_mtp.rs` / `glm4_moe_lite_mtp.rs` — P2
-- `mimo_mtp.rs` — MiMo; single-token only; P2
-- `exaone_moe_mtp.rs`, `longcat_flash_mtp.rs`, `openpangu_mtp.rs`, `step3p5_mtp.rs` — P2–P3
-- `glm_ocr_mtp.rs` — P3
-- **Reference:** `reference/vllm/model_executor/models/deepseek_mtp.py`, `qwen3_next_mtp.py`
+Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ### 1.5 Audio Pipeline + Models
 **Difficulty:** ★★★★☆ | **Effort:** 3–4 weeks
@@ -91,7 +86,7 @@ Layers cycle via `spec_step_idx % num_mtp_layers`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~34 models) ✅ InternS1 DONE
+### 2.1 Missing VLMs (~32 models) ✅ InternS1, Step3-VL DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -100,17 +95,20 @@ Layers cycle via `spec_step_idx % num_mtp_layers`.
 
 **Completed (2026-02-19):**
 - `interns1.rs` — `InternS1ForConditionalGeneration` ✅ (22 tests)
+- `step3_vl.rs` — `Step3VLForConditionalGeneration` ✅ (5 tests)
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
 Weight mapping: `model.vision_tower.*` → `vision_tower.*`, `model.multi_modal_projector.*` → `multi_modal_projector.*`.
 
+Step3-VL: Step3VisionTransformer (63-layer ViT, QuickGELU) + Conv2d downsamplers + Linear projector
++ Step3TextForCausalLM. TP-padding: 3 extra CLS tokens prepended → 2708 total, drop first 4 → 2704 patches.
+
 - **P1 models remaining (in order):**
-  1. `step3_vl.rs` — Step3 backbone + LLaVA projector; ~75% reuse; P1
+  1. `ernie45_vl.rs` — ViT (Linear patch embed, 2D RoPE) + VariableResolutionResampler + Ernie45MoE; P1
   2. `kimi_vl.rs` — after MoonViT; ~200 LOC; P1
-  3. `ernie45_vl.rs` — after ernie45_vl_rope RoPE variant; P1
-  4. `interns1_pro.rs` — Qwen3-VL vision + custom MoE LLM; P2
-  5. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
+  3. `interns1_pro.rs` — Qwen3-VL vision + custom MoE LLM; P2
+  4. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
 - **P2 models (~14 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, GLM-OCR, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
