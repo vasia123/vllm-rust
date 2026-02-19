@@ -188,6 +188,7 @@ pub mod starcoder2_quantized;
 pub mod step1;
 pub mod step1_quantized;
 pub mod step3_text;
+pub mod step3_vl;
 pub mod step3p5;
 pub mod step3p5_mtp;
 pub mod t5;
@@ -388,6 +389,7 @@ pub use starcoder2_quantized::QuantizedStarCoder2ForCausalLM;
 pub use step1::Step1ForCausalLM;
 pub use step1_quantized::QuantizedStep1ForCausalLM;
 pub use step3_text::Step3TextForCausalLM;
+pub use step3_vl::Step3VLForConditionalGeneration;
 pub use step3p5::Step3p5ForCausalLM;
 pub use step3p5_mtp::Step3p5MtpModel;
 pub use t5::T5ForConditionalGeneration;
@@ -695,6 +697,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen3NextForCausalLM" => Ok(Box::new(Qwen3NextForCausalLM::new(cfg, vb)?)),
         "Step1ForCausalLM" => Ok(Box::new(Step1ForCausalLM::new(cfg, vb)?)),
         "Step3TextForCausalLM" => Ok(Box::new(Step3TextForCausalLM::new(cfg, vb)?)),
+        "Step3VLForConditionalGeneration" => {
+            Ok(Box::new(Step3VLForConditionalGeneration::new(cfg, vb)?))
+        }
         "BailingMoeForCausalLM" | "BailingMoeV2ForCausalLM" => {
             Ok(Box::new(BailingMoeForCausalLM::new(cfg, vb)?))
         }
