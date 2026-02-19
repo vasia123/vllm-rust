@@ -82,23 +82,25 @@ impl QuantizedLlamaAttention {
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
 
+        let attn_bias = cfg.attention_bias.unwrap_or(false);
+
         let q_proj = loader.load_linear(
             &format!("{prefix}.q_proj"),
             cfg.hidden_size,
             num_heads * head_dim,
-            false,
+            attn_bias,
         )?;
         let k_proj = loader.load_linear(
             &format!("{prefix}.k_proj"),
             cfg.hidden_size,
             num_kv_heads * head_dim,
-            false,
+            attn_bias,
         )?;
         let v_proj = loader.load_linear(
             &format!("{prefix}.v_proj"),
             cfg.hidden_size,
             num_kv_heads * head_dim,
-            false,
+            attn_bias,
         )?;
         let o_proj = loader.load_linear(
             &format!("{prefix}.o_proj"),
@@ -682,5 +684,44 @@ mod tests {
         // GPTQ loader expects specific tensor shapes, so this may fail
         // In production, real safetensors would be loaded
         assert!(model.is_err() || model.is_ok());
+    }
+
+    #[test]
+    fn test_quantized_llama_with_attention_bias() {
+        // SeedOss uses Llama with attention_bias=true on QKV
+        let mut cfg = test_config();
+        cfg.attention_bias = Some(true);
+        cfg.rope_theta = 1_000_000.0;
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+
+        let model =
+            QuantizedLlamaForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build with bias");
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+
+        let cache_config = create_cache_config(&cfg, &device);
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let input_ids = Tensor::zeros((1, 4), DType::U32, &device).expect("input");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 4)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, 4);
+
+        let logits = model
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("forward with attention bias");
+        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
     }
 }

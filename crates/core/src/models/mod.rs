@@ -152,6 +152,7 @@ pub mod phimoe;
 pub mod pixtral;
 pub mod plamo2;
 pub mod plamo3;
+pub mod plamo3_quantized;
 pub mod qwen;
 pub mod qwen2;
 pub mod qwen2_5_vl;
@@ -174,6 +175,7 @@ pub mod seed_oss;
 pub mod starcoder2;
 pub mod starcoder2_quantized;
 pub mod step1;
+pub mod step1_quantized;
 pub mod step3_text;
 pub mod step3p5;
 pub mod t5;
@@ -336,6 +338,7 @@ pub use phimoe::PhiMoeForCausalLM;
 pub use pixtral::PixtralForConditionalGeneration;
 pub use plamo2::Plamo2ForCausalLM;
 pub use plamo3::Plamo3ForCausalLM;
+pub use plamo3_quantized::QuantizedPlamo3ForCausalLM;
 pub use qwen::QWenLMHeadModel;
 pub use qwen2::Qwen2ForCausalLM;
 pub use qwen2_5_vl::Qwen25VLForConditionalGeneration;
@@ -360,6 +363,7 @@ pub use seed_oss::SeedOssForCausalLM;
 pub use starcoder2::StarCoder2ForCausalLM;
 pub use starcoder2_quantized::QuantizedStarCoder2ForCausalLM;
 pub use step1::Step1ForCausalLM;
+pub use step1_quantized::QuantizedStep1ForCausalLM;
 pub use step3_text::Step3TextForCausalLM;
 pub use step3p5::Step3p5ForCausalLM;
 pub use t5::T5ForConditionalGeneration;
@@ -758,7 +762,8 @@ pub fn from_config_with_quant(
         | "OlmoForCausalLM"
         | "YiForCausalLM"
         | "BaichuanForCausalLM"
-        | "BaiChuanForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
+        | "BaiChuanForCausalLM"
+        | "SeedOssForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
             cfg,
             vb,
             weight_loader.as_ref(),
@@ -887,11 +892,9 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        "ChatGLMModel" | "ChatGLMForCausalLM" => Ok(Box::new(QuantizedChatGLMForCausalLM::new(
-            cfg,
-            vb,
-            weight_loader.as_ref(),
-        )?)),
+        "ChatGLMModel" | "ChatGLMForCausalLM" | "ChatGLMForConditionalGeneration" => Ok(Box::new(
+            QuantizedChatGLMForCausalLM::new(cfg, vb, weight_loader.as_ref())?,
+        )),
         "JAISLMHeadModel" => Ok(Box::new(QuantizedJAISLMHeadModel::new(
             cfg,
             vb,
@@ -933,6 +936,21 @@ pub fn from_config_with_quant(
             weight_loader.as_ref(),
         )?)),
         "HunYuanDenseV1ForCausalLM" => Ok(Box::new(QuantizedHunYuanDenseForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
+        "Exaone4ForCausalLM" => Ok(Box::new(QuantizedExaone4ForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
+        "Plamo3ForCausalLM" => Ok(Box::new(QuantizedPlamo3ForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
+        "Step1ForCausalLM" => Ok(Box::new(QuantizedStep1ForCausalLM::new(
             cfg,
             vb,
             weight_loader.as_ref(),
