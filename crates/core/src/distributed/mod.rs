@@ -23,6 +23,7 @@
 mod attention;
 mod communicator;
 mod context_parallel;
+mod data_parallel;
 mod error;
 #[cfg(feature = "cuda")]
 mod launcher;
@@ -37,6 +38,9 @@ pub use communicator::{DeviceCommunicator, MockCommunicator, ReduceOp};
 pub use context_parallel::{
     get_dcp_local_seq_lens, get_dcp_local_slot_mapping, lse_correct_and_reduce, CpConfig,
     CpContext, DcpAttentionWrapper,
+};
+pub use data_parallel::{
+    coordinate_batch_across_dp, request_belongs_to_rank, BatchCoordinationResult, DpContext,
 };
 pub use error::DistributedError;
 #[cfg(feature = "cuda")]

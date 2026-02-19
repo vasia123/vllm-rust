@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::distributed::DpContext;
 use crate::kv_cache::{MetricsSnapshot, PrefixCacheStatsSnapshot, SlidingWindowSnapshot};
 use crate::lora::LoraRequest;
 use crate::multimodal::ImageData;
@@ -136,6 +137,12 @@ pub struct EngineConfig {
     /// Cost of invalidation: one extra `compute_schedule` call (same as
     /// without the optimization). Never worse than disabled.
     pub enable_optimistic_scheduling: bool,
+    /// Data parallelism context for this engine instance.
+    ///
+    /// Default is `DpContext::single_gpu()` (no coordination). Set to a
+    /// multi-rank context when running DP inference to enable pre-forward-pass
+    /// batch-size synchronization across all DP ranks.
+    pub dp_context: DpContext,
 }
 
 impl EngineConfig {
@@ -155,6 +162,7 @@ impl EngineConfig {
             cuda_graph_config: super::cuda_graph::CudaGraphConfig::default(),
             sliding_window: None,
             enable_optimistic_scheduling: true,
+            dp_context: DpContext::single_gpu(),
         }
     }
 }
@@ -168,6 +176,7 @@ pub struct EngineConfigBuilder {
     cuda_graph_config: super::cuda_graph::CudaGraphConfig,
     sliding_window: Option<usize>,
     enable_optimistic_scheduling: bool,
+    dp_context: DpContext,
 }
 
 impl EngineConfigBuilder {
@@ -201,6 +210,15 @@ impl EngineConfigBuilder {
         self
     }
 
+    /// Set the data parallelism context for this engine instance.
+    ///
+    /// Only needed when running multiple engine replicas in DP mode.
+    /// The default is `DpContext::single_gpu()` (no coordination overhead).
+    pub fn dp_context(mut self, ctx: DpContext) -> Self {
+        self.dp_context = ctx;
+        self
+    }
+
     pub fn build(self) -> EngineConfig {
         EngineConfig {
             scheduler_config: self.scheduler_config,
@@ -211,6 +229,7 @@ impl EngineConfigBuilder {
             cuda_graph_config: self.cuda_graph_config,
             sliding_window: self.sliding_window,
             enable_optimistic_scheduling: self.enable_optimistic_scheduling,
+            dp_context: self.dp_context,
         }
     }
 }

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::distributed::coordinate_batch_across_dp;
 use crate::kv_cache::KVCacheManager;
 use crate::request::RequestId;
 use crate::scheduler::{ScheduleDecision, Scheduler, SchedulerOutput};
@@ -371,6 +372,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
     let multi_step_count = config.multi_step_count;
     let block_size = config.block_size;
     let optimistic_scheduling = config.enable_optimistic_scheduling;
+    let dp_context = config.dp_context;
 
     // Scheduler lives in the async loop, separate from OwnedExecutionState.
     let mut scheduler = Scheduler::new(config.scheduler_config);
@@ -504,7 +506,22 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
         // moves into the blocking thread pool. The scheduler stays in the async
         // loop. When execution returns, we reclaim ownership and apply deferred
         // scheduler removals from the StepResult.
+        let dp_ctx = dp_context.clone();
         let exec_future = tokio::task::spawn_blocking(move || {
+            // Synchronize batch size across DP ranks before GPU work.
+            // For single-GPU (default), is_single() returns true and this is a no-op.
+            // For multi-rank DP, all_reduces num_tokens so all ranks select the same
+            // CUDA graph bucket and no rank skips a forward pass while others are active.
+            let total_tokens = output
+                .prefill_requests
+                .iter()
+                .map(|r| r.chunk_size)
+                .sum::<usize>()
+                + output.decode_requests.len();
+            if let Err(e) = coordinate_batch_across_dp(total_tokens, &dp_ctx) {
+                warn!(error = %e, "DP batch coordination failed, continuing with local token count");
+            }
+
             let step_result = execute_engine_step(
                 &mut strategy,
                 &mut state,

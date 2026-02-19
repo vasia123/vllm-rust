@@ -17,6 +17,12 @@ pub struct ParallelConfig {
     /// DCP ranks share the same physical GPUs as TP — each GPU participates in both a
     /// TP group and a DCP group. `world_size()` is still `tp * pp`.
     pub decode_context_parallel_size: usize,
+    /// Number of independent engine replicas for data parallelism.
+    ///
+    /// Each DP replica runs its own `start_engine()` with replicated model weights.
+    /// Request routing is handled at the server level. Unlike TP/PP, DP does **not**
+    /// increase `world_size()` — that stays `tp * pp` (per-replica GPU count).
+    pub data_parallel_size: usize,
 }
 
 impl ParallelConfig {
@@ -35,6 +41,7 @@ impl ParallelConfig {
             pipeline_parallel_size,
             expert_parallel_size: 1,
             decode_context_parallel_size: 1,
+            data_parallel_size: 1,
         }
     }
 
@@ -58,6 +65,7 @@ impl ParallelConfig {
             pipeline_parallel_size,
             expert_parallel_size,
             decode_context_parallel_size: 1,
+            data_parallel_size: 1,
         }
     }
 
@@ -87,6 +95,7 @@ impl ParallelConfig {
             pipeline_parallel_size,
             expert_parallel_size: 1,
             decode_context_parallel_size,
+            data_parallel_size: 1,
         }
     }
 
@@ -97,6 +106,7 @@ impl ParallelConfig {
             pipeline_parallel_size: 1,
             expert_parallel_size: 1,
             decode_context_parallel_size: 1,
+            data_parallel_size: 1,
         }
     }
 
@@ -117,12 +127,54 @@ impl ParallelConfig {
             pipeline_parallel_size: 1,
             expert_parallel_size: size,
             decode_context_parallel_size: 1,
+            data_parallel_size: 1,
+        }
+    }
+
+    /// Data parallelism only: `dp_size` independent engine replicas, each single-GPU.
+    pub fn data_parallel(dp_size: usize) -> Self {
+        assert!(dp_size > 0, "data_parallel_size must be > 0");
+        Self {
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            expert_parallel_size: 1,
+            decode_context_parallel_size: 1,
+            data_parallel_size: dp_size,
+        }
+    }
+
+    /// Combined TP + PP + DP configuration.
+    ///
+    /// # Panics
+    /// Panics if any size is 0.
+    pub fn with_dp(
+        tensor_parallel_size: usize,
+        pipeline_parallel_size: usize,
+        data_parallel_size: usize,
+    ) -> Self {
+        assert!(tensor_parallel_size > 0, "tensor_parallel_size must be > 0");
+        assert!(
+            pipeline_parallel_size > 0,
+            "pipeline_parallel_size must be > 0"
+        );
+        assert!(data_parallel_size > 0, "data_parallel_size must be > 0");
+        Self {
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            expert_parallel_size: 1,
+            decode_context_parallel_size: 1,
+            data_parallel_size,
         }
     }
 
     /// Whether decode context parallelism is enabled.
     pub fn uses_context_parallelism(&self) -> bool {
         self.decode_context_parallel_size > 1
+    }
+
+    /// Whether data parallelism is enabled (more than one engine replica).
+    pub fn uses_data_parallelism(&self) -> bool {
+        self.data_parallel_size > 1
     }
 
     /// Total number of GPUs required.
