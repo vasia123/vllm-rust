@@ -86,7 +86,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~32 models) ✅ InternS1, Step3-VL DONE
+### 2.1 Missing VLMs (~31 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -96,6 +96,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 **Completed (2026-02-19):**
 - `interns1.rs` — `InternS1ForConditionalGeneration` ✅ (22 tests)
 - `step3_vl.rs` — `Step3VLForConditionalGeneration` ✅ (5 tests)
+- `ernie45_vl.rs` — `Ernie4_5_VLForConditionalGeneration` ✅ (5 tests) — commit b74d083
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -104,11 +105,14 @@ Weight mapping: `model.vision_tower.*` → `vision_tower.*`, `model.multi_modal_
 Step3-VL: Step3VisionTransformer (63-layer ViT, QuickGELU) + Conv2d downsamplers + Linear projector
 + Step3TextForCausalLM. TP-padding: 3 extra CLS tokens prepended → 2708 total, drop first 4 → 2704 patches.
 
+ERNIE4.5-VL: `Ernie4_5_VisionTransformer` (Linear patch embed, 2D spatial RoPE, QuickGELU) +
+`VariableResolutionResamplerModel` (spatial_conv_size² pooling, 2-layer GELU MLP, RMSNorm) + Ernie45MoeForCausalLM.
+Weight paths: `vision_model.*` (root), `model.resampler_model.spatial_linear.{0,2,3}.*`, `model.*` / `lm_head.*`.
+
 - **P1 models remaining (in order):**
-  1. `ernie45_vl.rs` — ViT (Linear patch embed, 2D RoPE) + VariableResolutionResampler + Ernie45MoE; P1
-  2. `kimi_vl.rs` — after MoonViT; ~200 LOC; P1
-  3. `interns1_pro.rs` — Qwen3-VL vision + custom MoE LLM; P2
-  4. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
+  1. `kimi_vl.rs` — after MoonViT; ~200 LOC; P1
+  2. `interns1_pro.rs` — Qwen3-VL vision + custom MoE LLM; P2
+  3. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
 - **P2 models (~14 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, GLM-OCR, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 

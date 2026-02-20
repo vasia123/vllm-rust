@@ -93,6 +93,7 @@ pub mod internlm2_quantized;
 pub mod internlm2_reward;
 pub mod internlm2_ve;
 pub mod interns1;
+pub mod interns1_pro;
 pub mod internvl;
 pub mod iquest_loopcoder;
 pub mod jais;
@@ -293,6 +294,7 @@ pub use internlm2_quantized::QuantizedInternLM2ForCausalLM;
 pub use internlm2_reward::InternLM2ForRewardModel;
 pub use internlm2_ve::InternLM2VEForCausalLM;
 pub use interns1::InternS1ForConditionalGeneration;
+pub use interns1_pro::InternS1ProForConditionalGeneration;
 pub use internvl::InternVLChatModel;
 pub use iquest_loopcoder::IQuestLoopCoderForCausalLM;
 pub use jais::JAISLMHeadModel;
@@ -589,6 +591,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         )),
         "InternS1ForConditionalGeneration" => Ok(Box::new(
             InternS1ForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
+        "InternS1ProForConditionalGeneration" => Ok(Box::new(
+            InternS1ProForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "InternVLChatModel" | "H2OVLChatModel" | "SkyworkR1VChatModel" => {
             Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?))
