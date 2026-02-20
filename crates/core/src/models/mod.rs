@@ -62,6 +62,7 @@ pub mod gemma_lora;
 pub mod gemma_quantized;
 pub mod glm;
 pub mod glm4;
+pub mod glm4_1v;
 pub mod glm4_moe;
 pub mod glm4_moe_mtp;
 pub mod glm4_quantized;
@@ -268,6 +269,7 @@ pub use gemma_lora::GemmaWithLora;
 pub use gemma_quantized::QuantizedGemmaForCausalLM;
 pub use glm::GlmForCausalLM;
 pub use glm4::Glm4ForCausalLM;
+pub use glm4_1v::Glm4vForConditionalGeneration;
 pub use glm4_moe::Glm4MoeForCausalLM;
 pub use glm4_moe_mtp::Glm4MoeMtpModel;
 pub use glm4_quantized::QuantizedGlm4ForCausalLM;
@@ -609,6 +611,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "NVLM_D_Model" | "NVLM_D" => Ok(Box::new(NVLMDModel::new(cfg, vb)?)),
         "MolmoForCausalLM" => Ok(Box::new(MolmoForCausalLM::from_model_config(cfg, vb)?)),
+        "Glm4vForConditionalGeneration" | "Glm4vMoeForConditionalGeneration" => {
+            Ok(Box::new(Glm4vForConditionalGeneration::new(cfg, vb)?))
+        }
         "GLM4VForCausalLM" | "Glm4VForConditionalGeneration" => {
             Ok(Box::new(Glm4VForConditionalGeneration::new(cfg, vb)?))
         }
