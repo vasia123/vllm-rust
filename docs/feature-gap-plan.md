@@ -86,17 +86,18 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~31 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL DONE
+### 2.1 Missing VLMs (~30 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
   - `MoonViT` — blocks Kimi-VL, Kimi-K2.5-VL (~300 LOC, `multimodal/vision.rs`)
   - `SigLIP2-NaViT` — blocks LFM2-VL (~250 LOC, `multimodal/vision.rs`)
 
-**Completed (2026-02-19):**
-- `interns1.rs` — `InternS1ForConditionalGeneration` ✅ (22 tests)
-- `step3_vl.rs` — `Step3VLForConditionalGeneration` ✅ (5 tests)
+**Completed:**
+- `interns1.rs` — `InternS1ForConditionalGeneration` ✅ (22 tests) — 2026-02-19
+- `step3_vl.rs` — `Step3VLForConditionalGeneration` ✅ (5 tests) — commit 809b3ba
 - `ernie45_vl.rs` — `Ernie4_5_VLForConditionalGeneration` ✅ (5 tests) — commit b74d083
+- `interns1_pro.rs` — `InternS1ProForConditionalGeneration` ✅ (5 tests) — commit a3e5cd3
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -111,8 +112,7 @@ Weight paths: `vision_model.*` (root), `model.resampler_model.spatial_linear.{0,
 
 - **P1 models remaining (in order):**
   1. `kimi_vl.rs` — after MoonViT; ~200 LOC; P1
-  2. `interns1_pro.rs` — Qwen3-VL vision + custom MoE LLM; P2
-  3. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
+  2. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
 - **P2 models (~14 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, GLM-OCR, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
