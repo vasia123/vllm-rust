@@ -86,7 +86,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~26 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X DONE
+### 2.1 Missing VLMs (~25 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -100,7 +100,8 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `interns1_pro.rs` — `InternS1ProForConditionalGeneration` ✅ (5 tests) — commit a3e5cd3
 - `moonvit.rs` + `kimi_vl.rs` — `MoonVitPretrainedModel` + `KimiVLForConditionalGeneration` ✅ (10 tests) — commit 463a5a5
 - `kimi_k25.rs` — `KimiK25ForConditionalGeneration` ✅ (5 tests)
-- `hyperclovax_vision.rs` — `HCXVisionForCausalLM` ✅ (5 tests) — commit TBD
+- `hyperclovax_vision.rs` — `HCXVisionForCausalLM` ✅ (5 tests) — commit 767ebec
+- `glm_ocr.rs` — `GlmOcrForConditionalGeneration` ✅ (5 tests)
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -129,9 +130,14 @@ HyperCLOVA-X Vision: CLIP/SigLIP vision encoder + `HCXCAbstractor` (timm RegNet 
 Weight paths: `vision_model.*`, `mm_projector.net.{0,2}.*`, `mm_projector.readout.{0,2}.*`.
 Projector types: `linear`, `mlp`, `inverted_mlp`, `cabstractor` (default). `skip_cls=true` for CLIP (not SigLIP).
 
+GLM-OCR: Linear patch embed (Conv3D equiv) + 2D block-tiled spatial RoPE (partial_factor=0.5, neox, sm²-grouped) +
+per-head q_norm/k_norm (RMSNorm) + SwiGLU MLP (bias=True) + Conv2d downsample + PatchMerger (proj→LayerNorm→
+GELU→SwiGLU, no bias) + Glm4ForCausalLM. `out_hidden_size` must match LLM `hidden_size`.
+Weight paths: `visual.*` (vision), `model.*` / `lm_head.*` (LLM).
+
 - **P1 models remaining (in order):**
   1. `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
-- **P2 models (~14 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, GLM-OCR, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
+- **P2 models (~13 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced

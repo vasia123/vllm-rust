@@ -66,6 +66,7 @@ pub mod glm4_moe;
 pub mod glm4_moe_mtp;
 pub mod glm4_quantized;
 pub mod glm4v;
+pub mod glm_ocr;
 pub mod glm_ocr_mtp;
 pub mod glm_quantized;
 pub mod gpt2;
@@ -271,6 +272,7 @@ pub use glm4_moe::Glm4MoeForCausalLM;
 pub use glm4_moe_mtp::Glm4MoeMtpModel;
 pub use glm4_quantized::QuantizedGlm4ForCausalLM;
 pub use glm4v::Glm4VForConditionalGeneration;
+pub use glm_ocr::GlmOcrForConditionalGeneration;
 pub use glm_ocr_mtp::GlmOcrMtpModel;
 pub use glm_quantized::QuantizedGlmForCausalLM;
 pub use gpt2::GPT2LMHeadModel;
@@ -609,6 +611,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "MolmoForCausalLM" => Ok(Box::new(MolmoForCausalLM::from_model_config(cfg, vb)?)),
         "GLM4VForCausalLM" | "Glm4VForConditionalGeneration" => {
             Ok(Box::new(Glm4VForConditionalGeneration::new(cfg, vb)?))
+        }
+        "GlmOcrForConditionalGeneration" => {
+            Ok(Box::new(GlmOcrForConditionalGeneration::new(cfg, vb)?))
         }
         "BertModel"
         | "BertForMaskedLM"
