@@ -87,6 +87,7 @@ pub mod grok1;
 pub mod gte;
 pub mod hunyuan;
 pub mod hunyuan_quantized;
+pub mod hyperclovax_vision;
 pub mod idefics3;
 pub mod internlm2;
 pub mod internlm2_quantized;
@@ -291,6 +292,7 @@ pub use grok1::Grok1ForCausalLM;
 pub use gte::{GteNewForEmbedding, GteNewForSequenceClassification};
 pub use hunyuan::{HunYuanDenseV1ForCausalLM, HunYuanMoEV1ForCausalLM};
 pub use hunyuan_quantized::QuantizedHunYuanDenseForCausalLM;
+pub use hyperclovax_vision::HCXVisionForCausalLM;
 pub use idefics3::{Idefics3ForConditionalGeneration, SmolVLMForConditionalGeneration};
 pub use internlm2::InternLM2ForCausalLM;
 pub use internlm2_quantized::QuantizedInternLM2ForCausalLM;
@@ -681,6 +683,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "HunYuanDenseV1ForCausalLM" => Ok(Box::new(HunYuanDenseV1ForCausalLM::new(cfg, vb)?)),
         "HunYuanMoEV1ForCausalLM" => Ok(Box::new(HunYuanMoEV1ForCausalLM::new(cfg, vb)?)),
+        "HCXVisionForCausalLM" => Ok(Box::new(HCXVisionForCausalLM::new(cfg, vb)?)),
         "JAISLMHeadModel" => Ok(Box::new(JAISLMHeadModel::new(cfg, vb)?)),
         "Jais2ForCausalLM" => Ok(Box::new(Jais2ForCausalLM::new(cfg, vb)?)),
         "KimiK25ForConditionalGeneration" => Ok(Box::new(
