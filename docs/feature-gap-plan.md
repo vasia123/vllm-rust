@@ -86,11 +86,11 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~30 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro DONE
+### 2.1 Missing VLMs (~28 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
-  - `MoonViT` — blocks Kimi-VL, Kimi-K2.5-VL (~300 LOC, `multimodal/vision.rs`)
+  - `MoonViT` ✅ — `moonvit.rs` done; also unblocks Kimi-K2.5-VL
   - `SigLIP2-NaViT` — blocks LFM2-VL (~250 LOC, `multimodal/vision.rs`)
 
 **Completed:**
@@ -98,6 +98,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `step3_vl.rs` — `Step3VLForConditionalGeneration` ✅ (5 tests) — commit 809b3ba
 - `ernie45_vl.rs` — `Ernie4_5_VLForConditionalGeneration` ✅ (5 tests) — commit b74d083
 - `interns1_pro.rs` — `InternS1ProForConditionalGeneration` ✅ (5 tests) — commit a3e5cd3
+- `moonvit.rs` + `kimi_vl.rs` — `MoonVitPretrainedModel` + `KimiVLForConditionalGeneration` ✅ (10 tests) — commit 463a5a5
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -110,8 +111,13 @@ ERNIE4.5-VL: `Ernie4_5_VisionTransformer` (Linear patch embed, 2D spatial RoPE, 
 `VariableResolutionResamplerModel` (spatial_conv_size² pooling, 2-layer GELU MLP, RMSNorm) + Ernie45MoeForCausalLM.
 Weight paths: `vision_model.*` (root), `model.resampler_model.spatial_linear.{0,2,3}.*`, `model.*` / `lm_head.*`.
 
+MoonViT+KimiVL: `MoonVitPretrainedModel` (Conv2d patch embed + `Learnable2DInterpPosEmb` + 2D RoPE interleaved x/y
+complex multiply + fused-QKV attention + bilinear pos-emb interpolation + `patch_merger`) +
+`KimiVLMultiModalProjector` (pre_norm LN + flatten + linear_1 + GELU + linear_2) + DeepSeekForCausalLM.
+Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.*`.
+
 - **P1 models remaining (in order):**
-  1. `kimi_vl.rs` — after MoonViT; ~200 LOC; P1
+  1. `kimi_k2_5_vl.rs` — MoonViT ✅ done, just needs separate VLM wrapper; ~100 LOC; P1
   2. `hyperclovax_vision.rs`, `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
 - **P2 models (~14 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, GLM-OCR, DeepSeek-OCR, GLM4-1V, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
