@@ -102,6 +102,7 @@ pub mod jais2_quantized;
 pub mod jais_quantized;
 pub mod jamba;
 pub mod kimi_linear;
+pub mod kimi_vl;
 pub mod lfm2;
 pub mod llama;
 pub mod llama4;
@@ -134,6 +135,7 @@ pub mod mlp_speculator;
 pub mod modernbert;
 pub mod molmo;
 pub mod molmo2;
+pub mod moonvit;
 pub mod mpt;
 pub mod mpt_quantized;
 pub mod mtp_base;
@@ -303,6 +305,7 @@ pub use jais2_quantized::QuantizedJais2ForCausalLM;
 pub use jais_quantized::QuantizedJAISLMHeadModel;
 pub use jamba::JambaForCausalLM;
 pub use kimi_linear::KimiLinearForCausalLM;
+pub use kimi_vl::KimiVLForConditionalGeneration;
 pub use lfm2::{Lfm2ForCausalLM, Lfm2MoeForCausalLM};
 pub use llama::LlamaForCausalLM;
 pub use llama4::Llama4ForCausalLM;
@@ -679,6 +682,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "JAISLMHeadModel" => Ok(Box::new(JAISLMHeadModel::new(cfg, vb)?)),
         "Jais2ForCausalLM" => Ok(Box::new(Jais2ForCausalLM::new(cfg, vb)?)),
         "KimiLinearForCausalLM" => Ok(Box::new(KimiLinearForCausalLM::new(cfg, vb)?)),
+        "KimiVLForConditionalGeneration" => Ok(Box::new(
+            KimiVLForConditionalGeneration::from_model_config(cfg, vb)?,
+        )),
         "Lfm2ForCausalLM" => Ok(Box::new(Lfm2ForCausalLM::new(cfg, vb)?)),
         "Lfm2MoeForCausalLM" => Ok(Box::new(Lfm2MoeForCausalLM::new(cfg, vb)?)),
         "Llama4ForCausalLM" => Ok(Box::new(Llama4ForCausalLM::new(cfg, vb)?)),
