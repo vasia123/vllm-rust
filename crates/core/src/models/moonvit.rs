@@ -122,7 +122,7 @@ impl MoonVitConfig {
 /// ```
 /// This matches the Python `Rope2DPosEmb.precomputed_freqs_cis` layout where
 /// x_cis and y_cis are interleaved: `cat([x_cis, y_cis], dim=-1)`.
-struct Rope2DPosEmb {
+pub(crate) struct Rope2DPosEmb {
     cos_table: Tensor, // [max_h, max_w, head_dim/2]
     sin_table: Tensor,
     #[allow(dead_code)]
@@ -134,7 +134,7 @@ struct Rope2DPosEmb {
 
 impl Rope2DPosEmb {
     /// Build precomputed tables.  `dim` = head_dim, must be divisible by 4.
-    fn new(
+    pub(crate) fn new(
         dim: usize,
         max_height: usize,
         max_width: usize,
@@ -186,7 +186,7 @@ impl Rope2DPosEmb {
     ///
     /// Returns `(cos, sin)` each of shape `[S, head_dim/2]`
     /// where `S = sum(h_i * w_i)`.
-    fn get_freqs_by_seqlens(&self, grid_hws: &[[usize; 2]]) -> Result<(Tensor, Tensor)> {
+    pub(crate) fn get_freqs_by_seqlens(&self, grid_hws: &[[usize; 2]]) -> Result<(Tensor, Tensor)> {
         let mut cos_parts = Vec::new();
         let mut sin_parts = Vec::new();
         for &[h, w] in grid_hws {
@@ -207,6 +207,38 @@ impl Rope2DPosEmb {
         }
         Ok((Tensor::cat(&cos_parts, 0)?, Tensor::cat(&sin_parts, 0)?))
     }
+
+    /// Select freqs for 3D grids (temporal + spatial), repeating spatial freqs T times per image.
+    ///
+    /// `grid_thws`: `[[t, h, w], ...]` — T frames, H×W spatial grid per image.
+    /// Returns `(cos, sin)` each of shape `[sum(t_i * h_i * w_i), head_dim/2]`.
+    pub(crate) fn get_freqs_by_seqlens_3d(
+        &self,
+        grid_thws: &[[usize; 3]],
+    ) -> Result<(Tensor, Tensor)> {
+        let mut cos_parts = Vec::new();
+        let mut sin_parts = Vec::new();
+        for &[t, h, w] in grid_thws {
+            let cos = self
+                .cos_table
+                .narrow(0, 0, h)?
+                .narrow(1, 0, w)?
+                .contiguous()?
+                .reshape((h * w, self.half_dim))?;
+            let sin = self
+                .sin_table
+                .narrow(0, 0, h)?
+                .narrow(1, 0, w)?
+                .contiguous()?
+                .reshape((h * w, self.half_dim))?;
+            // Repeat spatial freqs T times — mirrors Python's .repeat(t, 1)
+            for _ in 0..t {
+                cos_parts.push(cos.clone());
+                sin_parts.push(sin.clone());
+            }
+        }
+        Ok((Tensor::cat(&cos_parts, 0)?, Tensor::cat(&sin_parts, 0)?))
+    }
 }
 
 /// Apply interleaved 2D RoPE via complex multiplication.
@@ -216,7 +248,7 @@ impl Rope2DPosEmb {
 ///
 /// - `q`, `k`: `[S, heads, head_dim]`
 /// - `freqs_cos`, `freqs_sin`: `[S, head_dim/2]`
-fn apply_rope_2d(
+pub(crate) fn apply_rope_2d(
     q: &Tensor,
     k: &Tensor,
     freqs_cos: &Tensor,
@@ -296,7 +328,7 @@ impl Learnable2DInterpPosEmb {
 }
 
 /// Bilinear interpolation of `weight: [H_src, W_src, D]` to `[H_dst*W_dst, D]`.
-fn bilinear_interp_2d(weight: &Tensor, h_dst: usize, w_dst: usize) -> Result<Tensor> {
+pub(crate) fn bilinear_interp_2d(weight: &Tensor, h_dst: usize, w_dst: usize) -> Result<Tensor> {
     let (h_src, w_src, d) = weight.dims3()?;
     let device = weight.device();
     let dtype = weight.dtype();
@@ -405,7 +437,7 @@ impl MoonVitMlp {
 
 // ─── Encoder Layer ───────────────────────────────────────────────────────────
 
-struct MoonVitEncoderLayer {
+pub(crate) struct MoonVitEncoderLayer {
     norm0: LayerNorm,
     norm1: LayerNorm,
     wqkv: Linear, // fused QKV, bias=true: [hidden → 3*hidden]
@@ -417,7 +449,7 @@ struct MoonVitEncoderLayer {
 }
 
 impl MoonVitEncoderLayer {
-    fn new(cfg: &MoonVitConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &MoonVitConfig, vb: VarBuilder) -> Result<Self> {
         let h = cfg.hidden_size;
         let head_dim = cfg.head_dim();
         // Python: nn.LayerNorm(hidden_dim) — default eps=1e-5
@@ -448,7 +480,12 @@ impl MoonVitEncoderLayer {
     /// masking.  In the Python reference, `cu_seqlens` prevents cross-image
     /// attention, but this is an acceptable approximation for inference since ViT
     /// encoders are typically run one image at a time.
-    fn forward(&self, x: &Tensor, freqs_cos: &Tensor, freqs_sin: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(
+        &self,
+        x: &Tensor,
+        freqs_cos: &Tensor,
+        freqs_sin: &Tensor,
+    ) -> Result<Tensor> {
         let s = x.dim(0)?;
 
         // ── Attention block ──
