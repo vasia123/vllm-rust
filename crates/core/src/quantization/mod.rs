@@ -45,6 +45,7 @@ pub mod marlin;
 #[cfg(feature = "marlin")]
 pub mod marlin_cuda;
 pub mod moe_wna16;
+pub mod mxfp4;
 pub mod mxfp8;
 pub mod ptpc_fp8;
 pub mod weight_loader;
@@ -84,6 +85,7 @@ pub use marlin::{
 #[cfg(feature = "marlin")]
 pub use marlin_cuda::marlin_gemm;
 pub use moe_wna16::{MoeWNA16Config, MoeWNA16Format};
+pub use mxfp4::{MxFp4Config, MxFp4Linear, FP4_LUT, MXFP4_BLOCK_SIZE};
 pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 pub use ptpc_fp8::PtpcFp8Config;
 pub use weight_loader::{
@@ -158,6 +160,7 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             Box::new(FbgemmFp8Config::from_detected(&detected.raw_config))
         }
         QuantizationMethod::PtpcFp8 => Box::new(PtpcFp8Config::from_detected(&detected.raw_config)),
+        QuantizationMethod::Mxfp4 => Box::new(MxFp4Config::from_detected(&detected.raw_config)),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -202,6 +205,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::AwqMarlin => 80,         // Ampere (Marlin kernel)
         QuantizationMethod::FbgemmFp8 => 80, // Marlin FP8 fallback on Ampere; native FBGEMM on Hopper
         QuantizationMethod::PtpcFp8 => 94,   // AMD MI300 minimum (ROCm only)
+        QuantizationMethod::Mxfp4 => 80,     // Ampere minimum (hardware FP4 kernels)
     };
     capability >= min_cap
 }

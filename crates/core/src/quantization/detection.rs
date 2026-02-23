@@ -130,6 +130,7 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("awq_marlin") => QuantizationMethod::AwqMarlin,
         Some("fbgemm_fp8") => QuantizationMethod::FbgemmFp8,
         Some("ptpc_fp8") => QuantizationMethod::PtpcFp8,
+        Some("mxfp4") => QuantizationMethod::Mxfp4,
         // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
         Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {
@@ -236,6 +237,7 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "awq_marlin" => QuantizationMethod::AwqMarlin,
                 "fbgemm_fp8" => QuantizationMethod::FbgemmFp8,
                 "ptpc_fp8" => QuantizationMethod::PtpcFp8,
+                "mxfp4" => QuantizationMethod::Mxfp4,
                 // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
                 "gptq_marlin" => QuantizationMethod::Marlin,
                 "modelopt" => {

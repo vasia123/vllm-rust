@@ -46,6 +46,8 @@ pub enum QuantizationMethod {
     FbgemmFp8,
     /// PTPC FP8: Per-Token Per-Channel dynamic FP8 quantization (ROCm/AMD MI300+)
     PtpcFp8,
+    /// MXFP4 (OCP MX FP4 E2M1): 4-bit microscaling quantization
+    Mxfp4,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -67,6 +69,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::AwqMarlin => write!(f, "awq_marlin"),
             Self::FbgemmFp8 => write!(f, "fbgemm_fp8"),
             Self::PtpcFp8 => write!(f, "ptpc_fp8"),
+            Self::Mxfp4 => write!(f, "mxfp4"),
         }
     }
 }

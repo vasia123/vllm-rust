@@ -241,7 +241,9 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
   4. `ptpc_fp8.rs` ✅ DONE — `PtpcFp8Config` wrapping `Fp8Config`, min_capability=94 (AMD MI300+), reuses `Fp8WeightLoader`; 6 tests; 3936 total
      - Detection: `"ptpc_fp8"` in both config.json and quantize_config.json paths
      - Weight format identical to standard FP8 — `is_checkpoint_fp8_serialized=false`, dynamic-only
-  5. `mxfp4.rs` — MX floating-point 4-bit; ~400 LOC (new format, requires FP4 CUDA kernels)
+  5. `mxfp4.rs` ✅ DONE — `MxFp4Config`, `MxFp4Linear` (FP4 E2M1 nibble unpack + E8M0 block scales, CPU emulation); 19 tests; 4011 total
+     - FP4 E2M1 lookup table, lower-nibble-first packing, block_size=32, min_capability=80
+     - MoE GPU dispatch (FlashInfer/Marlin/Triton) tracked as TODO
   6. `modelopt.rs` — NVIDIA ModelOpt extended format; ~500 LOC
   - `input_quant_fp8.py` — NOT a QuantizationConfig (it's a CustomOp utility for FP8 activation quantization); skip
 - **Reference:** `reference/vllm/model_executor/layers/quantization/`
