@@ -34,8 +34,8 @@ pub mod video;
 mod vision;
 
 pub use inputs::{
-    ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage, ProcessedVideo,
-    VideoData, VideoSource, VideoUrl,
+    ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedAudio, ProcessedImage,
+    ProcessedVideo, VideoData, VideoSource, VideoUrl,
 };
 pub use mel_spectrogram::{
     build_mel_filterbank, hann_window, log_mel_spectrogram, stft_power_spectrum,

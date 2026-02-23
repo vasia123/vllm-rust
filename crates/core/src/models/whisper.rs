@@ -147,6 +147,15 @@ impl Default for WhisperConfig {
 /// is all sines, second half is all cosines (not interleaved).
 ///
 /// This matches `transformers.models.whisper.modeling_whisper.sinusoids`.
+/// Crate-visible alias used by audio models sharing this sinusoidal PE (e.g. Qwen2-Audio).
+pub(crate) fn build_sinusoidal_embeddings_pub(
+    max_positions: usize,
+    channels: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    build_sinusoidal_embeddings(max_positions, channels, device)
+}
+
 fn build_sinusoidal_embeddings(
     max_positions: usize,
     channels: usize,

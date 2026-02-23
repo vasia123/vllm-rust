@@ -293,6 +293,34 @@ impl ProcessedImage {
     }
 }
 
+/// A processed audio clip ready for model input.
+#[derive(Debug, Clone)]
+pub struct ProcessedAudio {
+    /// Audio embedding tensor `[num_tokens, hidden_size]` (after encoder + projector).
+    pub embedding: Tensor,
+    /// Number of audio tokens this embedding represents.
+    pub num_tokens: usize,
+    /// Duration in seconds (if known).
+    pub duration_secs: Option<f32>,
+}
+
+impl ProcessedAudio {
+    /// Create a new processed audio clip.
+    pub fn new(embedding: Tensor, num_tokens: usize) -> Self {
+        Self {
+            embedding,
+            num_tokens,
+            duration_secs: None,
+        }
+    }
+
+    /// Set the audio duration.
+    pub fn with_duration(mut self, duration_secs: f32) -> Self {
+        self.duration_secs = Some(duration_secs);
+        self
+    }
+}
+
 /// A processed video ready for model input.
 #[derive(Debug, Clone)]
 pub struct ProcessedVideo {
@@ -336,7 +364,7 @@ impl ProcessedVideo {
 /// Multimodal inputs ready for model forward pass.
 #[derive(Debug)]
 pub struct MultimodalInputs {
-    /// Token IDs with placeholder tokens for images/videos.
+    /// Token IDs with placeholder tokens for images/videos/audio.
     pub token_ids: Vec<u32>,
     /// Image embeddings indexed by their position in token_ids.
     /// Key: start position in token_ids, Value: processed image.
@@ -344,21 +372,28 @@ pub struct MultimodalInputs {
     /// Video embeddings indexed by their position in token_ids.
     /// Key: start position in token_ids, Value: processed video.
     pub video_embeddings: Vec<(usize, ProcessedVideo)>,
+    /// Audio embeddings indexed by their position in token_ids.
+    /// Key: start position in token_ids, Value: processed audio clip.
+    pub audio_embeddings: Vec<(usize, ProcessedAudio)>,
     /// Total number of image tokens.
     pub num_image_tokens: usize,
     /// Total number of video tokens.
     pub num_video_tokens: usize,
+    /// Total number of audio tokens.
+    pub num_audio_tokens: usize,
 }
 
 impl MultimodalInputs {
-    /// Create inputs with only text (no images or videos).
+    /// Create inputs with only text (no images, videos, or audio).
     pub fn text_only(token_ids: Vec<u32>) -> Self {
         Self {
             token_ids,
             image_embeddings: Vec::new(),
             video_embeddings: Vec::new(),
+            audio_embeddings: Vec::new(),
             num_image_tokens: 0,
             num_video_tokens: 0,
+            num_audio_tokens: 0,
         }
     }
 
@@ -372,8 +407,10 @@ impl MultimodalInputs {
             token_ids,
             image_embeddings,
             video_embeddings: Vec::new(),
+            audio_embeddings: Vec::new(),
             num_image_tokens,
             num_video_tokens: 0,
+            num_audio_tokens: 0,
         }
     }
 
@@ -387,8 +424,24 @@ impl MultimodalInputs {
             token_ids,
             image_embeddings: Vec::new(),
             video_embeddings,
+            audio_embeddings: Vec::new(),
             num_image_tokens: 0,
             num_video_tokens,
+            num_audio_tokens: 0,
+        }
+    }
+
+    /// Create inputs with text and audio clips.
+    pub fn with_audio(token_ids: Vec<u32>, audio_embeddings: Vec<(usize, ProcessedAudio)>) -> Self {
+        let num_audio_tokens = audio_embeddings.iter().map(|(_, a)| a.num_tokens).sum();
+        Self {
+            token_ids,
+            image_embeddings: Vec::new(),
+            video_embeddings: Vec::new(),
+            audio_embeddings,
+            num_image_tokens: 0,
+            num_video_tokens: 0,
+            num_audio_tokens,
         }
     }
 
@@ -404,8 +457,10 @@ impl MultimodalInputs {
             token_ids,
             image_embeddings,
             video_embeddings,
+            audio_embeddings: Vec::new(),
             num_image_tokens,
             num_video_tokens,
+            num_audio_tokens: 0,
         }
     }
 
@@ -419,12 +474,19 @@ impl MultimodalInputs {
         !self.video_embeddings.is_empty()
     }
 
-    /// Get the effective sequence length (text tokens + image tokens + video tokens).
+    /// Check if this input has any audio clips.
+    pub fn has_audio(&self) -> bool {
+        !self.audio_embeddings.is_empty()
+    }
+
+    /// Get the effective sequence length (text + image + video + audio tokens).
     pub fn effective_seq_len(&self) -> usize {
         // Placeholders are replaced by actual media tokens.
         // Each placeholder occupies 1 token in token_ids, replaced by num_tokens from the embedding.
-        let num_placeholders = self.image_embeddings.len() + self.video_embeddings.len();
-        self.token_ids.len() + self.num_image_tokens + self.num_video_tokens - num_placeholders
+        let num_placeholders =
+            self.image_embeddings.len() + self.video_embeddings.len() + self.audio_embeddings.len();
+        self.token_ids.len() + self.num_image_tokens + self.num_video_tokens + self.num_audio_tokens
+            - num_placeholders
     }
 }
 

@@ -79,7 +79,8 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - Add WAV/MP3 loading (hound + symphonia crates)
 - **Encoder models (12 total):**
   - `whisper.rs` ✅ DONE — `WhisperForConditionalGeneration`, implements `ModelForEncoderDecoder`; Conv1d×2 encoder + sinusoidal pos + cross-attn decoder; 5 tests; 3972 total — 2026-02-23
-  - `qwen2_audio.rs`, `ultravox.rs` — P1
+  - `qwen2_audio.rs` ✅ DONE — `Qwen2AudioForConditionalGeneration`; Conv1d(s=1)+Conv1d(s=2)+AvgPool1d(k=2,s=2) encoder; 5 tests; 3977 total — 2026-02-23
+  - `ultravox.rs` — P1
   - `qwen3_asr.rs`, `granite_speech.rs`, `funaudiochat.rs` — P2
   - `audioflamingo3.rs`, `glmasr.rs`, `voxtral.rs`, `phi4mm_audio.rs` — P2
   - `gemma3n_audio.rs`, `musicflamingo.rs` — P3

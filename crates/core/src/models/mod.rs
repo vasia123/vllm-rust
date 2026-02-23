@@ -185,6 +185,7 @@ pub mod plamo3_quantized;
 pub mod qwen;
 pub mod qwen2;
 pub mod qwen2_5_vl;
+pub mod qwen2_audio;
 pub mod qwen2_lora;
 pub mod qwen2_moe;
 pub mod qwen2_moe_quantized;
@@ -403,6 +404,7 @@ pub use plamo3_quantized::QuantizedPlamo3ForCausalLM;
 pub use qwen::QWenLMHeadModel;
 pub use qwen2::Qwen2ForCausalLM;
 pub use qwen2_5_vl::Qwen25VLForConditionalGeneration;
+pub use qwen2_audio::Qwen2AudioForConditionalGeneration;
 pub use qwen2_lora::Qwen2WithLora;
 pub use qwen2_moe::Qwen2MoeForCausalLM;
 pub use qwen2_moe_quantized::QuantizedQwen2MoeForCausalLM;
@@ -571,6 +573,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "BeeForConditionalGeneration" => Ok(Box::new(
             LlavaOnevisionForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "Qwen2AudioForConditionalGeneration" => {
+            Ok(Box::new(Qwen2AudioForConditionalGeneration::new(cfg, vb)?))
+        }
         "Qwen2VLForConditionalGeneration" | "Tarsier2ForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
