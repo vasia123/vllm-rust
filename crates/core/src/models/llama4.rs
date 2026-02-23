@@ -13,15 +13,15 @@ use super::tp_layers::{TpContext, TpEmbedding, TpLinear, TpSwiGluMlp};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-struct Llama4Config {
-    num_local_experts: usize,
-    num_experts_per_tok: usize,
-    interleave_moe_layer_step: usize,
-    no_rope_layers: Vec<bool>,
+pub(crate) struct Llama4Config {
+    pub(crate) num_local_experts: usize,
+    pub(crate) num_experts_per_tok: usize,
+    pub(crate) interleave_moe_layer_step: usize,
+    pub(crate) no_rope_layers: Vec<bool>,
 }
 
 impl Llama4Config {
-    fn from_model_config(cfg: &ModelConfig) -> Self {
+    pub(crate) fn from_model_config(cfg: &ModelConfig) -> Self {
         let num_local_experts = cfg
             .extra
             .get("num_local_experts")
@@ -340,7 +340,7 @@ impl Llama4FeedForward {
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
 
-struct Llama4DecoderLayer {
+pub(crate) struct Llama4DecoderLayer {
     self_attn: Llama4Attention,
     feed_forward: Llama4FeedForward,
     input_layernorm: RmsNorm,
@@ -348,7 +348,7 @@ struct Llama4DecoderLayer {
 }
 
 impl Llama4DecoderLayer {
-    fn new_with_tp(
+    pub(crate) fn new_with_tp(
         cfg: &ModelConfig,
         l4_cfg: &Llama4Config,
         layer_idx: usize,
@@ -414,7 +414,7 @@ impl Llama4DecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,

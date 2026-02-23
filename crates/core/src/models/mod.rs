@@ -35,6 +35,8 @@ pub mod eagle2_5_vl;
 pub mod eagle3;
 pub mod eagle3_mistral_large3;
 pub mod eagle_llama;
+pub mod eagle_llama4;
+pub mod eagle_minicpm;
 pub mod ernie45_moe;
 pub mod ernie45_vl;
 pub mod ernie_mtp;
@@ -248,6 +250,8 @@ pub use eagle2_5_vl::Eagle25VLForConditionalGeneration;
 pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
 pub use eagle_llama::{Eagle1DraftModel, EagleLlamaForCausalLM};
+pub use eagle_llama4::EagleLlama4ForCausalLM;
+pub use eagle_minicpm::EagleMiniCPMForCausalLM;
 pub use ernie45_moe::Ernie45MoeForCausalLM;
 pub use ernie45_vl::Ernie4_5_VLForConditionalGeneration;
 pub use ernie_mtp::ErnieMtpModel;
@@ -1079,6 +1083,27 @@ pub fn mtp_from_config(
         "OpenPanguMTPModel" => Ok(Box::new(OpenPanguMtpModel::new(cfg, vb)?)),
         "Qwen3NextMTP" => Ok(Box::new(Qwen3NextMtpModel::new(cfg, vb)?)),
         "Step3p5MTP" => Ok(Box::new(Step3p5MtpModel::new(cfg, vb)?)),
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
+/// Create an Eagle-1 draft model from a model configuration.
+///
+/// Dispatches to the correct Eagle-1 variant based on the architecture name:
+/// - `EagleLlamaForCausalLM` → Llama-based Eagle-1
+/// - `EagleLlama4ForCausalLM` → Llama-4-based Eagle-1
+/// - `EagleMiniCPMForCausalLM` → MiniCPM-based Eagle-1
+///
+/// Used by the speculative decoding engine to load the correct Eagle-1 model.
+pub fn eagle1_from_config(
+    cfg: &ModelConfig,
+    vb: VarBuilder,
+) -> Result<Box<dyn Eagle1DraftModel>, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        "EagleLlamaForCausalLM" => Ok(Box::new(EagleLlamaForCausalLM::new(cfg, vb)?)),
+        "EagleLlama4ForCausalLM" => Ok(Box::new(EagleLlama4ForCausalLM::new(cfg, vb)?)),
+        "EagleMiniCPMForCausalLM" => Ok(Box::new(EagleMiniCPMForCausalLM::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }

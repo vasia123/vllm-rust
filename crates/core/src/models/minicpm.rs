@@ -19,19 +19,19 @@ use crate::moe::{MoELayer, MoELayerConfig};
 
 // ─── MiniCPM Config ─────────────────────────────────────────────────────────
 
-struct MiniCPMConfig {
-    scale_emb: f64,
-    scale_depth: f64,
-    dim_model_base: f64,
-    num_experts: usize,
-    num_experts_per_tok: usize,
-    hidden_act: String,
+pub(crate) struct MiniCPMConfig {
+    pub(crate) scale_emb: f64,
+    pub(crate) scale_depth: f64,
+    pub(crate) dim_model_base: f64,
+    pub(crate) num_experts: usize,
+    pub(crate) num_experts_per_tok: usize,
+    pub(crate) hidden_act: String,
     #[allow(dead_code)]
-    hidden_act_param: f64,
+    pub(crate) hidden_act_param: f64,
 }
 
 impl MiniCPMConfig {
-    fn from_model_config(cfg: &ModelConfig) -> Self {
+    pub(crate) fn from_model_config(cfg: &ModelConfig) -> Self {
         let scale_emb = cfg
             .extra
             .get("scale_emb")
@@ -75,11 +75,11 @@ impl MiniCPMConfig {
         }
     }
 
-    fn residual_scale(&self, num_layers: usize) -> f64 {
+    pub(crate) fn residual_scale(&self, num_layers: usize) -> f64 {
         self.scale_depth / (num_layers as f64).sqrt()
     }
 
-    fn output_scale(&self, hidden_size: usize) -> f64 {
+    pub(crate) fn output_scale(&self, hidden_size: usize) -> f64 {
         hidden_size as f64 / self.dim_model_base
     }
 }
@@ -295,7 +295,7 @@ impl MiniCPMAttention {
 
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
-struct MiniCPMDecoderLayer {
+pub(crate) struct MiniCPMDecoderLayer {
     self_attn: MiniCPMAttention,
     feed_forward: MiniCPMFeedForward,
     input_layernorm: RmsNorm,
@@ -304,7 +304,7 @@ struct MiniCPMDecoderLayer {
 }
 
 impl MiniCPMDecoderLayer {
-    fn new(cfg: &ModelConfig, mini_cfg: &MiniCPMConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ModelConfig, mini_cfg: &MiniCPMConfig, vb: VarBuilder) -> Result<Self> {
         let self_attn = MiniCPMAttention::new(cfg, vb.pp("self_attn"))?;
 
         let feed_forward = if mini_cfg.num_experts > 0 {
@@ -351,7 +351,7 @@ impl MiniCPMDecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
