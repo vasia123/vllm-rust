@@ -109,6 +109,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `openpangu_vl.rs` — `OpenPanguVLForConditionalGeneration` ✅ (5 tests) — commit 8e77a55
 - `keye_vl.rs` — `KeyeVL1_5ForConditionalGeneration` ✅ (5 tests) — commit 0d3767d
 - `isaac.rs` — `IsaacForConditionalGeneration` ✅ (5 tests) — commit 3641eee
+- `deepseek_ocr2.rs` — `DeepseekOCR2ForCausalLM` ✅ (5 tests) — 2026-02-23
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -198,7 +199,15 @@ Weight paths: `vision_embedding.transformer.{embeddings,encoder,post_layernorm}.
 `vision_embedding.linear_fc{1,2}.weight`, `language_model.{model,lm_head}.*`.
 HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc2}`, `model.text_model.→language_model.model.`.
 
-- **P2 models (~6 remaining):** MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), DeepSeek-OCR, Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT)
+DeepSeek-OCR2: `SamImageEncoderViT` (Conv2d patch embed + abs pos embed + 12 blocks with decomposed relative pos embeds,
+window=14 for non-global, global attn at [2,5,8,11] → neck Conv2d×4 + net_2/net_3 stride-2 Conv2d → `[B, 896, H/64, W/64]`) +
+`Ocr2Qwen2Encoder` (24 Qwen2 decoder layers as visual encoder: flatten SAM output → cat with learnable queries [144 or 256] →
+custom dual-mode mask [image=full non-causal, query=causal] → return query tokens `[B, n_query, 896]`) +
+`Ocr2MlpProjector` (spatial unfold dr² patches into channel dim + 2-layer GELU MLP) + `view_seperator` token +
+`Qwen2ForCausalLM`. Weight paths: `model.sam_model.*` (SAM), `model.qwen2_model.*` (encoder), `model.projector.*`,
+`model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
+
+- **P2 models (~5 remaining):** MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
@@ -216,15 +225,23 @@ HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc
 **Difficulty:** ★★★☆☆ per method | **Effort:** 3–4 weeks (6 methods)
 - All follow `QuantizationConfig` + `QuantizedLinear` trait in `crates/core/src/quantization/`
 - **In order of priority:**
-  1. `awq_marlin.rs` — route AWQ weights to Marlin kernel; ~150 LOC, quick win
-  2. `fbgemm_fp8.rs` — Meta's FP8 GEMM wrapper; ~300 LOC
-  3. `input_quant_fp8.rs` — FP8 activation quantization; ~200 LOC
-  4. `ptpc_fp8.rs` — per-tensor/per-channel FP8; ~250 LOC
-  5. `mxfp4.rs` — MX floating-point 4-bit; ~400 LOC (new format)
-  6. `modelopt.rs` — NVIDIA ModelOpt format; ~500 LOC
+  1. `awq_marlin.rs` ✅ DONE — `AwqMarlinConfig`, `AwqMarlinWeightLoader`, CPU nibble deinterleave (`repack_awq_nibbles`); 7 tests; 3924 total
+     - CPU path: AWQ nibble deinterleave → GPTQ ordering → `MarlinLinear::process_weights()` (GPTQ→Marlin tile repack)
+     - GPU TODO: add `awq_marlin_repack_int4` PTX to `marlin_gemm.cu` for single-step AWQ→Marlin repack
+     - GPU TODO: qzeros need `marlin_awq_repack_zp` conversion for Marlin format
+  2. `fbgemm_fp8.rs` ✅ DONE — `FbgemmFp8Config` (modules_to_not_convert, activation_scale_ub), `FbgemmFp8Linear` (per-channel dequantize, F32 CPU path), `FbgemmFp8WeightLoader`; 6 tests; 3930 total
+     - CPU/Ampere: per-channel FP8 dequantize → F32 matmul; CUDA cap≥89: fp8_gemm (hardware FP8)
+     - Ampere TODO: wire `MarlinScalarType::Float8E4m3fn` path for `apply_fp8_marlin_linear`
+  3. `gptq_marlin` detection alias ✅ DONE — added `"gptq_marlin"` → `QuantizationMethod::Marlin` in detection.rs; min_capability=80 (Marlin)
+  4. `ptpc_fp8.rs` ✅ DONE — `PtpcFp8Config` wrapping `Fp8Config`, min_capability=94 (AMD MI300+), reuses `Fp8WeightLoader`; 6 tests; 3936 total
+     - Detection: `"ptpc_fp8"` in both config.json and quantize_config.json paths
+     - Weight format identical to standard FP8 — `is_checkpoint_fp8_serialized=false`, dynamic-only
+  5. `mxfp4.rs` — MX floating-point 4-bit; ~400 LOC (new format, requires FP4 CUDA kernels)
+  6. `modelopt.rs` — NVIDIA ModelOpt extended format; ~500 LOC
+  - `input_quant_fp8.py` — NOT a QuantizationConfig (it's a CustomOp utility for FP8 activation quantization); skip
 - **Reference:** `reference/vllm/model_executor/layers/quantization/`
 
-### 2.4 Speculative Decode: Missing Eagle Variants ✅ MOSTLY DONE
+### 2.4 Speculative Decode: Missing Eagle Variants + Medusa ✅ DONE
 **Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
 - Pattern fully established: `eagle_llama.rs` (Eagle-1) and `eagle3.rs` (Eagle-3)
 - **Completed:**
@@ -233,23 +250,21 @@ HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc
   - `eagle_deepseek.rs` — `EagleDeepSeekForCausalLM` (arch: `EagleDeepSeekMTPModel`) ✅ (5 tests) — commit abd76b0
   - `eagle1_from_config()` factory ✅ (4 variants: Llama, Llama4, MiniCPM, DeepSeek)
   - Fix: `EagleDeepSeekMTPModel` moved from `mtp_from_config()` to `eagle1_from_config()`
-- **Remaining (~1 item):**
-  1. Medusa model loader — add `MedusaModel` match arm in `from_config()`; ~100 LOC
+  - `models/medusa.rs` — `MedusaModel` + `MedusaDraftModel` trait + `medusa_from_config()` ✅ (5 tests)
 - **Architecture notes:**
   - DeepSeek Eagle: `fc(cat(enorm(embed), hnorm(hidden))) → MLA layers → norm`; MLA cache required
   - EagleLlama4: `fc(cat(embed, hidden)) → Llama4 layers → norm`; uses `TpContext::single_gpu()`
   - EagleMiniCPM: `fc(cat(norm1(embed), norm2(hidden))) → MiniCPM layers`; no final norm, divide by `scale_width`
+  - Medusa: K independent residual blocks (`x += SiLU(Wx)`) + K lm_heads; weights at `blocks.{i}.layers.{j}` / `lm_heads.{i}`
 
 ### 2.5 SSM/Mamba2 Ops
 **Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
-- **`mamba_mixer2`** — Mamba2's updated selective scan with state dimension splitting
-  - `crates/core/src/ssm/mamba_mixer2.rs` (~350 LOC CPU; +600 LOC CUDA kernel)
-- **Causal conv1d refactor** — currently duplicated inline in 8+ model files
-  - Create `crates/core/src/ssm/causal_conv1d.rs` (~100 LOC); remove ~500 LOC of duplication
-- **SSD ops** (6 Python files) — simplified state-space ops; required by future Mamba2 variants
-  - `crates/core/src/ssm/ssd.rs` (~300 LOC)
-- **Gated LayerNorm** — `crates/core/src/ssm/gated_layer_norm.rs` (~80 LOC)
-- **ShortConv** — fix `lfm2.rs:843` TODO; `crates/core/src/ssm/short_conv.rs` (~150 LOC)
+- **Causal conv1d refactor** ✅ DONE — `crates/core/src/ssm/causal_conv1d.rs` (5 tests); removed ~520 LOC duplication from 9 models (mamba, mamba2, jamba, bamba, zamba2, falcon_h1, plamo2, nemotron_h, granitemoe_hybrid); 3946 total
+- **ShortConv** ✅ DONE — `ShortConvBlock` + `Lfm2ShortConvDecoderLayer` implemented inline in `lfm2.rs`; `Lfm2ForCausalLM` + `Lfm2MoeForCausalLM` now fully hybrid (SSMStateManager, attn_layer_cache_idx, forward_with_request_id); 24 tests (3951 total) — 2026-02-23
+- **Gated LayerNorm** ✅ DONE — `crates/core/src/ssm/gated_layer_norm.rs`; `rms_norm_gated(x, z, weight, eps, norm_before_gate)`; 6 tests — 2026-02-23
+- **`mamba2.rs` correctness fix** ✅ DONE — fixed `in_proj` size (added gate dim → `2*d_inner + 2*n*S + H`), conv on full `xBC`, post-SSM `Mixer2RMSNormGated` output norm, `Mamba2DecoderLayer` pre-norm at correct weight path, removed spurious `norm_b`/`norm_c`; `SSMStateManager::new_with_conv_channels` for `conv_dim` states; 11 tests (3958 total) — 2026-02-23
+- **SSD ops** (6 Python files) — chunked parallel SSD scan; required for GPU-efficient Mamba2
+  - `crates/core/src/ssm/ssd.rs` (~300 LOC); CPU sequential recurrence is already correct
 
 ---
 
@@ -284,13 +299,19 @@ HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc
 
 ## Tier 4: Easy Wins (Low Complexity, High Value)
 
-### 4.1 Pipeline Parallelism — Enable
+### 4.1 Pipeline Parallelism — Enable ✅ DONE
 **Effort:** 2–3 days | **Difficulty:** ★★☆☆☆
-- Framework is 90% designed: `PipelineForward` trait, `PipelineStagedModel`, P2P comms exist
-- Wire `DeviceCommunicator.send()/recv()` calls in `crates/core/src/engine/pipeline.rs`
-- Remove error gate in `crates/server/src/main.rs:815`
-- Add 2-GPU integration test
-- **Reference:** `crates/core/src/distributed/pipeline.rs` + `communicator.rs`
+
+**Completed (2026-02-23):**
+- Extended `send_worker_signal` to 6-element header: `[signal, batch_size, seq_len, seqlen_offset, num_slots, num_block_ids]` + `WorkerSignal` struct ✅
+- Added `SIGNAL_EXECUTE_DECODE = 2`, `MAX_BLOCKS_PER_SEQ = 64`, `DECODE_META_WORDS_PER_SEQ = 67` ✅
+- `PipelineStagedModel::broadcast_prefill_signals()` — rank 0 sends control header + slot_mapping + block_ids to all workers before forwarding hidden states ✅
+- `PipelineStagedModel::broadcast_decode_signals()` — rank 0 sends decode metadata (fixed `DECODE_META_WORDS_PER_SEQ` words per sequence) to all workers ✅
+- `pipeline_worker_loop` — receives extended header, recvs slot_mapping/block_ids or decode_meta accordingly, reconstructs `BlockTable` + `DecodeSequenceMetadata`, dispatches to `forward_layers` or `forward_layers_decode_batch` ✅
+- Removed error gate at `crates/server/src/main.rs` ✅
+- 27 pipeline tests pass (2 new: `decode_meta_constants_consistent`, `send_worker_signal_decode_encodes_correctly`) ✅
+
+**Remaining:** `pipeline_parallel_size` not yet wired through `ServerLaunchConfig` → `run_server` (no model registry hook for stage slicing yet).
 
 ### 4.2 RoPE Variants
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
@@ -301,19 +322,29 @@ HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc
 
 ### 4.3 Resolve P1 Code TODOs
 **Effort:** 3–5 days
-1. `phi4mm.rs:271` — HD transform + 2x2 compression + projection (~150 LOC)
-2. `molmo2.rs:586` — extract vision features for multimodal path (~100 LOC)
-3. `multimodal/processor.rs:146` — video support in processor (~200 LOC)
-4. `mimo_v2_flash.rs:469` — MoE block instead of dense MLP (~50 LOC)
+1. ~~`phi4mm.rs:271` — HD transform + 2x2 compression + projection~~  ✅ DONE
+   - `avg_pool2x2_nhwc()`, `hd_transform()`, `glb_gn`/`sub_gn` learnable separators
+   - Fixed projector input dim (`image_dim_out` not `*4`), 2 new tests (single + HD)
+2. ~~`molmo2.rs:586` — extract vision features for multimodal path~~  ✅ DONE
+   - `merge_vision_features()`, splices pre-projected `[np, hidden]` embeddings at patch positions; 1 new test
+3. ~~`multimodal/processor.rs:146` — video support in processor~~  ✅ DONE
+   - `process_video()` (Embedding/Frames paths), `parse_video_url()`, `find_video_placeholder_positions()`
+   - `ProcessorConfig` extended with `video_placeholder`/`video_placeholder_id`/`num_video_tokens`
+   - `process_content()` handles `ContentPart::Video` (mixed image+video supported); 6 new tests; 3915 total
+4. ~~`mimo_v2_flash.rs:469` — MoE block instead of dense MLP~~  ✅ DONE
+   - `MiMoV2Expert`, `MiMoV2MoEBlock` (sigmoid + grouped top-k, no shared experts), `MiMoV2Mlp` enum; 1 new test; 3909 total
 
 ### 4.4 Tool & Reasoning Parsers
 **Effort:** 2–3 days
-- **GPT-OSS reasoning parser** — add to `crates/core/src/reasoning/mod.rs`; ~100 LOC
+- **GPT-OSS reasoning parser** ✅ DONE — `GptOssReasoningParser` in `reasoning/mod.rs`; 5 tests; 3905 total
+  - Format: `<|channel|>analysis<|message|>{reasoning}<|end|>` / `<|channel|>final<|message|>{content}<|end|>`
+  - Streaming: re-parse + diff (mirrors Python `parse_chat_output` approach)
+  - Aliases: `gpt_oss`, `gpt-oss`, `gptoss`
 - **Qwen-VL tool parser (legacy)** — add to `crates/core/src/tool_parser/`; ~150 LOC
 
-### 4.5 Medusa Model Loader
+### 4.5 Medusa Model Loader ✅ DONE
 **Effort:** 0.5 day
-- Add `MedusaModel` match arm in `from_config()` in `crates/core/src/models/mod.rs`; ~100 LOC
+- `models/medusa.rs` — `MedusaModel` + `MedusaDraftModel` trait + `medusa_from_config()` ✅ (5 tests)
 - Proposer (`medusa_proposer.rs`) already complete
 
 ---
@@ -342,8 +373,8 @@ Pipeline Parallelism (enable) → no blockers ← can do now
 
 ## Suggested Starting Point
 
-1. **Now (no blockers):** PP enable, GPT-OSS parser, Medusa loader, phi4mm TODO
-2. **Week 1–4:** ~~MTP framework + DeepSeek-MTP~~ ✅; ~~InternS1~~ ✅; ~~CP~~ ✅; ~~DP~~ ✅; ~~EP+EPLB~~ ✅; Step3-VL; AWQ-Marlin
+1. **Now (no blockers):** PP enable, ~~GPT-OSS parser~~ ✅, ~~Medusa loader~~ ✅, ~~phi4mm HD transform~~ ✅, molmo2 TODO
+2. **Week 1–4:** ~~MTP framework + DeepSeek-MTP~~ ✅; ~~InternS1~~ ✅; ~~CP~~ ✅; ~~DP~~ ✅; ~~EP+EPLB~~ ✅; ~~Step3-VL~~ ✅; ~~AWQ-Marlin~~ ✅; ~~FBGEMM FP8~~ ✅; ~~gptq_marlin alias~~ ✅; ~~PTPC FP8~~ ✅
 3. **Week 4–8:** Audio pipeline + Whisper; Kimi-VL (after MoonViT); remaining VLMs
 4. **Week 8–16:** Remaining VLMs; remaining Eagle variants; Quant P2
 5. **Week 16+:** Quant P3; server audio API; attention backends
