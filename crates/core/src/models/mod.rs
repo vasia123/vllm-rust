@@ -100,6 +100,7 @@ pub mod interns1;
 pub mod interns1_pro;
 pub mod internvl;
 pub mod iquest_loopcoder;
+pub mod isaac;
 pub mod jais;
 pub mod jais2;
 pub mod jais2_quantized;
@@ -312,6 +313,7 @@ pub use interns1::InternS1ForConditionalGeneration;
 pub use interns1_pro::InternS1ProForConditionalGeneration;
 pub use internvl::InternVLChatModel;
 pub use iquest_loopcoder::IQuestLoopCoderForCausalLM;
+pub use isaac::IsaacForConditionalGeneration;
 pub use jais::JAISLMHeadModel;
 pub use jais2::Jais2ForCausalLM;
 pub use jais2_quantized::QuantizedJais2ForCausalLM;
@@ -514,6 +516,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "InternLM2ForCausalLM" => Ok(Box::new(InternLM2ForCausalLM::new(cfg, vb)?)),
         "InternLM2VEForCausalLM" => Ok(Box::new(InternLM2VEForCausalLM::new(cfg, vb)?)),
         "IQuestLoopCoderForCausalLM" => Ok(Box::new(IQuestLoopCoderForCausalLM::new(cfg, vb)?)),
+        "IsaacForConditionalGeneration" => {
+            Ok(Box::new(IsaacForConditionalGeneration::new(cfg, vb)?))
+        }
         "LongcatFlashForCausalLM" => Ok(Box::new(LongcatFlashForCausalLM::new(cfg, vb)?)),
         "MiMoForCausalLM" | "MiMoV2FlashForCausalLM" => {
             Ok(Box::new(MiMoV2FlashForCausalLM::new(cfg, vb)?))
