@@ -224,18 +224,21 @@ HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc
   6. `modelopt.rs` — NVIDIA ModelOpt format; ~500 LOC
 - **Reference:** `reference/vllm/model_executor/layers/quantization/`
 
-### 2.4 Speculative Decode: Missing Eagle Variants ✅ PARTIALLY DONE
+### 2.4 Speculative Decode: Missing Eagle Variants ✅ MOSTLY DONE
 **Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
 - Pattern fully established: `eagle_llama.rs` (Eagle-1) and `eagle3.rs` (Eagle-3)
 - **Completed:**
   - `eagle_llama4.rs` — `EagleLlama4ForCausalLM` ✅ (5 tests) — commit 614ebc3
   - `eagle_minicpm.rs` — `EagleMiniCPMForCausalLM` ✅ (5 tests) — commit 614ebc3
-  - `eagle1_from_config()` factory in `mod.rs` ✅ — dispatches on arch name
-- **Files to create:**
-  1. `deepseek_eagle.rs` — Eagle-1 for DeepSeek V2/V3 MLA; ~500 LOC
-  2. Medusa model loader — add `MedusaModel` match arm in `from_config()`; ~100 LOC
-- **Proposers:** `crates/core/src/engine/spec_decode/`
-- **Reference:** `reference/vllm/model_executor/models/deepseek_eagle.py`
+  - `eagle_deepseek.rs` — `EagleDeepSeekForCausalLM` (arch: `EagleDeepSeekMTPModel`) ✅ (5 tests) — commit abd76b0
+  - `eagle1_from_config()` factory ✅ (4 variants: Llama, Llama4, MiniCPM, DeepSeek)
+  - Fix: `EagleDeepSeekMTPModel` moved from `mtp_from_config()` to `eagle1_from_config()`
+- **Remaining (~1 item):**
+  1. Medusa model loader — add `MedusaModel` match arm in `from_config()`; ~100 LOC
+- **Architecture notes:**
+  - DeepSeek Eagle: `fc(cat(enorm(embed), hnorm(hidden))) → MLA layers → norm`; MLA cache required
+  - EagleLlama4: `fc(cat(embed, hidden)) → Llama4 layers → norm`; uses `TpContext::single_gpu()`
+  - EagleMiniCPM: `fc(cat(norm1(embed), norm2(hidden))) → MiniCPM layers`; no final norm, divide by `scale_width`
 
 ### 2.5 SSM/Mamba2 Ops
 **Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
