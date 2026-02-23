@@ -34,6 +34,7 @@ pub mod e5_mistral;
 pub mod eagle2_5_vl;
 pub mod eagle3;
 pub mod eagle3_mistral_large3;
+pub mod eagle_deepseek;
 pub mod eagle_llama;
 pub mod eagle_llama4;
 pub mod eagle_minicpm;
@@ -249,6 +250,7 @@ pub use e5_mistral::E5MistralForEmbedding;
 pub use eagle2_5_vl::Eagle25VLForConditionalGeneration;
 pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
 pub use eagle3_mistral_large3::Eagle3MistralLarge3ForCausalLM;
+pub use eagle_deepseek::EagleDeepSeekForCausalLM;
 pub use eagle_llama::{Eagle1DraftModel, EagleLlamaForCausalLM};
 pub use eagle_llama4::EagleLlama4ForCausalLM;
 pub use eagle_minicpm::EagleMiniCPMForCausalLM;
@@ -1071,9 +1073,10 @@ pub fn mtp_from_config(
 ) -> Result<Box<dyn MtpDraftModel>, ModelError> {
     let arch = get_arch(cfg)?;
     match arch {
-        "DeepSeekMTPModel" | "EagleDeepSeekMTPModel" => {
-            Ok(Box::new(DeepSeekMtpModel::new(cfg, vb)?))
-        }
+        // NOTE: EagleDeepSeekMTPModel in the Python registry maps to
+        // EagleDeepseekV3ForCausalLM, which uses the Eagle-1 protocol —
+        // NOT the MTP protocol. It is handled in eagle1_from_config().
+        "DeepSeekMTPModel" => Ok(Box::new(DeepSeekMtpModel::new(cfg, vb)?)),
         "ErnieMTPModel" => Ok(Box::new(ErnieMtpModel::new(cfg, vb)?)),
         "ExaoneMoeMTP" => Ok(Box::new(ExaoneMoeMtpModel::new(cfg, vb)?)),
         "Glm4MoeMTPModel" | "Glm4MoeLiteMTPModel" => Ok(Box::new(Glm4MoeMtpModel::new(cfg, vb)?)),
@@ -1093,6 +1096,8 @@ pub fn mtp_from_config(
 /// - `EagleLlamaForCausalLM` → Llama-based Eagle-1
 /// - `EagleLlama4ForCausalLM` → Llama-4-based Eagle-1
 /// - `EagleMiniCPMForCausalLM` → MiniCPM-based Eagle-1
+/// - `EagleDeepSeekMTPModel` → DeepSeek V2/V3 MLA Eagle-1 (Eagle-1 protocol
+///   despite the name; see Python registry entry `deepseek_eagle.py`)
 ///
 /// Used by the speculative decoding engine to load the correct Eagle-1 model.
 pub fn eagle1_from_config(
@@ -1104,6 +1109,7 @@ pub fn eagle1_from_config(
         "EagleLlamaForCausalLM" => Ok(Box::new(EagleLlamaForCausalLM::new(cfg, vb)?)),
         "EagleLlama4ForCausalLM" => Ok(Box::new(EagleLlama4ForCausalLM::new(cfg, vb)?)),
         "EagleMiniCPMForCausalLM" => Ok(Box::new(EagleMiniCPMForCausalLM::new(cfg, vb)?)),
+        "EagleDeepSeekMTPModel" => Ok(Box::new(EagleDeepSeekForCausalLM::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
