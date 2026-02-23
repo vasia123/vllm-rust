@@ -86,7 +86,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~22 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V, Ovis DONE
+### 2.1 Missing VLMs (~21 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V, Ovis, Aria DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -105,6 +105,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `glm4_1v.rs` — `Glm4vForConditionalGeneration` ✅ (5 tests)
 - `kanana_v.rs` — `KananaVForConditionalGeneration` ✅ (5 tests)
 - `ovis.rs` — `OvisForConditionalGeneration` ✅ (6 tests)
+- `aria.rs` — `AriaForConditionalGeneration` ✅ (5 tests) — commit 3f285e8
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -161,9 +162,17 @@ Image pad token: qwen2→151655, llama→128002, gemma2→7.
 AIMv2 fc1/fc3 loaded separately (not merged fc13); `qkv_bias`/`use_bias` from config.
 `st_argmax`/`gumbel_argmax` → argmax + one-hot via broadcast_eq at inference (no noise).
 
+Aria: SigLIP ViT (no post_layernorm; `forward_no_post_norm`) + `AriaProjector` (learnable queries
+[max_q, vis_hidden] + `AriaCrossAttention` + MLP) + `AriaTextModel` (LlamaAttention + per-layer MoE).
+`AriaCrossAttention`: loads PyTorch MHA `in_proj_weight [3H, H]` split into q/k/v at load time.
+`AriaTextMoELayer`: shared `TpSwiGluMlp` always active + top-K routed sparse experts using HF weight
+format [E, H, 2I] (fc1) and [E, I, H] (fc2) — direct matmul `x @ fc[e]` (no transpose needed).
+Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model.*` / `language_model.lm_head.*`.
+`LlamaAttention` made `pub(crate)` to allow reuse from `AriaDecoderLayer`.
+
 - **P1 models remaining (in order):**
   1. `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
-- **P2 models (~10 remaining):** Aria, MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), DeepSeek-OCR, Hunyuan-Vision (BLOCKED), OpenPangu-VL, LFM2-VL (BLOCKED: SigLIP2-NaViT), Keye, Isaac
+- **P2 models (~9 remaining):** MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), DeepSeek-OCR, Hunyuan-Vision (BLOCKED), OpenPangu-VL, LFM2-VL (BLOCKED: SigLIP2-NaViT), Keye, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
