@@ -86,7 +86,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~19 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V, Ovis, Aria, OpenPangu-VL, Keye-VL DONE
+### 2.1 Missing VLMs (~18 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V, Ovis, Aria, OpenPangu-VL, Keye-VL, Isaac DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -108,6 +108,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `aria.rs` — `AriaForConditionalGeneration` ✅ (5 tests) — commit 3f285e8
 - `openpangu_vl.rs` — `OpenPanguVLForConditionalGeneration` ✅ (5 tests) — commit 8e77a55
 - `keye_vl.rs` — `KeyeVL1_5ForConditionalGeneration` ✅ (5 tests) — commit 0d3767d
+- `isaac.rs` — `IsaacForConditionalGeneration` ✅ (5 tests) — commit 3641eee
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -189,7 +190,15 @@ Weight paths: `visual.vision_model.embeddings.*`, `visual.vision_model.encoder.l
 `mlp_AR.{pre_norm,linear_1,linear_2}.*`, `language_model.{model.*,lm_head.*}`.
 VL helpers added to `Qwen3ForCausalLM` (embed_text, forward_with_embeddings, forward_decode_batch_with_embeddings).
 
-- **P2 models (~7 remaining):** MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), DeepSeek-OCR, Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT), Isaac
+Isaac: `Siglip2VisionTransformer` (Linear patch embed + bilinear-interp `position_embedding` (Embedding, `num_patches` entries, grid=√num_patches) +
+N pre-norm encoder layers (GELU-erf MLP, separate q/k/v proj with bias, out_proj with bias, `layer_norm1/2`) + `post_layernorm` + `pixel_shuffle` spatial merge (scale²× channel expand)) +
+`IsaacVisionEmbedding` projector (ViT at `transformer.*` + `linear_fc1` (SiLU, no bias) + `linear_fc2` (no bias)) + `Qwen3ForCausalLM`.
+`bilinear_interp_pos_emb`: align_corners=False CPU loop (no antialias); fast path when tgt==src.
+Weight paths: `vision_embedding.transformer.{embeddings,encoder,post_layernorm}.*`,
+`vision_embedding.linear_fc{1,2}.weight`, `language_model.{model,lm_head}.*`.
+HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc2}`, `model.text_model.→language_model.model.`.
+
+- **P2 models (~6 remaining):** MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), DeepSeek-OCR, Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
