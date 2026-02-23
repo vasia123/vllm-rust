@@ -156,6 +156,7 @@ pub mod openpangu_mtp;
 pub mod opt;
 pub mod opt_quantized;
 pub mod ouro;
+pub mod ovis;
 pub mod paligemma;
 pub mod pangu;
 pub mod persimmon;
@@ -363,6 +364,7 @@ pub use openpangu_mtp::OpenPanguMtpModel;
 pub use opt::OPTForCausalLM;
 pub use opt_quantized::QuantizedOPTForCausalLM;
 pub use ouro::OuroForCausalLM;
+pub use ovis::OvisForConditionalGeneration;
 pub use paligemma::PaliGemmaForConditionalGeneration;
 pub use pangu::{PanguEmbeddedForCausalLM, PanguProMoEV2ForCausalLM, PanguUltraMoEForCausalLM};
 pub use persimmon::PersimmonForCausalLM;
@@ -725,6 +727,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "OlmoeForCausalLM" => Ok(Box::new(OlmoeForCausalLM::new(cfg, vb)?)),
         "OPTForCausalLM" => Ok(Box::new(OPTForCausalLM::new(cfg, vb)?)),
         "OuroForCausalLM" => Ok(Box::new(OuroForCausalLM::new(cfg, vb)?)),
+        "OvisForConditionalGeneration" => Ok(Box::new(OvisForConditionalGeneration::new(cfg, vb)?)),
         "PanguEmbeddedForCausalLM" => Ok(Box::new(PanguEmbeddedForCausalLM::new(cfg, vb)?)),
         "PanguProMoEV2ForCausalLM" => Ok(Box::new(PanguProMoEV2ForCausalLM::new(cfg, vb)?)),
         "PanguUltraMoEForCausalLM" => Ok(Box::new(PanguUltraMoEForCausalLM::new(cfg, vb)?)),

@@ -86,7 +86,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~23 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V DONE
+### 2.1 Missing VLMs (~22 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V, Ovis DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -104,6 +104,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `glm_ocr.rs` — `GlmOcrForConditionalGeneration` ✅ (5 tests)
 - `glm4_1v.rs` — `Glm4vForConditionalGeneration` ✅ (5 tests)
 - `kanana_v.rs` — `KananaVForConditionalGeneration` ✅ (5 tests)
+- `ovis.rs` — `OvisForConditionalGeneration` ✅ (6 tests)
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -151,9 +152,18 @@ Kanana-V: `Qwen2VLVisionEncoder` (Qwen2ViT without merger; new `pub(crate)` stru
 Weight paths: `vision_model.*`, `abstractor.net.{0,2}.blocks.block{k}.*`, `abstractor.readout.*`,
 `model.model.*` / `model.lm_head.*`. `Qwen2VLVisionConfig::from_model_config()` added (reads `extra["vision_config"]`).
 
+Ovis: `AIMv2Model` (Conv2d patch embed + RMSNorm + learnable pos_embed; depth SwiGLU pre-norm blocks; no CLS token) +
+`VisualTokenizer` (AIMv2 → optional hidden_stride² spatial merge → Linear(no-bias) + LayerNorm head → softmax/st_argmax
+→ pad to vocab_size) + `VisualEmbedding` (soft_tokens @ vte.weight; float path: matmul, int path: table lookup) +
+LLM (LlamaForCausalLM or Qwen2ForCausalLM, enum `OvisLlm`).
+Weight paths: `visual_tokenizer.backbone.*` (AIMv2), `visual_tokenizer.head.{0,1}.*`, `vte.weight`, `llm.model.*` / `llm.lm_head.*`.
+Image pad token: qwen2→151655, llama→128002, gemma2→7.
+AIMv2 fc1/fc3 loaded separately (not merged fc13); `qkv_bias`/`use_bias` from config.
+`st_argmax`/`gumbel_argmax` → argmax + one-hot via broadcast_eq at inference (no noise).
+
 - **P1 models remaining (in order):**
   1. `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
-- **P2 models (~11 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, DeepSeek-OCR, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Isaac
+- **P2 models (~10 remaining):** Aria, MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), DeepSeek-OCR, Hunyuan-Vision (BLOCKED), OpenPangu-VL, LFM2-VL (BLOCKED: SigLIP2-NaViT), Keye, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
