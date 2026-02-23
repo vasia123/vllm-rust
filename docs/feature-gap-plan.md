@@ -224,14 +224,16 @@ HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc
   6. `modelopt.rs` — NVIDIA ModelOpt format; ~500 LOC
 - **Reference:** `reference/vllm/model_executor/layers/quantization/`
 
-### 2.4 Speculative Decode: Missing Eagle Variants
+### 2.4 Speculative Decode: Missing Eagle Variants ✅ PARTIALLY DONE
 **Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
 - Pattern fully established: `eagle_llama.rs` (Eagle-1) and `eagle3.rs` (Eagle-3)
+- **Completed:**
+  - `eagle_llama4.rs` — `EagleLlama4ForCausalLM` ✅ (5 tests) — commit 614ebc3
+  - `eagle_minicpm.rs` — `EagleMiniCPMForCausalLM` ✅ (5 tests) — commit 614ebc3
+  - `eagle1_from_config()` factory in `mod.rs` ✅ — dispatches on arch name
 - **Files to create:**
-  1. `deepseek_eagle.rs` — Eagle-1 for DeepSeek; ~600 LOC, adapt `eagle_llama.rs`
-  2. `llama4_eagle.rs` — Eagle for LLaMA4; ~700 LOC
-  3. `minicpm_eagle.rs` — Eagle for MiniCPM; ~500 LOC
-  4. Medusa model loader — add `MedusaModel` match arm in `from_config()`; ~100 LOC
+  1. `deepseek_eagle.rs` — Eagle-1 for DeepSeek V2/V3 MLA; ~500 LOC
+  2. Medusa model loader — add `MedusaModel` match arm in `from_config()`; ~100 LOC
 - **Proposers:** `crates/core/src/engine/spec_decode/`
 - **Reference:** `reference/vllm/model_executor/models/deepseek_eagle.py`
 
