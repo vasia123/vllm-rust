@@ -885,6 +885,121 @@ impl ReasoningParser for MiniMaxM2AppendThinkParser {
     }
 }
 
+// ─── GPT-OSS Reasoning Parser ────────────────────────────────────────────────
+
+/// Reasoning parser for GPT-OSS models (harmony-format channel protocol).
+///
+/// GPT-OSS structures output into named channels:
+/// ```text
+/// <|channel|>analysis<|message|>{reasoning}<|end|>
+/// <|channel|>final<|message|>{content}<|end|>
+/// ```
+///
+/// Up to ~200 bytes of special tokens may appear between `<|channel|>final` and
+/// `<|message|>` (equivalent to the "up to 20 token IDs" in the Python reference).
+/// These are silently skipped.
+///
+/// Streaming mirrors the Python `parse_chat_output()` approach: re-parse the full
+/// accumulated text on each delta and return the incremental diff.
+struct GptOssReasoningParser;
+
+impl GptOssReasoningParser {
+    const ANALYSIS_BEGIN: &'static str = "<|channel|>analysis<|message|>";
+    const FINAL_CHANNEL: &'static str = "<|channel|>final";
+    const MESSAGE_SEP: &'static str = "<|message|>";
+    const CHANNEL_END: &'static str = "<|end|>";
+    /// Byte budget between `<|channel|>final` and `<|message|>`.
+    /// Corresponds to the Python `reasoning_max_num_between_tokens = 20`.
+    /// 20 tokens × ≤ 10 bytes each = 200 bytes (generous upper bound).
+    const MAX_INTER_BYTES: usize = 200;
+
+    fn parse(text: &str) -> ReasoningOutput {
+        // Reasoning: text between ANALYSIS_BEGIN and CHANNEL_END (or end of string).
+        let reasoning = if let Some(a_pos) = text.find(Self::ANALYSIS_BEGIN) {
+            let after = a_pos + Self::ANALYSIS_BEGIN.len();
+            let body = match text[after..].find(Self::CHANNEL_END) {
+                Some(end_off) => &text[after..after + end_off],
+                None => &text[after..],
+            };
+            let s = body.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        } else {
+            None
+        };
+
+        // Content: after `<|channel|>final` + up to MAX_INTER_BYTES + `<|message|>`.
+        let content = if let Some(f_pos) = text.find(Self::FINAL_CHANNEL) {
+            let search_from = f_pos + Self::FINAL_CHANNEL.len();
+            let search_end = (search_from + Self::MAX_INTER_BYTES).min(text.len());
+            if let Some(msg_off) = text[search_from..search_end].find(Self::MESSAGE_SEP) {
+                let content_start = search_from + msg_off + Self::MESSAGE_SEP.len();
+                let body = match text[content_start..].find(Self::CHANNEL_END) {
+                    Some(end_off) => &text[content_start..content_start + end_off],
+                    None => &text[content_start..],
+                };
+                let s = body.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        ReasoningOutput { reasoning, content }
+    }
+
+    /// Compute the incremental delta between two versions of an accumulated string.
+    ///
+    /// If `cur` starts with `prev`, returns only the appended suffix.
+    /// If `cur` is `None`, returns `None`. If `prev` is `None`, returns all of `cur`.
+    fn delta(prev: Option<&str>, cur: Option<&str>) -> Option<String> {
+        let cur = cur?;
+        match prev {
+            None => Some(cur.to_string()),
+            Some(p) if cur.starts_with(p) => {
+                let tail = &cur[p.len()..];
+                if tail.is_empty() {
+                    None
+                } else {
+                    Some(tail.to_string())
+                }
+            }
+            // Edge case: text was truncated/re-emitted — return full cur.
+            Some(_) => Some(cur.to_string()),
+        }
+    }
+}
+
+impl ReasoningParser for GptOssReasoningParser {
+    fn extract_reasoning(&self, output: &str) -> ReasoningOutput {
+        Self::parse(output)
+    }
+
+    /// Re-parse the full accumulated text and return the incremental diff.
+    ///
+    /// This mirrors the Python streaming implementation which calls
+    /// `parse_chat_output(prev_ids)` and `parse_chat_output(cur_ids)` and diffs.
+    fn extract_reasoning_streaming(&self, previous_text: &str, delta_text: &str) -> ReasoningDelta {
+        let current = format!("{previous_text}{delta_text}");
+        let prev = Self::parse(previous_text);
+        let cur = Self::parse(&current);
+
+        ReasoningDelta {
+            reasoning: Self::delta(prev.reasoning.as_deref(), cur.reasoning.as_deref()),
+            content: Self::delta(prev.content.as_deref(), cur.content.as_deref()),
+        }
+    }
+}
+
 // ─── Factory ──────────────────────────────────────────────────────────────
 
 /// Create a reasoning parser by name.
@@ -904,6 +1019,7 @@ impl ReasoningParser for MiniMaxM2AppendThinkParser {
 /// - `minimax_m2_append_think` — MiniMax M2 passthrough (prepends `<think>` to content)
 /// - `hunyuan_a13b` — HunYuan A13B (`<think>`/`</think>`)
 /// - `glm45`, `holo2`, `kimi_k2` — aliases for `deepseek_r1`
+/// - `gpt_oss` — GPT-OSS harmony-format channels (`<|channel|>analysis` / `<|channel|>final`)
 /// - `identity` — no-op (all output → content)
 ///
 /// Unknown names default to `identity`.
@@ -979,6 +1095,7 @@ pub fn create_reasoning_parser(name: &str) -> Box<dyn ReasoningParser> {
             "</think>",
             TagParserMode::DeepSeekR1,
         )),
+        "gpt_oss" | "gpt-oss" | "gptoss" => Box::new(GptOssReasoningParser),
         // No-op: all output is content
         "identity" | "" => Box::new(IdentityReasoningParser),
         unknown => {
@@ -1292,6 +1409,7 @@ mod tests {
             "glm45",
             "holo2",
             "kimi_k2",
+            "gpt_oss",
             "identity",
             "",
         ];
@@ -1409,5 +1527,79 @@ mod tests {
         // After end tag — strips response tags
         let d2 = parser.extract_reasoning_streaming("<think>reasoning</think>", "\n<response>\n");
         assert!(d2.reasoning.is_none());
+    }
+
+    // ─── GPT-OSS ──────────────────────────────────────────────────────
+
+    #[test]
+    fn gptoss_basic_both_channels() {
+        let parser = create_reasoning_parser("gpt_oss");
+        let output =
+            "<|channel|>analysis<|message|>thinking here<|end|><|channel|>final<|message|>answer<|end|>";
+        let result = parser.extract_reasoning(output);
+        assert_eq!(result.reasoning.as_deref(), Some("thinking here"));
+        assert_eq!(result.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn gptoss_analysis_only_no_final() {
+        let parser = create_reasoning_parser("gpt_oss");
+        let output = "<|channel|>analysis<|message|>still reasoning";
+        let result = parser.extract_reasoning(output);
+        assert_eq!(result.reasoning.as_deref(), Some("still reasoning"));
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn gptoss_final_channel_inter_tokens() {
+        // Special tokens may appear between <|channel|>final and <|message|>.
+        let parser = create_reasoning_parser("gpt_oss");
+        let output =
+            "<|channel|>analysis<|message|>reasoning<|end|><|channel|>final<|action|>none<|message|>final answer<|end|>";
+        let result = parser.extract_reasoning(output);
+        assert_eq!(result.reasoning.as_deref(), Some("reasoning"));
+        assert_eq!(result.content.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn gptoss_streaming_progressive() {
+        let parser = create_reasoning_parser("gpt_oss");
+
+        // Delta arrives inside the analysis channel
+        let d1 = parser.extract_reasoning_streaming("<|channel|>analysis<|message|>", "thinking");
+        assert_eq!(d1.reasoning.as_deref(), Some("thinking"));
+        assert!(d1.content.is_none());
+
+        // More reasoning
+        let d2 =
+            parser.extract_reasoning_streaming("<|channel|>analysis<|message|>thinking", " deeply");
+        assert_eq!(d2.reasoning.as_deref(), Some(" deeply"));
+        assert!(d2.content.is_none());
+
+        // Transition: end of analysis + start of final content
+        let prev =
+            "<|channel|>analysis<|message|>thinking deeply<|end|><|channel|>final<|message|>";
+        let d3 = parser.extract_reasoning_streaming(prev, "answer");
+        assert!(d3.reasoning.is_none());
+        assert_eq!(d3.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn gptoss_factory_aliases() {
+        for name in &["gpt_oss", "gpt-oss", "gptoss"] {
+            let parser = create_reasoning_parser(name);
+            let out = "<|channel|>analysis<|message|>r<|end|><|channel|>final<|message|>c<|end|>";
+            let result = parser.extract_reasoning(out);
+            assert_eq!(
+                result.reasoning.as_deref(),
+                Some("r"),
+                "alias '{name}' failed"
+            );
+            assert_eq!(
+                result.content.as_deref(),
+                Some("c"),
+                "alias '{name}' failed"
+            );
+        }
     }
 }
