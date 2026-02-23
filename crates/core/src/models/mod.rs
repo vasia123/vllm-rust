@@ -27,6 +27,7 @@ pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_lora;
 pub mod deepseek_mtp;
+pub mod deepseek_ocr2;
 pub mod deepseek_quantized;
 pub mod deepseek_vl2;
 pub mod dots1;
@@ -127,6 +128,7 @@ pub mod longcat_flash;
 pub mod longcat_flash_mtp;
 pub mod mamba;
 pub mod mamba2;
+pub mod medusa;
 pub mod mimo_mtp;
 pub mod mimo_v2_flash;
 pub mod minicpm;
@@ -243,6 +245,7 @@ pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_lora::DeepSeekWithLora;
 pub use deepseek_mtp::DeepSeekMtpModel;
+pub use deepseek_ocr2::DeepseekOCR2ForCausalLM;
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use deepseek_vl2::DeepSeekVLV2ForConditionalGeneration;
 pub use dots1::Dots1ForCausalLM;
@@ -343,6 +346,7 @@ pub use longcat_flash::LongcatFlashForCausalLM;
 pub use longcat_flash_mtp::LongCatFlashMtpModel;
 pub use mamba::MambaForCausalLM;
 pub use mamba2::Mamba2ForCausalLM;
+pub use medusa::{MedusaDraftModel, MedusaModel};
 pub use mimo_mtp::MiMoMtpModel;
 pub use mimo_v2_flash::MiMoV2FlashForCausalLM;
 pub use minicpm::MiniCPMForCausalLM;
@@ -621,6 +625,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "DeepseekVLV2ForConditionalGeneration" => Ok(Box::new(
             DeepSeekVLV2ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "DeepseekOCR2ForCausalLM" => Ok(Box::new(DeepseekOCR2ForCausalLM::new(cfg, vb)?)),
         "InternS1ForConditionalGeneration" => Ok(Box::new(
             InternS1ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
@@ -1110,6 +1115,30 @@ pub fn eagle1_from_config(
         "EagleLlama4ForCausalLM" => Ok(Box::new(EagleLlama4ForCausalLM::new(cfg, vb)?)),
         "EagleMiniCPMForCausalLM" => Ok(Box::new(EagleMiniCPMForCausalLM::new(cfg, vb)?)),
         "EagleDeepSeekMTPModel" => Ok(Box::new(EagleDeepSeekForCausalLM::new(cfg, vb)?)),
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
+/// Create a Medusa draft model from a model configuration.
+///
+/// Dispatches to [`MedusaModel`] for the `MedusaModel` architecture.
+/// Returns a trait object implementing [`MedusaDraftModel`] which can be used
+/// by the speculative decoding engine to generate draft tokens from target
+/// model hidden states.
+///
+/// Config fields read from `ModelConfig::extra`:
+/// - `num_heads` — number of Medusa prediction heads (default: 4)
+/// - `medusa_fc_bias` — add bias to residual layers (default: false)
+/// - `truncated_vocab_size` — reduced vocab when a token_map is active
+///
+/// `ModelConfig::num_hidden_layers` is the number of residual layers per head.
+pub fn medusa_from_config(
+    cfg: &ModelConfig,
+    vb: VarBuilder,
+) -> Result<Box<dyn MedusaDraftModel>, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        "MedusaModel" => Ok(Box::new(MedusaModel::new(cfg, vb)?)),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
