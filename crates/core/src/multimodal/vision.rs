@@ -418,6 +418,27 @@ impl VisionEncoder {
         self.post_layernorm.forward(&embeddings)
     }
 
+    /// Encode without applying `post_layernorm` (used by models that skip it, e.g. Aria).
+    pub fn forward_no_post_norm(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let batch_size = pixel_values.dim(0)?;
+        let mut embeddings = self.patch_embedding.forward(pixel_values)?;
+        if let Some(cls) = &self.class_embedding {
+            let cls = cls.broadcast_as((batch_size, 1, self.config.hidden_size))?;
+            embeddings = Tensor::cat(&[cls, embeddings], 1)?;
+        }
+        let seq_len = embeddings.dim(1)?;
+        let position_ids = Tensor::arange(0u32, seq_len as u32, &self.device)?;
+        let position_embeddings = self.position_embedding.forward(&position_ids)?;
+        embeddings = embeddings.broadcast_add(&position_embeddings)?;
+        if let Some(ln) = &self.pre_layernorm {
+            embeddings = ln.forward(&embeddings)?;
+        }
+        for layer in &self.layers {
+            embeddings = layer.forward(&embeddings)?;
+        }
+        Ok(embeddings)
+    }
+
     /// Encode a single image and return a ProcessedImage.
     pub fn encode_image(&self, pixel_values: &Tensor) -> Result<ProcessedImage> {
         let embeddings = self.forward(pixel_values)?;

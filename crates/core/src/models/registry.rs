@@ -955,6 +955,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["AriaForConditionalGeneration"],
+        display_name: "Aria",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["Idefics3ForConditionalGeneration"],
         display_name: "Idefics3",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
