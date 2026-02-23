@@ -69,7 +69,7 @@ impl Default for Qwen2AudioEncoderConfig {
 }
 
 impl Qwen2AudioEncoderConfig {
-    fn from_json(json: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(json: &serde_json::Value) -> Self {
         let defaults = Self::default();
         let get_usize = |k: &str, d: usize| {
             json.get(k)
@@ -236,7 +236,7 @@ impl Qwen2AudioEncoderLayer {
 ///
 /// Pipeline: Conv1d(s=1) → GELU → Conv1d(s=2) → GELU → +pos_embed → N layers
 ///           → AvgPool1d(k=2,s=2) → LayerNorm → `[B, T/4, d_model]`
-struct Qwen2AudioEncoder {
+pub(crate) struct Qwen2AudioEncoder {
     conv1: Conv1d,
     conv2: Conv1d,
     /// Sinusoidal position embeddings `[max_source_positions, d_model]`.
@@ -247,7 +247,7 @@ struct Qwen2AudioEncoder {
 }
 
 impl Qwen2AudioEncoder {
-    fn new(cfg: &Qwen2AudioEncoderConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &Qwen2AudioEncoderConfig, vb: VarBuilder) -> Result<Self> {
         // conv1: stride=1, conv2: stride=2 (unlike Whisper where both are stride 1 and 2)
         let conv1 = conv1d(
             cfg.num_mel_bins,
@@ -314,7 +314,7 @@ impl Qwen2AudioEncoder {
     /// * `input_features` — `[B, num_mel_bins, T]` where T is typically 3000
     ///
     /// Returns `[B, T/4, d_model]` (750 tokens for T=3000).
-    fn forward(&self, input_features: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, input_features: &Tensor) -> Result<Tensor> {
         // Conv subsampling: [B, mel, T] → [B, d_model, T/2]
         let xs = self.conv1.forward(input_features)?.gelu_erf()?;
         let xs = self.conv2.forward(&xs)?.gelu_erf()?;

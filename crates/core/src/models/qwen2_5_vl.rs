@@ -24,18 +24,18 @@ use super::qwen2_vl::{Qwen2VLConfig, Qwen2VLDecoderLayer};
 
 /// Qwen2.5-VL vision encoder configuration.
 #[derive(Debug, Clone)]
-struct Qwen25VLVisionConfig {
-    depth: usize,
-    embed_dim: usize,
-    num_heads: usize,
-    intermediate_size: usize,
-    in_channels: usize,
-    patch_size: usize,
-    temporal_patch_size: usize,
-    spatial_merge_size: usize,
-    window_size: usize,
-    fullatt_block_indexes: Vec<usize>,
-    out_hidden_size: usize,
+pub(crate) struct Qwen25VLVisionConfig {
+    pub(crate) depth: usize,
+    pub(crate) embed_dim: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) in_channels: usize,
+    pub(crate) patch_size: usize,
+    pub(crate) temporal_patch_size: usize,
+    pub(crate) spatial_merge_size: usize,
+    pub(crate) window_size: usize,
+    pub(crate) fullatt_block_indexes: Vec<usize>,
+    pub(crate) out_hidden_size: usize,
 }
 
 impl Default for Qwen25VLVisionConfig {
@@ -69,7 +69,7 @@ impl Qwen25VLVisionConfig {
         self.embed_dim * self.spatial_merge_size * self.spatial_merge_size
     }
 
-    fn from_json(json: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(json: &serde_json::Value) -> Self {
         let defaults = Self::default();
 
         let embed_dim = json
@@ -523,7 +523,7 @@ fn invert_permutation(perm: &[usize]) -> Vec<usize> {
 
 /// Qwen2.5-VL Vision Transformer with window attention.
 #[allow(dead_code)]
-struct Qwen25VisionTransformer {
+pub(crate) struct Qwen25VisionTransformer {
     patch_embed: Qwen25VLPatchEmbed,
     rotary_emb: RotaryEmbedding,
     blocks: Vec<Qwen25VLVisionBlock>,
@@ -536,7 +536,7 @@ struct Qwen25VisionTransformer {
 
 #[allow(dead_code)]
 impl Qwen25VisionTransformer {
-    fn new(cfg: &Qwen25VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &Qwen25VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_embed = Qwen25VLPatchEmbed::new(cfg, vb.pp("patch_embed"))?;
 
         let rotary_emb = RotaryEmbedding::new_partial(
@@ -574,7 +574,7 @@ impl Qwen25VisionTransformer {
     /// * `patches` - [num_patches, C*T*H*W]
     /// * `grid_h` - Number of patches along height
     /// * `grid_w` - Number of patches along width
-    fn forward(&self, patches: &Tensor, grid_h: usize, grid_w: usize) -> Result<Tensor> {
+    pub(crate) fn forward(&self, patches: &Tensor, grid_h: usize, grid_w: usize) -> Result<Tensor> {
         let grid_t = 1; // Single image frame
 
         // Patch embedding

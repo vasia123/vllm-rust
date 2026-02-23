@@ -184,6 +184,7 @@ pub mod plamo3;
 pub mod plamo3_quantized;
 pub mod qwen;
 pub mod qwen2;
+pub mod qwen2_5_omni_thinker;
 pub mod qwen2_5_vl;
 pub mod qwen2_audio;
 pub mod qwen2_lora;
@@ -197,6 +198,7 @@ pub mod qwen3_lora;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod qwen3_next_mtp;
+pub mod qwen3_omni_moe_thinker;
 pub mod qwen3_quantized;
 pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
@@ -404,6 +406,7 @@ pub use plamo3::Plamo3ForCausalLM;
 pub use plamo3_quantized::QuantizedPlamo3ForCausalLM;
 pub use qwen::QWenLMHeadModel;
 pub use qwen2::Qwen2ForCausalLM;
+pub use qwen2_5_omni_thinker::Qwen2_5OmniThinkerForConditionalGeneration;
 pub use qwen2_5_vl::Qwen25VLForConditionalGeneration;
 pub use qwen2_audio::Qwen2AudioForConditionalGeneration;
 pub use qwen2_lora::Qwen2WithLora;
@@ -417,6 +420,7 @@ pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_moe::Qwen3MoeForCausalLM;
 pub use qwen3_next::Qwen3NextForCausalLM;
 pub use qwen3_next_mtp::Qwen3NextMtpModel;
+pub use qwen3_omni_moe_thinker::Qwen3OmniMoeThinkerForConditionalGeneration;
 pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
 pub use qwen3_vl::Qwen3VLForConditionalGeneration;
 pub use qwen3_vl_moe::Qwen3VLMoeForConditionalGeneration;
@@ -578,6 +582,12 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2AudioForConditionalGeneration" => {
             Ok(Box::new(Qwen2AudioForConditionalGeneration::new(cfg, vb)?))
         }
+        "Qwen2_5OmniThinkerForConditionalGeneration" => Ok(Box::new(
+            Qwen2_5OmniThinkerForConditionalGeneration::new(cfg, vb)?,
+        )),
+        "Qwen3OmniMoeThinkerForConditionalGeneration" => Ok(Box::new(
+            Qwen3OmniMoeThinkerForConditionalGeneration::new(cfg, vb)?,
+        )),
         "UltravoxModel" => Ok(Box::new(UltravoxModel::new(cfg, vb)?)),
         "Qwen2VLForConditionalGeneration" | "Tarsier2ForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
