@@ -106,6 +106,7 @@ pub mod jais2_quantized;
 pub mod jais_quantized;
 pub mod jamba;
 pub mod kanana_v;
+pub mod keye_vl;
 pub mod kimi_k25;
 pub mod kimi_linear;
 pub mod kimi_vl;
@@ -317,6 +318,7 @@ pub use jais2_quantized::QuantizedJais2ForCausalLM;
 pub use jais_quantized::QuantizedJAISLMHeadModel;
 pub use jamba::JambaForCausalLM;
 pub use kanana_v::KananaVForConditionalGeneration;
+pub use keye_vl::KeyeVL1_5ForConditionalGeneration;
 pub use kimi_k25::KimiK25ForConditionalGeneration;
 pub use kimi_linear::KimiLinearForCausalLM;
 pub use kimi_vl::KimiVLForConditionalGeneration;
@@ -707,6 +709,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Jais2ForCausalLM" => Ok(Box::new(Jais2ForCausalLM::new(cfg, vb)?)),
         "KananaVForConditionalGeneration" => {
             Ok(Box::new(KananaVForConditionalGeneration::new(cfg, vb)?))
+        }
+        "KeyeVL1_5ForConditionalGeneration" => {
+            Ok(Box::new(KeyeVL1_5ForConditionalGeneration::new(cfg, vb)?))
         }
         "KimiK25ForConditionalGeneration" => Ok(Box::new(
             KimiK25ForConditionalGeneration::from_model_config(cfg, vb)?,
