@@ -78,7 +78,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `crates/core/src/multimodal/audio.rs` has `AudioData`/`AudioSpec` + normalize/resample but NO audio file loading (see `audio` feature below)
 - Add WAV/MP3 loading (hound + symphonia crates)
 - **Encoder models (12 total):**
-  - `whisper.rs` — P1, gate-keeper for all audio; Conv1D + transformer, ~800 LOC
+  - `whisper.rs` ✅ DONE — `WhisperForConditionalGeneration`, implements `ModelForEncoderDecoder`; Conv1d×2 encoder + sinusoidal pos + cross-attn decoder; 5 tests; 3972 total — 2026-02-23
   - `qwen2_audio.rs`, `ultravox.rs` — P1
   - `qwen3_asr.rs`, `granite_speech.rs`, `funaudiochat.rs` — P2
   - `audioflamingo3.rs`, `glmasr.rs`, `voxtral.rs`, `phi4mm_audio.rs` — P2

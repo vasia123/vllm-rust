@@ -213,6 +213,7 @@ pub mod step3p5_mtp;
 pub mod t5;
 pub mod tp_layers;
 pub mod voyage;
+pub mod whisper;
 pub mod yi;
 pub mod zamba2;
 
@@ -431,6 +432,7 @@ pub use step3p5::Step3p5ForCausalLM;
 pub use step3p5_mtp::Step3p5MtpModel;
 pub use t5::T5ForConditionalGeneration;
 pub use voyage::VoyageForEmbedding;
+pub use whisper::WhisperForConditionalGeneration;
 pub use yi::YiForCausalLM;
 pub use zamba2::Zamba2ForCausalLM;
 
@@ -791,6 +793,9 @@ pub fn from_config_encoder_decoder(
     match arch {
         "T5ForConditionalGeneration" | "T5Model" => {
             Ok(Box::new(T5ForConditionalGeneration::new(cfg, vb)?))
+        }
+        "WhisperForConditionalGeneration" => {
+            Ok(Box::new(WhisperForConditionalGeneration::new(cfg, vb)?))
         }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
