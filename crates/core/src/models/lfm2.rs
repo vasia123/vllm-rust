@@ -12,6 +12,8 @@
 //!
 //! Key config fields (from extra):
 //! - `layer_types`: list of "full_attention" or "short_conv" per layer
+//! - `conv_L_cache`: convolution kernel size for short_conv layers (default 4)
+//! - `conv_bias`: whether conv/proj layers have bias (default false)
 //! - `block_dim`: MLP input dimension (default = hidden_size)
 //! - `block_ff_dim`: MLP intermediate dimension (default = intermediate_size)
 //! - `block_multiple_of`: alignment factor for auto-adjusted ff_dim
@@ -28,10 +30,12 @@
 //! - `norm_topk_prob`: whether to renormalize top-k probabilities
 //! - `use_expert_bias`: use learnable expert bias (e_score_correction)
 //!
-//! NOTE: Short-convolution layers (Mamba-like state-space layers) require
-//! SSM state infrastructure. This implementation supports only the
-//! full_attention layers. Models using short-conv layers need additional
-//! infrastructure (see Jamba for SSM patterns).
+//! Short-conv layers: `in_proj` (hidden→3·hidden), causal depthwise conv1d, gate by C, `out_proj`.
+//! HF checkpoint stores the conv weight as `conv.weight [hidden, L_cache]` (no groups dim);
+//! loaded as-is from `vb.pp("conv")` and unsqueeze(1) → `[hidden, 1, L_cache]` for causal_conv1d_*.
+//! Per-request conv state is tracked by `SSMStateManager` (d_state=1 unused, d_conv=L_cache).
+
+use std::sync::Mutex;
 
 use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
@@ -43,6 +47,7 @@ use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{apply_per_head_norm, paged_attention, RotaryEmbedding};
 use crate::moe::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
+use crate::ssm::{causal_conv1d_decode, causal_conv1d_prefill, SSMStateManager};
 
 pub use super::tp_layers::TpContext;
 use super::tp_layers::{TpEmbedding, TpLinear};
@@ -56,6 +61,10 @@ struct Lfm2Config {
     block_auto_adjust_ff_dim: bool,
     block_ffn_dim_multiplier: Option<f64>,
     norm_eps: f64,
+    // Hybrid layer config
+    layer_types: Vec<bool>, // true = full_attention, false = short_conv
+    conv_l_cache: usize,    // conv kernel size
+    conv_bias: bool,        // bias for conv weights
 }
 
 impl Lfm2Config {
@@ -98,6 +107,30 @@ impl Lfm2Config {
             .and_then(|v| v.as_f64())
             .unwrap_or(cfg.rms_norm_eps);
 
+        let layer_types = cfg
+            .extra
+            .get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("full_attention") == "full_attention")
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![true; cfg.num_hidden_layers]);
+
+        let conv_l_cache = cfg
+            .extra
+            .get("conv_L_cache")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(4);
+
+        let conv_bias = cfg
+            .extra
+            .get("conv_bias")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Self {
             block_dim,
             block_ff_dim,
@@ -105,6 +138,9 @@ impl Lfm2Config {
             block_auto_adjust_ff_dim,
             block_ffn_dim_multiplier,
             norm_eps,
+            layer_types,
+            conv_l_cache,
+            conv_bias,
         }
     }
 
@@ -134,6 +170,10 @@ struct Lfm2MoeConfig {
     norm_topk_prob: bool,
     use_expert_bias: bool,
     norm_eps: f64,
+    // Hybrid layer config
+    layer_types: Vec<bool>,
+    conv_l_cache: usize,
+    conv_bias: bool,
 }
 
 impl Lfm2MoeConfig {
@@ -180,6 +220,30 @@ impl Lfm2MoeConfig {
             .and_then(|v| v.as_f64())
             .unwrap_or(cfg.rms_norm_eps);
 
+        let layer_types = cfg
+            .extra
+            .get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("full_attention") == "full_attention")
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![true; cfg.num_hidden_layers]);
+
+        let conv_l_cache = cfg
+            .extra
+            .get("conv_L_cache")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(4);
+
+        let conv_bias = cfg
+            .extra
+            .get("conv_bias")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Self {
             num_experts,
             num_experts_per_tok,
@@ -189,6 +253,9 @@ impl Lfm2MoeConfig {
             norm_topk_prob,
             use_expert_bias,
             norm_eps,
+            layer_types,
+            conv_l_cache,
+            conv_bias,
         }
     }
 }
@@ -332,123 +399,6 @@ impl Lfm2Attention {
         )?;
 
         self.out_proj.forward(&attn_output, tp_ctx)
-    }
-
-    fn forward_decode_batch(
-        &self,
-        xs: &Tensor,
-        sequences: &[DecodeSequenceMetadata],
-        cache_engine: &mut CacheEngine,
-        tp_ctx: &TpContext,
-    ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let qkv = self.qkv_proj.forward(xs, tp_ctx)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // QK norm
-        let q = apply_per_head_norm(&q, &self.q_norm)?;
-        let k = apply_per_head_norm(&k, &self.k_norm)?;
-
-        #[cfg(feature = "cuda-kernels")]
-        {
-            let q = q.squeeze(2)?;
-            let k = k.squeeze(2)?;
-            let v = v.squeeze(2)?;
-
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
-
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
-            cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-                }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
-
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
-
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-                self.head_dim,
-                cache_engine.block_size(),
-            )?;
-
-            self.out_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)
-        }
-
-        #[cfg(not(feature = "cuda-kernels"))]
-        {
-            let mut outputs = Vec::with_capacity(batch_size);
-            for (i, seq) in sequences.iter().enumerate() {
-                let q_i = q.narrow(0, i, 1)?;
-                let k_i = k.narrow(0, i, 1)?;
-                let v_i = v.narrow(0, i, 1)?;
-
-                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None,
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-                outputs.push(attn_out);
-            }
-
-            let attn_output = Tensor::cat(&outputs, 0)?;
-            self.out_proj.forward(&attn_output, tp_ctx)
-        }
     }
 }
 
@@ -685,7 +635,7 @@ impl Lfm2AttentionDecoderLayer {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         kv_cache_mgr: &mut KVCacheManager,
-        layer_idx: usize,
+        cache_engine_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
@@ -696,32 +646,9 @@ impl Lfm2AttentionDecoderLayer {
             &xs,
             attention_mask,
             seqlen_offset,
-            kv_cache_mgr.engine_mut(layer_idx),
+            kv_cache_mgr.engine_mut(cache_engine_idx),
             block_table,
             slot_mapping,
-            tp_ctx,
-        )?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = self.ffn_norm.forward(&xs)?;
-        let xs = self.feed_forward.forward(&xs, tp_ctx)?;
-        residual + xs
-    }
-
-    fn forward_decode_batch(
-        &self,
-        xs: &Tensor,
-        sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &mut KVCacheManager,
-        layer_idx: usize,
-        tp_ctx: &TpContext,
-    ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.operator_norm.forward(xs)?;
-        let xs = self.self_attn.forward_decode_batch(
-            &xs,
-            sequences,
-            kv_cache_mgr.engine_mut(layer_idx),
             tp_ctx,
         )?;
         let xs = (xs + residual)?;
@@ -785,7 +712,7 @@ impl Lfm2MoeAttentionDecoderLayer {
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         kv_cache_mgr: &mut KVCacheManager,
-        layer_idx: usize,
+        cache_engine_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
@@ -796,7 +723,7 @@ impl Lfm2MoeAttentionDecoderLayer {
             &xs,
             attention_mask,
             seqlen_offset,
-            kv_cache_mgr.engine_mut(layer_idx),
+            kv_cache_mgr.engine_mut(cache_engine_idx),
             block_table,
             slot_mapping,
             tp_ctx,
@@ -807,48 +734,267 @@ impl Lfm2MoeAttentionDecoderLayer {
         let xs = self.feed_forward.forward(&xs, tp_ctx)?;
         residual + xs
     }
+}
 
-    fn forward_decode_batch(
+// ---- ShortConv Block ----
+//
+// Causal depthwise 1D convolution gated by a parallel branch.
+//
+// Forward (prefill, [B, S, H]):
+//   in_proj → [B, S, 3H_pg]  split → (bx, c, x)
+//   bxc = bx * x  [B, S, H_pg]
+//   conv out = causal_conv1d_prefill(bxc.T)  [B, H_pg, S]  .T  [B, S, H_pg]
+//   y = c * conv_out
+//   out = out_proj(y)  [B, S, H]
+//   state = bxc.T[:, :, -(L-1):]  [1, H_pg, L-1]
+//
+// Forward (decode, [1, 1, H]):
+//   in_proj → split bx, c, x  → bxc [1, H_pg]
+//   conv_out, new_state = causal_conv1d_decode(bxc, conv_state)
+//   y = c * conv_out
+//   out = out_proj(y.unsqueeze(1))  [1, 1, H]
+
+struct ShortConvBlock {
+    in_proj: TpLinear,     // hidden → 3·hidden (column-parallel)
+    conv1d_weight: Tensor, // [H_pg, 1, L]
+    conv1d_bias: Tensor,   // [H_pg]  (zeros when conv_bias=false)
+    out_proj: TpLinear,    // hidden → hidden (row-parallel)
+    hidden_per_gpu: usize,
+    l_cache: usize,
+}
+
+impl ShortConvBlock {
+    fn new_with_tp(
+        hidden_size: usize,
+        conv_bias: bool,
+        l_cache: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
+        let world_size = pg.world_size();
+        let hidden_per_gpu = hidden_size / world_size.max(1);
+
+        let in_proj = TpLinear::column_parallel(
+            hidden_size,
+            3 * hidden_size,
+            conv_bias,
+            false,
+            vb.pp("in_proj"),
+            pg,
+        )?;
+        let out_proj = TpLinear::row_parallel(
+            hidden_size,
+            hidden_size,
+            conv_bias,
+            true,
+            vb.pp("out_proj"),
+            pg,
+        )?;
+
+        // HF checkpoint stores conv weight as [hidden, L_cache] (no groups dim).
+        // We load the full weight and take our TP shard, then unsqueeze the groups dim.
+        let full_weight = vb.pp("conv").get((hidden_size, l_cache), "weight")?;
+        let rank = pg.rank();
+        let conv1d_weight = full_weight
+            .narrow(0, rank * hidden_per_gpu, hidden_per_gpu)?
+            .unsqueeze(1)?;
+        // [H_pg, 1, L]
+
+        let conv1d_bias = if conv_bias {
+            let full_bias = vb.pp("conv").get(hidden_size, "bias")?;
+            full_bias.narrow(0, rank * hidden_per_gpu, hidden_per_gpu)?
+        } else {
+            Tensor::zeros(hidden_per_gpu, vb.dtype(), vb.device())?
+        };
+
+        Ok(Self {
+            in_proj,
+            conv1d_weight,
+            conv1d_bias,
+            out_proj,
+            hidden_per_gpu,
+            l_cache,
+        })
+    }
+
+    /// Prefill forward. Returns (output [B, S, H], conv_state [1, H_pg, L-1]).
+    fn forward_prefill(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<(Tensor, Tensor)> {
+        let (b, s, _) = xs.dims3()?;
+        let proj = self.in_proj.forward(xs, tp_ctx)?; // [B, S, 3*H_pg]
+        let chunks = proj.chunk(3, 2)?;
+        let (bx, c, x) = (&chunks[0], &chunks[1], &chunks[2]);
+
+        let bxc = (bx * x)?; // [B, S, H_pg]
+        let bxc_t = bxc.transpose(1, 2)?; // [B, H_pg, S]
+
+        let conv_out_t = causal_conv1d_prefill(&bxc_t, &self.conv1d_weight, &self.conv1d_bias)?;
+        let conv_out = conv_out_t.transpose(1, 2)?; // [B, S, H_pg]
+
+        let y = (c * conv_out)?;
+        let out = self.out_proj.forward(&y, tp_ctx)?;
+
+        // Extract last L-1 input values as the new conv state for decode steps.
+        let conv_state_len = self.l_cache.saturating_sub(1);
+        let new_state = if conv_state_len == 0 {
+            Tensor::zeros((b, self.hidden_per_gpu, 0), bxc_t.dtype(), bxc_t.device())?
+        } else if s >= conv_state_len {
+            bxc_t.narrow(2, s - conv_state_len, conv_state_len)?
+        } else {
+            // Sequence shorter than conv window — left-pad with zeros.
+            let pad_len = conv_state_len - s;
+            let pad = Tensor::zeros(
+                (b, self.hidden_per_gpu, pad_len),
+                bxc_t.dtype(),
+                bxc_t.device(),
+            )?;
+            Tensor::cat(&[&pad, &bxc_t], 2)?
+        };
+        // Take only the first sequence (B=1 for single-sequence prefill).
+        let new_state = new_state.narrow(0, 0, 1)?; // [1, H_pg, L-1]
+
+        Ok((out, new_state))
+    }
+
+    /// Decode forward. Returns (output [1, 1, H], new_conv_state [1, H_pg, L-1]).
+    fn forward_decode(
         &self,
         xs: &Tensor,
-        sequences: &[DecodeSequenceMetadata],
-        kv_cache_mgr: &mut KVCacheManager,
-        layer_idx: usize,
         tp_ctx: &TpContext,
-    ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.operator_norm.forward(xs)?;
-        let xs = self.self_attn.forward_decode_batch(
-            &xs,
-            sequences,
-            kv_cache_mgr.engine_mut(layer_idx),
-            tp_ctx,
-        )?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = self.ffn_norm.forward(&xs)?;
-        let xs = self.feed_forward.forward(&xs, tp_ctx)?;
-        residual + xs
+        conv_state: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let proj = self.in_proj.forward(xs, tp_ctx)?; // [1, 1, 3*H_pg]
+        let chunks = proj.chunk(3, 2)?;
+        let (bx, c, x) = (&chunks[0], &chunks[1], &chunks[2]);
+
+        // Squeeze seq dim for causal_conv1d_decode which expects [B, D].
+        let bx_2d = bx.squeeze(1)?; // [1, H_pg]
+        let c_2d = c.squeeze(1)?;
+        let x_2d = x.squeeze(1)?;
+
+        let bxc = (bx_2d * x_2d)?; // [1, H_pg]
+
+        let (conv_out, new_state) =
+            causal_conv1d_decode(&bxc, &self.conv1d_weight, &self.conv1d_bias, conv_state)?;
+
+        let y = (c_2d * conv_out)?; // [1, H_pg]
+        let y_3d = y.unsqueeze(1)?; // [1, 1, H_pg]
+        let out = self.out_proj.forward(&y_3d, tp_ctx)?; // [1, 1, H]
+
+        Ok((out, new_state))
     }
+}
+
+// ---- Lfm2 Short-Conv Decoder Layer ----
+//
+// Used by both Dense and MoE models (short_conv layers always use dense MLP).
+// Weight layout in HF checkpoint: `conv.{in_proj,conv,out_proj}.*`, `operator_norm.*`, `ffn_norm.*`.
+
+struct Lfm2ShortConvDecoderLayer {
+    short_conv: ShortConvBlock,
+    operator_norm: RmsNorm,
+    ffn_norm: RmsNorm,
+    feed_forward: Lfm2MLP,
+}
+
+impl Lfm2ShortConvDecoderLayer {
+    fn new_with_tp(
+        cfg: &ModelConfig,
+        norm_eps: f64,
+        ff_dim: usize,
+        conv_l_cache: usize,
+        conv_bias: bool,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
+        // HF: weights under `conv.*` (vLLM renames .conv. → .short_conv. internally).
+        let short_conv = ShortConvBlock::new_with_tp(
+            cfg.hidden_size,
+            conv_bias,
+            conv_l_cache,
+            vb.pp("conv"),
+            pg,
+        )?;
+        let operator_norm = rms_norm(cfg.hidden_size, norm_eps, vb.pp("operator_norm"))?;
+        let ffn_norm = rms_norm(cfg.hidden_size, norm_eps, vb.pp("ffn_norm"))?;
+        let feed_forward = Lfm2MLP::new(cfg.hidden_size, ff_dim, vb.pp("feed_forward"), pg)?;
+
+        Ok(Self {
+            short_conv,
+            operator_norm,
+            ffn_norm,
+            feed_forward,
+        })
+    }
+
+    /// Prefill path. Returns (output [B, S, H], new_conv_state [1, H_pg, L-1]).
+    fn forward_prefill(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<(Tensor, Tensor)> {
+        let residual = xs;
+        let normed = self.operator_norm.forward(xs)?;
+        let (sc_out, new_state) = self.short_conv.forward_prefill(&normed, tp_ctx)?;
+        let xs = (sc_out + residual)?;
+        let residual = &xs;
+        let normed2 = self.ffn_norm.forward(&xs)?;
+        let ffn_out = self.feed_forward.forward(&normed2, tp_ctx)?;
+        let out = (residual + ffn_out)?;
+        Ok((out, new_state))
+    }
+
+    /// Decode path (seq_len=1). Returns (output [1, 1, H], new_conv_state [1, H_pg, L-1]).
+    fn forward_decode(
+        &self,
+        xs: &Tensor,
+        tp_ctx: &TpContext,
+        conv_state: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let residual = xs;
+        let normed = self.operator_norm.forward(xs)?;
+        let (sc_out, new_state) = self
+            .short_conv
+            .forward_decode(&normed, tp_ctx, conv_state)?;
+        let xs = (sc_out + residual)?;
+        let residual = &xs;
+        let normed2 = self.ffn_norm.forward(&xs)?;
+        let ffn_out = self.feed_forward.forward(&normed2, tp_ctx)?;
+        let out = (residual + ffn_out)?;
+        Ok((out, new_state))
+    }
+}
+
+// ---- Layer enums for hybrid models ----
+
+enum Lfm2Layer {
+    Attention(Lfm2AttentionDecoderLayer),
+    ShortConv(Lfm2ShortConvDecoderLayer),
+}
+
+enum Lfm2MoeLayer {
+    Attention(Lfm2MoeAttentionDecoderLayer),
+    ShortConv(Lfm2ShortConvDecoderLayer),
 }
 
 // ---- Lfm2ForCausalLM (Dense) ----
 
 /// Lfm2 Dense model for causal language modeling.
 ///
-/// NOTE: This implementation supports the attention-layer subset of the hybrid
-/// architecture. Short-convolution (ShortConv) layers require SSM state
-/// infrastructure not yet available. For models with `layer_types` containing
-/// "short_conv", only the attention layers will process tokens; short-conv
-/// layers are treated as identity (TODO: implement ShortConv layer support).
+/// Supports hybrid attention+short_conv architectures. Per-request SSM state
+/// is tracked via `SSMStateManager`. `forward()` uses `request_id=0` (single
+/// sequence); `forward_decode_batch()` dispatches per-sequence with request IDs.
 pub struct Lfm2ForCausalLM {
     embed_tokens: TpEmbedding,
-    layers: Vec<Lfm2AttentionDecoderLayer>,
+    layers: Vec<Lfm2Layer>,
     norm: RmsNorm,
     lm_head: TpLinear,
     tp_ctx: TpContext,
     device: Device,
     dtype: DType,
+    /// Per-request conv states for short_conv layers.
+    state_mgr: Mutex<SSMStateManager>,
+    /// model_layer_idx → KV cache engine index (None for short_conv layers).
+    attn_layer_cache_idx: Vec<Option<usize>>,
+    /// model_layer_idx → SSM state layer index (None for attention layers).
+    short_conv_state_idx: Vec<Option<usize>>,
+    /// Number of attention layers (= KV cache engine count).
+    num_attn_layers: usize,
 }
 
 impl Lfm2ForCausalLM {
@@ -869,16 +1015,39 @@ impl Lfm2ForCausalLM {
         let embed_tokens =
             TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
 
-        // Build only attention layers (all layers treated as attention for dense)
+        let ff_dim = lfm_cfg.effective_ff_dim();
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut attn_layer_cache_idx = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut short_conv_state_idx = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut num_attn_layers = 0usize;
+        let mut num_sc_layers = 0usize;
+
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(Lfm2AttentionDecoderLayer::new_with_tp(
-                cfg,
-                &lfm_cfg,
-                vb_l.pp(i),
-                pg,
-            )?);
+            let is_attn = lfm_cfg.layer_types.get(i).copied().unwrap_or(true);
+            if is_attn {
+                attn_layer_cache_idx.push(Some(num_attn_layers));
+                short_conv_state_idx.push(None);
+                num_attn_layers += 1;
+                layers.push(Lfm2Layer::Attention(
+                    Lfm2AttentionDecoderLayer::new_with_tp(cfg, &lfm_cfg, vb_l.pp(i), pg)?,
+                ));
+            } else {
+                attn_layer_cache_idx.push(None);
+                short_conv_state_idx.push(Some(num_sc_layers));
+                num_sc_layers += 1;
+                layers.push(Lfm2Layer::ShortConv(
+                    Lfm2ShortConvDecoderLayer::new_with_tp(
+                        cfg,
+                        lfm_cfg.norm_eps,
+                        ff_dim,
+                        lfm_cfg.conv_l_cache,
+                        lfm_cfg.conv_bias,
+                        vb_l.pp(i),
+                        pg,
+                    )?,
+                ));
+            }
         }
 
         let norm = rms_norm(cfg.hidden_size, lfm_cfg.norm_eps, vb_m.pp("embedding_norm"))?;
@@ -909,6 +1078,16 @@ impl Lfm2ForCausalLM {
             )?
         };
 
+        let hidden_per_gpu = cfg.hidden_size / world_size.max(1);
+        let state_mgr = SSMStateManager::new(
+            num_sc_layers,
+            hidden_per_gpu,
+            1, // d_state unused for short_conv
+            lfm_cfg.conv_l_cache,
+            vb.dtype(),
+            vb.device().clone(),
+        );
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -917,18 +1096,55 @@ impl Lfm2ForCausalLM {
             tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            state_mgr: Mutex::new(state_mgr),
+            attn_layer_cache_idx,
+            short_conv_state_idx,
+            num_attn_layers,
         })
     }
 
-    pub fn forward(
+    /// Number of attention layers (= required KV cache engine count).
+    pub fn num_attn_layers(&self) -> usize {
+        self.num_attn_layers
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn tp_context(&self) -> &TpContext {
+        &self.tp_ctx
+    }
+
+    /// Full forward pass with per-request SSM state tracking.
+    ///
+    /// `request_id` identifies the request for SSM conv state; use 0 for single-sequence calls.
+    pub fn forward_with_request_id(
         &self,
         input_ids: &Tensor,
         seqlen_offset: usize,
+        request_id: u64,
         kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
+
+        // Manage SSM state lifecycle: reset at start of each new request.
+        {
+            let mut mgr = self.state_mgr.lock().expect("state_mgr lock");
+            if seqlen_offset == 0 {
+                mgr.free_state(request_id);
+                mgr.allocate_state(request_id).map_err(|e| {
+                    candle_core::Error::Msg(format!("failed to allocate SSM state: {e}"))
+                })?;
+            } else if !mgr.has_state(request_id) {
+                mgr.allocate_state(request_id).map_err(|e| {
+                    candle_core::Error::Msg(format!("failed to allocate SSM state: {e}"))
+                })?;
+            }
+        }
+
         let attention_mask = if seq_len <= 1 {
             None
         } else {
@@ -941,28 +1157,76 @@ impl Lfm2ForCausalLM {
         };
 
         let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward(
-                &xs,
-                attention_mask.as_ref(),
-                seqlen_offset,
-                kv_cache_mgr,
-                layer_idx,
-                block_table,
-                slot_mapping,
-                &self.tp_ctx,
-            )?;
+            xs = match layer {
+                Lfm2Layer::Attention(attn) => {
+                    let cache_idx = self.attn_layer_cache_idx[layer_idx]
+                        .expect("attention layer must have cache index");
+                    attn.forward(
+                        &xs,
+                        attention_mask.as_ref(),
+                        seqlen_offset,
+                        kv_cache_mgr,
+                        cache_idx,
+                        block_table,
+                        slot_mapping,
+                        &self.tp_ctx,
+                    )?
+                }
+                Lfm2Layer::ShortConv(sc) => {
+                    let sc_idx = self.short_conv_state_idx[layer_idx]
+                        .expect("short_conv layer must have state index");
+
+                    let (out, new_state) = if seq_len > 1 {
+                        sc.forward_prefill(&xs, &self.tp_ctx)?
+                    } else {
+                        let conv_state = {
+                            let mut mgr = self.state_mgr.lock().expect("state_mgr lock");
+                            mgr.get_state(request_id)
+                                .ok_or_else(|| {
+                                    candle_core::Error::Msg("SSM state not found".into())
+                                })?
+                                .conv_states[sc_idx]
+                                .tensor
+                                .clone()
+                        };
+                        sc.forward_decode(&xs, &self.tp_ctx, &conv_state)?
+                    };
+
+                    // Persist updated conv state.
+                    {
+                        let mut mgr = self.state_mgr.lock().expect("state_mgr lock");
+                        if let Some(req_state) = mgr.get_state(request_id) {
+                            req_state.conv_states[sc_idx].tensor = new_state;
+                        }
+                    }
+
+                    out
+                }
+            };
         }
+
         let xs = self.norm.forward(&xs)?;
         self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    pub fn tp_context(&self) -> &TpContext {
-        &self.tp_ctx
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward_with_request_id(
+            input_ids,
+            seqlen_offset,
+            0,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 }
 
@@ -991,20 +1255,22 @@ impl crate::engine::ModelForward for Lfm2ForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_decode_batch(
-                &xs,
-                sequences,
+        let batch_size = sequences.len();
+        let mut outputs = Vec::with_capacity(batch_size);
+        for (i, seq) in sequences.iter().enumerate() {
+            let token = input_ids.narrow(0, i, 1)?;
+            let block_table = BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
+            let logits = self.forward_with_request_id(
+                &token,
+                seq.seqlen_offset,
+                seq.request_id,
                 kv_cache_mgr,
-                layer_idx,
-                &self.tp_ctx,
+                &block_table,
+                &seq.slot_mapping,
             )?;
+            outputs.push(logits);
         }
-
-        let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs, &self.tp_ctx)
+        Tensor::cat(&outputs, 0)
     }
 
     fn device(&self) -> &Device {
@@ -1017,17 +1283,20 @@ impl crate::engine::ModelForward for Lfm2ForCausalLM {
 /// Lfm2 MoE model for causal language modeling.
 ///
 /// Uses sigmoid-scored top-k routing with optional expert bias. First
-/// `num_dense_layers` layers use dense MLP, remaining layers use MoE.
-///
-/// NOTE: Same ShortConv limitation as Lfm2ForCausalLM applies. See above.
+/// `num_dense_layers` attention layers use dense MLP, remaining attention layers use MoE.
+/// Short-conv layers always use dense MLP.
 pub struct Lfm2MoeForCausalLM {
     embed_tokens: TpEmbedding,
-    layers: Vec<Lfm2MoeAttentionDecoderLayer>,
+    layers: Vec<Lfm2MoeLayer>,
     norm: RmsNorm,
     lm_head: TpLinear,
     tp_ctx: TpContext,
     device: Device,
     dtype: DType,
+    state_mgr: Mutex<SSMStateManager>,
+    attn_layer_cache_idx: Vec<Option<usize>>,
+    short_conv_state_idx: Vec<Option<usize>>,
+    num_attn_layers: usize,
 }
 
 impl Lfm2MoeForCausalLM {
@@ -1048,16 +1317,47 @@ impl Lfm2MoeForCausalLM {
         let embed_tokens =
             TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
 
+        // Shared dense ff_dim for short_conv layers (use intermediate_size directly).
+        let sc_ff_dim = cfg.intermediate_size;
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut attn_layer_cache_idx = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut short_conv_state_idx = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut num_attn_layers = 0usize;
+        let mut num_sc_layers = 0usize;
+
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(Lfm2MoeAttentionDecoderLayer::new_with_tp(
-                cfg,
-                &moe_cfg,
-                i,
-                vb_l.pp(i),
-                pg,
-            )?);
+            let is_attn = moe_cfg.layer_types.get(i).copied().unwrap_or(true);
+            if is_attn {
+                attn_layer_cache_idx.push(Some(num_attn_layers));
+                short_conv_state_idx.push(None);
+                num_attn_layers += 1;
+                layers.push(Lfm2MoeLayer::Attention(
+                    Lfm2MoeAttentionDecoderLayer::new_with_tp(
+                        cfg,
+                        &moe_cfg,
+                        num_attn_layers - 1, // dense/moe decision uses attn-layer-local index
+                        vb_l.pp(i),
+                        pg,
+                    )?,
+                ));
+            } else {
+                attn_layer_cache_idx.push(None);
+                short_conv_state_idx.push(Some(num_sc_layers));
+                num_sc_layers += 1;
+                layers.push(Lfm2MoeLayer::ShortConv(
+                    Lfm2ShortConvDecoderLayer::new_with_tp(
+                        cfg,
+                        moe_cfg.norm_eps,
+                        sc_ff_dim,
+                        moe_cfg.conv_l_cache,
+                        moe_cfg.conv_bias,
+                        vb_l.pp(i),
+                        pg,
+                    )?,
+                ));
+            }
         }
 
         let norm = rms_norm(cfg.hidden_size, moe_cfg.norm_eps, vb_m.pp("embedding_norm"))?;
@@ -1088,6 +1388,16 @@ impl Lfm2MoeForCausalLM {
             )?
         };
 
+        let hidden_per_gpu = cfg.hidden_size / world_size.max(1);
+        let state_mgr = SSMStateManager::new(
+            num_sc_layers,
+            hidden_per_gpu,
+            1,
+            moe_cfg.conv_l_cache,
+            vb.dtype(),
+            vb.device().clone(),
+        );
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -1096,18 +1406,51 @@ impl Lfm2MoeForCausalLM {
             tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            state_mgr: Mutex::new(state_mgr),
+            attn_layer_cache_idx,
+            short_conv_state_idx,
+            num_attn_layers,
         })
     }
 
-    pub fn forward(
+    /// Number of attention layers (= required KV cache engine count).
+    pub fn num_attn_layers(&self) -> usize {
+        self.num_attn_layers
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn tp_context(&self) -> &TpContext {
+        &self.tp_ctx
+    }
+
+    pub fn forward_with_request_id(
         &self,
         input_ids: &Tensor,
         seqlen_offset: usize,
+        request_id: u64,
         kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
+
+        {
+            let mut mgr = self.state_mgr.lock().expect("state_mgr lock");
+            if seqlen_offset == 0 {
+                mgr.free_state(request_id);
+                mgr.allocate_state(request_id).map_err(|e| {
+                    candle_core::Error::Msg(format!("failed to allocate SSM state: {e}"))
+                })?;
+            } else if !mgr.has_state(request_id) {
+                mgr.allocate_state(request_id).map_err(|e| {
+                    candle_core::Error::Msg(format!("failed to allocate SSM state: {e}"))
+                })?;
+            }
+        }
+
         let attention_mask = if seq_len <= 1 {
             None
         } else {
@@ -1120,28 +1463,75 @@ impl Lfm2MoeForCausalLM {
         };
 
         let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward(
-                &xs,
-                attention_mask.as_ref(),
-                seqlen_offset,
-                kv_cache_mgr,
-                layer_idx,
-                block_table,
-                slot_mapping,
-                &self.tp_ctx,
-            )?;
+            xs = match layer {
+                Lfm2MoeLayer::Attention(attn) => {
+                    let cache_idx = self.attn_layer_cache_idx[layer_idx]
+                        .expect("attention layer must have cache index");
+                    attn.forward(
+                        &xs,
+                        attention_mask.as_ref(),
+                        seqlen_offset,
+                        kv_cache_mgr,
+                        cache_idx,
+                        block_table,
+                        slot_mapping,
+                        &self.tp_ctx,
+                    )?
+                }
+                Lfm2MoeLayer::ShortConv(sc) => {
+                    let sc_idx = self.short_conv_state_idx[layer_idx]
+                        .expect("short_conv layer must have state index");
+
+                    let (out, new_state) = if seq_len > 1 {
+                        sc.forward_prefill(&xs, &self.tp_ctx)?
+                    } else {
+                        let conv_state = {
+                            let mut mgr = self.state_mgr.lock().expect("state_mgr lock");
+                            mgr.get_state(request_id)
+                                .ok_or_else(|| {
+                                    candle_core::Error::Msg("SSM state not found".into())
+                                })?
+                                .conv_states[sc_idx]
+                                .tensor
+                                .clone()
+                        };
+                        sc.forward_decode(&xs, &self.tp_ctx, &conv_state)?
+                    };
+
+                    {
+                        let mut mgr = self.state_mgr.lock().expect("state_mgr lock");
+                        if let Some(req_state) = mgr.get_state(request_id) {
+                            req_state.conv_states[sc_idx].tensor = new_state;
+                        }
+                    }
+
+                    out
+                }
+            };
         }
+
         let xs = self.norm.forward(&xs)?;
         self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    pub fn tp_context(&self) -> &TpContext {
-        &self.tp_ctx
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward_with_request_id(
+            input_ids,
+            seqlen_offset,
+            0,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
     }
 }
 
@@ -1170,20 +1560,22 @@ impl crate::engine::ModelForward for Lfm2MoeForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_decode_batch(
-                &xs,
-                sequences,
+        let batch_size = sequences.len();
+        let mut outputs = Vec::with_capacity(batch_size);
+        for (i, seq) in sequences.iter().enumerate() {
+            let token = input_ids.narrow(0, i, 1)?;
+            let block_table = BlockTable::from_block_ids(seq.block_ids.clone(), seq.seqlen_offset);
+            let logits = self.forward_with_request_id(
+                &token,
+                seq.seqlen_offset,
+                seq.request_id,
                 kv_cache_mgr,
-                layer_idx,
-                &self.tp_ctx,
+                &block_table,
+                &seq.slot_mapping,
             )?;
+            outputs.push(logits);
         }
-
-        let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs, &self.tp_ctx)
+        Tensor::cat(&outputs, 0)
     }
 
     fn device(&self) -> &Device {
@@ -1252,13 +1644,45 @@ mod tests {
         }
     }
 
-    fn create_cache_config(cfg: &ModelConfig, device: &Device) -> CacheConfig {
+    /// Config with 1 short_conv layer (layer 0) and 1 attention layer (layer 1).
+    fn hybrid_config() -> ModelConfig {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "layer_types".to_string(),
+            serde_json::json!(["short_conv", "full_attention"]),
+        );
+        extra.insert("conv_L_cache".to_string(), serde_json::json!(4));
+        extra.insert("conv_bias".to_string(), serde_json::json!(false));
+
+        ModelConfig {
+            architectures: vec!["Lfm2ForCausalLM".to_string()],
+            hidden_size: 64,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            num_hidden_layers: 2,
+            intermediate_size: 128,
+            vocab_size: 256,
+            max_position_embeddings: 512,
+            head_dim: 16,
+            hidden_act: "silu".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: true,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            sliding_window: None,
+            attention_bias: Some(false),
+            extra,
+        }
+    }
+
+    fn create_cache_config(num_layers: usize, device: &Device) -> CacheConfig {
         CacheConfig {
             block_size: 16,
             num_blocks: 8,
-            num_layers: cfg.num_hidden_layers,
-            num_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
+            num_layers,
+            num_kv_heads: 2,
+            head_dim: 16,
             dtype: DType::F32,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
@@ -1277,6 +1701,10 @@ mod tests {
         assert_eq!(lfm_cfg.block_multiple_of, 256);
         assert!(!lfm_cfg.block_auto_adjust_ff_dim);
         assert!(lfm_cfg.block_ffn_dim_multiplier.is_none());
+        // Default: all attention
+        assert!(lfm_cfg.layer_types.iter().all(|&t| t));
+        assert_eq!(lfm_cfg.conv_l_cache, 4);
+        assert!(!lfm_cfg.conv_bias);
     }
 
     #[test]
@@ -1331,6 +1759,14 @@ mod tests {
         assert!(!moe_cfg.use_expert_bias);
     }
 
+    #[test]
+    fn test_lfm2_hybrid_layer_types_parsed() {
+        let cfg = hybrid_config();
+        let lfm_cfg = Lfm2Config::from_model_config(&cfg);
+        assert_eq!(lfm_cfg.layer_types, vec![false, true]); // short_conv, full_attention
+        assert_eq!(lfm_cfg.conv_l_cache, 4);
+    }
+
     // ---- Dense Construction Tests ----
 
     #[test]
@@ -1345,7 +1781,9 @@ mod tests {
             "Lfm2ForCausalLM should construct: {:?}",
             model.err()
         );
-        assert_eq!(model.unwrap().layers.len(), cfg.num_hidden_layers);
+        let model = model.unwrap();
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+        assert_eq!(model.num_attn_layers(), cfg.num_hidden_layers); // all attention
     }
 
     #[test]
@@ -1355,9 +1793,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Lfm2ForCausalLM::new(&cfg, vb).expect("build model");
 
-        let cache_config = create_cache_config(&cfg, &device);
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
-        let mut block_table = BlockTable::new(cache_config.block_size);
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
 
         let batch_size = 1;
         let seq_len = 3;
@@ -1388,9 +1827,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Lfm2ForCausalLM::new(&cfg, vb).expect("build model");
 
-        let cache_config = create_cache_config(&cfg, &device);
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
-        let mut block_table = BlockTable::new(cache_config.block_size);
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
 
         // Prefill
         let prompt = Tensor::zeros((1, 3), DType::U32, &device).expect("prompt");
@@ -1433,9 +1873,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Lfm2ForCausalLM::new(&cfg, vb).expect("build model");
 
-        let cache_config = create_cache_config(&cfg, &device);
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
-        let mut block_table = BlockTable::new(cache_config.block_size);
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
 
         let input_ids = Tensor::zeros((1, 3), DType::U32, &device).expect("input");
         kv_cache_mgr
@@ -1508,7 +1949,9 @@ mod tests {
             "Lfm2MoeForCausalLM should construct: {:?}",
             model.err()
         );
-        assert_eq!(model.unwrap().layers.len(), cfg.num_hidden_layers);
+        let model = model.unwrap();
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+        assert_eq!(model.num_attn_layers(), cfg.num_hidden_layers); // all attention
     }
 
     #[test]
@@ -1519,15 +1962,19 @@ mod tests {
 
         let model = Lfm2MoeForCausalLM::new(&cfg, vb).unwrap();
 
-        // Layer 0: dense (num_dense_layers=1), Layer 1: MoE
-        assert!(matches!(
-            model.layers[0].feed_forward,
-            MoeFfnVariant::Dense(_)
-        ));
-        assert!(matches!(
-            model.layers[1].feed_forward,
-            MoeFfnVariant::MoE(_)
-        ));
+        // Layer 0: dense attention (num_dense_layers=1), Layer 1: MoE attention
+        match &model.layers[0] {
+            Lfm2MoeLayer::Attention(l) => {
+                assert!(matches!(l.feed_forward, MoeFfnVariant::Dense(_)))
+            }
+            Lfm2MoeLayer::ShortConv(_) => panic!("layer 0 should be attention"),
+        }
+        match &model.layers[1] {
+            Lfm2MoeLayer::Attention(l) => {
+                assert!(matches!(l.feed_forward, MoeFfnVariant::MoE(_)))
+            }
+            Lfm2MoeLayer::ShortConv(_) => panic!("layer 1 should be attention"),
+        }
     }
 
     #[test]
@@ -1537,9 +1984,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Lfm2MoeForCausalLM::new(&cfg, vb).expect("build model");
 
-        let cache_config = create_cache_config(&cfg, &device);
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
-        let mut block_table = BlockTable::new(cache_config.block_size);
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
 
         let batch_size = 1;
         let seq_len = 3;
@@ -1570,9 +2018,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Lfm2MoeForCausalLM::new(&cfg, vb).expect("build model");
 
-        let cache_config = create_cache_config(&cfg, &device);
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
-        let mut block_table = BlockTable::new(cache_config.block_size);
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
 
         // Prefill
         let prompt = Tensor::zeros((1, 3), DType::U32, &device).expect("prompt");
@@ -1615,9 +2064,10 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let model = Lfm2MoeForCausalLM::new(&cfg, vb).expect("build model");
 
-        let cache_config = create_cache_config(&cfg, &device);
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
-        let mut block_table = BlockTable::new(cache_config.block_size);
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
 
         let input_ids = Tensor::zeros((1, 3), DType::U32, &device).expect("input");
         kv_cache_mgr
@@ -1689,5 +2139,133 @@ mod tests {
 
         let moe = Lfm2SparseMoeBlock::new(&cfg, &moe_cfg, vb.pp("moe"), &pg);
         assert!(moe.is_ok(), "MoE with expert bias: {:?}", moe.err());
+    }
+
+    // ---- Hybrid (ShortConv) Tests ----
+
+    #[test]
+    fn test_lfm2_hybrid_construction() {
+        let cfg = hybrid_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        let model = Lfm2ForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "hybrid Lfm2ForCausalLM should construct: {:?}",
+            model.err()
+        );
+        let model = model.unwrap();
+        assert_eq!(model.layers.len(), 2);
+        assert_eq!(model.num_attn_layers(), 1); // only layer 1 is attention
+        assert!(matches!(model.layers[0], Lfm2Layer::ShortConv(_)));
+        assert!(matches!(model.layers[1], Lfm2Layer::Attention(_)));
+    }
+
+    #[test]
+    fn test_lfm2_hybrid_prefill_shape() {
+        let cfg = hybrid_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Lfm2ForCausalLM::new(&cfg, vb).expect("build hybrid model");
+
+        // KV cache only for the 1 attention layer.
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
+
+        let seq_len = 4;
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).expect("input");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("hybrid prefill");
+
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_lfm2_hybrid_prefill_then_decode() {
+        let cfg = hybrid_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = Lfm2ForCausalLM::new(&cfg, vb).expect("build hybrid model");
+
+        let mut kv_cache_mgr =
+            KVCacheManager::new(&create_cache_config(model.num_attn_layers(), &device))
+                .expect("cache manager");
+        let mut block_table = BlockTable::new(16);
+
+        // Prefill
+        let prompt = Tensor::zeros((1, 3), DType::U32, &device).expect("prompt");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 3)
+            .expect("allocate prefill");
+        let slot_mapping = block_table.slot_mapping(0, 3);
+
+        let logits = model
+            .forward_with_request_id(
+                &prompt,
+                0,
+                42,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("hybrid prefill");
+        assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
+        block_table.advance(3);
+
+        // Decode
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 1)
+            .expect("allocate decode");
+        let slot_mapping = block_table.slot_mapping(3, 1);
+        let next_token = Tensor::zeros((1, 1), DType::U32, &device).expect("next token");
+
+        let logits = model
+            .forward_with_request_id(
+                &next_token,
+                3,
+                42,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("hybrid decode");
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_lfm2_short_conv_block_shapes() {
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let pg = LocalProcessGroup::new();
+        let tp_ctx = TpContext::single_gpu();
+
+        let block = ShortConvBlock::new_with_tp(64, false, 4, vb.pp("sc"), &pg).unwrap();
+
+        // Prefill: [1, S, 64] → output [1, S, 64], state [1, 64, 3]
+        let xs = Tensor::zeros((1, 5, 64), DType::F32, &device).unwrap();
+        let (out, state) = block.forward_prefill(&xs, &tp_ctx).unwrap();
+        assert_eq!(out.dims(), &[1, 5, 64]);
+        assert_eq!(state.dims(), &[1, 64, 3]); // l_cache-1 = 3
+
+        // Decode: [1, 1, 64] → output [1, 1, 64], new_state [1, 64, 3]
+        let xs1 = Tensor::zeros((1, 1, 64), DType::F32, &device).unwrap();
+        let (out1, state1) = block.forward_decode(&xs1, &tp_ctx, &state).unwrap();
+        assert_eq!(out1.dims(), &[1, 1, 64]);
+        assert_eq!(state1.dims(), &[1, 64, 3]);
     }
 }

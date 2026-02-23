@@ -26,6 +26,7 @@ use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::ssm::selective_scan;
 use crate::ssm::state::SSMStateManager;
+use crate::ssm::{causal_conv1d_decode, causal_conv1d_prefill};
 
 // ─── Mamba Config Extraction ────────────────────────────────────────────────
 
@@ -86,85 +87,6 @@ impl MambaConfig {
         }
     }
 }
-
-// ─── Causal Conv1D ──────────────────────────────────────────────────────────
-
-/// Applies causal 1D convolution.
-///
-/// During prefill, performs full causal convolution with left-padding.
-/// During decode, uses the conv state buffer (shift in, convolve).
-fn causal_conv1d_prefill(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    let (_batch, d_inner, seq_len) = x.dims3()?;
-    let (_d_inner_w, _one, kernel_size) = weight.dims3()?;
-
-    // Left-pad the input with zeros: [batch, d_inner, pad + seq_len]
-    let pad_len = kernel_size - 1;
-    let pad = Tensor::zeros((x.dims()[0], d_inner, pad_len), x.dtype(), x.device())?;
-    let padded = Tensor::cat(&[&pad, x], 2)?; // [batch, d_inner, pad_len + seq_len]
-
-    // Manual depthwise convolution: for each output position, compute the dot product
-    let mut outputs = Vec::with_capacity(seq_len);
-    for t in 0..seq_len {
-        // Extract window: [batch, d_inner, kernel_size]
-        let window = padded.narrow(2, t, kernel_size)?;
-        // Weight: [d_inner, 1, kernel_size] -> squeeze -> [d_inner, kernel_size]
-        let w = weight.squeeze(1)?;
-        // Depthwise: element-wise multiply and sum over kernel dim
-        // window: [batch, d_inner, kernel_size], w: [d_inner, kernel_size]
-        let w_expanded = w.unsqueeze(0)?; // [1, d_inner, kernel_size]
-        let product = window.broadcast_mul(&w_expanded)?; // [batch, d_inner, kernel_size]
-        let conv_out = product.sum(2)?; // [batch, d_inner]
-                                        // Add bias: [d_inner]
-        let conv_out = conv_out.broadcast_add(bias)?;
-        outputs.push(conv_out.unsqueeze(2)?); // [batch, d_inner, 1]
-    }
-
-    Tensor::cat(&outputs, 2) // [batch, d_inner, seq_len]
-}
-
-/// Apply causal conv1d during decode (single token) using conv state.
-///
-/// Shifts the new value into the conv state buffer and computes the convolution
-/// for the current position.
-fn causal_conv1d_decode(
-    x: &Tensor,
-    weight: &Tensor,
-    bias: &Tensor,
-    conv_state: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    let (batch, d_inner) = x.dims2()?;
-    let (_d_inner_w, _one, kernel_size) = weight.dims3()?;
-    let conv_state_len = kernel_size - 1;
-
-    // Shift conv state left and append new value
-    // conv_state: [batch, d_inner, conv_state_len]
-    // new value x: [batch, d_inner] -> [batch, d_inner, 1]
-    let x_expanded = x.unsqueeze(2)?;
-
-    let new_conv_state = if conv_state_len > 1 {
-        // Drop oldest, append newest: [batch, d_inner, conv_state_len-1] ++ [batch, d_inner, 1]
-        let shifted = conv_state.narrow(2, 1, conv_state_len - 1)?;
-        Tensor::cat(&[&shifted, &x_expanded], 2)? // [batch, d_inner, conv_state_len]
-    } else if conv_state_len == 1 {
-        x_expanded.clone()
-    } else {
-        // conv_state_len == 0, kernel_size == 1
-        Tensor::zeros((batch, d_inner, 0), x.dtype(), x.device())?
-    };
-
-    // Full window: [conv_state, x] = [batch, d_inner, kernel_size]
-    let full_window = Tensor::cat(&[&new_conv_state, &x_expanded], 2)?;
-
-    // Depthwise convolution
-    let w = weight.squeeze(1)?; // [d_inner, kernel_size]
-    let w_expanded = w.unsqueeze(0)?; // [1, d_inner, kernel_size]
-    let product = full_window.broadcast_mul(&w_expanded)?; // [batch, d_inner, kernel_size]
-    let conv_out = product.sum(2)?; // [batch, d_inner]
-    let conv_out = conv_out.broadcast_add(bias)?;
-
-    Ok((conv_out, new_conv_state))
-}
-
 // ─── Mamba Block ────────────────────────────────────────────────────────────
 
 struct MambaBlock {

@@ -34,6 +34,7 @@ use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding};
 use crate::ssm::selective_scan;
 use crate::ssm::state::SSMStateManager;
+use crate::ssm::{causal_conv1d_decode, causal_conv1d_prefill};
 
 // ─── Config Extraction ──────────────────────────────────────────────────────
 
@@ -162,63 +163,6 @@ impl FalconH1Config {
         }
     }
 }
-
-// ─── Causal Conv1D helpers ──────────────────────────────────────────────────
-
-fn causal_conv1d_prefill(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    let (_batch, d_inner, seq_len) = x.dims3()?;
-    let (_d_inner_w, _one, kernel_size) = weight.dims3()?;
-
-    let pad_len = kernel_size - 1;
-    let pad = Tensor::zeros((x.dims()[0], d_inner, pad_len), x.dtype(), x.device())?;
-    let padded = Tensor::cat(&[&pad, x], 2)?;
-
-    let mut outputs = Vec::with_capacity(seq_len);
-    for t in 0..seq_len {
-        let window = padded.narrow(2, t, kernel_size)?;
-        let w = weight.squeeze(1)?;
-        let w_expanded = w.unsqueeze(0)?;
-        let product = window.broadcast_mul(&w_expanded)?;
-        let conv_out = product.sum(2)?;
-        let conv_out = conv_out.broadcast_add(bias)?;
-        outputs.push(conv_out.unsqueeze(2)?);
-    }
-
-    Tensor::cat(&outputs, 2)
-}
-
-fn causal_conv1d_decode(
-    x: &Tensor,
-    weight: &Tensor,
-    bias: &Tensor,
-    conv_state: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    let (batch, d_inner) = x.dims2()?;
-    let (_d_inner_w, _one, kernel_size) = weight.dims3()?;
-    let conv_state_len = kernel_size - 1;
-
-    let x_expanded = x.unsqueeze(2)?;
-
-    let new_conv_state = if conv_state_len > 1 {
-        let shifted = conv_state.narrow(2, 1, conv_state_len - 1)?;
-        Tensor::cat(&[&shifted, &x_expanded], 2)?
-    } else if conv_state_len == 1 {
-        x_expanded.clone()
-    } else {
-        Tensor::zeros((batch, d_inner, 0), x.dtype(), x.device())?
-    };
-
-    let full_window = Tensor::cat(&[&new_conv_state, &x_expanded], 2)?;
-
-    let w = weight.squeeze(1)?;
-    let w_expanded = w.unsqueeze(0)?;
-    let product = full_window.broadcast_mul(&w_expanded)?;
-    let conv_out = product.sum(2)?;
-    let conv_out = conv_out.broadcast_add(bias)?;
-
-    Ok((conv_out, new_conv_state))
-}
-
 fn softplus(x: &Tensor) -> Result<Tensor> {
     let ones = Tensor::ones(x.dims(), x.dtype(), x.device())?;
     let exp_x = x.exp()?;
