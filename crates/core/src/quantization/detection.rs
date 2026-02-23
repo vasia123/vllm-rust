@@ -127,6 +127,11 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("torchao") => QuantizationMethod::Torchao,
         Some("experts_int8") => QuantizationMethod::ExpertsInt8,
         Some("moe_wna16") => QuantizationMethod::MoeWNA16,
+        Some("awq_marlin") => QuantizationMethod::AwqMarlin,
+        Some("fbgemm_fp8") => QuantizationMethod::FbgemmFp8,
+        Some("ptpc_fp8") => QuantizationMethod::PtpcFp8,
+        // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
+        Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {
             let quant_algo = quant_config
                 .get("quantization")
@@ -162,8 +167,15 @@ fn detect_from_quantize_config(path: &Path) -> Option<DetectedQuantConfig> {
     if let Ok(gptq) = serde_json::from_value::<GptqConfig>(json.clone()) {
         if gptq.bits.is_some() && gptq.group_size.is_some() {
             let raw_config: HashMap<String, Value> = serde_json::from_value(json).ok()?;
+            // "gptq_marlin" in quantize_config.json → route to Marlin (same weight format)
+            let method =
+                if raw_config.get("quant_method").and_then(|v| v.as_str()) == Some("gptq_marlin") {
+                    QuantizationMethod::Marlin
+                } else {
+                    QuantizationMethod::Gptq
+                };
             return Some(DetectedQuantConfig {
-                method: QuantizationMethod::Gptq,
+                method,
                 bits: gptq.bits,
                 group_size: gptq.group_size.map(|g| g as usize),
                 desc_act: gptq.desc_act,
@@ -221,6 +233,11 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "torchao" => QuantizationMethod::Torchao,
                 "experts_int8" => QuantizationMethod::ExpertsInt8,
                 "moe_wna16" => QuantizationMethod::MoeWNA16,
+                "awq_marlin" => QuantizationMethod::AwqMarlin,
+                "fbgemm_fp8" => QuantizationMethod::FbgemmFp8,
+                "ptpc_fp8" => QuantizationMethod::PtpcFp8,
+                // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
+                "gptq_marlin" => QuantizationMethod::Marlin,
                 "modelopt" => {
                     let quant_algo = quant_config
                         .get("quantization")

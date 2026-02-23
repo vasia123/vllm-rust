@@ -10,10 +10,13 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use super::awq::{AwqConfig, AwqLinear};
+use super::awq_marlin::{repack_awq_nibbles, AwqMarlinConfig};
 use super::bitsandbytes::{BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType};
 use super::config::{QuantizationConfig, QuantizedLinear};
+use super::fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
 use super::fp8::{Fp8Config, Fp8Linear};
 use super::gptq::{GptqConfig, GptqLinear};
+use super::marlin::MarlinLinear;
 use super::mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 use super::{create_config_from_directory, DetectedQuantConfig, QuantizationMethod};
 
@@ -864,6 +867,214 @@ impl QuantizedWeightLoader for MoeWNA16WeightLoader {
     }
 }
 
+// ─── AwqMarlin Weight Loader ──────────────────────────────────────────────────
+
+/// Weight loader for AWQ-Marlin quantized models.
+///
+/// Loads AWQ checkpoint tensors (`qweight`, `scales`, `qzeros`) and
+/// deinterleaves AWQ's interleaved nibble packing into GPTQ sequential order
+/// before routing to `MarlinLinear`.  The Marlin GPTQ→tile repack happens
+/// inside `MarlinLinear::process_weights()`.
+pub struct AwqMarlinWeightLoader {
+    vb: VarBuilder<'static>,
+    config: AwqMarlinConfig,
+    device: Device,
+    dtype: DType,
+}
+
+impl AwqMarlinWeightLoader {
+    /// Create a new AWQ-Marlin weight loader.
+    pub fn new(vb: VarBuilder<'static>, config: AwqMarlinConfig) -> Self {
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        Self {
+            vb,
+            config,
+            device,
+            dtype,
+        }
+    }
+}
+
+impl QuantizedWeightLoader for AwqMarlinWeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        // Skip lm_head unless explicitly quantized.
+        if self.config.is_layer_skipped(prefix) {
+            let vb = self.vb.pp(prefix);
+            let weight = vb.get((out_features, in_features), "weight")?;
+            let bias_tensor = if bias {
+                Some(vb.get(out_features, "bias")?)
+            } else {
+                None
+            };
+            return Ok(Box::new(LoadedUnquantizedLinear {
+                weight,
+                bias: bias_tensor,
+                in_features,
+                out_features,
+            }));
+        }
+
+        let vb = self.vb.pp(prefix);
+        let mc = self.config.marlin_config();
+        let pack_factor = 8usize; // 32 / 4 bits = 8 int4 values per u32
+        let packed_in = in_features / pack_factor;
+        let num_groups = mc.num_groups(in_features);
+        let packed_out = out_features / pack_factor;
+
+        let mut linear =
+            MarlinLinear::new(in_features, out_features, bias, mc.clone(), &self.device)?;
+
+        let mut weights = HashMap::new();
+
+        // Load and deinterleave AWQ qweight → GPTQ nibble ordering.
+        if let Ok(qw) = vb.get((packed_in, out_features), "qweight") {
+            let reordered = repack_awq_nibbles(&qw)?;
+            weights.insert("qweight".to_string(), reordered);
+        }
+
+        // Scales are already in the standard [num_groups, out_features] format.
+        if let Ok(s) = vb.get((num_groups, out_features), "scales") {
+            weights.insert("scales".to_string(), s);
+        }
+
+        // Zero points (AWQ packed format [num_groups, out_features/pack_factor]).
+        // NOTE: For the Marlin CUDA kernel, qzeros need additional repacking to
+        // Marlin format (`marlin_awq_repack_zp`).  This CPU path stores them as-is;
+        // a GPU-accelerated conversion will be needed when the
+        // `awq_marlin_repack_int4` PTX function is added to `marlin_gemm.cu`.
+        if let Ok(z) = vb.get((num_groups, packed_out), "qzeros") {
+            weights.insert("qzeros".to_string(), z);
+        }
+
+        if bias {
+            if let Ok(b) = vb.get(out_features, "bias") {
+                weights.insert("bias".to_string(), b);
+            }
+        }
+
+        linear.load_weights(&weights)?;
+        Ok(Box::new(linear))
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::AwqMarlin
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+// ─── FbgemmFp8 Weight Loader ──────────────────────────────────────────────────
+
+/// Weight loader for FBGEMM FP8 quantized models.
+///
+/// Loads FP8 E4M3 weights (stored as U8) plus per-channel F32 scales
+/// (`[out, 1]` or `[out]`) from the checkpoint.
+pub struct FbgemmFp8WeightLoader {
+    vb: VarBuilder<'static>,
+    config: FbgemmFp8Config,
+    device: Device,
+    dtype: DType,
+}
+
+impl FbgemmFp8WeightLoader {
+    /// Create a new FBGEMM FP8 weight loader.
+    pub fn new(vb: VarBuilder<'static>, config: FbgemmFp8Config) -> Self {
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        Self {
+            vb,
+            config,
+            device,
+            dtype,
+        }
+    }
+}
+
+impl QuantizedWeightLoader for FbgemmFp8WeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        // Fall back to unquantized for skipped layers.
+        if self.config.is_layer_skipped(prefix) {
+            let vb = self.vb.pp(prefix);
+            let weight = vb.get((out_features, in_features), "weight")?;
+            let bias_tensor = if bias {
+                Some(vb.get(out_features, "bias")?)
+            } else {
+                None
+            };
+            return Ok(Box::new(LoadedUnquantizedLinear {
+                weight,
+                bias: bias_tensor,
+                in_features,
+                out_features,
+            }));
+        }
+
+        let vb = self.vb.pp(prefix);
+        let mut linear = FbgemmFp8Linear::new(
+            in_features,
+            out_features,
+            bias,
+            self.config.input_scale_ub,
+            &self.device,
+        )?;
+
+        let mut weights = HashMap::new();
+
+        // FP8 weight: U8 (E4M3), shape [out_features, in_features].
+        if let Ok(w) = vb.get((out_features, in_features), "weight") {
+            weights.insert("weight".to_string(), w);
+        }
+
+        // Per-channel scale: F32, shape [out_features, 1] or [out_features].
+        // Try both shapes; the [out, 1] form is what HuggingFace Meta-Llama checkpoints use.
+        if let Ok(s) = vb.get((out_features, 1usize), "weight_scale") {
+            weights.insert("weight_scale".to_string(), s);
+        } else if let Ok(s) = vb.get(out_features, "weight_scale") {
+            weights.insert("weight_scale".to_string(), s);
+        }
+
+        if bias {
+            if let Ok(b) = vb.get(out_features, "bias") {
+                weights.insert("bias".to_string(), b);
+            }
+        }
+
+        linear.load_weights(&weights)?;
+        Ok(Box::new(linear))
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::FbgemmFp8
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
 /// Create an appropriate weight loader for a model directory.
 ///
 /// This function detects the quantization method from the model config
@@ -925,6 +1136,19 @@ pub fn create_weight_loader_from_config(
             let wna16_config = super::moe_wna16::MoeWNA16Config::from_detected(&HashMap::new());
             Box::new(MoeWNA16WeightLoader::new(vb, wna16_config))
         }
+        QuantizationMethod::AwqMarlin => {
+            let awq_marlin_config = AwqMarlinConfig::from_detected(None, None, &HashMap::new());
+            Box::new(AwqMarlinWeightLoader::new(vb, awq_marlin_config))
+        }
+        QuantizationMethod::FbgemmFp8 => {
+            let cfg = FbgemmFp8Config::from_detected(&HashMap::new());
+            Box::new(FbgemmFp8WeightLoader::new(vb, cfg))
+        }
+        QuantizationMethod::PtpcFp8 => {
+            // Same weights as standard FP8 — reuse Fp8WeightLoader.
+            let fp8_config = Fp8Config::dynamic();
+            Box::new(Fp8WeightLoader::new(vb, fp8_config))
+        }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }
 }
@@ -980,6 +1204,27 @@ pub fn create_weight_loader_with_params(
             let wna16_config =
                 super::moe_wna16::MoeWNA16Config::from_detected(&detected.raw_config);
             Box::new(MoeWNA16WeightLoader::new(vb, wna16_config))
+        }
+        QuantizationMethod::AwqMarlin => {
+            let awq_marlin_config = AwqMarlinConfig::from_detected(
+                detected.bits,
+                detected.group_size,
+                &detected.raw_config,
+            );
+            Box::new(AwqMarlinWeightLoader::new(vb, awq_marlin_config))
+        }
+        QuantizationMethod::FbgemmFp8 => {
+            let cfg = FbgemmFp8Config::from_detected(&detected.raw_config);
+            Box::new(FbgemmFp8WeightLoader::new(vb, cfg))
+        }
+        QuantizationMethod::PtpcFp8 => {
+            // Same weight format as Fp8 — dynamic, no serialised FP8.
+            let fp8_config = Fp8Config::from_detected(
+                detected.bits,
+                detected.activation_scheme.as_deref(),
+                &detected.raw_config,
+            );
+            Box::new(Fp8WeightLoader::new(vb, fp8_config))
         }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }

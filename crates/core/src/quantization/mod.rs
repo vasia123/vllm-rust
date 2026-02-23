@@ -25,6 +25,7 @@
 //! ```
 
 pub mod awq;
+pub mod awq_marlin;
 pub mod bitsandbytes;
 #[cfg(feature = "cuda-kernels")]
 pub mod bnb_cuda;
@@ -32,6 +33,7 @@ pub mod compressed_tensors;
 mod config;
 mod detection;
 pub mod experts_int8;
+pub mod fbgemm_fp8;
 pub mod fp8;
 #[cfg(feature = "cuda-kernels")]
 pub mod fp8_cuda;
@@ -44,10 +46,12 @@ pub mod marlin;
 pub mod marlin_cuda;
 pub mod moe_wna16;
 pub mod mxfp8;
+pub mod ptpc_fp8;
 pub mod weight_loader;
 
 // Re-export public types
 pub use awq::{AwqConfig, AwqLinear, AwqVersion};
+pub use awq_marlin::AwqMarlinConfig;
 pub use bitsandbytes::{
     quantize_int8, quantize_nf4, unpack_nf4, BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType,
 };
@@ -60,6 +64,7 @@ pub use config::{
 };
 pub use detection::{detect_from_directory, detect_from_json, DetectedQuantConfig};
 pub use experts_int8::{ExpertsInt8Config, ExpertsInt8Linear};
+pub use fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
 pub use fp8::Fp8Config;
 #[cfg(feature = "cuda-kernels")]
 pub use fp8_cuda::{fp8_dequantize, fp8_gemm, fp8_quantize_dynamic_per_token, fp8_quantize_static};
@@ -80,11 +85,13 @@ pub use marlin::{
 pub use marlin_cuda::marlin_gemm;
 pub use moe_wna16::{MoeWNA16Config, MoeWNA16Format};
 pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
+pub use ptpc_fp8::PtpcFp8Config;
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
-    AwqWeightLoader, BitsAndBytesWeightLoader, CompressedTensorsWeightLoader,
-    ExpertsInt8WeightLoader, Fp8WeightLoader, GptqWeightLoader, MoeWNA16WeightLoader,
-    MxFp8WeightLoader, QuantizedWeightLoader, UnquantizedWeightLoader,
+    AwqMarlinWeightLoader, AwqWeightLoader, BitsAndBytesWeightLoader,
+    CompressedTensorsWeightLoader, ExpertsInt8WeightLoader, FbgemmFp8WeightLoader, Fp8WeightLoader,
+    GptqWeightLoader, MoeWNA16WeightLoader, MxFp8WeightLoader, QuantizedWeightLoader,
+    UnquantizedWeightLoader,
 };
 
 use std::path::Path;
@@ -142,6 +149,15 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
         QuantizationMethod::MoeWNA16 => {
             Box::new(MoeWNA16Config::from_detected(&detected.raw_config))
         }
+        QuantizationMethod::AwqMarlin => Box::new(AwqMarlinConfig::from_detected(
+            detected.bits,
+            detected.group_size,
+            &detected.raw_config,
+        )),
+        QuantizationMethod::FbgemmFp8 => {
+            Box::new(FbgemmFp8Config::from_detected(&detected.raw_config))
+        }
+        QuantizationMethod::PtpcFp8 => Box::new(PtpcFp8Config::from_detected(&detected.raw_config)),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -183,6 +199,9 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::ModelOpt => 0,           // Emulation on any GPU
         QuantizationMethod::ExpertsInt8 => 0,        // CPU supported (online quantization)
         QuantizationMethod::MoeWNA16 => 70,          // Volta (GPTQ/AWQ based)
+        QuantizationMethod::AwqMarlin => 80,         // Ampere (Marlin kernel)
+        QuantizationMethod::FbgemmFp8 => 80, // Marlin FP8 fallback on Ampere; native FBGEMM on Hopper
+        QuantizationMethod::PtpcFp8 => 94,   // AMD MI300 minimum (ROCm only)
     };
     capability >= min_cap
 }

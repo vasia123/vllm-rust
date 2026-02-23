@@ -40,6 +40,12 @@ pub enum QuantizationMethod {
     ExpertsInt8,
     /// MoeWNA16: GPTQ/AWQ weight-only INT4/INT8 for MoE experts
     MoeWNA16,
+    /// AWQ weights with Marlin inference kernel (AWQ-Marlin)
+    AwqMarlin,
+    /// FBGEMM FP8: per-channel FP8 weights with dynamic activation quantization (Meta)
+    FbgemmFp8,
+    /// PTPC FP8: Per-Token Per-Channel dynamic FP8 quantization (ROCm/AMD MI300+)
+    PtpcFp8,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -58,6 +64,9 @@ impl std::fmt::Display for QuantizationMethod {
             Self::ModelOpt => write!(f, "modelopt"),
             Self::ExpertsInt8 => write!(f, "experts_int8"),
             Self::MoeWNA16 => write!(f, "moe_wna16"),
+            Self::AwqMarlin => write!(f, "awq_marlin"),
+            Self::FbgemmFp8 => write!(f, "fbgemm_fp8"),
+            Self::PtpcFp8 => write!(f, "ptpc_fp8"),
         }
     }
 }
