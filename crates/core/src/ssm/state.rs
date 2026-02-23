@@ -93,6 +93,9 @@ pub struct SSMStateManager {
     d_inner: usize,
     d_state: usize,
     d_conv: usize,
+    /// Channel count for conv state buffer. Equals `d_inner` for Mamba-1;
+    /// for Mamba-2 it is `d_inner + 2 * n_groups * d_state` (the conv_dim).
+    d_conv_channels: usize,
     dtype: DType,
     device: Device,
     states: HashMap<u64, RequestSSMState>,
@@ -121,6 +124,35 @@ impl SSMStateManager {
             d_inner,
             d_state,
             d_conv,
+            d_conv_channels: d_inner,
+            dtype,
+            device,
+            states: HashMap::new(),
+        }
+    }
+
+    /// Create a state manager where the conv state has a different channel
+    /// count from the SSM state.
+    ///
+    /// Used by Mamba-2 where `conv_dim = d_inner + 2 * n_groups * d_state`.
+    ///
+    /// # Arguments
+    /// * `d_conv_channels` - Number of channels for conv state (overrides `d_inner`)
+    pub fn new_with_conv_channels(
+        num_layers: usize,
+        d_inner: usize,
+        d_state: usize,
+        d_conv: usize,
+        d_conv_channels: usize,
+        dtype: DType,
+        device: Device,
+    ) -> Self {
+        Self {
+            num_layers,
+            d_inner,
+            d_state,
+            d_conv,
+            d_conv_channels,
             dtype,
             device,
             states: HashMap::new(),
@@ -150,7 +182,7 @@ impl SSMStateManager {
                 &self.device,
             )?);
             conv_states.push(SSMConvState::zeros(
-                self.d_inner,
+                self.d_conv_channels,
                 self.d_conv,
                 self.dtype,
                 &self.device,
