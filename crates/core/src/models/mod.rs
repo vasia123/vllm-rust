@@ -154,6 +154,7 @@ pub mod olmo2_lora;
 pub mod olmo2_quantized;
 pub mod olmoe;
 pub mod openpangu_mtp;
+pub mod openpangu_vl;
 pub mod opt;
 pub mod opt_quantized;
 pub mod ouro;
@@ -363,6 +364,7 @@ pub use olmo2_lora::Olmo2WithLora;
 pub use olmo2_quantized::QuantizedOlmo2ForCausalLM;
 pub use olmoe::OlmoeForCausalLM;
 pub use openpangu_mtp::OpenPanguMtpModel;
+pub use openpangu_vl::OpenPanguVLForConditionalGeneration;
 pub use opt::OPTForCausalLM;
 pub use opt_quantized::QuantizedOPTForCausalLM;
 pub use ouro::OuroForCausalLM;
@@ -751,6 +753,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "Ernie4_5ForCausalLM" => Ok(Box::new(Ernie45MoeForCausalLM::new(cfg, vb)?)),
         "Ernie4_5_VLMoeForConditionalGeneration" => {
             Ok(Box::new(Ernie4_5_VLForConditionalGeneration::new(cfg, vb)?))
+        }
+        "OpenPanguVLForConditionalGeneration" => {
+            Ok(Box::new(OpenPanguVLForConditionalGeneration::new(cfg, vb)?))
         }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
