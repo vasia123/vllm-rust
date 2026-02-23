@@ -562,10 +562,39 @@ impl Molmo2ForConditionalGeneration {
         })
     }
 
+    /// Replace image patch positions in text embeddings with pre-projected vision features.
+    ///
+    /// `ProcessedImage.embedding` holds features `[num_patch_tokens, hidden_size]` that
+    /// have already been processed by the vision backbone + pooling attention + MLP projector.
+    /// The preprocessor maps patch positions in the token sequence to `mm_inputs.image_embeddings`.
+    fn merge_vision_features(
+        &self,
+        text_embeddings: &Tensor, // [B, S, H]
+        mm_inputs: &MultimodalInputs,
+    ) -> Result<Tensor> {
+        let (_batch_size, seq_len, _) = text_embeddings.dims3()?;
+        let mut merged = text_embeddings.to_vec3::<f32>()?;
+
+        for (position, processed_image) in &mm_inputs.image_embeddings {
+            let img_emb: Vec<Vec<f32>> =
+                processed_image.embedding.to_dtype(DType::F32)?.to_vec2()?;
+            let batch_idx = position / seq_len;
+            let start_pos = position % seq_len;
+            for (i, emb) in img_emb.iter().enumerate() {
+                let target_pos = start_pos + i;
+                if target_pos < seq_len && batch_idx < merged.len() {
+                    merged[batch_idx][target_pos] = emb.clone();
+                }
+            }
+        }
+
+        Tensor::new(merged, &self.device)?.to_dtype(self.dtype)
+    }
+
     fn forward_inner(
         &self,
         input_ids: &Tensor,
-        _multimodal_inputs: Option<&MultimodalInputs>,
+        multimodal_inputs: Option<&MultimodalInputs>,
         seqlen_offset: usize,
         kv_cache_mgr: &mut KVCacheManager,
         block_table: &BlockTable,
@@ -583,9 +612,16 @@ impl Molmo2ForConditionalGeneration {
             )?)
         };
 
-        // TODO: For multimodal, extract vision features and replace image patch tokens.
-        // Currently only supports text-only forward.
-        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        let text_emb = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        let mut xs = if let Some(mm) = multimodal_inputs {
+            if mm.has_images() {
+                self.merge_vision_features(&text_emb, mm)?
+            } else {
+                text_emb
+            }
+        } else {
+            text_emb
+        };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
@@ -688,6 +724,7 @@ mod tests {
     use super::*;
     use crate::engine::ModelForward;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use crate::multimodal::ProcessedImage;
 
     fn test_model_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();
@@ -857,5 +894,40 @@ mod tests {
         let input = Tensor::zeros((1, 16, 128), DType::F32, &device).unwrap();
         let output = projector.forward(&input).unwrap();
         assert_eq!(output.dims(), &[1, 16, 64]);
+    }
+
+    #[test]
+    fn test_forward_multimodal_with_image() {
+        // ProcessedImage.embedding is pre-projected [num_patch_tokens, hidden_size].
+        // The model simply splices these features into the text embedding at patch positions.
+        let device = Device::Cpu;
+        let cfg = test_model_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Molmo2ForConditionalGeneration::new(&cfg, vb).unwrap();
+
+        // 4 image patch tokens starting at position 2 in a 7-token sequence.
+        let num_patch = 4usize;
+        let hidden = cfg.hidden_size; // 64
+        let seq_len = 2 + num_patch + 1; // 7
+
+        let img_emb = Tensor::zeros((num_patch, hidden), DType::F32, &device).unwrap();
+        let pi = ProcessedImage::new(img_emb, num_patch);
+        let mm = MultimodalInputs::with_images(
+            vec![0u32; seq_len],
+            vec![(2, pi)], // start at position 2
+        );
+
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let bt = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).unwrap();
+        let logits = model
+            .forward_multimodal(&input_ids, Some(&mm), 0, &mut kv_cache, &bt, &slot_mapping)
+            .unwrap();
+
+        // vocab_size + additional_vocab_size = 256 + 16 = 272
+        assert_eq!(logits.dims(), &[1, seq_len, 272]);
     }
 }

@@ -120,6 +120,24 @@ impl Phi4MMConfig {
     }
 }
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// 2×2 average pooling for a batched NHWC tensor.
+///
+/// Reduces spatial H and W by a factor of 2, equivalent to PyTorch's
+/// `nn.AvgPool2d(kernel_size=2, stride=2)` applied to an NCHW tensor that
+/// has been converted to NHWC before and after.
+fn avg_pool2x2_nhwc(x: &Tensor) -> Result<Tensor> {
+    let (n, h, w, c) = x.dims4()?;
+    // Reshape each 2×2 spatial block so we can average over it:
+    //   [N, H, W, C] → [N, H/2, 2, W/2, 2, C]
+    // Element (n, a, b, c_, d, e) maps to original (n, 2a+b, 2c_+d, e). ✓
+    x.contiguous()?
+        .reshape((n, h / 2, 2, w / 2, 2, c))?
+        .mean(2)? // [N, H/2, W/2, 2, C]
+        .mean(3) // [N, H/2, W/2, C]
+}
+
 // ─── Image Projector ────────────────────────────────────────────────────────
 
 /// Phi4MM image projector: 2-layer MLP.
@@ -154,8 +172,13 @@ impl Phi4MMProjector {
 pub struct Phi4MMForCausalLM {
     #[allow(dead_code)]
     vision_encoder: VisionEncoder,
-    #[allow(dead_code)]
     projector: Phi4MMProjector,
+    /// Global separator token inserted between sub-images and the global crop.
+    /// Shape: [1, image_dim_out].
+    glb_gn: Tensor,
+    /// Row separator appended at the end of each spatial row in a crop.
+    /// Shape: [1, image_dim_out].
+    sub_gn: Tensor,
     // LLM
     embed_tokens: TpEmbedding,
     layers: Vec<LlamaDecoderLayer>,
@@ -191,15 +214,21 @@ impl Phi4MMForCausalLM {
                 .pp("vision_model"),
         )?;
 
-        // Projector: input_dim is 4x vision_hidden (due to 2x2 compression)
-        let proj_input = config.image_dim_out * 4;
-        let projector = Phi4MMProjector::new(
-            proj_input,
-            cfg.hidden_size,
-            vb.pp("model")
-                .pp("vision_embed_tokens")
-                .pp("img_projection"),
-        )?;
+        // Projector: input_dim == image_dim_out because base_feat_height_reduction=1.
+        // The 2x2 spatial compression (AvgPool2d) is applied in hd_transform()
+        // before projection; it halves H and W but does NOT merge channels.
+        let vb_ve = vb.pp("model").pp("vision_embed_tokens");
+        let image_dim_out = config.image_dim_out;
+        let projector =
+            Phi4MMProjector::new(image_dim_out, cfg.hidden_size, vb_ve.pp("img_projection"))?;
+
+        // Learnable separators for the HD transform (Python: glb_GN [1,1,C], sub_GN [1,1,1,C]).
+        let glb_gn = vb_ve
+            .get((1, 1, image_dim_out), "glb_GN")?
+            .reshape((1, image_dim_out))?;
+        let sub_gn = vb_ve
+            .get((1, 1, 1, image_dim_out), "sub_GN")?
+            .reshape((1, image_dim_out))?;
 
         // LLM backbone (Llama-like)
         let vb_m = vb.pp("model");
@@ -244,6 +273,8 @@ impl Phi4MMForCausalLM {
         Ok(Self {
             vision_encoder,
             projector,
+            glb_gn,
+            sub_gn,
             embed_tokens,
             layers,
             norm,
@@ -253,6 +284,78 @@ impl Phi4MMForCausalLM {
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
+    }
+
+    /// Apply HD transform + 2×2 compression + MLP projection to one image.
+    ///
+    /// `embedding`: `[num_crops * H_raw², C]` — all crop patch features concatenated.
+    /// `grid_size`: `(h_crops, w_crops)` sub-image grid, or `None` / `(0,0)` for
+    ///   a single global crop only.
+    ///
+    /// Returns `[T, hidden_size]` where T is the token count after the HD transform.
+    fn hd_transform(
+        &self,
+        embedding: &Tensor,
+        grid_size: Option<(usize, usize)>,
+    ) -> Result<Tensor> {
+        let (total_patches, c) = embedding.dims2()?;
+        let (h_crops, w_crops) = grid_size.unwrap_or((0, 0));
+
+        if h_crops == 0 || w_crops == 0 {
+            // Global-only path: compress and add row separators.
+            let h_raw = (total_patches as f64).sqrt() as usize;
+            let x = embedding.reshape((1, h_raw, h_raw, c))?;
+            let x = avg_pool2x2_nhwc(&x)?; // [1, H, H, C]
+            let h = h_raw / 2;
+            let global_img = x.squeeze(0)?.contiguous()?; // [H, H, C]
+
+            // Append sub_GN separator at the end of each row: [H, H, C]+[H,1,C] → [H,H+1,C]
+            let sep = self.sub_gn.unsqueeze(0)?.expand((h, 1, c))?;
+            let glb_with_sep = Tensor::cat(&[&global_img, &sep], 1)?;
+            let flat = glb_with_sep.reshape((h * (h + 1), c))?;
+            return self.projector.forward(&flat);
+        }
+
+        let b_ = h_crops * w_crops;
+        let num_crops = 1 + b_;
+        let patches_per_crop = total_patches / num_crops;
+        let h_raw = (patches_per_crop as f64).sqrt() as usize;
+        let h = h_raw / 2; // after 2×2 avg-pool
+
+        // Compress all crops.
+        let x = embedding.reshape((num_crops, h_raw, h_raw, c))?;
+        let x = avg_pool2x2_nhwc(&x)?; // [num_crops, H, H, C]
+
+        // Split global (index 0) from sub crops (indices 1..).
+        let global_img = x.narrow(0, 0, 1)?.squeeze(0)?.contiguous()?; // [H, H, C]
+        let sub_imgs = x.narrow(0, 1, b_)?.contiguous()?; // [B_, H, H, C]
+
+        // ── Build global arrangement ───────────────────────────────────────
+        // Append sub_GN at the end of each row → [H, H+1, C] → [H*(H+1), C]
+        let sep_glb = self.sub_gn.unsqueeze(0)?.expand((h, 1, c))?;
+        let glb_with_sep = Tensor::cat(&[&global_img, &sep_glb], 1)?;
+        let glb_flat = glb_with_sep.reshape((h * (h + 1), c))?;
+
+        // ── Build sub arrangement ──────────────────────────────────────────
+        // Arrange h_crops×w_crops patches into a spatial grid:
+        //   [B_, H, H, C] → [1, h_c, w_c, H, H, C]
+        //   → permute(0,1,3,2,4,5) → [1, h_c*H, w_c*H, C]
+        let sub_grid = sub_imgs
+            .reshape((1, h_crops, w_crops, h, h, c))?
+            .permute((0, 1, 3, 2, 4, 5))?
+            .contiguous()?
+            .reshape((1, h_crops * h, w_crops * h, c))?
+            .squeeze(0)?
+            .contiguous()?; // [h*H, w*H, C]
+
+        // Append sub_GN at the end of each row → [h*H, w*H+1, C] → flat
+        let sep_sub = self.sub_gn.unsqueeze(0)?.expand((h_crops * h, 1, c))?;
+        let sub_with_sep = Tensor::cat(&[&sub_grid, &sep_sub], 1)?;
+        let sub_flat = sub_with_sep.reshape((h_crops * h * (w_crops * h + 1), c))?;
+
+        // ── Concatenate: sub + glb_GN + global (sub_glb order) ────────────
+        let combined = Tensor::cat(&[&sub_flat, &self.glb_gn, &glb_flat], 0)?;
+        self.projector.forward(&combined)
     }
 
     fn merge_multimodal_embeddings(
@@ -268,12 +371,9 @@ impl Phi4MMForCausalLM {
         let mut merged = text_embeddings.to_vec3::<f32>()?;
 
         for (position, processed_image) in &mm_inputs.image_embeddings {
-            // TODO: Apply HD transform + 2x2 compression + projection
-            // For now, project raw vision features through the MLP
-            let vision_emb = processed_image.embedding.unsqueeze(0)?;
-            let projected = self.projector.forward(&vision_emb)?;
-            let projected = projected.squeeze(0)?;
-            let img_emb: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
+            let image_features =
+                self.hd_transform(&processed_image.embedding, processed_image.grid_size)?;
+            let img_emb: Vec<Vec<f32>> = image_features.to_dtype(DType::F32)?.to_vec2()?;
 
             let batch_idx = *position / seq_len;
             let start_pos = *position % seq_len;
@@ -416,6 +516,7 @@ mod tests {
     use super::*;
     use crate::engine::ModelForward;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use crate::multimodal::ProcessedImage;
 
     fn test_model_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();
@@ -562,5 +663,98 @@ mod tests {
             .forward(&next_token, 3, &mut kv_cache, &block_table, &slot_mapping)
             .unwrap();
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+    }
+
+    /// Helper: test config uses image_size=56, patch_size=14 → 4 patches per side per crop.
+    /// After 2×2 AvgPool: H=2, 4 patches per crop.
+    fn make_processed_image(
+        num_crops: usize,
+        c: usize,
+        h_raw: usize,
+        grid_size: Option<(usize, usize)>,
+        device: &Device,
+    ) -> ProcessedImage {
+        let total = num_crops * h_raw * h_raw;
+        let emb = Tensor::zeros((total, c), DType::F32, device).unwrap();
+        let mut pi = ProcessedImage::new(emb, /* num_tokens placeholder */ 0);
+        pi.grid_size = grid_size;
+        pi
+    }
+
+    #[test]
+    fn test_forward_multimodal_single_image() {
+        // Single global crop (no sub-images). H_raw=4, H=2 after compression.
+        // HD-transform output tokens = H*(H+1) = 2*3 = 6.
+        let device = Device::Cpu;
+        let cfg = test_model_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Phi4MMForCausalLM::new(&cfg, vb).unwrap();
+
+        let image_dim_out = 64; // matches test config hidden_size
+        let h_raw = 4; // image_size/patch_size = 56/14 = 4 patches per side
+        let h = h_raw / 2; // 2 after AvgPool
+        let num_tokens = h * (h + 1); // 6
+
+        // Sequence: 3 text tokens + 6 image tokens (positions 0..5 are image)
+        let seq_len = 3 + num_tokens;
+        let pi = make_processed_image(1, image_dim_out, h_raw, None, &device);
+        let mm = MultimodalInputs::with_images(vec![0u32; seq_len], vec![(0, pi)]);
+
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let bt = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).unwrap();
+        let logits = model
+            .forward_multimodal(&input_ids, Some(&mm), 0, &mut kv_cache, &bt, &slot_mapping)
+            .unwrap();
+
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_forward_multimodal_hd_transform() {
+        // 2×2 sub crops + 1 global = 5 crops total. H_raw=4, H=2.
+        // sub tokens = h_c * H * (w_c * H + 1) = 2*2*(2*2+1) = 20
+        // glb tokens = H*(H+1) = 6
+        // separator = 1
+        // Total image tokens = 20 + 1 + 6 = 27.
+        let device = Device::Cpu;
+        let cfg = test_model_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Phi4MMForCausalLM::new(&cfg, vb).unwrap();
+
+        let image_dim_out = 64;
+        let h_raw = 4;
+        let h = h_raw / 2;
+        let h_crops = 2usize;
+        let w_crops = 2usize;
+        let num_tokens = h_crops * h * (w_crops * h + 1) // sub + sub_GN separators
+            + 1                              // glb_GN
+            + h * (h + 1); // global + sub_GN per row
+
+        let seq_len = num_tokens + 2; // 2 extra text tokens
+        let num_crops = 1 + h_crops * w_crops; // 5
+        let pi = make_processed_image(
+            num_crops,
+            image_dim_out,
+            h_raw,
+            Some((h_crops, w_crops)),
+            &device,
+        );
+        let mm = MultimodalInputs::with_images(vec![0u32; seq_len], vec![(0, pi)]);
+
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let bt = BlockTable::from_block_ids(vec![0, 1, 2], 0);
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).unwrap();
+        let logits = model
+            .forward_multimodal(&input_ids, Some(&mm), 0, &mut kv_cache, &bt, &slot_mapping)
+            .unwrap();
+
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
     }
 }

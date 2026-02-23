@@ -12,6 +12,7 @@
 //! Architecturally similar to Qwen2 with DeepSeek V2-style attention features.
 
 use crate::layers::{rms_norm, RmsNorm};
+use crate::moe::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
@@ -300,7 +301,6 @@ impl MiMoV2Attention {
 
 // ─── MiMo V2 Config ─────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 struct MiMoV2Config {
     hybrid_layer_pattern: Vec<u8>,
     moe_layer_freq: Vec<bool>,
@@ -309,10 +309,18 @@ struct MiMoV2Config {
     swa_head_dim: usize,
     swa_v_head_dim: Option<usize>,
     swa_rope_theta: f64,
+    #[allow(dead_code)]
     sliding_window_size: Option<usize>,
     v_head_dim: Option<usize>,
     v_scale: Option<f64>,
     layernorm_epsilon: f64,
+    // MoE
+    n_routed_experts: Option<usize>,
+    num_experts_per_tok: usize,
+    moe_intermediate_size: Option<usize>,
+    norm_topk_prob: bool,
+    n_group: Option<usize>,
+    topk_group: Option<usize>,
 }
 
 impl MiMoV2Config {
@@ -388,6 +396,42 @@ impl MiMoV2Config {
             .and_then(|v| v.as_f64())
             .unwrap_or(cfg.rms_norm_eps);
 
+        let n_routed_experts = cfg
+            .extra
+            .get("n_routed_experts")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let num_experts_per_tok = cfg
+            .extra
+            .get("num_experts_per_tok")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize;
+
+        let moe_intermediate_size = cfg
+            .extra
+            .get("moe_intermediate_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let norm_topk_prob = cfg
+            .extra
+            .get("norm_topk_prob")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let n_group = cfg
+            .extra
+            .get("n_group")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let topk_group = cfg
+            .extra
+            .get("topk_group")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
         Self {
             hybrid_layer_pattern,
             moe_layer_freq,
@@ -400,6 +444,12 @@ impl MiMoV2Config {
             v_head_dim,
             v_scale,
             layernorm_epsilon,
+            n_routed_experts,
+            num_experts_per_tok,
+            moe_intermediate_size,
+            norm_topk_prob,
+            n_group,
+            topk_group,
         }
     }
 
@@ -411,9 +461,169 @@ impl MiMoV2Config {
             == 1
     }
 
-    #[allow(dead_code)]
     fn is_moe_layer(&self, layer_idx: usize) -> bool {
         self.moe_layer_freq.get(layer_idx).copied().unwrap_or(false)
+    }
+}
+
+// ─── MoE Block ───────────────────────────────────────────────────────────────
+
+struct MiMoV2Expert {
+    gate_proj: TpLinear,
+    up_proj: TpLinear,
+    down_proj: TpLinear,
+}
+
+impl MiMoV2Expert {
+    fn new(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
+        let gate_proj = TpLinear::column_parallel(
+            hidden_size,
+            intermediate_size,
+            false,
+            false,
+            vb.pp("gate_proj"),
+            pg,
+        )?;
+        let up_proj = TpLinear::column_parallel(
+            hidden_size,
+            intermediate_size,
+            false,
+            false,
+            vb.pp("up_proj"),
+            pg,
+        )?;
+        let down_proj = TpLinear::row_parallel(
+            intermediate_size,
+            hidden_size,
+            false,
+            true,
+            vb.pp("down_proj"),
+            pg,
+        )?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs, tp_ctx)?)?;
+        let up = self.up_proj.forward(xs, tp_ctx)?;
+        self.down_proj.forward(&gate.mul(&up)?, tp_ctx)
+    }
+}
+
+struct MiMoV2MoEBlock {
+    router: TopKRouter,
+    experts: Vec<MiMoV2Expert>,
+    num_experts: usize,
+}
+
+impl MiMoV2MoEBlock {
+    fn new(
+        cfg: &ModelConfig,
+        mimo_cfg: &MiMoV2Config,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
+        let num_experts = mimo_cfg.n_routed_experts.unwrap_or(0);
+        let top_k = mimo_cfg.num_experts_per_tok;
+        let moe_intermediate_size = mimo_cfg
+            .moe_intermediate_size
+            .unwrap_or(cfg.intermediate_size);
+
+        let router_config = RouterConfig {
+            hidden_size: cfg.hidden_size,
+            num_experts,
+            top_k,
+            renormalize: mimo_cfg.norm_topk_prob,
+            scoring_func: ScoringFunc::Sigmoid,
+            use_grouped_topk: mimo_cfg.n_group.is_some(),
+            num_expert_groups: mimo_cfg.n_group,
+            topk_per_group: mimo_cfg.topk_group,
+        };
+
+        // Load optional score correction bias stored alongside the gate weights.
+        let bias = vb
+            .pp("gate")
+            .get((num_experts,), "e_score_correction_bias")
+            .ok();
+        let router = TopKRouter::new_with_bias(router_config, vb.pp("gate"), bias)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        let vb_experts = vb.pp("experts");
+        for i in 0..num_experts {
+            experts.push(MiMoV2Expert::new(
+                cfg.hidden_size,
+                moe_intermediate_size,
+                vb_experts.pp(i),
+                pg,
+            )?);
+        }
+
+        Ok(Self {
+            router,
+            experts,
+            num_experts,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+        let orig_shape = xs.dims().to_vec();
+        let hidden_dim = *orig_shape.last().unwrap();
+        let xs_2d = xs.reshape(((), hidden_dim))?;
+        let num_tokens = xs_2d.dim(0)?;
+
+        let (routing_weights, selected_experts) = self.router.route(&xs_2d)?;
+
+        let mut routed_output = Tensor::zeros((num_tokens, hidden_dim), xs.dtype(), xs.device())?;
+
+        for token_idx in 0..num_tokens {
+            let token_input = xs_2d.narrow(0, token_idx, 1)?;
+            let token_weights = routing_weights.narrow(0, token_idx, 1)?;
+            let token_experts = selected_experts.narrow(0, token_idx, 1)?;
+
+            let expert_indices: Vec<u32> = token_experts.flatten_all()?.to_vec1()?;
+            let weights: Vec<f32> = token_weights
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1()?;
+
+            let mut token_output = Tensor::zeros((1, hidden_dim), xs.dtype(), xs.device())?;
+
+            for (k, &expert_idx) in expert_indices.iter().enumerate() {
+                let expert_idx = expert_idx as usize;
+                if expert_idx < self.num_experts {
+                    let expert_out = self.experts[expert_idx].forward(&token_input, tp_ctx)?;
+                    token_output = (token_output + expert_out.affine(weights[k] as f64, 0.0)?)?;
+                }
+            }
+
+            let indices = Tensor::new(&[token_idx as u32], xs.device())?;
+            routed_output = routed_output.index_add(&indices, &token_output, 0)?;
+        }
+
+        routed_output.reshape(orig_shape)
+    }
+}
+
+enum MiMoV2Mlp {
+    Dense(TpSwiGluMlp),
+    Sparse(MiMoV2MoEBlock),
+}
+
+impl MiMoV2Mlp {
+    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+        match self {
+            MiMoV2Mlp::Dense(mlp) => mlp.forward(xs, tp_ctx),
+            MiMoV2Mlp::Sparse(moe) => moe.forward(xs, tp_ctx),
+        }
     }
 }
 
@@ -421,7 +631,7 @@ impl MiMoV2Config {
 
 struct MiMoV2FlashDecoderLayer {
     self_attn: MiMoV2Attention,
-    mlp: TpSwiGluMlp,
+    mlp: MiMoV2Mlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -466,10 +676,16 @@ impl MiMoV2FlashDecoderLayer {
             )?
         };
 
-        // TODO: For MoE layers, this should use a MoE block instead of dense MLP.
-        // For now, all layers use dense MLP since MoE requires router/expert config
-        // not readily extractable from the basic ModelConfig.
-        let mlp = TpSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
+        let mlp = if mimo_cfg.is_moe_layer(layer_idx) {
+            MiMoV2Mlp::Sparse(MiMoV2MoEBlock::new(cfg, mimo_cfg, vb.pp("mlp"), pg)?)
+        } else {
+            MiMoV2Mlp::Dense(TpSwiGluMlp::new(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("mlp"),
+                pg,
+            )?)
+        };
 
         let input_layernorm = rms_norm(
             cfg.hidden_size,
@@ -954,5 +1170,36 @@ mod tests {
 
         assert!(!mimo_cfg.is_moe_layer(0), "layer 0 should be dense");
         assert!(!mimo_cfg.is_moe_layer(1), "layer 1 should be dense");
+    }
+
+    #[test]
+    fn test_mimo_v2_moe_construction() {
+        let mut cfg = test_config();
+        // Layer 0 = MoE, layer 1 = dense
+        cfg.extra.insert(
+            "moe_layer_freq".to_string(),
+            serde_json::json!([true, false]),
+        );
+        cfg.extra
+            .insert("n_routed_experts".to_string(), serde_json::json!(4u64));
+        cfg.extra
+            .insert("num_experts_per_tok".to_string(), serde_json::json!(2u64));
+        cfg.extra.insert(
+            "moe_intermediate_size".to_string(),
+            serde_json::json!(64u64),
+        );
+        cfg.extra
+            .insert("n_group".to_string(), serde_json::json!(2u64));
+        cfg.extra
+            .insert("topk_group".to_string(), serde_json::json!(1u64));
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = MiMoV2FlashForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "MoE model construction failed: {:?}",
+            model.err()
+        );
     }
 }

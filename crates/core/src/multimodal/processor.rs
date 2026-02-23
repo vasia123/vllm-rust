@@ -10,7 +10,10 @@
 use candle_core::{DType, Device, Result, Tensor};
 use thiserror::Error;
 
-use super::inputs::{ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage};
+use super::inputs::{
+    ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage, ProcessedVideo,
+    VideoData, VideoSource,
+};
 use super::vision::VisionEncoder;
 
 /// Error type for multimodal processing.
@@ -43,6 +46,12 @@ pub struct ProcessorConfig {
     pub image_std: [f32; 3],
     /// Target image size.
     pub image_size: usize,
+    /// Video placeholder token string.
+    pub video_placeholder: String,
+    /// Token ID for the video placeholder.
+    pub video_placeholder_id: u32,
+    /// Default number of tokens each video produces (num_frames * tokens_per_frame).
+    pub num_video_tokens: usize,
 }
 
 impl Default for ProcessorConfig {
@@ -55,6 +64,9 @@ impl Default for ProcessorConfig {
             image_mean: [0.48145466, 0.4578275, 0.40821073],
             image_std: [0.2686295, 0.2613026, 0.2757771],
             image_size: 336,
+            video_placeholder: "<video>".to_string(),
+            video_placeholder_id: 32001,
+            num_video_tokens: 2048, // 8 frames × 256 patches
         }
     }
 }
@@ -69,6 +81,9 @@ impl ProcessorConfig {
             image_mean: [0.48145466, 0.4578275, 0.40821073],
             image_std: [0.2686295, 0.2613026, 0.2757771],
             image_size: 336,
+            video_placeholder: "<video>".to_string(),
+            video_placeholder_id: 32001,
+            num_video_tokens: 2048,
         }
     }
 
@@ -81,6 +96,9 @@ impl ProcessorConfig {
             image_mean: [0.48145466, 0.4578275, 0.40821073],
             image_std: [0.2686295, 0.2613026, 0.2757771],
             image_size: 448,
+            video_placeholder: "<video>".to_string(),
+            video_placeholder_id: 151656,
+            num_video_tokens: 2048,
         }
     }
 }
@@ -121,9 +139,9 @@ impl MultimodalProcessor {
     /// Process content parts into model inputs.
     ///
     /// This method:
-    /// 1. Extracts text and image content
-    /// 2. Processes images through the vision encoder
-    /// 3. Returns token IDs with placeholder positions and image embeddings
+    /// 1. Extracts text, image, and video content
+    /// 2. Processes images/videos through the vision encoder
+    /// 3. Returns token IDs with placeholder positions and media embeddings
     pub fn process_content(
         &self,
         content: &[ContentPart],
@@ -131,57 +149,81 @@ impl MultimodalProcessor {
     ) -> std::result::Result<MultimodalInputs, ProcessorError> {
         let mut text_parts = Vec::new();
         let mut images = Vec::new();
+        let mut videos = Vec::new();
 
-        // Collect text and images
+        // Collect text, images, and videos
         for part in content {
             match part {
                 ContentPart::Text { text } => {
                     text_parts.push(text.clone());
                 }
                 ContentPart::Image { image_url } => {
-                    // Insert placeholder for image
                     text_parts.push(self.config.image_placeholder.clone());
                     images.push(self.parse_image_url(&image_url.url)?);
                 }
-                // TODO: Video support not yet implemented in processor
-                ContentPart::Video { .. } => {
-                    return Err(ProcessorError::InvalidContent(
-                        "video content not yet supported".to_string(),
-                    ));
+                ContentPart::Video { video_url } => {
+                    text_parts.push(self.config.video_placeholder.clone());
+                    videos.push(self.parse_video_url(video_url)?);
                 }
             }
         }
 
-        // Join text with images replaced by placeholders
+        // Join text with media replaced by placeholders
         let full_text = text_parts.join("");
 
         // Tokenize
         let token_ids = tokenize(&full_text).map_err(ProcessorError::Tokenize)?;
 
-        // If no images, return text-only inputs
-        if images.is_empty() {
+        // Text-only fast path
+        if images.is_empty() && videos.is_empty() {
             return Ok(MultimodalInputs::text_only(token_ids));
-        }
-
-        // Find placeholder positions in token_ids
-        let placeholder_positions = self.find_placeholder_positions(&token_ids);
-
-        if placeholder_positions.len() != images.len() {
-            return Err(ProcessorError::InvalidContent(format!(
-                "Found {} placeholders but {} images",
-                placeholder_positions.len(),
-                images.len()
-            )));
         }
 
         // Process images
         let mut image_embeddings = Vec::with_capacity(images.len());
-        for (pos, image) in placeholder_positions.into_iter().zip(images) {
-            let processed = self.process_image(image)?;
-            image_embeddings.push((pos, processed));
+        if !images.is_empty() {
+            let image_positions = self.find_placeholder_positions(&token_ids);
+            if image_positions.len() != images.len() {
+                return Err(ProcessorError::InvalidContent(format!(
+                    "Found {} image placeholders but {} images",
+                    image_positions.len(),
+                    images.len()
+                )));
+            }
+            for (pos, image) in image_positions.into_iter().zip(images) {
+                let processed = self.process_image(image)?;
+                image_embeddings.push((pos, processed));
+            }
         }
 
-        Ok(MultimodalInputs::with_images(token_ids, image_embeddings))
+        // Process videos
+        let mut video_embeddings = Vec::with_capacity(videos.len());
+        if !videos.is_empty() {
+            let video_positions = self.find_video_placeholder_positions(&token_ids);
+            if video_positions.len() != videos.len() {
+                return Err(ProcessorError::InvalidContent(format!(
+                    "Found {} video placeholders but {} videos",
+                    video_positions.len(),
+                    videos.len()
+                )));
+            }
+            for (pos, video) in video_positions.into_iter().zip(videos) {
+                let processed = self.process_video(video)?;
+                video_embeddings.push((pos, processed));
+            }
+        }
+
+        if video_embeddings.is_empty() {
+            Ok(MultimodalInputs::with_images(token_ids, image_embeddings))
+        } else if image_embeddings.is_empty() {
+            Ok(MultimodalInputs::with_videos(token_ids, video_embeddings))
+        } else {
+            Ok(MultimodalInputs::with_images_and_videos(
+                token_ids,
+                image_embeddings,
+                video_embeddings,
+            ))
+        }
     }
 
     /// Process a single image into embeddings.
@@ -311,6 +353,98 @@ impl MultimodalProcessor {
         Ok(pixel_values)
     }
 
+    /// Process a video into frame embeddings.
+    ///
+    /// Handles two cases:
+    /// - `VideoSource::Embedding` — returned as-is (pre-computed by the caller).
+    /// - `VideoSource::Frames` — each frame is encoded with the vision encoder and
+    ///   the per-frame embeddings are concatenated along the token dimension.
+    /// - All other sources (URL/Base64/Bytes) — not supported without a video codec.
+    pub fn process_video(
+        &self,
+        video: VideoData,
+    ) -> std::result::Result<ProcessedVideo, ProcessorError> {
+        match video.source {
+            VideoSource::Embedding(tensor) => {
+                let num_tokens = tensor.dim(0).map_err(ProcessorError::Candle)?;
+                let num_frames = video.num_frames.unwrap_or(1);
+                Ok(ProcessedVideo::new(tensor, num_tokens, num_frames))
+            }
+            VideoSource::Frames(frames) => {
+                let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
+                    ProcessorError::ImageEncode(
+                        "vision encoder required to encode video frames".to_string(),
+                    )
+                })?;
+                let num_frames = frames.len();
+                if num_frames == 0 {
+                    return Err(ProcessorError::InvalidContent(
+                        "video has no frames".to_string(),
+                    ));
+                }
+                let mut frame_embeddings = Vec::with_capacity(num_frames);
+                for frame in &frames {
+                    let processed = encoder
+                        .encode_image(frame)
+                        .map_err(|e| ProcessorError::ImageEncode(e.to_string()))?;
+                    frame_embeddings.push(processed.embedding);
+                }
+                let all_embeddings =
+                    Tensor::cat(&frame_embeddings, 0).map_err(ProcessorError::Candle)?;
+                let num_tokens = all_embeddings.dim(0).map_err(ProcessorError::Candle)?;
+                Ok(ProcessedVideo::new(all_embeddings, num_tokens, num_frames))
+            }
+            VideoSource::Url(_) | VideoSource::Base64(_) | VideoSource::Bytes(_) => {
+                // Video decoding requires a codec library (e.g., ffmpeg). Callers should
+                // pre-extract frames (VideoSource::Frames) or pre-compute embeddings
+                // (VideoSource::Embedding) before calling this method.
+                Err(ProcessorError::InvalidContent(
+                    "video decoding from URL/bytes is not supported; \
+                     provide pre-extracted frames or a pre-computed embedding"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Parse a `VideoUrl` into `VideoData`.
+    fn parse_video_url(
+        &self,
+        video_url: &super::inputs::VideoUrl,
+    ) -> std::result::Result<VideoData, ProcessorError> {
+        let mut data = if video_url.url.starts_with("data:") {
+            let parts: Vec<&str> = video_url.url.splitn(2, ',').collect();
+            if parts.len() != 2 {
+                return Err(ProcessorError::ImageLoad("Invalid data URI".to_string()));
+            }
+            VideoData::base64(parts[1])
+        } else {
+            VideoData::url(&video_url.url)
+        };
+        if let Some(n) = video_url.num_frames {
+            data = data.with_num_frames(n);
+        }
+        if let Some(fps) = video_url.fps {
+            data = data.with_fps(fps);
+        }
+        Ok(data)
+    }
+
+    /// Find positions of video placeholder tokens in the token sequence.
+    fn find_video_placeholder_positions(&self, token_ids: &[u32]) -> Vec<usize> {
+        token_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| {
+                if id == self.config.video_placeholder_id {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Parse an image URL into ImageData.
     fn parse_image_url(&self, url: &str) -> std::result::Result<ImageData, ProcessorError> {
         if url.starts_with("data:") {
@@ -359,6 +493,21 @@ impl MultimodalProcessor {
     /// Check if this processor has a vision encoder.
     pub fn has_vision_encoder(&self) -> bool {
         self.vision_encoder.is_some()
+    }
+
+    /// Get the video placeholder token.
+    pub fn video_placeholder(&self) -> &str {
+        &self.config.video_placeholder
+    }
+
+    /// Get the video placeholder token ID.
+    pub fn video_placeholder_id(&self) -> u32 {
+        self.config.video_placeholder_id
+    }
+
+    /// Get the default number of video tokens.
+    pub fn num_video_tokens(&self) -> usize {
+        self.config.num_video_tokens
     }
 }
 
@@ -623,6 +772,99 @@ mod tests {
 
         let merged = merge_embeddings(&text_emb, &[], 64).unwrap();
         assert_eq!(merged.dims(), text_emb.dims());
+    }
+
+    #[test]
+    fn test_processor_video_config() {
+        let cfg = ProcessorConfig::default();
+        assert_eq!(cfg.video_placeholder, "<video>");
+        assert_eq!(cfg.video_placeholder_id, 32001);
+        assert_eq!(cfg.num_video_tokens, 2048);
+    }
+
+    #[test]
+    fn test_process_video_embedding() {
+        let cfg = ProcessorConfig::default();
+        let device = Device::Cpu;
+        let processor = MultimodalProcessor::new(cfg, &device, DType::F32);
+
+        let embedding = Tensor::zeros((64, 512), DType::F32, &device).unwrap();
+        let video = VideoData::embedding(embedding).with_num_frames(8);
+        let processed = processor.process_video(video).unwrap();
+
+        assert_eq!(processed.num_tokens, 64);
+        assert_eq!(processed.num_frames, 8);
+        assert_eq!(processed.embedding.dims(), &[64, 512]);
+    }
+
+    #[test]
+    fn test_process_video_url_not_supported() {
+        let cfg = ProcessorConfig::default();
+        let device = Device::Cpu;
+        let processor = MultimodalProcessor::new(cfg, &device, DType::F32);
+
+        let video = VideoData::url("https://example.com/video.mp4");
+        let result = processor.process_video(video);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not supported"));
+    }
+
+    #[test]
+    fn test_process_content_text_only_with_video_config() {
+        let cfg = ProcessorConfig::default();
+        let device = Device::Cpu;
+        let processor = MultimodalProcessor::new(cfg, &device, DType::F32);
+
+        let content = vec![ContentPart::text("Hello, world!")];
+        let inputs = processor
+            .process_content(&content, |text| {
+                Ok(text.chars().map(|c| c as u32).collect())
+            })
+            .unwrap();
+
+        assert!(!inputs.has_images());
+        assert!(!inputs.has_videos());
+    }
+
+    #[test]
+    fn test_process_content_video_url_error() {
+        // process_content with a video URL (non-embedding) must return an error
+        // because video decoding from URL/bytes is not supported without a codec.
+        let cfg = ProcessorConfig {
+            video_placeholder: "V".to_string(),
+            video_placeholder_id: b'V' as u32,
+            ..ProcessorConfig::default()
+        };
+        let device = Device::Cpu;
+        let processor = MultimodalProcessor::new(cfg, &device, DType::F32);
+
+        let content = vec![ContentPart::video_url("https://example.com/clip.mp4")];
+        let result = processor.process_content(&content, |text| {
+            // ASCII tokenizer: each character maps to its code point
+            Ok(text.chars().map(|c| c as u32).collect())
+        });
+        // Expect failure: URL video decoding is not supported
+        assert!(result.is_err(), "expected error for URL video, got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not supported"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_find_video_placeholder_positions() {
+        let cfg = ProcessorConfig {
+            video_placeholder_id: 200,
+            ..ProcessorConfig::default()
+        };
+        let device = Device::Cpu;
+        let processor = MultimodalProcessor::new(cfg, &device, DType::F32);
+
+        let tokens = vec![1, 200, 3, 200, 5];
+        let positions = processor.find_video_placeholder_positions(&tokens);
+        assert_eq!(positions, vec![1, 3]);
     }
 
     #[test]
