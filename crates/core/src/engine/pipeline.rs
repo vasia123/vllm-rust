@@ -220,6 +220,111 @@ impl<M: PipelineForward> PipelineStagedModel<M> {
             .send(logits, 0)
             .map_err(|e| candle_core::Error::Msg(format!("pipeline send logits to rank 0: {e}")))
     }
+
+    /// Broadcast prefill execution signal and cache metadata to all worker ranks.
+    ///
+    /// Called by rank 0 before sending hidden states to rank 1. All workers
+    /// receive identical cache metadata because the scheduler on rank 0 allocates
+    /// blocks globally and each stage uses the same logical block IDs for its
+    /// own physical KV cache.
+    fn broadcast_prefill_signals(
+        &self,
+        batch_size: usize,
+        seq_len: usize,
+        seqlen_offset: usize,
+        slot_mapping: &[usize],
+        block_table: &BlockTable,
+    ) -> candle_core::Result<()> {
+        let num_slots = slot_mapping.len() as u32;
+        let block_ids: Vec<u32> = block_table.block_ids().iter().map(|&x| x as u32).collect();
+        let num_block_ids = block_ids.len() as u32;
+        let device = self.model.device();
+
+        for worker_rank in 1..self.stage_config.num_stages {
+            send_worker_signal(
+                &*self.comm,
+                worker_rank,
+                WorkerSignal {
+                    signal: SIGNAL_EXECUTE,
+                    batch_size: batch_size as u32,
+                    seq_len: seq_len as u32,
+                    seqlen_offset: seqlen_offset as u32,
+                    num_slots,
+                    num_block_ids,
+                },
+                device,
+            )?;
+            if num_slots > 0 {
+                let slot_tensor = Tensor::from_vec(
+                    slot_mapping.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+                    num_slots as usize,
+                    device,
+                )?;
+                self.comm.send(&slot_tensor, worker_rank).map_err(|e| {
+                    candle_core::Error::Msg(format!("send slots to rank {worker_rank}: {e}"))
+                })?;
+            }
+            if num_block_ids > 0 {
+                let blk_tensor =
+                    Tensor::from_vec(block_ids.clone(), num_block_ids as usize, device)?;
+                self.comm.send(&blk_tensor, worker_rank).map_err(|e| {
+                    candle_core::Error::Msg(format!("send block_ids to rank {worker_rank}: {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Broadcast decode batch execution signal and per-sequence metadata to all workers.
+    ///
+    /// Uses a fixed-size encoding of `DECODE_META_WORDS_PER_SEQ` u32 per sequence
+    /// to avoid variable-length framing. Block lists longer than `MAX_BLOCKS_PER_SEQ`
+    /// are silently truncated (sequences exceeding this threshold are expected to be
+    /// extremely rare in practice).
+    fn broadcast_decode_signals(
+        &self,
+        sequences: &[DecodeSequenceMetadata],
+    ) -> candle_core::Result<()> {
+        let batch_size = sequences.len();
+        if batch_size == 0 {
+            return Ok(());
+        }
+        let device = self.model.device();
+
+        let mut meta_data = vec![0u32; batch_size * DECODE_META_WORDS_PER_SEQ];
+        for (i, seq) in sequences.iter().enumerate() {
+            let base = i * DECODE_META_WORDS_PER_SEQ;
+            meta_data[base] = seq.seqlen_offset as u32;
+            meta_data[base + 1] = seq.slot_mapping.first().copied().unwrap_or(0) as u32;
+            let n = seq.block_ids.len().min(MAX_BLOCKS_PER_SEQ);
+            meta_data[base + 2] = n as u32;
+            for (j, &bid) in seq.block_ids[..n].iter().enumerate() {
+                meta_data[base + 3 + j] = bid as u32;
+            }
+        }
+        let meta_tensor =
+            Tensor::from_vec(meta_data, batch_size * DECODE_META_WORDS_PER_SEQ, device)?;
+
+        for worker_rank in 1..self.stage_config.num_stages {
+            send_worker_signal(
+                &*self.comm,
+                worker_rank,
+                WorkerSignal {
+                    signal: SIGNAL_EXECUTE_DECODE,
+                    batch_size: batch_size as u32,
+                    seq_len: 1,
+                    seqlen_offset: 0,
+                    num_slots: 0,
+                    num_block_ids: 0,
+                },
+                device,
+            )?;
+            self.comm.send(&meta_tensor, worker_rank).map_err(|e| {
+                candle_core::Error::Msg(format!("send decode meta to rank {worker_rank}: {e}"))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl<M: PipelineForward> ModelForward for PipelineStagedModel<M> {
@@ -245,13 +350,23 @@ impl<M: PipelineForward> ModelForward for PipelineStagedModel<M> {
         }
 
         // Multi-stage pipeline execution
+        let batch_size = input_ids.dim(0)?;
+        let seq_len = input_ids.dim(1)?;
+
         let hidden = if self.stage_config.is_first {
+            // Broadcast execution signal and cache metadata to all downstream workers
+            // before doing local work, so workers can begin their recv.
+            self.broadcast_prefill_signals(
+                batch_size,
+                seq_len,
+                seqlen_offset,
+                slot_mapping,
+                block_table,
+            )?;
             // First stage: embed input tokens
             self.model.embed(input_ids)?
         } else {
             // Non-first stage: receive hidden states from previous stage
-            let batch_size = input_ids.dim(0)?;
-            let seq_len = input_ids.dim(1)?;
             self.recv_from_prev(&[batch_size, seq_len, self.model.hidden_size()], DType::F32)?
         };
 
@@ -303,6 +418,8 @@ impl<M: PipelineForward> ModelForward for PipelineStagedModel<M> {
 
         // Multi-stage pipeline execution
         let hidden = if self.stage_config.is_first {
+            // Broadcast execution signal and per-sequence metadata to all workers.
+            self.broadcast_decode_signals(sequences)?;
             self.model.embed(input_ids)?
         } else {
             self.recv_from_prev(&[batch_size, 1, self.model.hidden_size()], DType::F32)?
@@ -332,26 +449,71 @@ impl<M: PipelineForward> ModelForward for PipelineStagedModel<M> {
 // ─── Pipeline Worker Loop ────────────────────────────────────────────────
 
 // Control signals sent from the coordinator to pipeline workers.
-// Packed as a 1D u32 tensor: [signal_type, batch_size, seq_len].
+// Header packed as a 1D u32 tensor of length SIGNAL_LEN:
+//   [signal_type, batch_size, seq_len, seqlen_offset, num_slots, num_block_ids]
+//
+// After the header, additional tensors may follow depending on signal_type:
+//   SIGNAL_EXECUTE:        [num_slots] u32 slot_mapping, [num_block_ids] u32 block_ids
+//   SIGNAL_EXECUTE_DECODE: [batch_size * DECODE_META_WORDS_PER_SEQ] u32 decode_meta
 
-/// Execute signal: tells the worker to process the next batch.
+/// Execute signal (prefill/forward): tells the worker to process the next batch.
 pub const SIGNAL_EXECUTE: u32 = 0;
 
 /// Shutdown signal: tells the worker to exit its loop.
 pub const SIGNAL_SHUTDOWN: u32 = 1;
 
-/// Send a control signal to a pipeline worker.
+/// Execute decode batch signal: one token per sequence.
+pub const SIGNAL_EXECUTE_DECODE: u32 = 2;
+
+/// Number of u32 elements in the control signal header.
+const SIGNAL_LEN: usize = 6;
+
+/// Maximum KV cache blocks per sequence in the fixed-size decode metadata encoding.
+///
+/// Supports sequences up to `MAX_BLOCKS_PER_SEQ * block_size` tokens.
+pub const MAX_BLOCKS_PER_SEQ: usize = 64;
+
+/// Words per sequence in the decode metadata tensor.
+///
+/// Layout: `[seqlen_offset, slot, num_block_ids, block_id_0..block_id_{MAX-1}]`
+pub const DECODE_META_WORDS_PER_SEQ: usize = 3 + MAX_BLOCKS_PER_SEQ;
+
+/// Payload for a pipeline worker control signal header.
+pub struct WorkerSignal {
+    pub signal: u32,
+    pub batch_size: u32,
+    pub seq_len: u32,
+    pub seqlen_offset: u32,
+    pub num_slots: u32,
+    pub num_block_ids: u32,
+}
+
+/// Send a control signal header to a pipeline worker.
+///
+/// For `SIGNAL_EXECUTE`, the caller must then send the slot_mapping and block_ids
+/// tensors. For `SIGNAL_EXECUTE_DECODE`, send the decode metadata tensor after.
+/// For `SIGNAL_SHUTDOWN`, no additional tensors are expected.
 pub fn send_worker_signal(
     comm: &dyn DeviceCommunicator,
     dst_rank: usize,
-    signal: u32,
-    batch_size: u32,
-    seq_len: u32,
+    sig: WorkerSignal,
     device: &Device,
 ) -> candle_core::Result<()> {
-    let data = Tensor::from_vec(vec![signal, batch_size, seq_len], 3, device)?;
+    let data = Tensor::from_vec(
+        vec![
+            sig.signal,
+            sig.batch_size,
+            sig.seq_len,
+            sig.seqlen_offset,
+            sig.num_slots,
+            sig.num_block_ids,
+        ],
+        SIGNAL_LEN,
+        device,
+    )?;
     comm.send(&data, dst_rank)
-        .map_err(|e| candle_core::Error::Msg(format!("send signal to rank {dst_rank}: {e}")))
+        .map_err(|e| candle_core::Error::Msg(format!("send signal to rank {dst_rank}: {e}")))?;
+    Ok(())
 }
 
 /// Worker loop for non-coordinator pipeline stages (ranks 1..N-1).
@@ -400,8 +562,8 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
     );
 
     loop {
-        // 1. Receive control signal from coordinator
-        let signal_tensor = match comm.recv(&[3], DType::U32, 0) {
+        // 1. Receive control signal header from coordinator (rank 0).
+        let signal_tensor = match comm.recv(&[SIGNAL_LEN], DType::U32, 0) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = %e, "Worker failed to receive control signal");
@@ -417,7 +579,7 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
             }
         };
 
-        if signal_vec.len() < 3 {
+        if signal_vec.len() < SIGNAL_LEN {
             tracing::error!(len = signal_vec.len(), "Invalid control signal length");
             break;
         }
@@ -425,6 +587,9 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
         let signal_type = signal_vec[0];
         let batch_size = signal_vec[1] as usize;
         let seq_len = signal_vec[2] as usize;
+        let seqlen_offset = signal_vec[3] as usize;
+        let num_slots = signal_vec[4] as usize;
+        let num_block_ids = signal_vec[5] as usize;
 
         if signal_type == SIGNAL_SHUTDOWN {
             tracing::info!(
@@ -434,11 +599,96 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
             break;
         }
 
-        if batch_size == 0 || seq_len == 0 {
+        if batch_size == 0 {
             continue;
         }
 
-        // 2. Receive hidden states from previous stage
+        // 2. Receive cache metadata from coordinator, reconstruct execution context.
+        //    Workers cannot independently allocate blocks; rank 0 broadcasts the
+        //    block assignments so every stage uses the same logical block IDs.
+        enum ExecMode {
+            Prefill {
+                block_table: BlockTable,
+                slot_mapping: Vec<usize>,
+            },
+            Decode {
+                sequences: Vec<DecodeSequenceMetadata>,
+            },
+        }
+
+        let exec_mode = if signal_type == SIGNAL_EXECUTE {
+            let slot_mapping: Vec<usize> = if num_slots > 0 {
+                match comm
+                    .recv(&[num_slots], DType::U32, 0)
+                    .and_then(|t| t.to_vec1::<u32>().map_err(|e| e.into()))
+                {
+                    Ok(v) => v.into_iter().map(|x| x as usize).collect(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Worker failed to recv slot_mapping");
+                        continue;
+                    }
+                }
+            } else {
+                vec![]
+            };
+
+            let block_ids: Vec<usize> = if num_block_ids > 0 {
+                match comm
+                    .recv(&[num_block_ids], DType::U32, 0)
+                    .and_then(|t| t.to_vec1::<u32>().map_err(|e| e.into()))
+                {
+                    Ok(v) => v.into_iter().map(|x| x as usize).collect(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Worker failed to recv block_ids");
+                        continue;
+                    }
+                }
+            } else {
+                vec![]
+            };
+
+            let block_table = BlockTable::from_block_ids(block_ids, seqlen_offset);
+            ExecMode::Prefill {
+                block_table,
+                slot_mapping,
+            }
+        } else if signal_type == SIGNAL_EXECUTE_DECODE {
+            let meta_len = batch_size * DECODE_META_WORDS_PER_SEQ;
+            let meta_vec = match comm
+                .recv(&[meta_len], DType::U32, 0)
+                .and_then(|t| t.to_vec1::<u32>().map_err(|e| e.into()))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "Worker failed to recv decode metadata");
+                    continue;
+                }
+            };
+
+            let sequences: Vec<DecodeSequenceMetadata> = (0..batch_size)
+                .map(|i| {
+                    let base = i * DECODE_META_WORDS_PER_SEQ;
+                    let seq_offset = meta_vec[base] as usize;
+                    let slot = meta_vec[base + 1] as usize;
+                    let n = (meta_vec[base + 2] as usize).min(MAX_BLOCKS_PER_SEQ);
+                    let block_ids: Vec<usize> =
+                        (0..n).map(|j| meta_vec[base + 3 + j] as usize).collect();
+                    DecodeSequenceMetadata {
+                        request_id: i as u64,
+                        seqlen_offset: seq_offset,
+                        block_ids,
+                        slot_mapping: vec![slot],
+                    }
+                })
+                .collect();
+
+            ExecMode::Decode { sequences }
+        } else {
+            tracing::error!(signal = signal_type, "Worker received unknown signal type");
+            continue;
+        };
+
+        // 3. Receive hidden states from the previous pipeline stage.
         let hidden = match comm.recv(&[batch_size, seq_len, hidden_size], DType::F32, prev_rank) {
             Ok(t) => t,
             Err(e) => {
@@ -447,28 +697,36 @@ pub fn pipeline_worker_loop<M: PipelineForward>(
             }
         };
 
-        // 3. Forward through local layers
-        // NOTE: For the initial implementation, workers use a simple block table.
-        // Full KV cache coordination (block allocation broadcast from rank 0)
-        // is needed for production multi-GPU deployment.
-        let block_table = BlockTable::new(kv_cache_mgr.block_size());
-        let slot_mapping: Vec<usize> = Vec::new();
-
-        let output = match model.forward_layers(
-            &hidden,
-            0, // seqlen_offset — should be broadcast from rank 0
-            &mut kv_cache_mgr,
-            &block_table,
-            &slot_mapping,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(error = %e, stage = stage_config.stage_id, "Worker forward failed");
-                continue;
+        // 4. Forward through local layers using the received execution context.
+        let output = match exec_mode {
+            ExecMode::Prefill {
+                block_table,
+                slot_mapping,
+            } => match model.forward_layers(
+                &hidden,
+                seqlen_offset,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(error = %e, stage = stage_config.stage_id, "Worker forward_layers failed");
+                    continue;
+                }
+            },
+            ExecMode::Decode { sequences } => {
+                match model.forward_layers_decode_batch(&hidden, &sequences, &mut kv_cache_mgr) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, stage = stage_config.stage_id, "Worker forward_decode failed");
+                        continue;
+                    }
+                }
             }
         };
 
-        // 4. Send output
+        // 5. Send output to the next stage (or logits to coordinator).
         if stage_config.is_last {
             // Last stage: apply lm_head and send logits to coordinator
             match model.lm_head(&output) {
@@ -944,13 +1202,67 @@ mod tests {
         let comm = MockCommunicator::new(pg);
 
         // Should not error (MockCommunicator send is no-op)
-        send_worker_signal(&comm, 1, SIGNAL_EXECUTE, 4, 128, &Device::Cpu).unwrap();
-        send_worker_signal(&comm, 1, SIGNAL_SHUTDOWN, 0, 0, &Device::Cpu).unwrap();
+        send_worker_signal(
+            &comm,
+            1,
+            WorkerSignal {
+                signal: SIGNAL_EXECUTE,
+                batch_size: 4,
+                seq_len: 128,
+                seqlen_offset: 0,
+                num_slots: 0,
+                num_block_ids: 0,
+            },
+            &Device::Cpu,
+        )
+        .unwrap();
+        send_worker_signal(
+            &comm,
+            1,
+            WorkerSignal {
+                signal: SIGNAL_SHUTDOWN,
+                batch_size: 0,
+                seq_len: 0,
+                seqlen_offset: 0,
+                num_slots: 0,
+                num_block_ids: 0,
+            },
+            &Device::Cpu,
+        )
+        .unwrap();
     }
 
     #[test]
     fn signal_constants_distinct() {
         assert_ne!(SIGNAL_EXECUTE, SIGNAL_SHUTDOWN);
+        assert_ne!(SIGNAL_EXECUTE, SIGNAL_EXECUTE_DECODE);
+        assert_ne!(SIGNAL_SHUTDOWN, SIGNAL_EXECUTE_DECODE);
+    }
+
+    #[test]
+    fn decode_meta_constants_consistent() {
+        assert_eq!(DECODE_META_WORDS_PER_SEQ, 3 + MAX_BLOCKS_PER_SEQ);
+    }
+
+    #[test]
+    fn send_worker_signal_decode_encodes_correctly() {
+        let pg = LocalProcessGroup::new();
+        let comm = MockCommunicator::new(pg);
+
+        send_worker_signal(
+            &comm,
+            1,
+            WorkerSignal {
+                signal: SIGNAL_EXECUTE_DECODE,
+                batch_size: 2,
+                seq_len: 1,
+                seqlen_offset: 0,
+                num_slots: 0,
+                num_block_ids: 0,
+            },
+            &Device::Cpu,
+        )
+        .unwrap();
     }
 
     // ─── Integration: PipelineStagedModel as ModelForward ────────────────

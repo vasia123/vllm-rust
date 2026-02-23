@@ -779,7 +779,9 @@ async fn main() -> anyhow::Result<()> {
                 || file_config.disable_mm_preprocessor_cache.unwrap_or(false);
 
             // Pipeline Parallelism
-            let pipeline_parallel_size = if pipeline_parallel_size == 1 {
+            // NOTE: merged value not yet wired into ServerLaunchConfig; plumbing
+            // through run_server is a follow-up once stage-model construction is added.
+            let _pipeline_parallel_size = if pipeline_parallel_size == 1 {
                 file_config.pipeline_parallel_size.unwrap_or(1)
             } else {
                 pipeline_parallel_size
@@ -808,14 +810,6 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!(
                     "--tensor-parallel-size {} is not yet supported (only 1 is currently implemented)",
                     tensor_parallel_size
-                );
-            }
-
-            // Validate pipeline_parallel_size
-            if pipeline_parallel_size != 1 {
-                anyhow::bail!(
-                    "--pipeline-parallel-size {} is not yet supported (only 1 is currently implemented)",
-                    pipeline_parallel_size
                 );
             }
 

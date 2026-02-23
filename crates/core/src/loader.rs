@@ -137,6 +137,13 @@ pub fn quantization_info(files: &ModelFiles) -> String {
             let group_size = files.quantization.group_size.unwrap_or(128);
             format!("MoeWNA16 (bits: {}, group_size: {})", bits, group_size)
         }
+        QuantizationMethod::AwqMarlin => {
+            let bits = files.quantization.bits.unwrap_or(4);
+            let group_size = files.quantization.group_size.unwrap_or(128);
+            format!("AWQ-Marlin (bits: {}, group_size: {})", bits, group_size)
+        }
+        QuantizationMethod::FbgemmFp8 => "FBGEMM FP8 (per-channel, dynamic activation)".to_string(),
+        QuantizationMethod::PtpcFp8 => "PTPC FP8 (per-token per-channel, ROCm MI300+)".to_string(),
     }
 }
 
