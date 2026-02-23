@@ -81,6 +81,8 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - `whisper.rs` ✅ DONE — `WhisperForConditionalGeneration`, implements `ModelForEncoderDecoder`; Conv1d×2 encoder + sinusoidal pos + cross-attn decoder; 5 tests; 3972 total — 2026-02-23
   - `qwen2_audio.rs` ✅ DONE — `Qwen2AudioForConditionalGeneration`; Conv1d(s=1)+Conv1d(s=2)+AvgPool1d(k=2,s=2) encoder; 5 tests; 3977 total — 2026-02-23
   - `ultravox.rs` ✅ DONE — `UltravoxModel`; WhisperEncoder + StackAudioFrames + FFProjector(SwiGLU) + Llama LLM; 5 tests; 3982 total — 2026-02-23
+  - `qwen2_5_omni_thinker.rs` ✅ DONE — `Qwen2_5OmniThinkerForConditionalGeneration`; Qwen2AudioEncoder + Qwen25VisionTransformer + Qwen2ForCausalLM; 5 tests; 3987 total — commit cc24c0e
+  - `qwen3_omni_moe_thinker.rs` ✅ DONE — `Qwen3OmniMoeThinkerForConditionalGeneration`; Conv2d×3 audio encoder + Qwen3OmniVisionTransformer (LayerNorm + SiLU MLP) + Qwen3MoeForCausalLM; 5 tests; 3992 total — commit cc24c0e
   - `qwen3_asr.rs`, `granite_speech.rs`, `funaudiochat.rs` — P2
   - `audioflamingo3.rs`, `glmasr.rs`, `voxtral.rs`, `phi4mm_audio.rs` — P2
   - `gemma3n_audio.rs`, `musicflamingo.rs` — P3
@@ -186,7 +188,6 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 `LlamaAttention` made `pub(crate)` to allow reuse from `AriaDecoderLayer`.
 
 - **P1 models remaining (in order):**
-  1. `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
 Keye-VL 1.5: `KeyeSiglipVisionTransformer` (Conv2d patch embed + `packing_position_embedding` (Embedding, 32768 entries) +
 SigLIP encoder with 2D RoPE (`SigLipRotaryEmbedding`, split-half rotation, head_dim/2 freqs) + `post_layernorm`) +
 `KeyeVL1_5Projector` (2×2 spatial merge → `pre_norm` LayerNorm → `linear_1`(bias) → GELU → `linear_2`(bias)) +
