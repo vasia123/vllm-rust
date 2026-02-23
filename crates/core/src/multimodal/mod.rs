@@ -27,6 +27,7 @@
 
 pub mod audio;
 mod inputs;
+pub mod mel_spectrogram;
 mod processor;
 mod projector;
 pub mod video;
@@ -35,6 +36,10 @@ mod vision;
 pub use inputs::{
     ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage, ProcessedVideo,
     VideoData, VideoSource, VideoUrl,
+};
+pub use mel_spectrogram::{
+    build_mel_filterbank, hann_window, log_mel_spectrogram, stft_power_spectrum,
+    MelSpectrogramConfig,
 };
 pub use processor::{MultimodalProcessor, ProcessorConfig};
 pub use projector::{MultimodalProjector, ProjectorConfig, ProjectorType};

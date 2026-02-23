@@ -71,8 +71,11 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ### 1.5 Audio Pipeline + Models
 **Difficulty:** ★★★★☆ | **Effort:** 3–4 weeks
-- `crates/core/src/multimodal/audio.rs` has `AudioData`/`AudioSpec` but NO encoders, NO mel spectrogram, NO file loading
-- Need librosa-equivalent Rust: FFT, mel filterbank, STFT → ~150 LOC DSP
+- `crates/core/src/multimodal/mel_spectrogram.rs` ✅ DONE — log-mel spectrogram (pure Rust DFT STFT + mel filterbank + Whisper normalization); 9 tests; 3967 total — 2026-02-23
+  - `MelSpectrogramConfig::whisper()`: n_fft=400, hop=160, n_mels=80, sr=16000, f_max=8000
+  - `hann_window()`, `stft_power_spectrum()`, `build_mel_filterbank()`, `log_mel_spectrogram()`
+  - Output `[n_mels, n_frames]` matches HuggingFace `WhisperFeatureExtractor`
+- `crates/core/src/multimodal/audio.rs` has `AudioData`/`AudioSpec` + normalize/resample but NO audio file loading (see `audio` feature below)
 - Add WAV/MP3 loading (hound + symphonia crates)
 - **Encoder models (12 total):**
   - `whisper.rs` — P1, gate-keeper for all audio; Conv1D + transformer, ~800 LOC
