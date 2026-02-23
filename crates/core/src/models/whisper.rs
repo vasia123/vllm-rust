@@ -488,7 +488,7 @@ impl WhisperDecoderLayer {
 ///
 /// Two 1D strided convolutions subsample the time axis by 2, followed by
 /// sinusoidal position embeddings and N transformer layers.
-struct WhisperEncoder {
+pub(crate) struct WhisperEncoder {
     conv1: Conv1d,
     conv2: Conv1d,
     /// Fixed sinusoidal position embeddings `[max_source_positions, d_model]`.
@@ -499,7 +499,7 @@ struct WhisperEncoder {
 }
 
 impl WhisperEncoder {
-    fn new(cfg: &WhisperConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &WhisperConfig, vb: VarBuilder) -> Result<Self> {
         let conv1 = conv1d(
             cfg.num_mel_bins,
             cfg.d_model,
@@ -554,7 +554,7 @@ impl WhisperEncoder {
     /// * `input_features` — `[B, n_mels, T]`
     ///
     /// Returns `[B, T/2, d_model]`.
-    fn forward(&self, input_features: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, input_features: &Tensor) -> Result<Tensor> {
         // Conv subsampling: [B, n_mels, T] → [B, d_model, T/2]
         let xs = self.conv1.forward(input_features)?.gelu_erf()?;
         let xs = self.conv2.forward(&xs)?.gelu_erf()?;
