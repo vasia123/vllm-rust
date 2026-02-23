@@ -70,6 +70,14 @@ impl Qwen2VLVisionConfig {
         self.embed_dim * self.spatial_merge_size * self.spatial_merge_size
     }
 
+    /// Build from the outer `ModelConfig`, reading `extra["vision_config"]`.
+    pub fn from_model_config(cfg: &ModelConfig) -> Self {
+        cfg.extra
+            .get("vision_config")
+            .map(Self::from_json)
+            .unwrap_or_default()
+    }
+
     fn from_json(json: &serde_json::Value) -> Self {
         let defaults = Self::default();
         Self {
@@ -675,6 +683,86 @@ impl Qwen2VisionTransformer {
         let sin = Tensor::cat(&[sin_h, sin_w], 1)?;
 
         Ok(Some((cos, sin)))
+    }
+}
+
+// ─── Vision Encoder (no merger — for reuse by other VLMs) ───────────────────
+
+/// Qwen2-VL vision encoder without the PatchMerger.
+///
+/// Produces per-patch features `[num_patches, embed_dim]` that downstream
+/// models (e.g. Kanana-V) can post-process with their own projectors.
+pub(crate) struct Qwen2VLVisionEncoder {
+    patch_embed: Qwen2VLPatchEmbed,
+    rotary_emb: RotaryEmbedding,
+    blocks: Vec<Qwen2VLVisionBlock>,
+}
+
+impl Qwen2VLVisionEncoder {
+    pub(crate) fn new(cfg: &Qwen2VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+        let patch_embed = Qwen2VLPatchEmbed::new(cfg, vb.pp("patch_embed"))?;
+
+        let rotary_emb = RotaryEmbedding::new_partial(
+            cfg.head_dim(),
+            8192,
+            10000.0,
+            0.5,
+            true,
+            vb.dtype(),
+            vb.device(),
+        )?;
+
+        let mut blocks = Vec::with_capacity(cfg.depth);
+        for i in 0..cfg.depth {
+            blocks.push(Qwen2VLVisionBlock::new(cfg, vb.pp("blocks").pp(i))?);
+        }
+
+        Ok(Self {
+            patch_embed,
+            rotary_emb,
+            blocks,
+        })
+    }
+
+    /// Encode a single image: `patches [np, cps]` → `[np, embed_dim]`.
+    pub(crate) fn encode(&self, patches: &Tensor, grid_h: usize, grid_w: usize) -> Result<Tensor> {
+        let mut x = self.patch_embed.forward(patches)?;
+
+        // Compute 2D rotary embeddings (same as Qwen2VisionTransformer).
+        let rotary_dim = self.rotary_emb.rotary_dim();
+        let half_rotary = rotary_dim / 2;
+        let device = patches.device();
+
+        let mut h_positions = Vec::with_capacity(grid_h * grid_w);
+        let mut w_positions = Vec::with_capacity(grid_h * grid_w);
+        for h in 0..grid_h {
+            for w in 0..grid_w {
+                h_positions.push(h as u32);
+                w_positions.push(w as u32);
+            }
+        }
+        let h_pos = Tensor::from_vec(h_positions, (grid_h * grid_w,), device)?;
+        let w_pos = Tensor::from_vec(w_positions, (grid_h * grid_w,), device)?;
+
+        let cos_h = self.rotary_emb.cos().index_select(&h_pos, 0)?;
+        let sin_h = self.rotary_emb.sin().index_select(&h_pos, 0)?;
+        let cos_w = self.rotary_emb.cos().index_select(&w_pos, 0)?;
+        let sin_w = self.rotary_emb.sin().index_select(&w_pos, 0)?;
+
+        let cos_h = cos_h.narrow(1, 0, half_rotary)?;
+        let sin_h = sin_h.narrow(1, 0, half_rotary)?;
+        let cos_w = cos_w.narrow(1, 0, half_rotary)?;
+        let sin_w = sin_w.narrow(1, 0, half_rotary)?;
+
+        let cos = Tensor::cat(&[cos_h, cos_w], 1)?;
+        let sin = Tensor::cat(&[sin_h, sin_w], 1)?;
+        let rotary_emb = Some((&cos, &sin));
+
+        for block in &self.blocks {
+            x = block.forward(&x, rotary_emb.map(|(c, s)| (c as &Tensor, s as &Tensor)))?;
+        }
+
+        Ok(x)
     }
 }
 

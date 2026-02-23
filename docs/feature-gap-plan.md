@@ -86,7 +86,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 
 ## Tier 2: Model Expansion (Hard — High Volume)
 
-### 2.1 Missing VLMs (~24 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V DONE
+### 2.1 Missing VLMs (~23 models) ✅ InternS1, Step3-VL, ERNIE4.5-VL, InternS1Pro, MoonViT+Kimi-VL, Kimi-K2.5, HyperCLOVA-X, GLM-OCR, GLM4-1V, Kanana-V DONE
 **Difficulty:** ★★★☆☆ per model | **Effort:** 4–6 weeks total
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
@@ -103,6 +103,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `hyperclovax_vision.rs` — `HCXVisionForCausalLM` ✅ (5 tests) — commit 767ebec
 - `glm_ocr.rs` — `GlmOcrForConditionalGeneration` ✅ (5 tests)
 - `glm4_1v.rs` — `Glm4vForConditionalGeneration` ✅ (5 tests)
+- `kanana_v.rs` — `KananaVForConditionalGeneration` ✅ (5 tests)
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -143,9 +144,16 @@ Merger `context_dim = intermediate_size`. Backbone: `Glm4ForCausalLM` (glm4v) or
 Bilinear pixel coords: `src = (coord + 0.5) * orig_size / target - 0.5` (align_corners=False → border clamp).
 Weight paths: `visual.*` (vision), `model.*` / `lm_head.*` (LLM).
 
+Kanana-V: `Qwen2VLVisionEncoder` (Qwen2ViT without merger; new `pub(crate)` struct in qwen2_vl.rs) +
+`DynamicCAbstractor` (bilinear pos-emb resampling + two timm `RegStage`s with `LayerNorm2d` channel-norm +
+`PatchMerge` + `ReadoutMLP`) + `LlamaForCausalLM`. Requires `depth ≥ 1` (depth=0 has ambiguous dim layout).
+`RegBottleneck`: conv1(1×1,act) → conv2(3×3,act) → conv3(1×1) + skip(1×1 if in≠out) → SiLU.
+Weight paths: `vision_model.*`, `abstractor.net.{0,2}.blocks.block{k}.*`, `abstractor.readout.*`,
+`model.model.*` / `model.lm_head.*`. `Qwen2VLVisionConfig::from_model_config()` added (reads `extra["vision_config"]`).
+
 - **P1 models remaining (in order):**
   1. `qwen2_5_omni_thinker.rs` (after audio), `qwen3_omni_moe_thinker.rs` (after audio)
-- **P2 models (~12 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, DeepSeek-OCR, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Kanana-V, Isaac
+- **P2 models (~11 remaining):** Ovis, Aria, MiniCPM-O, MiniMax-VL-01, Nemotron-VL, DeepSeek-OCR, Hunyuan-Vision, OpenPangu-VL, LFM2-VL (after SigLIP2), Keye, Isaac
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
