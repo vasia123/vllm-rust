@@ -51,6 +51,7 @@ pub mod moe_wna16;
 pub mod mxfp4;
 pub mod mxfp8;
 pub mod ptpc_fp8;
+pub mod torchao;
 pub mod weight_loader;
 
 // Re-export public types
@@ -97,6 +98,7 @@ pub use moe_wna16::{MoeWNA16Config, MoeWNA16Format};
 pub use mxfp4::{MxFp4Config, MxFp4Linear, FP4_LUT, MXFP4_BLOCK_SIZE};
 pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 pub use ptpc_fp8::PtpcFp8Config;
+pub use torchao::TorchaoConfig;
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
     AwqMarlinWeightLoader, AwqWeightLoader, BitsAndBytesWeightLoader,
@@ -184,6 +186,7 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             detected.desc_act,
             &detected.raw_config,
         )),
+        QuantizationMethod::Torchao => Box::new(TorchaoConfig::from_detected(&detected.raw_config)),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
