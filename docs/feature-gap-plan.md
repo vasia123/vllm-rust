@@ -103,7 +103,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - All follow Vision→Projector→LM pattern; 150–300 LOC per model
 - **Blockers to resolve first (new vision encoders):**
   - `MoonViT` ✅ — `moonvit.rs` done; also unblocks Kimi-K2.5-VL
-  - `SigLIP2-NaViT` — blocks LFM2-VL (~250 LOC, `multimodal/vision.rs`)
+  - `SigLIP2-NaViT` ✅ — implemented directly inside `lfm2_vl.rs` (no external NaViT needed; the LFM2-VL variant is simpler — standard attention, bilinear pos-emb resize, no windowed attention)
 
 **Completed:**
 - `interns1.rs` — `InternS1ForConditionalGeneration` ✅ (22 tests) — 2026-02-19
@@ -122,6 +122,8 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `keye_vl.rs` — `KeyeVL1_5ForConditionalGeneration` ✅ (5 tests) — commit 0d3767d
 - `isaac.rs` — `IsaacForConditionalGeneration` ✅ (5 tests) — commit 3641eee
 - `deepseek_ocr2.rs` — `DeepseekOCR2ForCausalLM` ✅ (5 tests) — 2026-02-23
+- `dots_ocr.rs` — `DotsOCRForCausalLM` ✅ (6 tests) — commit 6f8fbf4 — DotsVisionTransformer (Conv2d patchifier + VisionRoPE + SwiGLU blocks + PatchMerger) + Qwen2
+- `mistral3.rs` — `LightOnOCRForConditionalGeneration` ✅ (1 test) — commit 6f8fbf4 — Mistral3 variant with HF weight path remapping
 
 **Architecture:** InternS1ViT (separate Q/K/V, `layernorm_before/after`, `encoder.layer.{i}` singular) +
 InternS1-specific pixel shuffle + `multi_modal_projector` (LN+Linear+GELU+Linear) + InternLM2 LLM.
@@ -218,7 +220,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 `Qwen2ForCausalLM`. Weight paths: `model.sam_model.*` (SAM), `model.qwen2_model.*` (encoder), `model.projector.*`,
 `model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
 
-- **P2 models (~3 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), ~~Hunyuan-Vision~~ ✅ DONE (`hunyuan_vision.rs`, 5 tests + XDRoPE — commit 94ada76), LFM2-VL (BLOCKED: SigLIP2-NaViT)
+- **P2 models (~2 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), ~~Hunyuan-Vision~~ ✅ DONE (`hunyuan_vision.rs`, 5 tests + XDRoPE — commit 94ada76), ~~LFM2-VL~~ ✅ DONE (`lfm2_vl.rs`, 6 tests — commit f0ac8f7 — Siglip2VisionTransformer + pixel-shuffle projector + Lfm2ForCausalLM)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
@@ -383,7 +385,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 ```
 MTP Framework → DeepSeek-MTP model
 MoonViT encoder → Kimi-VL, Kimi-K2.5-VL
-SigLIP2-NaViT → LFM2-VL
+~~SigLIP2-NaViT → LFM2-VL~~ ✅ DONE
 ERNIE4.5-VL RoPE → ERNIE4.5-VL
 Audio Pipeline → Whisper → Qwen2-Audio, Ultravox → Qwen2.5-Omni, Qwen3-Omni
 ~~Data Parallelism → Expert Parallelism → EPLB~~ ✅ ALL DONE

@@ -163,6 +163,7 @@ pub mod mtp_base;
 pub mod musicflamingo;
 pub mod nemotron;
 pub mod nemotron_h;
+pub mod nemotron_nas;
 pub mod nemotron_quantized;
 pub mod nvlm_d;
 pub mod olmo2;
@@ -397,6 +398,7 @@ pub use mtp_base::MtpDraftModel;
 pub use musicflamingo::MusicFlamingoForConditionalGeneration;
 pub use nemotron::NemotronForCausalLM;
 pub use nemotron_h::NemotronHForCausalLM;
+pub use nemotron_nas::NemotronNasForCausalLM;
 pub use nemotron_quantized::QuantizedNemotronForCausalLM;
 pub use nvlm_d::NVLMDModel;
 pub use olmo2::Olmo2ForCausalLM;
@@ -531,7 +533,6 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "TeleChatForCausalLM"
         | "TeleChat2ForCausalLM"
         | "TeleFLMForCausalLM"
-        | "DeciLMForCausalLM"
         | "OlmoForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
         "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new(cfg, vb)?)),
         "MixtralForCausalLM" => Ok(Box::new(MixtralForCausalLM::new(cfg, vb)?)),
@@ -825,6 +826,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "NemotronHForCausalLM" | "NemotronHPuzzleForCausalLM" => {
             Ok(Box::new(NemotronHForCausalLM::new(cfg, vb)?))
         }
+        "DeciLMForCausalLM" | "NemotronNasForCausalLM" => {
+            Ok(Box::new(NemotronNasForCausalLM::new(cfg, vb)?))
+        }
         "OlmoeForCausalLM" => Ok(Box::new(OlmoeForCausalLM::new(cfg, vb)?)),
         "OPTForCausalLM" => Ok(Box::new(OPTForCausalLM::new(cfg, vb)?)),
         "OuroForCausalLM" => Ok(Box::new(OuroForCausalLM::new(cfg, vb)?)),
@@ -939,7 +943,6 @@ pub fn from_config_with_quant(
         | "TeleChatForCausalLM"
         | "TeleChat2ForCausalLM"
         | "TeleFLMForCausalLM"
-        | "DeciLMForCausalLM"
         | "OlmoForCausalLM"
         | "YiForCausalLM"
         | "BaichuanForCausalLM"
@@ -1380,7 +1383,6 @@ pub fn from_config_with_tp(
         | "TeleChatForCausalLM"
         | "TeleChat2ForCausalLM"
         | "TeleFLMForCausalLM"
-        | "DeciLMForCausalLM"
         | "OlmoForCausalLM" => Ok(Box::new(LlamaForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -1517,6 +1519,9 @@ pub fn from_config_with_tp(
         "NemotronForCausalLM" => Ok(Box::new(NemotronForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
+        "DeciLMForCausalLM" | "NemotronNasForCausalLM" => Ok(Box::new(
+            NemotronNasForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
+        )),
         "OlmoeForCausalLM" => Ok(Box::new(OlmoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
