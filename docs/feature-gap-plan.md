@@ -83,7 +83,9 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - `ultravox.rs` ✅ DONE — `UltravoxModel`; WhisperEncoder + StackAudioFrames + FFProjector(SwiGLU) + Llama LLM; 5 tests; 3982 total — 2026-02-23
   - `qwen2_5_omni_thinker.rs` ✅ DONE — `Qwen2_5OmniThinkerForConditionalGeneration`; Qwen2AudioEncoder + Qwen25VisionTransformer + Qwen2ForCausalLM; 5 tests; 3987 total — commit cc24c0e
   - `qwen3_omni_moe_thinker.rs` ✅ DONE — `Qwen3OmniMoeThinkerForConditionalGeneration`; Conv2d×3 audio encoder + Qwen3OmniVisionTransformer (LayerNorm + SiLU MLP) + Qwen3MoeForCausalLM; 5 tests; 3992 total — commit cc24c0e
-  - `qwen3_asr.rs`, `granite_speech.rs`, `funaudiochat.rs` — P2
+  - `qwen3_asr.rs` ✅ DONE — `Qwen3ASRForConditionalGeneration`; Qwen3OmniMoeAudioEncoder + Qwen3ForCausalLM; 5 tests; commit 21fa570
+  - `granite_speech.rs` ✅ DONE — `GraniteSpeechForConditionalGeneration`; Conformer CTC encoder (Shaw RPE + block attn) + BLIP2 QFormer projector + GraniteForCausalLM; 5 tests — commit PENDING
+  - `funaudiochat.rs` — P2
   - `audioflamingo3.rs`, `glmasr.rs`, `voxtral.rs`, `phi4mm_audio.rs` — P2
   - `gemma3n_audio.rs`, `musicflamingo.rs` — P3
 - **Files:** extend `multimodal/audio.rs`, new `multimodal/audio_encoder.rs`, per-model files

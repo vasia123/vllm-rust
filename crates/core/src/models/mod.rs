@@ -86,6 +86,7 @@ pub mod gpt_neox_quantized;
 pub mod gpt_oss;
 pub mod granite;
 pub mod granite_quantized;
+pub mod granite_speech;
 pub mod granitemoe;
 pub mod granitemoe_hybrid;
 pub mod granitemoe_shared;
@@ -310,6 +311,7 @@ pub use gpt_neox_quantized::QuantizedGPTNeoXForCausalLM;
 pub use gpt_oss::GptOssForCausalLM;
 pub use granite::GraniteForCausalLM;
 pub use granite_quantized::QuantizedGraniteForCausalLM;
+pub use granite_speech::GraniteSpeechForConditionalGeneration;
 pub use granitemoe::GraniteMoeForCausalLM;
 pub use granitemoe_hybrid::GraniteMoeHybridForCausalLM;
 pub use granitemoe_shared::GraniteMoeSharedForCausalLM;
@@ -737,6 +739,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "GPTJForCausalLM" => Ok(Box::new(GPTJForCausalLM::new(cfg, vb)?)),
         "GptOssForCausalLM" => Ok(Box::new(GptOssForCausalLM::new(cfg, vb)?)),
         "GraniteForCausalLM" => Ok(Box::new(GraniteForCausalLM::new(cfg, vb)?)),
+        "GraniteSpeechForConditionalGeneration" => Ok(Box::new(
+            GraniteSpeechForConditionalGeneration::new(cfg, vb)?,
+        )),
         "GraniteMoeForCausalLM" => Ok(Box::new(GraniteMoeForCausalLM::new(cfg, vb)?)),
         "GraniteMoeSharedForCausalLM" => Ok(Box::new(GraniteMoeSharedForCausalLM::new(cfg, vb)?)),
         "GritLM" => Ok(Box::new(GritLM::new(cfg, vb)?)),
