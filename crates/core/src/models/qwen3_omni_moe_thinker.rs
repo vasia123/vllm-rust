@@ -34,18 +34,19 @@ use super::qwen3_moe::Qwen3MoeForCausalLM;
 
 // ─── Audio Encoder Config ────────────────────────────────────────────────────
 
-struct Qwen3OmniAudioCfg {
-    d_model: usize,
-    encoder_layers: usize,
-    encoder_attention_heads: usize,
-    encoder_ffn_dim: usize,
-    num_mel_bins: usize,
-    max_source_positions: usize,
-    downsample_hidden_size: usize,
-    output_dim: usize,
+pub(crate) struct Qwen3OmniAudioCfg {
+    pub(crate) d_model: usize,
+    pub(crate) encoder_layers: usize,
+    pub(crate) encoder_attention_heads: usize,
+    pub(crate) encoder_ffn_dim: usize,
+    pub(crate) num_mel_bins: usize,
+    pub(crate) max_source_positions: usize,
+    pub(crate) downsample_hidden_size: usize,
+    pub(crate) output_dim: usize,
 }
 
 impl Default for Qwen3OmniAudioCfg {
+    // needed by Qwen3-ASR which reuses this config via pub(crate)
     fn default() -> Self {
         Self {
             d_model: 1536,
@@ -61,7 +62,7 @@ impl Default for Qwen3OmniAudioCfg {
 }
 
 impl Qwen3OmniAudioCfg {
-    fn from_json(v: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(v: &serde_json::Value) -> Self {
         let d = Self::default();
         Self {
             d_model: v
@@ -368,7 +369,7 @@ impl Qwen3OmniAudioEncoderLayer {
 
 // ─── Audio Encoder ───────────────────────────────────────────────────────────
 
-struct Qwen3OmniMoeAudioEncoder {
+pub(crate) struct Qwen3OmniMoeAudioEncoder {
     conv2d1: candle_nn::Conv2d,
     conv2d2: candle_nn::Conv2d,
     conv2d3: candle_nn::Conv2d,
@@ -381,7 +382,7 @@ struct Qwen3OmniMoeAudioEncoder {
 }
 
 impl Qwen3OmniMoeAudioEncoder {
-    fn new(cfg: &Qwen3OmniAudioCfg, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &Qwen3OmniAudioCfg, vb: VarBuilder) -> Result<Self> {
         let conv_cfg = Conv2dConfig {
             padding: 1,
             stride: 2,
@@ -444,7 +445,7 @@ impl Qwen3OmniMoeAudioEncoder {
     /// * `mel` — `[B, num_mel_bins, T]`
     ///
     /// Returns `[B, T_out, output_dim]`.
-    fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let (b, _n_mels, _t) = mel.dims3()?;
 
         // [B, 1, n_mels, T] → conv2d×3 → [B, hidden, freq, time]

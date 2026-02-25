@@ -194,6 +194,7 @@ pub mod qwen2_quantized;
 pub mod qwen2_reward;
 pub mod qwen2_vl;
 pub mod qwen3;
+pub mod qwen3_asr;
 pub mod qwen3_lora;
 pub mod qwen3_moe;
 pub mod qwen3_next;
@@ -416,6 +417,7 @@ pub use qwen2_quantized::QuantizedQwen2ForCausalLM;
 pub use qwen2_reward::{Qwen2ForProcessRewardModel, Qwen2ForRewardModel};
 pub use qwen2_vl::Qwen2VLForConditionalGeneration;
 pub use qwen3::Qwen3ForCausalLM;
+pub use qwen3_asr::Qwen3ASRForConditionalGeneration;
 pub use qwen3_lora::Qwen3WithLora;
 pub use qwen3_moe::Qwen3MoeForCausalLM;
 pub use qwen3_next::Qwen3NextForCausalLM;
@@ -588,6 +590,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen3OmniMoeThinkerForConditionalGeneration" => Ok(Box::new(
             Qwen3OmniMoeThinkerForConditionalGeneration::new(cfg, vb)?,
         )),
+        "Qwen3ASRForConditionalGeneration" => {
+            Ok(Box::new(Qwen3ASRForConditionalGeneration::new(cfg, vb)?))
+        }
         "UltravoxModel" => Ok(Box::new(UltravoxModel::new(cfg, vb)?)),
         "Qwen2VLForConditionalGeneration" | "Tarsier2ForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
