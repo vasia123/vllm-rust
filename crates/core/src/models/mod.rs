@@ -52,6 +52,7 @@ pub mod falcon;
 pub mod falcon_h1;
 pub mod falcon_quantized;
 pub mod flex_olmo;
+pub mod funaudiochat;
 pub mod fuyu;
 pub mod gemma;
 pub mod gemma2;
@@ -277,6 +278,7 @@ pub use falcon::FalconForCausalLM;
 pub use falcon_h1::FalconH1ForCausalLM;
 pub use falcon_quantized::QuantizedFalconForCausalLM;
 pub use flex_olmo::FlexOlmoForCausalLM;
+pub use funaudiochat::FunAudioChatForConditionalGeneration;
 pub use fuyu::FuyuForCausalLM;
 pub use gemma::GemmaForCausalLM;
 pub use gemma2::Gemma2ForCausalLM;
@@ -569,6 +571,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Mamba2ForCausalLM" => Ok(Box::new(Mamba2ForCausalLM::new(cfg, vb)?)),
         "BambaForCausalLM" => Ok(Box::new(BambaForCausalLM::new(cfg, vb)?)),
         "FalconH1ForCausalLM" => Ok(Box::new(FalconH1ForCausalLM::new(cfg, vb)?)),
+        "FunAudioChatForConditionalGeneration" => Ok(Box::new(
+            FunAudioChatForConditionalGeneration::new(cfg, vb)?,
+        )),
         "FuyuForCausalLM" => Ok(Box::new(FuyuForCausalLM::new(cfg, vb)?)),
         "Zamba2ForCausalLM" => Ok(Box::new(Zamba2ForCausalLM::new(cfg, vb)?)),
         "GraniteMoeHybridForCausalLM" => Ok(Box::new(GraniteMoeHybridForCausalLM::new(cfg, vb)?)),
