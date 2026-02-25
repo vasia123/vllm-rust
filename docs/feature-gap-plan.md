@@ -288,7 +288,9 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 ### 3.1 Quantization P3 Methods
 **Effort:** 4–6 weeks (7 methods) | Same trait pattern as P2
 - ✅ `cpu_wna16.rs` DONE — `CpuWna16Config` wraps `AwqConfig` (Marlin disabled); detection keys `"cpu_awq"`/`"cpu_wna16"`; min_capability=0; 5 tests
-- AWQ-Triton, TorchAO, Intel INC, Petit (NvFP4), QUARK (6 files), FP-Quant
+- ✅ `inc.rs` DONE — `IncConfig` routes to `GptqConfig`/`AwqConfig` based on `packing_format`; detection keys `"inc"`/`"auto-round"`; 7 tests
+- ✅ `torchao.rs` DONE — `TorchaoConfig` wraps `NoQuantizationConfig` (standard BF16 matmul); detection already wired; 5 tests
+- AWQ-Triton, Petit (NvFP4), QUARK (6 files), FP-Quant
 - All in `crates/core/src/quantization/`
 
 ### 3.2 Server API — Speech & Realtime

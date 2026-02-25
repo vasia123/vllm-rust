@@ -1149,6 +1149,17 @@ pub fn create_weight_loader_from_config(
             let fp8_config = Fp8Config::dynamic();
             Box::new(Fp8WeightLoader::new(vb, fp8_config))
         }
+        // CPU AWQ has the same packed-INT4 weight format as standard AWQ.
+        QuantizationMethod::CpuWna16 => {
+            let awq_config = AwqConfig::default();
+            Box::new(AwqWeightLoader::new(vb, awq_config))
+        }
+        // INC defaults to GPTQ packing; AWQ packing cannot be distinguished at
+        // this point without the raw config, so fall back to GPTQ layout.
+        QuantizationMethod::Inc => {
+            let gptq_config = GptqConfig::from_detected(None, None, None, &HashMap::new());
+            Box::new(GptqWeightLoader::new(vb, gptq_config))
+        }
         _ => Box::new(UnquantizedWeightLoader::new(vb)),
     }
 }

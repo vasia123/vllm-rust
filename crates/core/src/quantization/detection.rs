@@ -120,7 +120,7 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
     let method = match hf_config.quant_method.as_deref() {
         Some("fp8") => QuantizationMethod::Fp8,
         Some("gptq") => QuantizationMethod::Gptq,
-        Some("awq") => QuantizationMethod::Awq,
+        Some("awq") | Some("awq_triton") => QuantizationMethod::Awq,
         Some("bitsandbytes") => QuantizationMethod::BitsAndBytes,
         Some("squeezellm") => QuantizationMethod::SqueezeLlm,
         Some("compressed-tensors") => QuantizationMethod::CompressedTensors,
@@ -238,7 +238,7 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
             let method = match method_str {
                 "fp8" => QuantizationMethod::Fp8,
                 "gptq" => QuantizationMethod::Gptq,
-                "awq" => QuantizationMethod::Awq,
+                "awq" | "awq_triton" => QuantizationMethod::Awq,
                 "bitsandbytes" => QuantizationMethod::BitsAndBytes,
                 "squeezellm" => QuantizationMethod::SqueezeLlm,
                 "compressed-tensors" => QuantizationMethod::CompressedTensors,
@@ -495,6 +495,21 @@ mod tests {
         });
         let detected = detect_from_json(&config);
         assert_eq!(detected.method, QuantizationMethod::ModelOptFull);
+    }
+
+    #[test]
+    fn test_detect_awq_triton_alias() {
+        // awq_triton uses AWQ weight format with Triton GPU kernels — routes to Awq.
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "awq_triton",
+                "bits": 4,
+                "group_size": 128
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::Awq);
+        assert_eq!(detected.bits, Some(4));
     }
 
     #[test]
