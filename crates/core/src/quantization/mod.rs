@@ -31,6 +31,7 @@ pub mod bitsandbytes;
 pub mod bnb_cuda;
 pub mod compressed_tensors;
 mod config;
+pub mod cpu_wna16;
 mod detection;
 pub mod experts_int8;
 pub mod fbgemm_fp8;
@@ -64,6 +65,7 @@ pub use config::{
     ActivationScheme, NoQuantizationConfig, QuantizationConfig, QuantizationMethod,
     QuantizedLinear, UnquantizedLinear,
 };
+pub use cpu_wna16::CpuWna16Config;
 pub use detection::{detect_from_directory, detect_from_json, DetectedQuantConfig};
 pub use experts_int8::{ExpertsInt8Config, ExpertsInt8Linear};
 pub use fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
@@ -169,6 +171,11 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
         QuantizationMethod::ModelOptFull => {
             Box::new(ModelOptConfig::from_detected(&detected.raw_config).unwrap_or_default())
         }
+        QuantizationMethod::CpuWna16 => Box::new(CpuWna16Config::from_detected(
+            detected.bits,
+            detected.group_size,
+            &detected.raw_config,
+        )),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -215,6 +222,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::PtpcFp8 => 94,   // AMD MI300 minimum (ROCm only)
         QuantizationMethod::Mxfp4 => 80,     // Ampere minimum (hardware FP4 kernels)
         QuantizationMethod::ModelOptFull => 80, // FP8 needs Ampere+; NVFP4 needs Hopper (89) but emulation works on 80
+        QuantizationMethod::CpuWna16 => 0,      // CPU-only, no GPU required
     };
     capability >= min_cap
 }

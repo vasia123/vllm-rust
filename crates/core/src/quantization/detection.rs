@@ -131,6 +131,8 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("fbgemm_fp8") => QuantizationMethod::FbgemmFp8,
         Some("ptpc_fp8") => QuantizationMethod::PtpcFp8,
         Some("mxfp4") => QuantizationMethod::Mxfp4,
+        // cpu_awq / cpu_wna16: same weight format as AWQ, CPU-only
+        Some("cpu_awq") | Some("cpu_wna16") => QuantizationMethod::CpuWna16,
         // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
         Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {
@@ -245,6 +247,8 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "fbgemm_fp8" => QuantizationMethod::FbgemmFp8,
                 "ptpc_fp8" => QuantizationMethod::PtpcFp8,
                 "mxfp4" => QuantizationMethod::Mxfp4,
+                // cpu_awq / cpu_wna16: same weight format as AWQ, CPU-only
+                "cpu_awq" | "cpu_wna16" => QuantizationMethod::CpuWna16,
                 // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
                 "gptq_marlin" => QuantizationMethod::Marlin,
                 "modelopt" => {
@@ -487,5 +491,34 @@ mod tests {
         });
         let detected = detect_from_json(&config);
         assert_eq!(detected.method, QuantizationMethod::ModelOptFull);
+    }
+
+    #[test]
+    fn test_detect_cpu_awq_from_json() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "cpu_awq",
+                "bits": 4,
+                "group_size": 128
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::CpuWna16);
+        assert_eq!(detected.bits, Some(4));
+        assert_eq!(detected.group_size, Some(128));
+    }
+
+    #[test]
+    fn test_detect_cpu_wna16_alias_from_json() {
+        // The Python class is also reachable as "cpu_wna16".
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "cpu_wna16",
+                "bits": 4,
+                "group_size": 128
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::CpuWna16);
     }
 }

@@ -89,8 +89,9 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - `audioflamingo3.rs` ✅ DONE — `AudioFlamingo3ForConditionalGeneration`; Qwen2AudioEncoder + 2-layer GELU MLP projector + Qwen2; 5 tests — commit 1c5dce2
   - `voxtral.rs` ✅ DONE — `VoxtralForConditionalGeneration`; WhisperEncoder + downsample reshape + AudioLanguageAdapter + MistralForCausalLM; 5 tests — commit 18a930e
   - `glmasr.rs` ✅ DONE — `GlmAsrForConditionalGeneration`; Conv1d×2+GELU + GQA+partial-RoPE encoder + MLP projector + LlamaForCausalLM; 6 tests — commit f0dc167
-  - `phi4mm_audio.rs` — P2
-  - `gemma3n_audio.rs`, `musicflamingo.rs` — P3
+  - `phi4mm_audio.rs` ✅ DONE — `Phi4MMAudioEmbedding` (ConformerEncoder stub + MLP/linear AudioProjection); 11 tests — commit 727e7dc
+  - `gemma3n_audio` ✅ DONE — extended `gemma3n_vlm.rs` with `Gemma3nAudioEncoder` stub + `embed_audio` projector; audio scatter in `forward_multimodal`; 1 new test — commit f5856bb
+  - `musicflamingo.rs` ✅ DONE — `MusicFlamingoForConditionalGeneration` = type alias for `AudioFlamingo3ForConditionalGeneration`; 3 tests — commit f5856bb
 - **Files:** extend `multimodal/audio.rs`, new `multimodal/audio_encoder.rs`, per-model files
 
 ---
@@ -217,7 +218,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 `Qwen2ForCausalLM`. Weight paths: `model.sam_model.*` (SAM), `model.qwen2_model.*` (encoder), `model.projector.*`,
 `model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
 
-- **P2 models (~5 remaining):** MiniCPM-O, MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT)
+- **P2 models (~4 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
@@ -285,8 +286,9 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 ## Tier 3: Feature Completion (Medium)
 
 ### 3.1 Quantization P3 Methods
-**Effort:** 4–6 weeks (8 methods) | Same trait pattern as P2
-- AWQ-Triton, TorchAO, Intel INC, Petit (NvFP4), CPU-WNA16, QUARK (6 files), FP-Quant
+**Effort:** 4–6 weeks (7 methods) | Same trait pattern as P2
+- ✅ `cpu_wna16.rs` DONE — `CpuWna16Config` wraps `AwqConfig` (Marlin disabled); detection keys `"cpu_awq"`/`"cpu_wna16"`; min_capability=0; 5 tests
+- AWQ-Triton, TorchAO, Intel INC, Petit (NvFP4), QUARK (6 files), FP-Quant
 - All in `crates/core/src/quantization/`
 
 ### 3.2 Server API — Speech & Realtime

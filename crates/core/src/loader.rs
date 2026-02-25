@@ -146,6 +146,14 @@ pub fn quantization_info(files: &ModelFiles) -> String {
         QuantizationMethod::PtpcFp8 => "PTPC FP8 (per-token per-channel, ROCm MI300+)".to_string(),
         QuantizationMethod::Mxfp4 => "MXFP4 (OCP MX FP4 E2M1, block-32)".to_string(),
         QuantizationMethod::ModelOptFull => "ModelOpt (FP8/NVFP4/MXFP8 extended)".to_string(),
+        QuantizationMethod::CpuWna16 => {
+            let bits = files.quantization.bits.unwrap_or(4);
+            let group_size = files.quantization.group_size.unwrap_or(128);
+            format!(
+                "CPU AWQ / cpu_wna16 (bits: {}, group_size: {})",
+                bits, group_size
+            )
+        }
     }
 }
 

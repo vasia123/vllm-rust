@@ -50,6 +50,8 @@ pub enum QuantizationMethod {
     Mxfp4,
     /// ModelOpt full extended format: FP8/NVFP4/MXFP8 variants
     ModelOptFull,
+    /// CPU AWQ: weight-only INT4 quantization for CPU inference (cpu_awq)
+    CpuWna16,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -73,6 +75,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::PtpcFp8 => write!(f, "ptpc_fp8"),
             Self::Mxfp4 => write!(f, "mxfp4"),
             Self::ModelOptFull => write!(f, "modelopt_full"),
+            Self::CpuWna16 => write!(f, "cpu_awq"),
         }
     }
 }
