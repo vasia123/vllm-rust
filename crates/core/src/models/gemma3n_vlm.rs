@@ -1,11 +1,22 @@
-//! Gemma3n vision-language model implementation.
+//! Gemma3n vision-language (and audio-language) model implementation.
 //!
 //! Architecture:
-//! - Vision encoder: SigLIP
-//! - Vision embedder: Embedding + RMSNorm + Linear projection + RMSNorm
+//! - Vision encoder: SigLIP (produces `tokens_per_image` = 256 tokens)
+//! - Audio encoder: Gemma3nAudioFeatureExtractor stub (preprocessing only)
+//! - Multimodal embedder (shared pattern for vision + audio):
+//!   soft_embedding_norm(RMSNorm) → embedding_projection(Linear) → post_projection_norm(RMSNorm)
 //! - Language model: Gemma3nForCausalLM (with AltUp, per-layer projections)
 //!
-//! NOTE: Audio support is deferred; only vision is implemented.
+//! Audio path uses pre-encoded embeddings (`ProcessedAudio.embedding`) produced
+//! by Python preprocessing; `embed_audio` projects them to text hidden size.
+//! Fixed 188 audio tokens per audio clip (`audio_soft_tokens_per_image`).
+//!
+//! ## Weight paths
+//! - `vision_tower.*` — SigLIP
+//! - `embed_vision.{soft_embedding_norm,embedding_projection,embedding_post_projection_norm}.*`
+//! - `audio_tower.*` — stub (not used at inference)
+//! - `embed_audio.{soft_embedding_norm,embedding_projection,embedding_post_projection_norm}.*`
+//! - `language_model.*` — Gemma3nForCausalLM
 //!
 //! Reference: reference/vllm/vllm/model_executor/models/gemma3n_mm.py
 
@@ -29,6 +40,9 @@ struct Gemma3nVLMConfig {
     vision_config: VisionEncoderConfig,
     vision_hidden_size: usize,
     tokens_per_image: usize,
+    audio_hidden_size: usize,
+    tokens_per_audio: usize,
+    audio_token_id: u32,
 }
 
 impl Gemma3nVLMConfig {
@@ -90,12 +104,57 @@ impl Gemma3nVLMConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(256) as usize;
 
+        // Audio config
+        let audio_hidden_size = cfg
+            .extra
+            .get("audio_config")
+            .and_then(|ac| ac.get("hidden_size"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024) as usize;
+
+        // Confusingly named field covers both image and audio soft tokens.
+        let tokens_per_audio = cfg
+            .extra
+            .get("audio_soft_tokens_per_image")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(188) as usize;
+
+        let audio_token_id = cfg
+            .extra
+            .get("audio_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(108) as u32;
+
         Self {
             model_config: cfg.clone(),
             vision_config,
             vision_hidden_size,
             tokens_per_image,
+            audio_hidden_size,
+            tokens_per_audio,
+            audio_token_id,
         }
+    }
+}
+
+// ─── Audio encoder stub ─────────────────────────────────────────────────────
+
+/// Stub for the Gemma3n audio feature extractor (preprocessing only).
+///
+/// The full encoder (conformer-style) runs during Python preprocessing and is
+/// NOT invoked during Rust inference.  This struct exists to satisfy weight
+/// loading (weights are not loaded since only `embed_audio` is needed).
+///
+/// TODO: Implement full encoder for native Rust audio encoding. Reference:
+/// the `AutoModel.from_config(audio_config)` call in gemma3n_mm.py resolves
+/// to a conformer-style audio tower (similar to `Phi4MMConformerEncoder`).
+#[allow(dead_code)]
+struct Gemma3nAudioEncoder;
+
+#[allow(dead_code)]
+impl Gemma3nAudioEncoder {
+    fn new(_vb: VarBuilder) -> Result<Self> {
+        Ok(Self)
     }
 }
 
@@ -149,15 +208,18 @@ impl Gemma3nMultimodalEmbedder {
 
 // ─── Full Model ─────────────────────────────────────────────────────────────
 
-/// Gemma3n vision-language model for conditional generation.
+/// Gemma3n vision-language (and audio-language) model for conditional generation.
 ///
-/// SigLIP vision encoder + multimodal embedder + Gemma3n language model.
+/// SigLIP vision encoder + Gemma3nAudioEncoder stub + dual multimodal embedder
+/// + Gemma3n language model.
 pub struct Gemma3nForConditionalGeneration {
     #[allow(dead_code)]
     vision_tower: VisionEncoder,
     embed_vision: Gemma3nMultimodalEmbedder,
-    language_model: Gemma3nForCausalLM,
     #[allow(dead_code)]
+    audio_tower: Gemma3nAudioEncoder,
+    embed_audio: Gemma3nMultimodalEmbedder,
+    language_model: Gemma3nForCausalLM,
     config: Gemma3nVLMConfig,
     device: Device,
     dtype: DType,
@@ -178,12 +240,25 @@ impl Gemma3nForConditionalGeneration {
             vb.pp("embed_vision"),
         )?;
 
+        // Audio encoder stub — weights not loaded (preprocessing-only path)
+        let audio_tower = Gemma3nAudioEncoder::new(vb.pp("audio_tower"))?;
+
+        // Audio embedder: projects audio_hidden → text_hidden (same structure as vision)
+        let embed_audio = Gemma3nMultimodalEmbedder::new(
+            config.audio_hidden_size,
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("embed_audio"),
+        )?;
+
         // Language model
         let language_model = Gemma3nForCausalLM::new(cfg, vb.pp("language_model"))?;
 
         Ok(Self {
             vision_tower,
             embed_vision,
+            audio_tower,
+            embed_audio,
             language_model,
             config,
             device: vb.device().clone(),
@@ -196,29 +271,43 @@ impl Gemma3nForConditionalGeneration {
         text_embeddings: &Tensor,
         mm_inputs: &MultimodalInputs,
     ) -> Result<Tensor> {
-        if !mm_inputs.has_images() {
-            return Ok(text_embeddings.clone());
-        }
-
         let (_batch_size, seq_len, _) = text_embeddings.dims3()?;
         let mut merged = text_embeddings.to_vec3::<f32>()?;
 
+        // Vision: project via embed_vision, scale by sqrt(hidden_size)
         for (position, processed_image) in &mm_inputs.image_embeddings {
-            // Vision tower → embedder projection
             let vision_emb = processed_image.embedding.unsqueeze(0)?;
             let projected = self.embed_vision.forward(&vision_emb)?;
             let projected = projected.squeeze(0)?;
 
-            // Scale by sqrt(hidden_size) to match Gemma3n's embedding scaling
             let normalizer = (self.config.model_config.hidden_size as f64).sqrt();
             let projected = (projected * normalizer)?;
 
             let img_emb: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
-
-            let batch_idx = *position / seq_len;
-            let start_pos = *position % seq_len;
+            let batch_idx = position / seq_len;
+            let start_pos = position % seq_len;
 
             for (i, emb) in img_emb.iter().enumerate() {
+                let target_pos = start_pos + i;
+                if target_pos < seq_len && batch_idx < merged.len() {
+                    merged[batch_idx][target_pos] = emb.clone();
+                }
+            }
+        }
+
+        // Audio: project via embed_audio; no scaling (audio embeddings are already
+        // soft tokens normalized by the Python encoder; vision scaling comes from
+        // last_hidden_state channel-first reshape in _process_image_input).
+        for (position, processed_audio) in &mm_inputs.audio_embeddings {
+            let audio_emb = processed_audio.embedding.unsqueeze(0)?;
+            let projected = self.embed_audio.forward(&audio_emb)?;
+            let projected = projected.squeeze(0)?;
+
+            let audio_emb_f32: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
+            let batch_idx = position / seq_len;
+            let start_pos = position % seq_len;
+
+            for (i, emb) in audio_emb_f32.iter().enumerate() {
                 let target_pos = start_pos + i;
                 if target_pos < seq_len && batch_idx < merged.len() {
                     merged[batch_idx][target_pos] = emb.clone();
@@ -276,15 +365,28 @@ impl crate::engine::ModelForward for Gemma3nForConditionalGeneration {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         if let Some(mm_inputs) = multimodal_inputs {
-            if mm_inputs.has_images() {
-                // Get text embeddings from the language model
-                let text_embeddings = self.language_model.embed_tokens(input_ids)?;
+            if mm_inputs.has_images() || mm_inputs.has_audio() {
+                // Mask out-of-vocab audio placeholder tokens before embed_tokens
+                let safe_ids = if mm_inputs.has_audio() {
+                    let tok = self.config.audio_token_id;
+                    let ids = input_ids.to_vec2::<u32>()?;
+                    let masked: Vec<Vec<u32>> = ids
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .map(|t| if t == tok { 0 } else { t })
+                                .collect()
+                        })
+                        .collect();
+                    Tensor::new(masked, input_ids.device())?
+                } else {
+                    input_ids.clone()
+                };
 
-                // Merge vision embeddings
+                let text_embeddings = self.language_model.embed_tokens(&safe_ids)?;
                 let hidden_states_0 =
                     self.merge_multimodal_embeddings(&text_embeddings, mm_inputs)?;
 
-                // Forward through language model from hidden states
                 return self.language_model.forward_from_hidden(
                     &hidden_states_0,
                     seqlen_offset,
@@ -316,6 +418,7 @@ mod tests {
     use super::*;
     use crate::engine::ModelForward;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use crate::multimodal::{MultimodalInputs, ProcessedAudio};
 
     fn test_model_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();
@@ -350,6 +453,17 @@ mod tests {
             serde_json::json!(32),
         );
         extra.insert("laurel_rank".to_string(), serde_json::json!(16));
+
+        // Audio config (same hidden_size=64 for simplicity)
+        extra.insert(
+            "audio_config".to_string(),
+            serde_json::json!({ "hidden_size": 64 }),
+        );
+        extra.insert(
+            "audio_soft_tokens_per_image".to_string(),
+            serde_json::json!(4),
+        );
+        extra.insert("audio_token_id".to_string(), serde_json::json!(200));
 
         ModelConfig {
             architectures: vec!["Gemma3nForConditionalGeneration".to_string()],
@@ -459,5 +573,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.dim(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_forward_multimodal_audio() {
+        let device = Device::Cpu;
+        let cfg = test_model_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Gemma3nForConditionalGeneration::new(&cfg, vb).unwrap();
+
+        let audio_token_id = 200u32;
+        let seq_len = 6usize;
+        let audio_tokens = 2usize;
+
+        // Sequence: [audio, audio, text, text, text, text]
+        let token_ids = vec![audio_token_id, audio_token_id, 1u32, 2, 3, 4];
+        let embedding =
+            Tensor::zeros((audio_tokens, cfg.hidden_size), DType::F32, &device).unwrap();
+        let processed = ProcessedAudio::new(embedding, audio_tokens);
+        let mm = MultimodalInputs::with_audio(token_ids.clone(), vec![(0, processed)]);
+
+        let input_ids = Tensor::from_vec(token_ids, (1, seq_len), &device).unwrap();
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let block_table = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+
+        let logits = model
+            .forward_multimodal(
+                &input_ids,
+                Some(&mm),
+                0,
+                &mut kv_cache,
+                &block_table,
+                &slot_mapping,
+            )
+            .unwrap();
+
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
     }
 }

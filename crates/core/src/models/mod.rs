@@ -156,6 +156,7 @@ pub mod moonvit;
 pub mod mpt;
 pub mod mpt_quantized;
 pub mod mtp_base;
+pub mod musicflamingo;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_quantized;
@@ -385,6 +386,7 @@ pub use molmo2::Molmo2ForConditionalGeneration;
 pub use mpt::MptForCausalLM;
 pub use mpt_quantized::QuantizedMptForCausalLM;
 pub use mtp_base::MtpDraftModel;
+pub use musicflamingo::MusicFlamingoForConditionalGeneration;
 pub use nemotron::NemotronForCausalLM;
 pub use nemotron_h::NemotronHForCausalLM;
 pub use nemotron_quantized::QuantizedNemotronForCausalLM;
@@ -742,6 +744,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "AriaForConditionalGeneration" => Ok(Box::new(AriaForConditionalGeneration::new(cfg, vb)?)),
         "AudioFlamingo3ForConditionalGeneration" => Ok(Box::new(
             AudioFlamingo3ForConditionalGeneration::new(cfg, vb)?,
+        )),
+        "MusicFlamingoForConditionalGeneration" => Ok(Box::new(
+            MusicFlamingoForConditionalGeneration::new(cfg, vb)?,
         )),
         "AyaVisionForConditionalGeneration" | "Cohere2VisionForConditionalGeneration" => {
             Ok(Box::new(AyaVisionForConditionalGeneration::new(cfg, vb)?))
