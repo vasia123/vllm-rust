@@ -220,6 +220,7 @@ pub mod step3p5_mtp;
 pub mod t5;
 pub mod tp_layers;
 pub mod ultravox;
+pub mod voxtral;
 pub mod voyage;
 pub mod whisper;
 pub mod yi;
@@ -447,6 +448,7 @@ pub use step3p5::Step3p5ForCausalLM;
 pub use step3p5_mtp::Step3p5MtpModel;
 pub use t5::T5ForConditionalGeneration;
 pub use ultravox::UltravoxModel;
+pub use voxtral::VoxtralForConditionalGeneration;
 pub use voyage::VoyageForEmbedding;
 pub use whisper::WhisperForConditionalGeneration;
 pub use yi::YiForCausalLM;
@@ -603,6 +605,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(Qwen3ASRForConditionalGeneration::new(cfg, vb)?))
         }
         "UltravoxModel" => Ok(Box::new(UltravoxModel::new(cfg, vb)?)),
+        "VoxtralForConditionalGeneration" => {
+            Ok(Box::new(VoxtralForConditionalGeneration::new(cfg, vb)?))
+        }
         "Qwen2VLForConditionalGeneration" | "Tarsier2ForConditionalGeneration" => Ok(Box::new(
             Qwen2VLForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
