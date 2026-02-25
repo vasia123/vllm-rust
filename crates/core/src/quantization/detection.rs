@@ -134,14 +134,21 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
         Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {
+            // ModelOpt supports both nested {"quantization": {"quant_algo": ...}} and
+            // flat {"quant_algo": ...} layouts depending on the config file source.
             let quant_algo = quant_config
                 .get("quantization")
                 .and_then(|q| q.get("quant_algo"))
-                .and_then(|v| v.as_str());
-            if quant_algo == Some("MXFP8") {
-                QuantizationMethod::ModelOpt
-            } else {
-                return None;
+                .or_else(|| quant_config.get("quant_algo"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_uppercase());
+            match quant_algo.as_deref() {
+                Some("MXFP8") => QuantizationMethod::ModelOpt,
+                Some("FP8")
+                | Some("FP8_PER_CHANNEL_PER_TOKEN")
+                | Some("FP8_PB_WO")
+                | Some("NVFP4") => QuantizationMethod::ModelOptFull,
+                _ => return None,
             }
         }
         _ => return None,
@@ -244,11 +251,16 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                     let quant_algo = quant_config
                         .get("quantization")
                         .and_then(|q| q.get("quant_algo"))
-                        .and_then(|v| v.as_str());
-                    if quant_algo == Some("MXFP8") {
-                        QuantizationMethod::ModelOpt
-                    } else {
-                        QuantizationMethod::None
+                        .or_else(|| quant_config.get("quant_algo"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_uppercase());
+                    match quant_algo.as_deref() {
+                        Some("MXFP8") => QuantizationMethod::ModelOpt,
+                        Some("FP8")
+                        | Some("FP8_PER_CHANNEL_PER_TOKEN")
+                        | Some("FP8_PB_WO")
+                        | Some("NVFP4") => QuantizationMethod::ModelOptFull,
+                        _ => QuantizationMethod::None,
                     }
                 }
                 _ => QuantizationMethod::None,
@@ -426,5 +438,54 @@ mod tests {
         assert_eq!(detected.method, QuantizationMethod::MoeWNA16);
         assert_eq!(detected.bits, Some(4));
         assert_eq!(detected.group_size, Some(128));
+    }
+
+    #[test]
+    fn test_detect_modelopt_fp8_nested() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quantization": { "quant_algo": "FP8" }
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::ModelOptFull);
+    }
+
+    #[test]
+    fn test_detect_modelopt_fp8_per_channel() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quantization": { "quant_algo": "FP8_PER_CHANNEL_PER_TOKEN" }
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::ModelOptFull);
+    }
+
+    #[test]
+    fn test_detect_modelopt_nvfp4_flat_layout() {
+        // Flat layout: quant_algo at top level of quantization_config
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4"
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::ModelOptFull);
+    }
+
+    #[test]
+    fn test_detect_modelopt_fp8_pb_wo() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quantization": { "quant_algo": "FP8_PB_WO" }
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::ModelOptFull);
     }
 }

@@ -48,6 +48,8 @@ pub enum QuantizationMethod {
     PtpcFp8,
     /// MXFP4 (OCP MX FP4 E2M1): 4-bit microscaling quantization
     Mxfp4,
+    /// ModelOpt full extended format: FP8/NVFP4/MXFP8 variants
+    ModelOptFull,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -70,6 +72,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::FbgemmFp8 => write!(f, "fbgemm_fp8"),
             Self::PtpcFp8 => write!(f, "ptpc_fp8"),
             Self::Mxfp4 => write!(f, "mxfp4"),
+            Self::ModelOptFull => write!(f, "modelopt_full"),
         }
     }
 }

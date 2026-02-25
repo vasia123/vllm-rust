@@ -145,6 +145,7 @@ pub fn quantization_info(files: &ModelFiles) -> String {
         QuantizationMethod::FbgemmFp8 => "FBGEMM FP8 (per-channel, dynamic activation)".to_string(),
         QuantizationMethod::PtpcFp8 => "PTPC FP8 (per-token per-channel, ROCm MI300+)".to_string(),
         QuantizationMethod::Mxfp4 => "MXFP4 (OCP MX FP4 E2M1, block-32)".to_string(),
+        QuantizationMethod::ModelOptFull => "ModelOpt (FP8/NVFP4/MXFP8 extended)".to_string(),
     }
 }
 
