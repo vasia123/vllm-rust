@@ -87,7 +87,8 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - `granite_speech.rs` ✅ DONE — `GraniteSpeechForConditionalGeneration`; Conformer CTC encoder (Shaw RPE + block attn) + BLIP2 QFormer projector + GraniteForCausalLM; 5 tests — commit 9297a5b
   - `funaudiochat.rs` ✅ DONE — `FunAudioChatForConditionalGeneration`; continuous Conv1d×2+transformer encoder + discrete group-avg encoder + Qwen3; 5 tests — commit 96aff3b
   - `audioflamingo3.rs` ✅ DONE — `AudioFlamingo3ForConditionalGeneration`; Qwen2AudioEncoder + 2-layer GELU MLP projector + Qwen2; 5 tests — commit 1c5dce2
-  - `glmasr.rs`, `voxtral.rs`, `phi4mm_audio.rs` — P2
+  - `voxtral.rs` ✅ DONE — `VoxtralForConditionalGeneration`; WhisperEncoder + downsample reshape + AudioLanguageAdapter + MistralForCausalLM; 5 tests — commit 18a930e
+  - `glmasr.rs`, `phi4mm_audio.rs` — P2
   - `gemma3n_audio.rs`, `musicflamingo.rs` — P3
 - **Files:** extend `multimodal/audio.rs`, new `multimodal/audio_encoder.rs`, per-model files
 

@@ -77,6 +77,7 @@ pub mod glm4v;
 pub mod glm_ocr;
 pub mod glm_ocr_mtp;
 pub mod glm_quantized;
+pub mod glmasr;
 pub mod gpt2;
 pub mod gpt2_quantized;
 pub mod gpt_bigcode;
@@ -305,6 +306,7 @@ pub use glm4v::Glm4VForConditionalGeneration;
 pub use glm_ocr::GlmOcrForConditionalGeneration;
 pub use glm_ocr_mtp::GlmOcrMtpModel;
 pub use glm_quantized::QuantizedGlmForCausalLM;
+pub use glmasr::GlmAsrForConditionalGeneration;
 pub use gpt2::GPT2LMHeadModel;
 pub use gpt2_quantized::QuantizedGPT2LMHeadModel;
 pub use gpt_bigcode::GPTBigCodeForCausalLM;
@@ -684,6 +686,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "GlmOcrForConditionalGeneration" => {
             Ok(Box::new(GlmOcrForConditionalGeneration::new(cfg, vb)?))
+        }
+        "GlmAsrForConditionalGeneration" => {
+            Ok(Box::new(GlmAsrForConditionalGeneration::new(cfg, vb)?))
         }
         "BertModel"
         | "BertForMaskedLM"
