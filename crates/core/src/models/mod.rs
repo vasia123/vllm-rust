@@ -122,6 +122,7 @@ pub mod kimi_k25;
 pub mod kimi_linear;
 pub mod kimi_vl;
 pub mod lfm2;
+pub mod lfm2_vl;
 pub mod llama;
 pub mod llama4;
 pub mod llama4_vl;
@@ -356,6 +357,7 @@ pub use kimi_k25::KimiK25ForConditionalGeneration;
 pub use kimi_linear::KimiLinearForCausalLM;
 pub use kimi_vl::KimiVLForConditionalGeneration;
 pub use lfm2::{Lfm2ForCausalLM, Lfm2MoeForCausalLM};
+pub use lfm2_vl::Lfm2VLForConditionalGeneration;
 pub use llama::LlamaForCausalLM;
 pub use llama4::Llama4ForCausalLM;
 pub use llama4_vl::Llama4VLForConditionalGeneration;
@@ -808,6 +810,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         )),
         "Lfm2ForCausalLM" => Ok(Box::new(Lfm2ForCausalLM::new(cfg, vb)?)),
         "Lfm2MoeForCausalLM" => Ok(Box::new(Lfm2MoeForCausalLM::new(cfg, vb)?)),
+        "Lfm2VLForConditionalGeneration" => {
+            Ok(Box::new(Lfm2VLForConditionalGeneration::new(cfg, vb)?))
+        }
         "Llama4ForCausalLM" => Ok(Box::new(Llama4ForCausalLM::new(cfg, vb)?)),
         "Llama4VLForConditionalGeneration"
         | "MLlama4ForConditionalGeneration"
@@ -1503,6 +1508,9 @@ pub fn from_config_with_tp(
         "Lfm2MoeForCausalLM" => Ok(Box::new(Lfm2MoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
+        "Lfm2VLForConditionalGeneration" => {
+            Ok(Box::new(Lfm2VLForConditionalGeneration::new(cfg, vb)?))
+        }
         "Llama4ForCausalLM" => Ok(Box::new(Llama4ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -2120,6 +2128,36 @@ mod tests {
         assert!(
             result.is_ok(),
             "LightOnOCRForConditionalGeneration should build via Mistral3: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_lfm2_vl() {
+        use serde_json::json;
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let mut cfg = minimal_config("Lfm2VLForConditionalGeneration");
+        cfg.extra.insert(
+            "vision_config".to_string(),
+            json!({
+                "patch_size": 2, "num_channels": 1, "hidden_size": 8,
+                "num_attention_heads": 2, "intermediate_size": 16,
+                "num_hidden_layers": 1, "layer_norm_eps": 1e-6, "num_patches": 4
+            }),
+        );
+        cfg.extra.insert("downsample_factor".to_string(), json!(2));
+        cfg.extra
+            .insert("projector_hidden_size".to_string(), json!(16));
+        cfg.extra.insert("projector_bias".to_string(), json!(false));
+        cfg.extra
+            .insert("projector_use_layernorm".to_string(), json!(false));
+        cfg.extra
+            .insert("layer_types".to_string(), json!(["full_attention"]));
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "Lfm2VLForConditionalGeneration should build: {:?}",
             result.err()
         );
     }

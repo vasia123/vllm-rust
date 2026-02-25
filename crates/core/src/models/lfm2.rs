@@ -1008,8 +1008,35 @@ impl Lfm2ForCausalLM {
         pg: &dyn ProcessGroup,
         tp_ctx: TpContext,
     ) -> Result<Self> {
+        Self::build_with_tp(cfg, vb.pp("model"), vb, pg, tp_ctx)
+    }
+
+    /// Construct for VLM use where the HF checkpoint stores the LLM body at
+    /// `model.language_model.*` and the LM head at `lm_head.*` (root).
+    ///
+    /// Called by `Lfm2VLForConditionalGeneration` with the whole-model VarBuilder.
+    pub fn new_vlm(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_vlm_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
+    }
+
+    pub fn new_vlm_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
+        Self::build_with_tp(cfg, vb.pp("model").pp("language_model"), vb, pg, tp_ctx)
+    }
+
+    fn build_with_tp(
+        cfg: &ModelConfig,
+        vb_body: VarBuilder, // root for embed_tokens, layers, embedding_norm
+        vb_root: VarBuilder, // root for lm_head (and dtype/device source)
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
         let lfm_cfg = Lfm2Config::from_model_config(cfg);
-        let vb_m = vb.pp("model");
+        let vb_m = vb_body;
         let world_size = pg.world_size();
 
         let embed_tokens =
@@ -1073,7 +1100,7 @@ impl Lfm2ForCausalLM {
                 cfg.vocab_size,
                 false,
                 true,
-                vb.pp("lm_head"),
+                vb_root.pp("lm_head"),
                 pg,
             )?
         };
@@ -1084,8 +1111,8 @@ impl Lfm2ForCausalLM {
             hidden_per_gpu,
             1, // d_state unused for short_conv
             lfm_cfg.conv_l_cache,
-            vb.dtype(),
-            vb.device().clone(),
+            vb_root.dtype(),
+            vb_root.device().clone(),
         );
 
         Ok(Self {
@@ -1094,8 +1121,8 @@ impl Lfm2ForCausalLM {
             norm,
             lm_head,
             tp_ctx,
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
+            device: vb_root.device().clone(),
+            dtype: vb_root.dtype(),
             state_mgr: Mutex::new(state_mgr),
             attn_layer_cache_idx,
             short_conv_state_idx,
@@ -1116,6 +1143,35 @@ impl Lfm2ForCausalLM {
         &self.tp_ctx
     }
 
+    /// Embed `input_ids` through the token embedding table.
+    ///
+    /// Used by VLM wrappers that splice image features before running the transformer.
+    pub fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids, &self.tp_ctx)
+    }
+
+    /// Run the full transformer on pre-built embeddings `[B, S, D]`.
+    ///
+    /// Used by VLM wrappers after merging image features into the text embedding stream.
+    /// Uses `request_id = 0` (single-request VLM prefill only).
+    pub fn forward_with_embeddings(
+        &self,
+        embeddings: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward_embedded(
+            embeddings,
+            seqlen_offset,
+            0,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
     /// Full forward pass with per-request SSM state tracking.
     ///
     /// `request_id` identifies the request for SSM conv state; use 0 for single-sequence calls.
@@ -1128,7 +1184,28 @@ impl Lfm2ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (_b_size, seq_len) = input_ids.dims2()?;
+        let xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        self.forward_embedded(
+            &xs,
+            seqlen_offset,
+            request_id,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    /// Inner forward on pre-embedded `[B, S, D]` with SSM state management.
+    fn forward_embedded(
+        &self,
+        xs: &Tensor,
+        seqlen_offset: usize,
+        request_id: u64,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let seq_len = xs.dim(1)?;
 
         // Manage SSM state lifecycle: reset at start of each new request.
         {
@@ -1156,7 +1233,7 @@ impl Lfm2ForCausalLM {
             )?)
         };
 
-        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        let mut xs = xs.clone();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = match layer {
