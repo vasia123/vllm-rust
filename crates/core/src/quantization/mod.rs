@@ -38,6 +38,7 @@ pub mod fbgemm_fp8;
 pub mod fp8;
 #[cfg(feature = "cuda-kernels")]
 pub mod fp8_cuda;
+pub mod fp_quant;
 pub mod gguf;
 pub mod gptq;
 #[cfg(feature = "cuda-kernels")]
@@ -48,7 +49,6 @@ pub mod marlin;
 pub mod marlin_cuda;
 pub mod modelopt;
 pub mod moe_wna16;
-pub mod fp_quant;
 pub mod mxfp4;
 pub mod mxfp8;
 pub mod ptpc_fp8;
@@ -75,6 +75,7 @@ pub use fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
 pub use fp8::Fp8Config;
 #[cfg(feature = "cuda-kernels")]
 pub use fp8_cuda::{fp8_dequantize, fp8_gemm, fp8_quantize_dynamic_per_token, fp8_quantize_static};
+pub use fp_quant::{FpQuantConfig, FpQuantForwardDtype, FpQuantLinear};
 pub use gguf::{
     dequantize as gguf_dequantize, GgmlType, GgufConfig, GgufFile, GgufLinear, GgufMetadata,
     GgufTensorInfo, GgufValue, GgufWeightLoader,
@@ -82,7 +83,6 @@ pub use gguf::{
 pub use gptq::GptqConfig;
 #[cfg(feature = "cuda-kernels")]
 pub use gptq_cuda::{gptq_dequantize, gptq_gemm};
-pub use fp_quant::{FpQuantConfig, FpQuantForwardDtype, FpQuantLinear};
 pub use inc::IncConfig;
 pub use marlin::{
     check_marlin_supported, check_marlin_supports_shape, marlin_make_workspace,
@@ -189,9 +189,7 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             &detected.raw_config,
         )),
         QuantizationMethod::Torchao => Box::new(TorchaoConfig::from_detected(&detected.raw_config)),
-        QuantizationMethod::FpQuant => {
-            Box::new(FpQuantConfig::from_detected(&detected.raw_config))
-        }
+        QuantizationMethod::FpQuant => Box::new(FpQuantConfig::from_detected(&detected.raw_config)),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }

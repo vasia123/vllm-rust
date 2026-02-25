@@ -1232,11 +1232,7 @@ mod tests {
 
     // ── XDRotaryEmbedding Tests ──────────────────────────────────────────────
 
-    fn make_xdrope(
-        head_dim: usize,
-        max_seq: usize,
-        sections: Vec<usize>,
-    ) -> XDRotaryEmbedding {
+    fn make_xdrope(head_dim: usize, max_seq: usize, sections: Vec<usize>) -> XDRotaryEmbedding {
         let rotary_dim = sections.iter().sum::<usize>() * 2;
         XDRotaryEmbedding::new(
             head_dim,
@@ -1271,7 +1267,10 @@ mod tests {
             DType::F32,
             &Device::Cpu,
         );
-        assert!(result.is_err(), "Should fail when section sum ≠ rotary_dim/2");
+        assert!(
+            result.is_err(),
+            "Should fail when section sum ≠ rotary_dim/2"
+        );
     }
 
     #[test]
@@ -1287,9 +1286,13 @@ mod tests {
 
         let q =
             Tensor::randn(0.0f32, 1.0, (num_tokens, num_heads, head_dim), &Device::Cpu).unwrap();
-        let k =
-            Tensor::randn(0.0f32, 1.0, (num_tokens, num_kv_heads, head_dim), &Device::Cpu)
-                .unwrap();
+        let k = Tensor::randn(
+            0.0f32,
+            1.0,
+            (num_tokens, num_kv_heads, head_dim),
+            &Device::Cpu,
+        )
+        .unwrap();
 
         // positions: [2, num_tokens] — section 0 uses 0..7, section 1 uses 4..11
         let pos_data: Vec<u32> = (0..num_tokens as u32)
@@ -1392,9 +1395,7 @@ mod tests {
         let (q_std, _) = std_rope.apply_varlen(&q, &k, &positions).unwrap();
 
         // XDRoPE with uniform positions (all sections use same 1D positions)
-        let pos_data: Vec<u32> = (0..num_tokens as u32)
-            .chain(0..num_tokens as u32)
-            .collect();
+        let pos_data: Vec<u32> = (0..num_tokens as u32).chain(0..num_tokens as u32).collect();
         let pos_tensor = Tensor::from_vec(pos_data, (2, num_tokens), &Device::Cpu).unwrap();
         let (q_xd, _) = xd.apply_varlen_xd(&q, &k, &pos_tensor).unwrap();
 

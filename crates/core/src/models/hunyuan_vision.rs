@@ -24,6 +24,7 @@ use crate::config::ModelConfig;
 use crate::distributed::ProcessGroup;
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::layers::{rms_norm, RmsNorm};
+use crate::multimodal::MultimodalInputs;
 
 use super::hunyuan::{HunYuanDenseV1ForCausalLM, HunYuanMoEV1ForCausalLM};
 use super::tp_layers::TpContext;
@@ -118,8 +119,7 @@ fn bilinear_interp_pos_emb_2d(
                 let v01 = pe_data[sy0 * src_w + sx1][k];
                 let v10 = pe_data[sy1 * src_w + sx0][k];
                 let v11 = pe_data[sy1 * src_w + sx1][k];
-                out[dst + k] =
-                    wy0 * (wx0 * v00 + wx1 * v01) + wy1 * (wx0 * v10 + wx1 * v11);
+                out[dst + k] = wy0 * (wx0 * v00 + wx1 * v01) + wy1 * (wx0 * v10 + wx1 * v11);
             }
         }
     }
@@ -154,7 +154,8 @@ impl HunYuanVisionPatchEmbed {
             },
             vb.pp("patch_embedding"),
         )?;
-        let position_embedding = embedding(num_positions, vcfg.hidden_size, vb.pp("position_embedding"))?;
+        let position_embedding =
+            embedding(num_positions, vcfg.hidden_size, vb.pp("position_embedding"))?;
 
         Ok(Self {
             patch_embedding,
@@ -169,11 +170,7 @@ impl HunYuanVisionPatchEmbed {
     /// * `grid_thw`     – list of `(T, H, W)` grids, one per image; H and W are in patches
     ///
     /// Returns `[1, num_patches_total, hidden_size]`.
-    fn forward(
-        &self,
-        pixel_values: &Tensor,
-        grid_thw: &[[usize; 3]],
-    ) -> Result<Tensor> {
+    fn forward(&self, pixel_values: &Tensor, grid_thw: &[[usize; 3]]) -> Result<Tensor> {
         let num_patches = pixel_values.dim(0)?;
         let patch_size = self.patch_embedding.weight().dim(2)?;
         let num_channels = self.patch_embedding.weight().dim(1)?;
@@ -189,18 +186,16 @@ impl HunYuanVisionPatchEmbed {
 
         // Build per-image position embeddings via bilinear interpolation and sum.
         // position_embedding.weight[1:, :] gives the grid (skip CLS at index 0).
-        let pe_grid = self.position_embedding.embeddings()
-            .narrow(0, 1, self.position_edge * self.position_edge)?; // [edge^2, H]
+        let pe_grid = self.position_embedding.embeddings().narrow(
+            0,
+            1,
+            self.position_edge * self.position_edge,
+        )?; // [edge^2, H]
 
         let mut pos_embed_parts: Vec<Tensor> = Vec::with_capacity(grid_thw.len());
         for &[_, h, w] in grid_thw {
-            let pe = bilinear_interp_pos_emb_2d(
-                &pe_grid,
-                self.position_edge,
-                self.position_edge,
-                h,
-                w,
-            )?; // [h*w, H]
+            let pe =
+                bilinear_interp_pos_emb_2d(&pe_grid, self.position_edge, self.position_edge, h, w)?; // [h*w, H]
             pos_embed_parts.push(pe.unsqueeze(0)?); // [1, h*w, H]
         }
         let pos_embed = Tensor::cat(&pos_embed_parts, 1)?; // [1, total_patches, H]
@@ -243,7 +238,11 @@ impl HunYuanVisionAttention {
         let (b, t, _) = x.dims3()?;
         let qkv = self.qkv.forward(x)?; // [b, t, 3*D]
         let q = qkv.narrow(2, 0, self.num_heads * self.head_dim)?;
-        let k = qkv.narrow(2, self.num_heads * self.head_dim, self.num_heads * self.head_dim)?;
+        let k = qkv.narrow(
+            2,
+            self.num_heads * self.head_dim,
+            self.num_heads * self.head_dim,
+        )?;
         let v = qkv.narrow(
             2,
             2 * self.num_heads * self.head_dim,
@@ -251,16 +250,24 @@ impl HunYuanVisionAttention {
         )?;
 
         // Reshape to [b, heads, t, head_dim]
-        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q
+            .reshape((b, t, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, t, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, t, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
 
         // Scaled dot-product attention (no mask — encoder style).
         let scores = q.matmul(&k.transpose(2, 3)?)?.affine(self.scale, 0.0)?;
         let weights = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = weights.matmul(&v)?; // [b, heads, t, head_dim]
 
-        let out = out.transpose(1, 2)?.reshape((b, t, self.num_heads * self.head_dim))?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, t, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
 }
@@ -275,8 +282,16 @@ struct HunYuanVisionMlp {
 impl HunYuanVisionMlp {
     fn new(vcfg: &HunYuanVisionConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            dense_h_to_4h: linear(vcfg.hidden_size, vcfg.intermediate_size, vb.pp("dense_h_to_4h"))?,
-            dense_4h_to_h: linear(vcfg.intermediate_size, vcfg.hidden_size, vb.pp("dense_4h_to_h"))?,
+            dense_h_to_4h: linear(
+                vcfg.hidden_size,
+                vcfg.intermediate_size,
+                vb.pp("dense_h_to_4h"),
+            )?,
+            dense_4h_to_h: linear(
+                vcfg.intermediate_size,
+                vcfg.hidden_size,
+                vb.pp("dense_4h_to_h"),
+            )?,
         })
     }
 
@@ -331,10 +346,10 @@ struct HunYuanVisionPatchMerger {
     before_rms: RmsNorm,
     proj_conv1: candle_nn::Conv2d, // hidden → hidden*2, kernel=s, stride=s
     proj_conv2: candle_nn::Conv2d, // hidden*2 → hidden*4, kernel=1, stride=1
-    mlp: Linear,                  // hidden*4 → out_hidden
-    image_newline: Tensor,        // [hidden*4]
-    image_begin: Tensor,          // [out_hidden]
-    image_end: Tensor,            // [out_hidden]
+    mlp: Linear,                   // hidden*4 → out_hidden
+    image_newline: Tensor,         // [hidden*4]
+    image_begin: Tensor,           // [out_hidden]
+    image_end: Tensor,             // [out_hidden]
     after_rms: RmsNorm,
 }
 
@@ -467,17 +482,12 @@ impl HunYuanVisionTransformer {
     /// * `grid_thw`     – `(T, H, W)` patch counts per image
     ///
     /// Returns one tensor per image: `[tokens_per_image, out_hidden_size]`.
-    pub fn forward(
-        &self,
-        pixel_values: &Tensor,
-        grid_thw: &[[usize; 3]],
-    ) -> Result<Vec<Tensor>> {
+    pub fn forward(&self, pixel_values: &Tensor, grid_thw: &[[usize; 3]]) -> Result<Vec<Tensor>> {
         // Patch + position embeddings → [1, total_patches, hidden]
         let mut hidden = self.embeddings.forward(pixel_values, grid_thw)?;
 
         // Per-image layer application (no cross-image attention).
-        let split_lengths: Vec<usize> =
-            grid_thw.iter().map(|&[_, h, w]| h * w).collect();
+        let split_lengths: Vec<usize> = grid_thw.iter().map(|&[_, h, w]| h * w).collect();
         for layer in &self.layers {
             let parts: Result<Vec<_>> = split_lengths
                 .iter()
@@ -527,18 +537,39 @@ pub enum HunYuanVLForConditionalGeneration {
 }
 
 impl HunYuanVLForConditionalGeneration {
+    /// Dispatch to Dense or MoE variant based on `num_experts` in config.
+    pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let is_moe = cfg
+            .extra
+            .get("num_experts")
+            .and_then(|v| v.as_u64())
+            .map(|n| n > 1)
+            .unwrap_or(false);
+        if is_moe {
+            Self::new_moe(cfg, vb)
+        } else {
+            Self::new_dense(cfg, vb)
+        }
+    }
+
     pub fn new_dense(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let vcfg = HunYuanVisionConfig::from_model_config(cfg);
         let visual = HunYuanVisionTransformer::new(&vcfg, vb.pp("visual"))?;
         let language_model = HunYuanDenseV1ForCausalLM::new(cfg, vb.pp("language_model"))?;
-        Ok(Self::Dense { visual, language_model })
+        Ok(Self::Dense {
+            visual,
+            language_model,
+        })
     }
 
     pub fn new_moe(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let vcfg = HunYuanVisionConfig::from_model_config(cfg);
         let visual = HunYuanVisionTransformer::new(&vcfg, vb.pp("visual"))?;
         let language_model = HunYuanMoEV1ForCausalLM::new(cfg, vb.pp("language_model"))?;
-        Ok(Self::Moe { visual, language_model })
+        Ok(Self::Moe {
+            visual,
+            language_model,
+        })
     }
 
     pub fn new_dense_with_tp(
@@ -551,7 +582,10 @@ impl HunYuanVLForConditionalGeneration {
         let visual = HunYuanVisionTransformer::new(&vcfg, vb.pp("visual"))?;
         let language_model =
             HunYuanDenseV1ForCausalLM::new_with_tp(cfg, vb.pp("language_model"), pg, tp_ctx)?;
-        Ok(Self::Dense { visual, language_model })
+        Ok(Self::Dense {
+            visual,
+            language_model,
+        })
     }
 
     /// Encode image patches to features (one tensor per image).
@@ -599,6 +633,7 @@ impl HunYuanVLForConditionalGeneration {
     /// `image_embeds` is a flat `[total_image_tokens, hidden_size]` tensor.
     /// `image_positions` contains the token indices in `input_ids` where image
     /// features should replace text embeddings.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_multimodal(
         &self,
         input_ids: &Tensor,
@@ -660,6 +695,82 @@ impl HunYuanVLForConditionalGeneration {
     }
 }
 
+impl crate::engine::ModelForward for HunYuanVLForConditionalGeneration {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        // Text-only decode path.
+        HunYuanVLForConditionalGeneration::forward(
+            self,
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        true
+    }
+
+    fn forward_multimodal(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        let (image_embeds, image_positions) =
+            if let Some(mm) = multimodal_inputs.filter(|m| m.has_images()) {
+                let mut all_embeds = Vec::new();
+                let mut positions = Vec::new();
+                for (pos, processed) in &mm.image_embeddings {
+                    let emb = &processed.embedding;
+                    let n = emb.dim(0)?;
+                    all_embeds.push(emb.clone());
+                    for i in 0..n {
+                        positions.push(pos + i);
+                    }
+                }
+                let flat = Tensor::cat(&all_embeds, 0)?;
+                (flat, positions)
+            } else {
+                // No images — just run text-only forward.
+                return HunYuanVLForConditionalGeneration::forward(
+                    self,
+                    input_ids,
+                    seqlen_offset,
+                    kv_cache_mgr,
+                    block_table,
+                    slot_mapping,
+                );
+            };
+
+        HunYuanVLForConditionalGeneration::forward_multimodal(
+            self,
+            input_ids,
+            &image_embeds,
+            &image_positions,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn device(&self) -> &Device {
+        HunYuanVLForConditionalGeneration::device(self)
+    }
+}
+
 /// Splice `image_embeds` into `text_embeddings` at the given token positions.
 ///
 /// * `text_embeddings`  – `[1, seq_len, hidden]`
@@ -675,8 +786,7 @@ fn splice_image_embeds(
 
     // Build a 2D embedding tensor from the 3D text_embeddings.
     let mut rows: Vec<Tensor> = Vec::with_capacity(seq_len);
-    let pos_set: std::collections::HashSet<usize> =
-        image_positions.iter().copied().collect();
+    let pos_set: std::collections::HashSet<usize> = image_positions.iter().copied().collect();
 
     let mut img_idx = 0usize;
     for i in 0..seq_len {
@@ -861,9 +971,12 @@ mod tests {
         let mut cfg = vl_model_config();
         cfg.architectures = vec!["HunYuanMoEV1ForCausalLM".to_string()];
         // Set MoE config via extra
-        cfg.extra.insert("num_experts".to_string(), serde_json::json!(4));
-        cfg.extra.insert("moe_topk".to_string(), serde_json::json!(2));
-        cfg.extra.insert("moe_intermediate_size".to_string(), serde_json::json!(32));
+        cfg.extra
+            .insert("num_experts".to_string(), serde_json::json!(4));
+        cfg.extra
+            .insert("moe_topk".to_string(), serde_json::json!(2));
+        cfg.extra
+            .insert("moe_intermediate_size".to_string(), serde_json::json!(32));
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(candle_core::DType::F32, &device);
         let model = HunYuanVLForConditionalGeneration::new_moe(&cfg, vb);

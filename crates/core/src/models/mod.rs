@@ -331,6 +331,7 @@ pub use grok1::Grok1ForCausalLM;
 pub use gte::{GteNewForEmbedding, GteNewForSequenceClassification};
 pub use hunyuan::{HunYuanDenseV1ForCausalLM, HunYuanMoEV1ForCausalLM};
 pub use hunyuan_quantized::QuantizedHunYuanDenseForCausalLM;
+pub use hunyuan_vision::HunYuanVLForConditionalGeneration;
 pub use hyperclovax_vision::HCXVisionForCausalLM;
 pub use idefics3::{Idefics3ForConditionalGeneration, SmolVLMForConditionalGeneration};
 pub use internlm2::InternLM2ForCausalLM;
@@ -674,7 +675,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             DeepSeekVLV2ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "DeepseekOCR2ForCausalLM" => Ok(Box::new(DeepseekOCR2ForCausalLM::new(cfg, vb)?)),
-        "InternS1ForConditionalGeneration" => Ok(Box::new(
+        "InternS1ForConditionalGeneration" | "InternVLForConditionalGeneration" => Ok(Box::new(
             InternS1ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "InternS1ProForConditionalGeneration" => Ok(Box::new(
@@ -682,6 +683,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         )),
         "InternVLChatModel" | "H2OVLChatModel" | "SkyworkR1VChatModel" => {
             Ok(Box::new(InternVLChatModel::from_model_config(cfg, vb)?))
+        }
+        "HunYuanVLForConditionalGeneration" => {
+            Ok(Box::new(HunYuanVLForConditionalGeneration::new(cfg, vb)?))
         }
         "NVLM_D_Model" | "NVLM_D" => Ok(Box::new(NVLMDModel::new(cfg, vb)?)),
         "MolmoForCausalLM" => Ok(Box::new(MolmoForCausalLM::from_model_config(cfg, vb)?)),
@@ -822,7 +826,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen3NextForCausalLM" => Ok(Box::new(Qwen3NextForCausalLM::new(cfg, vb)?)),
         "Step1ForCausalLM" => Ok(Box::new(Step1ForCausalLM::new(cfg, vb)?)),
         "Step3TextForCausalLM" => Ok(Box::new(Step3TextForCausalLM::new(cfg, vb)?)),
-        "Step3VLForConditionalGeneration" => {
+        "Step3VLForConditionalGeneration" | "StepVLForConditionalGeneration" => {
             Ok(Box::new(Step3VLForConditionalGeneration::new(cfg, vb)?))
         }
         "BailingMoeForCausalLM" | "BailingMoeV2ForCausalLM" => {
@@ -2008,6 +2012,73 @@ mod tests {
         assert!(
             matches!(err, ModelError::UnsupportedArchitecture(_)),
             "expected UnsupportedArchitecture, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_config_hunyuan_vl() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let mut cfg = minimal_config("HunYuanVLForConditionalGeneration");
+        cfg.extra.insert(
+            "vision_config".to_string(),
+            serde_json::json!({
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_channels": 3,
+                "patch_size": 4,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 32,
+                "max_image_size": 8,
+                "rms_norm_eps": 1e-5
+            }),
+        );
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "from_config should handle HunYuanVLForConditionalGeneration: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_intern_vl_alias() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let mut cfg = minimal_config("InternVLForConditionalGeneration");
+        cfg.extra.insert(
+            "vision_config".to_string(),
+            serde_json::json!({
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 1,
+                "image_size": 32,
+                "patch_size": 8,
+                "layer_norm_eps": 1e-6,
+                "qkv_bias": true
+            }),
+        );
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "InternVLForConditionalGeneration should alias to InternS1: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_step_vl_alias() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let cfg = minimal_config("StepVLForConditionalGeneration");
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "StepVLForConditionalGeneration should alias to Step3VL: {:?}",
+            result.err()
         );
     }
 }

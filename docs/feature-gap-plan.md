@@ -290,7 +290,8 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 - ✅ `cpu_wna16.rs` DONE — `CpuWna16Config` wraps `AwqConfig` (Marlin disabled); detection keys `"cpu_awq"`/`"cpu_wna16"`; min_capability=0; 5 tests
 - ✅ `inc.rs` DONE — `IncConfig` routes to `GptqConfig`/`AwqConfig` based on `packing_format`; detection keys `"inc"`/`"auto-round"`; 7 tests
 - ✅ `torchao.rs` DONE — `TorchaoConfig` wraps `NoQuantizationConfig` (standard BF16 matmul); detection already wired; 5 tests
-- AWQ-Triton, Petit (NvFP4), QUARK (6 files), FP-Quant
+- ✅ `fp_quant.rs` DONE — `FpQuantConfig`, `FpQuantLinear` (FP4 E2M1 + per-group E8M0/FP8 scales + global scale); MxFp4/NvFp4 variants; CPU dequant→F32 matmul; detection key `"fp_quant"`; 7 tests — commit `89b94e8`
+- AWQ-Triton (kernel-only, no separate config), Petit (AMD-only external kernel — skip), QUARK (6 files, complex)
 - All in `crates/core/src/quantization/`
 
 ### 3.2 Server API — Speech & Realtime

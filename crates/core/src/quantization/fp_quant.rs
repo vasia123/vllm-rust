@@ -114,9 +114,9 @@ impl QuantizationConfig for FpQuantConfig {
     }
 
     fn is_layer_skipped(&self, layer_name: &str) -> bool {
-        self.modules_to_not_convert.iter().any(|pattern| {
-            layer_name.contains(pattern.trim_end_matches('*').trim_end_matches('.'))
-        })
+        self.modules_to_not_convert
+            .iter()
+            .any(|pattern| layer_name.contains(pattern.trim_end_matches('*').trim_end_matches('.')))
     }
 
     fn create_linear(
@@ -305,9 +305,7 @@ impl QuantizedLinear for FpQuantLinear {
 
         // BF16 matmul is not available on CPU; use F32 for portability.
         let (x_f32, weight_f32) = (x.to_dtype(DType::F32)?, weight_bf16.to_dtype(DType::F32)?);
-        let y = x_f32
-            .matmul(&weight_f32.t()?)?
-            .to_dtype(x.dtype())?;
+        let y = x_f32.matmul(&weight_f32.t()?)?.to_dtype(x.dtype())?;
         match &self.bias {
             Some(b) => y.broadcast_add(b),
             None => Ok(y),
@@ -321,7 +319,10 @@ impl QuantizedLinear for FpQuantLinear {
             self.weight = w.clone();
         }
 
-        if let Some(s) = weights.get("scales").or_else(|| weights.get("weight_scale")) {
+        if let Some(s) = weights
+            .get("scales")
+            .or_else(|| weights.get("weight_scale"))
+        {
             self.weight_scale = Some(s.clone());
         }
 
@@ -392,10 +393,7 @@ mod tests {
     #[test]
     fn test_fp_quant_nvfp4_config() {
         let mut raw = HashMap::new();
-        raw.insert(
-            "forward_dtype".to_string(),
-            serde_json::json!("nvfp4"),
-        );
+        raw.insert("forward_dtype".to_string(), serde_json::json!("nvfp4"));
         raw.insert("hadamard_group_size".to_string(), serde_json::json!(16));
         let cfg = FpQuantConfig::from_detected(&raw);
         assert_eq!(cfg.forward_dtype, FpQuantForwardDtype::NvFp4);
@@ -429,8 +427,7 @@ mod tests {
         // qweight: [4, 16] uint8 (all zeros → nibbles = 0 → FP4_LUT[0] = 0.0)
         let qweight = Tensor::zeros((n, k / 2), DType::U8, &device).unwrap();
         // E8M0 scale 127 → 2^0 = 1.0; [4, 1] (one group per row since K/32=1)
-        let scales =
-            Tensor::from_vec(vec![127u8; n * (k / 32)], (n, k / 32), &device).unwrap();
+        let scales = Tensor::from_vec(vec![127u8; n * (k / 32)], (n, k / 32), &device).unwrap();
         // global scale = 1.0 (F32)
         let global = Tensor::from_vec(vec![1.0f32], 1, &device).unwrap();
 
@@ -461,8 +458,7 @@ mod tests {
         // qweight: [4, 16] uint8 all zeros
         let qweight = Tensor::zeros((n, k / 2), DType::U8, &device).unwrap();
         // FP8 E4M3 scale 0x38 = 1.0; [4, 2] (k/16=2 groups per row)
-        let scales =
-            Tensor::from_vec(vec![0x38u8; n * (k / 16)], (n, k / 16), &device).unwrap();
+        let scales = Tensor::from_vec(vec![0x38u8; n * (k / 16)], (n, k / 16), &device).unwrap();
         let global = Tensor::from_vec(vec![1.0f32], 1, &device).unwrap();
 
         let mut weights = HashMap::new();
