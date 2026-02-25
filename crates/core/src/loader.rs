@@ -154,6 +154,14 @@ pub fn quantization_info(files: &ModelFiles) -> String {
                 bits, group_size
             )
         }
+        QuantizationMethod::Inc => {
+            let bits = files.quantization.bits.unwrap_or(4);
+            let group_size = files.quantization.group_size.unwrap_or(128);
+            format!(
+                "INC / auto-round (bits: {}, group_size: {})",
+                bits, group_size
+            )
+        }
     }
 }
 

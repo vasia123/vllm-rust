@@ -42,6 +42,7 @@ pub mod gguf;
 pub mod gptq;
 #[cfg(feature = "cuda-kernels")]
 pub mod gptq_cuda;
+pub mod inc;
 pub mod marlin;
 #[cfg(feature = "marlin")]
 pub mod marlin_cuda;
@@ -79,6 +80,7 @@ pub use gguf::{
 pub use gptq::GptqConfig;
 #[cfg(feature = "cuda-kernels")]
 pub use gptq_cuda::{gptq_dequantize, gptq_gemm};
+pub use inc::IncConfig;
 pub use marlin::{
     check_marlin_supported, check_marlin_supports_shape, marlin_make_workspace,
     marlin_permute_scales, repack_gptq_to_marlin, MarlinConfig, MarlinLinear, MarlinScalarType,
@@ -176,6 +178,12 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             detected.group_size,
             &detected.raw_config,
         )),
+        QuantizationMethod::Inc => Box::new(IncConfig::from_detected(
+            detected.bits,
+            detected.group_size,
+            detected.desc_act,
+            &detected.raw_config,
+        )),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -223,6 +231,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::Mxfp4 => 80,     // Ampere minimum (hardware FP4 kernels)
         QuantizationMethod::ModelOptFull => 80, // FP8 needs Ampere+; NVFP4 needs Hopper (89) but emulation works on 80
         QuantizationMethod::CpuWna16 => 0,      // CPU-only, no GPU required
+        QuantizationMethod::Inc => 70,          // Volta minimum (delegates to GPTQ/AWQ)
     };
     capability >= min_cap
 }

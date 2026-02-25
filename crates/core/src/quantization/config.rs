@@ -52,6 +52,8 @@ pub enum QuantizationMethod {
     ModelOptFull,
     /// CPU AWQ: weight-only INT4 quantization for CPU inference (cpu_awq)
     CpuWna16,
+    /// INC (Intel Neural Compressor): routes to GPTQ or AWQ based on packing_format
+    Inc,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -76,6 +78,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::Mxfp4 => write!(f, "mxfp4"),
             Self::ModelOptFull => write!(f, "modelopt_full"),
             Self::CpuWna16 => write!(f, "cpu_awq"),
+            Self::Inc => write!(f, "inc"),
         }
     }
 }
