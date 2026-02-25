@@ -307,6 +307,75 @@ impl Mistral3ForConditionalGeneration {
         })
     }
 
+    /// Load a LightOnOCR checkpoint using its HF weight paths.
+    ///
+    /// LightOnOCR is structurally identical to Mistral3 but the HF checkpoint
+    /// stores weights at different paths:
+    ///   `model.vision_encoder.*`  → vision tower
+    ///   `model.vision_projection.*` → multi-modal projector
+    ///   `model.language_model.*` → LLM body (embed_tokens / layers / norm)
+    ///   `lm_head.*`              → LM head
+    pub fn new_lighton(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let config = Mistral3Config::from_model_config(cfg);
+        let pg = &LocalProcessGroup::new();
+
+        let vision_tower = PixtralVisionTransformer::new(
+            &config.vision_config,
+            vb.pp("model").pp("vision_encoder"),
+        )?;
+
+        let multi_modal_projector = Mistral3MultiModalProjector::new(
+            config.vision_config.hidden_size,
+            cfg.hidden_size,
+            config.spatial_merge_size,
+            config.multimodal_projector_bias,
+            vb.pp("model").pp("vision_projection"),
+        )?;
+
+        let vb_m = vb.pp("model").pp("language_model");
+
+        let embed_tokens =
+            TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let vb_l = vb_m.pp("layers");
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(MistralDecoderLayer::new_with_tp(cfg, vb_l.pp(i), pg)?);
+        }
+
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+
+        let lm_head = if cfg.tie_word_embeddings {
+            let emb_weights = embed_tokens
+                .embeddings()
+                .expect("single GPU should have accessible embeddings")
+                .clone();
+            TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
+        } else {
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true,
+                vb.pp("lm_head"),
+                pg,
+            )?
+        };
+
+        Ok(Self {
+            vision_tower,
+            multi_modal_projector,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            tp_ctx: TpContext::single_gpu(),
+            config,
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
+        })
+    }
+
     /// Encode images through vision tower and projector.
     #[allow(dead_code)]
     fn encode_images(&self, images: &[Tensor]) -> Result<Vec<Tensor>> {
@@ -564,6 +633,21 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
         let model = Mistral3ForConditionalGeneration::new(&cfg, vb);
         assert!(model.is_ok(), "construction failed: {:?}", model.err());
+        assert!(model.unwrap().supports_multimodal());
+    }
+
+    #[test]
+    fn test_lighton_construction() {
+        let device = Device::Cpu;
+        let cfg = test_model_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        // LightOnOCR uses model.vision_encoder / model.vision_projection / lm_head paths.
+        let model = Mistral3ForConditionalGeneration::new_lighton(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "LightOnOCR construction failed: {:?}",
+            model.err()
+        );
         assert!(model.unwrap().supports_multimodal());
     }
 

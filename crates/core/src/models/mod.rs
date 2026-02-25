@@ -32,6 +32,7 @@ pub mod deepseek_ocr2;
 pub mod deepseek_quantized;
 pub mod deepseek_vl2;
 pub mod dots1;
+pub mod dots_ocr;
 pub mod e5_mistral;
 pub mod eagle2_5_vl;
 pub mod eagle3;
@@ -265,6 +266,7 @@ pub use deepseek_ocr2::DeepseekOCR2ForCausalLM;
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use deepseek_vl2::DeepSeekVLV2ForConditionalGeneration;
 pub use dots1::Dots1ForCausalLM;
+pub use dots_ocr::DotsOCRForCausalLM;
 pub use e5_mistral::E5MistralForEmbedding;
 pub use eagle2_5_vl::Eagle25VLForConditionalGeneration;
 pub use eagle3::{Eagle3DraftModel, Eagle3LlamaForCausalLM};
@@ -637,6 +639,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Mistral3ForConditionalGeneration" => {
             Ok(Box::new(Mistral3ForConditionalGeneration::new(cfg, vb)?))
         }
+        "LightOnOCRForConditionalGeneration" => Ok(Box::new(
+            Mistral3ForConditionalGeneration::new_lighton(cfg, vb)?,
+        )),
         "Idefics3ForConditionalGeneration" => {
             Ok(Box::new(Idefics3ForConditionalGeneration::new(cfg, vb)?))
         }
@@ -763,6 +768,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(ChatGLMForCausalLM::new(cfg, vb)?))
         }
         "Dots1ForCausalLM" => Ok(Box::new(Dots1ForCausalLM::new(cfg, vb)?)),
+        "DotsOCRForCausalLM" => Ok(Box::new(DotsOCRForCausalLM::new(cfg, vb)?)),
         "Exaone4ForCausalLM" => Ok(Box::new(Exaone4ForCausalLM::new(cfg, vb)?)),
         "ExaoneMoeForCausalLM" | "ExaoneMoEForCausalLM" => {
             Ok(Box::new(ExaoneMoeForCausalLM::new(cfg, vb)?))
@@ -2078,6 +2084,42 @@ mod tests {
         assert!(
             result.is_ok(),
             "StepVLForConditionalGeneration should alias to Step3VL: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_dots_ocr() {
+        use serde_json::json;
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let mut cfg = minimal_config("DotsOCRForCausalLM");
+        cfg.extra.insert(
+            "vision_config".into(),
+            json!({
+                "embed_dim": 8, "hidden_size": 16, "intermediate_size": 16,
+                "num_hidden_layers": 1, "num_attention_heads": 2, "num_channels": 3,
+                "patch_size": 4, "spatial_merge_size": 1, "temporal_patch_size": 1,
+                "rms_norm_eps": 1e-5, "use_bias": false, "post_norm": false
+            }),
+        );
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "DotsOCRForCausalLM should build: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_lighton_ocr() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let cfg = minimal_config("LightOnOCRForConditionalGeneration");
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "LightOnOCRForConditionalGeneration should build via Mistral3: {:?}",
             result.err()
         );
     }
