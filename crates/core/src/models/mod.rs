@@ -180,6 +180,7 @@ pub mod phi3_lora;
 pub mod phi3_quantized;
 pub mod phi3v;
 pub mod phi4mm;
+pub mod phi4mm_audio;
 pub mod phi_quantized;
 pub mod phimoe;
 pub mod pixtral;

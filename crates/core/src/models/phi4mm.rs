@@ -6,7 +6,9 @@
 //! - Projector: 2-layer MLP with AvgPool2d compression
 //! - Language model: LLaMA-compatible decoder layers
 //!
-//! NOTE: Audio support is deferred; only vision is implemented.
+//! Audio support: `AudioEmbedding` (`embed_tokens_extend`) is defined in
+//! `phi4mm_audio.rs` and wired in here. The conformer encoder runs in Python
+//! preprocessing; at inference time we scatter pre-encoded audio embeddings.
 //!
 //! Reference: reference/vllm/vllm/model_executor/models/phi4mm.py
 
@@ -22,6 +24,7 @@ use crate::layers::causal_mask;
 use crate::multimodal::{MultimodalInputs, VisionEncoder, VisionEncoderConfig, VisionEncoderType};
 
 use super::llama::{LlamaDecoderLayer, TpContext};
+use super::phi4mm_audio::Phi4MMAudioEmbedding;
 use super::tp_layers::{TpEmbedding, TpLinear};
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -168,11 +171,14 @@ impl Phi4MMProjector {
 /// Phi-4 Multimodal model for conditional generation.
 ///
 /// SigLIP vision encoder + HD transform + MLP projector + LLaMA backbone.
-/// Audio support is not yet implemented.
+/// Audio: `Phi4MMAudioEmbedding` (conformer stub + projection layers) at
+/// `embed_tokens_extend.*`; pre-encoded audio embeddings scattered at
+/// `_AUDIO_PLACEHOLDER_TOKEN_ID = 200011` positions.
 pub struct Phi4MMForCausalLM {
     #[allow(dead_code)]
     vision_encoder: VisionEncoder,
     projector: Phi4MMProjector,
+    audio_embed: Option<Phi4MMAudioEmbedding>,
     /// Global separator token inserted between sub-images and the global crop.
     /// Shape: [1, image_dim_out].
     glb_gn: Tensor,
@@ -230,6 +236,10 @@ impl Phi4MMForCausalLM {
             .get((1, 1, 1, image_dim_out), "sub_GN")?
             .reshape((1, image_dim_out))?;
 
+        // Audio embedding (conformer stub + projection; optional — only present
+        // if audio_processor config is in the model config).
+        let audio_embed = Phi4MMAudioEmbedding::new(cfg, vb.pp("embed_tokens_extend"))?;
+
         // LLM backbone (Llama-like)
         let vb_m = vb.pp("model");
 
@@ -273,6 +283,7 @@ impl Phi4MMForCausalLM {
         Ok(Self {
             vision_encoder,
             projector,
+            audio_embed,
             glb_gn,
             sub_gn,
             embed_tokens,
@@ -410,13 +421,48 @@ impl Phi4MMForCausalLM {
             )?)
         };
 
-        let text_embeddings = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        // Audio placeholder token IDs (e.g., 200011) are out of vocabulary range.
+        // Replace them with 0 before embedding; the scatter step overrides those
+        // positions with pre-encoded audio embeddings anyway.
+        let safe_input_ids = if let Some(mm) = multimodal_inputs {
+            if mm.has_audio() {
+                if let Some(audio) = &self.audio_embed {
+                    let tok = audio.audio_token_id;
+                    let ids = input_ids.to_vec2::<u32>()?;
+                    let masked: Vec<Vec<u32>> = ids
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .map(|t| if t == tok { 0 } else { t })
+                                .collect()
+                        })
+                        .collect();
+                    Tensor::new(masked, input_ids.device())?
+                } else {
+                    input_ids.clone()
+                }
+            } else {
+                input_ids.clone()
+            }
+        } else {
+            input_ids.clone()
+        };
+        let text_embeddings = self.embed_tokens.forward(&safe_input_ids, &self.tp_ctx)?;
 
         let mut xs = if let Some(mm_inputs) = multimodal_inputs {
-            if mm_inputs.has_images() {
+            let xs = if mm_inputs.has_images() {
                 self.merge_multimodal_embeddings(&text_embeddings, mm_inputs)?
             } else {
                 text_embeddings
+            };
+            if mm_inputs.has_audio() {
+                if let Some(audio) = &self.audio_embed {
+                    scatter_audio_into_text(&xs, mm_inputs, audio.audio_token_id)?
+                } else {
+                    xs
+                }
+            } else {
+                xs
             }
         } else {
             text_embeddings
@@ -438,6 +484,55 @@ impl Phi4MMForCausalLM {
         let xs = self.norm.forward(&xs)?;
         self.lm_head.forward(&xs, &self.tp_ctx)
     }
+}
+
+// ─── Audio scatter ────────────────────────────────────────────────────────────
+
+/// Scatter pre-encoded audio embeddings into text embedding positions.
+///
+/// Works identically to the audio scatter in other audio-language models:
+/// iterates token_ids and replaces `audio_token_id` positions with
+/// successive rows from the sorted audio clip embeddings.
+fn scatter_audio_into_text(
+    text_embeds: &Tensor,
+    mm: &MultimodalInputs,
+    audio_token_id: u32,
+) -> Result<Tensor> {
+    if mm.audio_embeddings.is_empty() {
+        return Ok(text_embeds.clone());
+    }
+
+    let (b, s, d) = text_embeds.dims3()?;
+    let mut audio_clips: Vec<(usize, Tensor)> = mm
+        .audio_embeddings
+        .iter()
+        .map(|(pos, pa)| (*pos, pa.embedding.clone()))
+        .collect();
+    audio_clips.sort_by_key(|(pos, _)| *pos);
+
+    let flat_embeds = text_embeds.reshape((b * s, d))?;
+    let token_ids = &mm.token_ids;
+
+    let mut rows: Vec<Tensor> = Vec::with_capacity(b * s);
+    let mut clip_idx = 0usize;
+    let mut clip_offset = 0usize;
+
+    for (seq_idx, &tok) in token_ids.iter().enumerate() {
+        if tok == audio_token_id && clip_idx < audio_clips.len() {
+            let clip = &audio_clips[clip_idx].1;
+            let clip_len = clip.dim(0)?;
+            rows.push(clip.narrow(0, clip_offset, 1)?.squeeze(0)?);
+            clip_offset += 1;
+            if clip_offset >= clip_len {
+                clip_idx += 1;
+                clip_offset = 0;
+            }
+        } else {
+            rows.push(flat_embeds.narrow(0, seq_idx, 1)?.squeeze(0)?);
+        }
+    }
+
+    Tensor::stack(&rows, 0)?.reshape((b, s, d))
 }
 
 impl crate::engine::ModelForward for Phi4MMForCausalLM {
@@ -755,6 +850,94 @@ mod tests {
             .forward_multimodal(&input_ids, Some(&mm), 0, &mut kv_cache, &bt, &slot_mapping)
             .unwrap();
 
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_forward_multimodal_audio() {
+        use crate::kv_cache::KVCacheManager;
+        use crate::multimodal::ProcessedAudio;
+
+        let device = Device::Cpu;
+        let mut extra = serde_json::Map::new();
+        extra.insert("audio_token_id".into(), serde_json::json!(200011u32));
+        extra.insert(
+            "audio_processor".into(),
+            serde_json::json!({
+                "name": "cascades",
+                "config": { "input_size": 8, "attention_dim": 8,
+                            "attention_heads": 2, "linear_units": 16, "num_block": 1 }
+            }),
+        );
+        extra.insert(
+            "embd_layer".into(),
+            serde_json::json!({
+                "audio_embd_layer": {
+                    "embedding_cls": "cascades",
+                    "projection_cls": "mlp",
+                    "downsample_rate": 1,
+                    "use_qformer": false,
+                    "use_conv_downsample": false
+                }
+            }),
+        );
+        extra.insert(
+            "img_processor".to_string(),
+            serde_json::json!({
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "image_size": 28,
+                "patch_size": 14,
+                "model_type": "siglip"
+            }),
+        );
+        extra.insert("use_hd_transform".to_string(), serde_json::json!(false));
+        extra.insert("image_token_id".to_string(), serde_json::json!(200010u32));
+
+        let cfg = ModelConfig {
+            architectures: vec!["Phi4MMForCausalLM".to_string()],
+            hidden_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            num_hidden_layers: 1,
+            intermediate_size: 16,
+            vocab_size: 32,
+            max_position_embeddings: 64,
+            head_dim: 4,
+            hidden_act: "silu".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            extra,
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Phi4MMForCausalLM::new(&cfg, vb).unwrap();
+        assert!(model.audio_embed.is_some());
+
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+
+        let audio_token_id: u32 = 200011;
+        let token_ids = vec![1u32, audio_token_id, audio_token_id, 2u32];
+        let seq_len = token_ids.len();
+        let audio_emb = Tensor::zeros((2usize, 8usize), DType::F32, &device).unwrap();
+        let processed = ProcessedAudio::new(audio_emb, 2);
+        let mm = MultimodalInputs::with_audio(token_ids.clone(), vec![(1, processed)]);
+
+        let mut bt = BlockTable::new(cache_cfg.block_size);
+        kv_cache.allocate_for_request(&mut bt, seq_len).unwrap();
+        let slot_mapping = bt.slot_mapping(0, seq_len);
+
+        let input_ids = Tensor::from_vec(token_ids, (1usize, seq_len), &device)
+            .unwrap()
+            .to_dtype(DType::U32)
+            .unwrap();
+        let logits = model
+            .forward_multimodal(&input_ids, Some(&mm), 0, &mut kv_cache, &bt, &slot_mapping)
+            .unwrap();
         assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
     }
 }

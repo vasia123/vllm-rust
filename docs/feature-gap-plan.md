@@ -88,7 +88,8 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - `funaudiochat.rs` ✅ DONE — `FunAudioChatForConditionalGeneration`; continuous Conv1d×2+transformer encoder + discrete group-avg encoder + Qwen3; 5 tests — commit 96aff3b
   - `audioflamingo3.rs` ✅ DONE — `AudioFlamingo3ForConditionalGeneration`; Qwen2AudioEncoder + 2-layer GELU MLP projector + Qwen2; 5 tests — commit 1c5dce2
   - `voxtral.rs` ✅ DONE — `VoxtralForConditionalGeneration`; WhisperEncoder + downsample reshape + AudioLanguageAdapter + MistralForCausalLM; 5 tests — commit 18a930e
-  - `glmasr.rs`, `phi4mm_audio.rs` — P2
+  - `glmasr.rs` ✅ DONE — `GlmAsrForConditionalGeneration`; Conv1d×2+GELU + GQA+partial-RoPE encoder + MLP projector + LlamaForCausalLM; 6 tests — commit f0dc167
+  - `phi4mm_audio.rs` — P2
   - `gemma3n_audio.rs`, `musicflamingo.rs` — P3
 - **Files:** extend `multimodal/audio.rs`, new `multimodal/audio_encoder.rs`, per-model files
 
