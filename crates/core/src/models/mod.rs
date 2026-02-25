@@ -138,6 +138,7 @@ pub mod mimo_v2_flash;
 pub mod minicpm;
 pub mod minicpm3;
 pub mod minicpm_quantized;
+pub mod minicpmo;
 pub mod minicpmv;
 pub mod minimax_m2;
 pub mod minimax_text01;
@@ -369,6 +370,7 @@ pub use mimo_v2_flash::MiMoV2FlashForCausalLM;
 pub use minicpm::MiniCPMForCausalLM;
 pub use minicpm3::MiniCPM3ForCausalLM;
 pub use minicpm_quantized::QuantizedMiniCPMForCausalLM;
+pub use minicpmo::MiniCPMOForCausalLM;
 pub use minicpmv::MiniCPMVForConditionalGeneration;
 pub use minimax_m2::MiniMaxM2ForCausalLM;
 pub use minimax_text01::MiniMaxText01ForCausalLM;
@@ -658,6 +660,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "MiniCPMV" | "MiniCPMVForConditionalGeneration" => {
             Ok(Box::new(MiniCPMVForConditionalGeneration::new(cfg, vb)?))
         }
+        "MiniCPMO" | "MiniCPMOForCausalLM" => Ok(Box::new(MiniCPMOForCausalLM::new(cfg, vb)?)),
         "PaliGemmaForConditionalGeneration" => Ok(Box::new(
             PaliGemmaForConditionalGeneration::from_model_config(cfg, vb)?,
         )),

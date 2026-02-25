@@ -828,6 +828,66 @@ impl MiniCPMVForConditionalGeneration {
         let xs = self.norm.forward(&xs)?;
         self.lm_head.forward(&xs, &self.tp_ctx)
     }
+
+    /// Build initial embeddings (text + merged vision), without running LLM layers.
+    ///
+    /// Called by `MiniCPMOForCausalLM` to obtain the embedding tensor before
+    /// injecting audio embeddings, after which `forward_from_embeddings` runs
+    /// the remaining LLM pass.
+    pub(crate) fn embed_and_merge_vision(
+        &self,
+        input_ids: &Tensor,
+        mm: Option<&MultimodalInputs>,
+    ) -> Result<Tensor> {
+        let text_embeddings = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        if let Some(mm_inputs) = mm {
+            if mm_inputs.has_images() {
+                return self.merge_multimodal_embeddings(input_ids, &text_embeddings, mm_inputs);
+            }
+        }
+        Ok(text_embeddings)
+    }
+
+    /// Complete the LLM forward pass from an existing embedding tensor.
+    ///
+    /// Called by `MiniCPMOForCausalLM` after audio embedding injection.
+    pub(crate) fn forward_from_embeddings(
+        &self,
+        xs: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let (_, seq_len, _) = xs.dims3()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+
+        let mut xs = xs.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+                &self.tp_ctx,
+            )?;
+        }
+
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs, &self.tp_ctx)
+    }
 }
 
 impl crate::engine::ModelForward for MiniCPMVForConditionalGeneration {
