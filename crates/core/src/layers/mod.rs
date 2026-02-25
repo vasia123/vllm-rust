@@ -13,4 +13,4 @@ pub use attention::{
 pub use mask::causal_mask;
 pub use mlp::{fused_swiglu, SwiGluMlp};
 pub use normalization::{rms_norm, RmsNorm};
-pub use rotary::RotaryEmbedding;
+pub use rotary::{RotaryEmbedding, XDRotaryEmbedding};

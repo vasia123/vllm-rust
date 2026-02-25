@@ -407,6 +407,170 @@ impl RotaryEmbedding {
     }
 }
 
+// ─── XDRotaryEmbedding ────────────────────────────────────────────────────────
+
+/// Cross-Dimensional RoPE (XDRoPE) for multimodal models.
+///
+/// Extends `DynamicNTKAlphaRotaryEmbedding` with per-dimension position channels.
+/// Each section of the rotary half-dim uses positions from a different channel
+/// (P=positional, W=width, H=height, T=temporal), enabling the model to encode
+/// 2D/3D spatial structure without separate encoders.
+///
+/// Reference: `vllm/model_executor/layers/rotary_embedding/xdrope.py`
+pub struct XDRotaryEmbedding {
+    sin: Tensor,
+    cos: Tensor,
+    /// Size of each section in the rotary half-dim. `sum(xdrope_section) == rotary_dim / 2`.
+    xdrope_section: Vec<usize>,
+    /// Actual rotation dimension (may be less than head_dim).
+    rotary_dim: usize,
+    /// Full head dimension.
+    head_dim: usize,
+}
+
+impl XDRotaryEmbedding {
+    /// Create an XDRoPE embedding with NTK-alpha scaling.
+    ///
+    /// # Arguments
+    /// * `head_dim` - Full head dimension
+    /// * `max_seq_len` - Maximum sequence length (cache size)
+    /// * `rope_theta` - RoPE base frequency
+    /// * `scaling_alpha` - NTK scaling factor; scaled_base = theta * alpha^(dim/(dim-2))
+    /// * `xdrope_section` - Section sizes; must sum to `rotary_dim / 2`
+    /// * `rotary_dim` - Effective rotation dimension (≤ head_dim)
+    /// * `dtype` - Data type for sin/cos tables
+    /// * `device` - Target device
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        head_dim: usize,
+        max_seq_len: usize,
+        rope_theta: f64,
+        scaling_alpha: f64,
+        xdrope_section: Vec<usize>,
+        rotary_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let half_dim = rotary_dim / 2;
+        let section_sum: usize = xdrope_section.iter().sum();
+        if section_sum != half_dim {
+            return Err(candle_core::Error::Msg(format!(
+                "xdrope_section sum ({section_sum}) must equal rotary_dim/2 ({half_dim})"
+            )));
+        }
+
+        // NTK alpha scaling: scaled_base = theta * alpha^(dim/(dim-2))
+        let scaled_theta = if scaling_alpha > 1.0 && rotary_dim > 2 {
+            rope_theta * scaling_alpha.powf(rotary_dim as f64 / (rotary_dim as f64 - 2.0))
+        } else {
+            rope_theta
+        };
+
+        let inv_freq: Vec<f32> = (0..rotary_dim)
+            .step_by(2)
+            .map(|i| 1.0 / (scaled_theta as f32).powf(i as f32 / rotary_dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq =
+            Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+
+        Ok(Self {
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            xdrope_section,
+            rotary_dim,
+            head_dim,
+        })
+    }
+
+    /// Apply XDRoPE to variable-length batched tokens with per-dimension position channels.
+    ///
+    /// # Arguments
+    /// * `q` - Query tensor `[num_tokens, num_heads, head_dim]`
+    /// * `k` - Key tensor `[num_tokens, num_kv_heads, head_dim]`
+    /// * `positions` - Position indices `[xd_sections, num_tokens]` (u32 on CPU)
+    ///
+    /// For each section `i`, positions from channel `i` are used to index the
+    /// cos/sin tables for the corresponding rotary half-dim slice.
+    pub fn apply_varlen_xd(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let num_sections = self.xdrope_section.len();
+        let (num_tokens, num_heads, _) = q.dims3()?;
+        let num_kv_heads = k.dim(1)?;
+
+        // Build per-token cos/sin by gathering each section's positions.
+        let mut cos_parts: Vec<Tensor> = Vec::with_capacity(num_sections);
+        let mut sin_parts: Vec<Tensor> = Vec::with_capacity(num_sections);
+
+        let mut half_offset = 0usize;
+        for (i, &section_size) in self.xdrope_section.iter().enumerate() {
+            // positions[i, :] → [num_tokens] position indices for this channel
+            let pos_i = positions.narrow(0, i, 1)?.squeeze(0)?;
+            // Index the full cos/sin table: [num_tokens, rotary_dim/2]
+            let cos_full = self.cos.index_select(&pos_i, 0)?;
+            let sin_full = self.sin.index_select(&pos_i, 0)?;
+            // Slice the section columns
+            cos_parts.push(cos_full.narrow(1, half_offset, section_size)?);
+            sin_parts.push(sin_full.narrow(1, half_offset, section_size)?);
+            half_offset += section_size;
+        }
+
+        // Concatenate all sections → [num_tokens, rotary_dim/2]; must be contiguous for rope().
+        let cos = Tensor::cat(&cos_parts, 1)?.contiguous()?;
+        let sin = Tensor::cat(&sin_parts, 1)?.contiguous()?;
+
+        // Reshape q/k to [1, heads, num_tokens, head_dim] for the rope utilities.
+        let q4 = q.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let k4 = k.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+
+        let (q_out4, k_out4) = if self.rotary_dim < self.head_dim {
+            // Partial rotation: only rotate first rotary_dim dims.
+            let q_rot = q4.narrow(3, 0, self.rotary_dim)?.contiguous()?;
+            let q_pass = q4.narrow(3, self.rotary_dim, self.head_dim - self.rotary_dim)?;
+            let k_rot = k4.narrow(3, 0, self.rotary_dim)?.contiguous()?;
+            let k_pass = k4.narrow(3, self.rotary_dim, self.head_dim - self.rotary_dim)?;
+            let q_rot = candle_nn::rotary_emb::rope(&q_rot, &cos, &sin)?;
+            let k_rot = candle_nn::rotary_emb::rope(&k_rot, &cos, &sin)?;
+            (
+                Tensor::cat(&[q_rot, q_pass.contiguous()?], 3)?,
+                Tensor::cat(&[k_rot, k_pass.contiguous()?], 3)?,
+            )
+        } else {
+            let q_rot = candle_nn::rotary_emb::rope(&q4, &cos, &sin)?;
+            let k_rot = candle_nn::rotary_emb::rope(&k4, &cos, &sin)?;
+            (q_rot, k_rot)
+        };
+
+        // Back to [num_tokens, heads, head_dim]
+        let q_out = q_out4.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let k_out = k_out4.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+
+        // Sanity-check shapes.
+        debug_assert_eq!(q_out.dims(), &[num_tokens, num_heads, self.head_dim]);
+        debug_assert_eq!(k_out.dims(), &[num_tokens, num_kv_heads, self.head_dim]);
+
+        Ok((q_out, k_out))
+    }
+
+    /// Returns the rotary dimension.
+    pub fn rotary_dim(&self) -> usize {
+        self.rotary_dim
+    }
+
+    /// Returns the number of XD sections (position channels).
+    pub fn num_sections(&self) -> usize {
+        self.xdrope_section.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,6 +1226,184 @@ mod tests {
             assert!(
                 (sum - expected_mscale_sq).abs() < 1e-4,
                 "cos^2+sin^2 = {sum}, expected mscale^2 = {expected_mscale_sq}"
+            );
+        }
+    }
+
+    // ── XDRotaryEmbedding Tests ──────────────────────────────────────────────
+
+    fn make_xdrope(
+        head_dim: usize,
+        max_seq: usize,
+        sections: Vec<usize>,
+    ) -> XDRotaryEmbedding {
+        let rotary_dim = sections.iter().sum::<usize>() * 2;
+        XDRotaryEmbedding::new(
+            head_dim,
+            max_seq,
+            10000.0,
+            1.0, // no NTK scaling
+            sections,
+            rotary_dim,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .expect("XDRoPE construction failed")
+    }
+
+    #[test]
+    fn test_xdrope_construction() {
+        // sections [4, 4] → rotary_dim = 16, head_dim = 32
+        let xd = make_xdrope(32, 128, vec![4, 4]);
+        assert_eq!(xd.rotary_dim(), 16);
+        assert_eq!(xd.num_sections(), 2);
+    }
+
+    #[test]
+    fn test_xdrope_section_sum_mismatch_error() {
+        let result = XDRotaryEmbedding::new(
+            32,
+            128,
+            10000.0,
+            1.0,
+            vec![3, 4], // sum=7, but rotary_dim/2 must equal sum
+            16,         // rotary_dim=16, half=8 ≠ 7
+            DType::F32,
+            &Device::Cpu,
+        );
+        assert!(result.is_err(), "Should fail when section sum ≠ rotary_dim/2");
+    }
+
+    #[test]
+    fn test_xdrope_apply_varlen_shape() {
+        let head_dim = 32;
+        let rotary_dim = 16;
+        let num_tokens = 8;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+
+        let xd = make_xdrope(head_dim, 128, vec![4, 4]);
+        assert_eq!(xd.rotary_dim(), rotary_dim);
+
+        let q =
+            Tensor::randn(0.0f32, 1.0, (num_tokens, num_heads, head_dim), &Device::Cpu).unwrap();
+        let k =
+            Tensor::randn(0.0f32, 1.0, (num_tokens, num_kv_heads, head_dim), &Device::Cpu)
+                .unwrap();
+
+        // positions: [2, num_tokens] — section 0 uses 0..7, section 1 uses 4..11
+        let pos_data: Vec<u32> = (0..num_tokens as u32)
+            .chain((4..4 + num_tokens as u32).map(|p| p.min(127)))
+            .collect();
+        let positions = Tensor::from_vec(pos_data, (2, num_tokens), &Device::Cpu).unwrap();
+
+        let (q_out, k_out) = xd.apply_varlen_xd(&q, &k, &positions).unwrap();
+        assert_eq!(q_out.dims(), &[num_tokens, num_heads, head_dim]);
+        assert_eq!(k_out.dims(), &[num_tokens, num_kv_heads, head_dim]);
+    }
+
+    #[test]
+    fn test_xdrope_ntk_alpha_changes_frequencies() {
+        let head_dim = 16;
+        let rotary_dim = 16;
+        let sections = vec![4, 4];
+
+        let xd_no_ntk = XDRotaryEmbedding::new(
+            head_dim,
+            64,
+            10000.0,
+            1.0,
+            sections.clone(),
+            rotary_dim,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let xd_ntk = XDRotaryEmbedding::new(
+            head_dim,
+            64,
+            10000.0,
+            2.0, // alpha > 1 → scaled theta
+            sections,
+            rotary_dim,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let cos_no_ntk: Vec<f32> = xd_no_ntk
+            .cos
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let cos_ntk: Vec<f32> = xd_ntk
+            .cos
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        assert!(
+            cos_no_ntk
+                .iter()
+                .zip(cos_ntk.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "NTK alpha scaling should change frequencies"
+        );
+    }
+
+    #[test]
+    fn test_xdrope_uniform_sections_matches_standard_rope() {
+        // When all sections use the same positions (same as 1D RoPE), the result
+        // should match applying standard neox-style RoPE with those positions.
+        let head_dim = 16;
+        let rotary_dim = 16;
+        let num_tokens = 4;
+        let num_heads = 2;
+        let max_seq = 32;
+
+        // Standard RoPE (neox, full head_dim)
+        let std_rope =
+            RotaryEmbedding::new(head_dim, max_seq, 10000.0, DType::F32, &Device::Cpu).unwrap();
+        // XDRoPE with 2 equal sections, same alpha=1
+        let xd = XDRotaryEmbedding::new(
+            head_dim,
+            max_seq,
+            10000.0,
+            1.0,
+            vec![4, 4],
+            rotary_dim,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let q =
+            Tensor::randn(0.0f32, 1.0, (num_tokens, num_heads, head_dim), &Device::Cpu).unwrap();
+        let k = Tensor::zeros((num_tokens, num_heads, head_dim), DType::F32, &Device::Cpu).unwrap();
+
+        // Standard varlen with positions [0,1,2,3]
+        let positions: Vec<usize> = (0..num_tokens).collect();
+        let (q_std, _) = std_rope.apply_varlen(&q, &k, &positions).unwrap();
+
+        // XDRoPE with uniform positions (all sections use same 1D positions)
+        let pos_data: Vec<u32> = (0..num_tokens as u32)
+            .chain(0..num_tokens as u32)
+            .collect();
+        let pos_tensor = Tensor::from_vec(pos_data, (2, num_tokens), &Device::Cpu).unwrap();
+        let (q_xd, _) = xd.apply_varlen_xd(&q, &k, &pos_tensor).unwrap();
+
+        let q_std_v: Vec<f32> = q_std.flatten_all().unwrap().to_vec1().unwrap();
+        let q_xd_v: Vec<f32> = q_xd.flatten_all().unwrap().to_vec1().unwrap();
+        for (a, b) in q_std_v.iter().zip(q_xd_v.iter()) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "XDRoPE with uniform positions should match standard RoPE: {a} vs {b}"
             );
         }
     }

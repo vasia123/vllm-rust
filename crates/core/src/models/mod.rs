@@ -98,6 +98,7 @@ pub mod grok1;
 pub mod gte;
 pub mod hunyuan;
 pub mod hunyuan_quantized;
+pub mod hunyuan_vision;
 pub mod hyperclovax_vision;
 pub mod idefics3;
 pub mod internlm2;
