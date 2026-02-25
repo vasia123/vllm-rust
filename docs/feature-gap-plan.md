@@ -218,7 +218,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 `Qwen2ForCausalLM`. Weight paths: `model.sam_model.*` (SAM), `model.qwen2_model.*` (encoder), `model.projector.*`,
 `model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
 
-- **P2 models (~4 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), Hunyuan-Vision (BLOCKED), LFM2-VL (BLOCKED: SigLIP2-NaViT)
+- **P2 models (~3 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), ~~Hunyuan-Vision~~ ✅ DONE (`hunyuan_vision.rs`, 5 tests + XDRoPE — commit 94ada76), LFM2-VL (BLOCKED: SigLIP2-NaViT)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced
@@ -335,7 +335,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
 - **MRoPE Interleaved** — `mrope_interleaved.py`; ~200 LOC; interleaved frequency layout
 - **FoPE** — `fope.py`; ~200 LOC; factored positional encoding
-- **XDRoPE** — `xdrope.py`; ~250 LOC; cross-dimensional RoPE
+- ~~**XDRoPE**~~ ✅ DONE — `xdrope.py`; `XDRotaryEmbedding` in `layers/rotary.rs`, 5 tests — commit 94ada76
 - **ERNIE4.5-VL RoPE** — `ernie45_vl_rope.py`; ~150 LOC; unblocks ERNIE4.5-VL
 
 ### 4.3 Resolve P1 Code TODOs

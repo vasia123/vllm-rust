@@ -54,6 +54,8 @@ pub enum QuantizationMethod {
     CpuWna16,
     /// INC (Intel Neural Compressor): routes to GPTQ or AWQ based on packing_format
     Inc,
+    /// FP-Quant: FP4 E2M1 weights + per-group scales + optional global scale (Hadamard rotation)
+    FpQuant,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -79,6 +81,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::ModelOptFull => write!(f, "modelopt_full"),
             Self::CpuWna16 => write!(f, "cpu_awq"),
             Self::Inc => write!(f, "inc"),
+            Self::FpQuant => write!(f, "fp_quant"),
         }
     }
 }

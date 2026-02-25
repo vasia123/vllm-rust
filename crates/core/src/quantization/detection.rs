@@ -135,6 +135,7 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("cpu_awq") | Some("cpu_wna16") => QuantizationMethod::CpuWna16,
         // INC (Intel Neural Compressor) and auto-round format route to GPTQ/AWQ delegate
         Some("inc") | Some("auto-round") => QuantizationMethod::Inc,
+        Some("fp_quant") => QuantizationMethod::FpQuant,
         // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
         Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {
@@ -253,6 +254,7 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 "cpu_awq" | "cpu_wna16" => QuantizationMethod::CpuWna16,
                 // INC (Intel Neural Compressor) and auto-round format route to GPTQ/AWQ delegate
                 "inc" | "auto-round" => QuantizationMethod::Inc,
+                "fp_quant" => QuantizationMethod::FpQuant,
                 // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
                 "gptq_marlin" => QuantizationMethod::Marlin,
                 "modelopt" => {

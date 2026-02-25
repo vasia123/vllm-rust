@@ -48,6 +48,7 @@ pub mod marlin;
 pub mod marlin_cuda;
 pub mod modelopt;
 pub mod moe_wna16;
+pub mod fp_quant;
 pub mod mxfp4;
 pub mod mxfp8;
 pub mod ptpc_fp8;
@@ -81,6 +82,7 @@ pub use gguf::{
 pub use gptq::GptqConfig;
 #[cfg(feature = "cuda-kernels")]
 pub use gptq_cuda::{gptq_dequantize, gptq_gemm};
+pub use fp_quant::{FpQuantConfig, FpQuantForwardDtype, FpQuantLinear};
 pub use inc::IncConfig;
 pub use marlin::{
     check_marlin_supported, check_marlin_supports_shape, marlin_make_workspace,
@@ -187,6 +189,9 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
             &detected.raw_config,
         )),
         QuantizationMethod::Torchao => Box::new(TorchaoConfig::from_detected(&detected.raw_config)),
+        QuantizationMethod::FpQuant => {
+            Box::new(FpQuantConfig::from_detected(&detected.raw_config))
+        }
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -235,6 +240,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::ModelOptFull => 80, // FP8 needs Ampere+; NVFP4 needs Hopper (89) but emulation works on 80
         QuantizationMethod::CpuWna16 => 0,      // CPU-only, no GPU required
         QuantizationMethod::Inc => 70,          // Volta minimum (delegates to GPTQ/AWQ)
+        QuantizationMethod::FpQuant => 0,       // CPU dequant path works anywhere
     };
     capability >= min_cap
 }

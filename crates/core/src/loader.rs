@@ -162,6 +162,7 @@ pub fn quantization_info(files: &ModelFiles) -> String {
                 bits, group_size
             )
         }
+        QuantizationMethod::FpQuant => "FP-Quant (FP4 E2M1 + Hadamard rotation)".to_string(),
     }
 }
 
