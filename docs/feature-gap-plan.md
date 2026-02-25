@@ -244,7 +244,9 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
   5. `mxfp4.rs` ✅ DONE — `MxFp4Config`, `MxFp4Linear` (FP4 E2M1 nibble unpack + E8M0 block scales, CPU emulation); 19 tests; 4011 total
      - FP4 E2M1 lookup table, lower-nibble-first packing, block_size=32, min_capability=80
      - MoE GPU dispatch (FlashInfer/Marlin/Triton) tracked as TODO
-  6. `modelopt.rs` — NVIDIA ModelOpt extended format; ~500 LOC
+  6. `modelopt.rs` ✅ DONE — `ModelOptConfig` + `ModelOptLinear` covering FP8/FP8_PER_CHANNEL_PER_TOKEN/FP8_PB_WO/NVFP4/MXFP8; 20 tests; 4035 total — commit 80459fe
+     - Detection routes FP8/NVFP4/FP8_PB_WO → `ModelOptFull`; MXFP8 stays → `ModelOpt` (existing MxFp8Config)
+     - Both nested `{"quantization":{"quant_algo":...}}` and flat `{"quant_algo":...}` JSON layouts
   - `input_quant_fp8.py` — NOT a QuantizationConfig (it's a CustomOp utility for FP8 activation quantization); skip
 - **Reference:** `reference/vllm/model_executor/layers/quantization/`
 

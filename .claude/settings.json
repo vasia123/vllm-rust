@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/vasis/projects_hobby/vllm-rust/.claude/check-pending-tasks.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
