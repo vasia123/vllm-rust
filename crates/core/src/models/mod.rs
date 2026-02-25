@@ -6,6 +6,7 @@ pub mod apertus_quantized;
 pub mod arcee;
 pub mod arctic;
 pub mod aria;
+pub mod audioflamingo3;
 pub mod aya_vision;
 pub mod bagel;
 pub mod baichuan;
@@ -232,6 +233,7 @@ pub use apertus::ApertusForCausalLM;
 pub use apertus_quantized::QuantizedApertusForCausalLM;
 pub use arctic::ArcticForCausalLM;
 pub use aria::AriaForConditionalGeneration;
+pub use audioflamingo3::AudioFlamingo3ForConditionalGeneration;
 pub use aya_vision::AyaVisionForConditionalGeneration;
 pub use bagel::BagelForConditionalGeneration;
 pub use baichuan::BaichuanForCausalLM;
@@ -727,6 +729,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "ArceeForCausalLM" => Ok(Box::new(arcee::new_arcee(cfg, vb)?)),
         "ArcticForCausalLM" => Ok(Box::new(ArcticForCausalLM::new(cfg, vb)?)),
         "AriaForConditionalGeneration" => Ok(Box::new(AriaForConditionalGeneration::new(cfg, vb)?)),
+        "AudioFlamingo3ForConditionalGeneration" => Ok(Box::new(
+            AudioFlamingo3ForConditionalGeneration::new(cfg, vb)?,
+        )),
         "AyaVisionForConditionalGeneration" | "Cohere2VisionForConditionalGeneration" => {
             Ok(Box::new(AyaVisionForConditionalGeneration::new(cfg, vb)?))
         }
