@@ -1,6 +1,6 @@
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use std::path::PathBuf;
 
 use crate::config::ModelConfig;
@@ -25,7 +25,25 @@ pub fn fetch_model(model_id: &str) -> anyhow::Result<ModelFiles> {
 
 /// Downloads model files from HuggingFace Hub at a specific revision.
 pub fn fetch_model_with_revision(model_id: &str, revision: &str) -> anyhow::Result<ModelFiles> {
-    let api = Api::new()?;
+    fetch_model_with_auth(model_id, revision, None, None)
+}
+
+/// Downloads model files, optionally authenticating with an HF token and/or using
+/// a custom cache directory.
+pub fn fetch_model_with_auth(
+    model_id: &str,
+    revision: &str,
+    hf_token: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+) -> anyhow::Result<ModelFiles> {
+    let mut builder = ApiBuilder::from_env();
+    if let Some(token) = hf_token {
+        builder = builder.with_token(Some(token.to_string()));
+    }
+    if let Some(dir) = cache_dir {
+        builder = builder.with_cache_dir(dir.to_path_buf());
+    }
+    let api = builder.build()?;
     let repo = api.repo(Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,

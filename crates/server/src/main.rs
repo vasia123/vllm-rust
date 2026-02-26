@@ -1097,11 +1097,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = &kv_cache_dtype; // Used below in CacheConfig
     let _ = enforce_eager; // TODO: wire to CUDA graph control
     let _ = &load_format; // TODO: wire to weight loading strategy
-    let _ = &download_dir; // TODO: wire to HF cache dir
     let _ = &tokenizer_mode; // TODO: wire to tokenizer selection
     let _ = &tokenizer_revision; // TODO: wire to tokenizer revision
     let _ = &code_revision; // TODO: wire to custom code loading
-    let _ = &hf_token; // TODO: wire to HF Hub authentication
     let _ = max_parallel_loading_workers; // TODO: wire to parallel weight loading
     let _ = &preemption_mode; // TODO: wire to scheduler preemption strategy
     let _ = max_num_partial_prefills; // TODO: wire to partial prefill limits
@@ -1135,7 +1133,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     }
 
     eprintln!("Loading model: {model_id}");
-    let files = loader::fetch_model_with_revision(&model_id, &revision)?;
+    let cache_dir = download_dir.as_deref().map(std::path::Path::new);
+    let files =
+        loader::fetch_model_with_auth(&model_id, &revision, hf_token.as_deref(), cache_dir)?;
 
     let device = Device::new_cuda(0)?;
     let dtype_label = match dtype {
@@ -1215,7 +1215,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             tok_path.to_path_buf()
         } else {
             // Try as HuggingFace model ID
-            let tok_files = loader::fetch_model_with_revision(tok_override, "main")?;
+            let tok_files = loader::fetch_model_with_auth(
+                tok_override,
+                "main",
+                hf_token.as_deref(),
+                cache_dir,
+            )?;
             tok_files.tokenizer
         }
     } else {
@@ -1340,7 +1345,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     let handle = if let Some(ref draft_id) = draft_model_id {
         eprintln!("Loading draft model: {draft_id}");
-        let draft_files = loader::fetch_model(draft_id)?;
+        let draft_files =
+            loader::fetch_model_with_auth(draft_id, "main", hf_token.as_deref(), cache_dir)?;
 
         eprintln!("Loading draft weights to GPU (bf16)...");
         let draft_vb = loader::load_weights(&draft_files.weights, dtype, &device)?;
