@@ -84,6 +84,10 @@ pub struct AppState {
     /// Value of 1 (default) sends every token immediately; higher values batch
     /// tokens to reduce SSE/HTTP overhead. Mirrors vLLM `--stream-interval`.
     pub stream_interval: usize,
+    /// Whether dynamic LoRA adapter loading is enabled via the
+    /// `/v1/load_lora_adapter` endpoint. When false, the endpoint rejects
+    /// all requests. Mirrors vLLM `--enable-lora`.
+    pub enable_lora: bool,
 }
 
 impl AppState {
@@ -104,6 +108,7 @@ impl AppState {
         max_logprobs: usize,
         mm_limits: HashMap<String, usize>,
         stream_interval: usize,
+        enable_lora: bool,
     ) -> Self {
         Self {
             engine,
@@ -126,6 +131,7 @@ impl AppState {
             max_logprobs,
             mm_limits,
             stream_interval: stream_interval.max(1),
+            enable_lora,
         }
     }
 
@@ -483,6 +489,13 @@ async fn load_lora_adapter(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(req): Json<LoadLoRAAdapterRequest>,
 ) -> Result<String, error::ApiError> {
+    if !state.enable_lora {
+        return Err(error::ApiError::InvalidRequest(
+            "LoRA is not enabled on this server. Start with --enable-lora to allow \
+             dynamic adapter loading."
+                .to_string(),
+        ));
+    }
     if req.lora_name.is_empty() {
         return Err(error::ApiError::InvalidRequest(
             "lora_name is required".to_string(),
@@ -970,6 +983,7 @@ mod tests {
             20,
             HashMap::new(),
             1,
+            true,
         )
     }
 
@@ -2694,6 +2708,30 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["is_sleeping"], false);
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_rejected_when_lora_disabled() {
+        let mut state = test_app_state();
+        state.enable_lora = false;
+        let router = create_router(state);
+        let body = serde_json::json!({
+            "lora_name": "my-adapter",
+            "lora_path": "/path/to/adapter"
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/load_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("--enable-lora"));
     }
 
     #[tokio::test]

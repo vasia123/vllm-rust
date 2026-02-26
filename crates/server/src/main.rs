@@ -1102,10 +1102,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = &preemption_mode; // TODO: wire to scheduler preemption strategy
     let _ = max_num_partial_prefills; // TODO: wire to partial prefill limits
     let _ = long_prefill_token_threshold; // TODO: wire to long prefill classification
-    let _ = enable_lora; // TODO: wire to global LoRA enable
-                         // max_loras: wired to SchedulerConfig.max_loras_per_batch below
+                                          // max_loras: wired to SchedulerConfig.max_loras_per_batch below
     let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
-    let _ = &lora_dtype; // TODO: wire to LoRA weight dtype
     let _ = max_cpu_loras; // TODO: wire to CPU LoRA cache limit
     let _ = &spec_decoding_acceptance_method; // TODO: wire to acceptance sampler type
     let _ = disable_log_stats; // TODO: wire to periodic stats suppression
@@ -1190,7 +1188,20 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         let mut lora_model = models::from_config_with_lora(&files.config, vb)?;
 
         eprintln!("Loading {} LoRA adapter(s)...", parsed_lora_specs.len());
-        let lora_loader = LoraLoader::new(device.clone(), dtype);
+        // Use explicit --lora-dtype if specified; fall back to model dtype.
+        let lora_load_dtype = match lora_dtype.as_deref() {
+            Some("float16") | Some("fp16") | Some("half") => DType::F16,
+            Some("bfloat16") | Some("bf16") => DType::BF16,
+            Some("float32") | Some("fp32") | Some("float") => DType::F32,
+            Some(other) => {
+                anyhow::bail!(
+                    "--lora-dtype '{}' is not supported; use float16, bfloat16, or float32",
+                    other
+                );
+            }
+            None => dtype,
+        };
+        let lora_loader = LoraLoader::new(device.clone(), lora_load_dtype);
 
         for (idx, (name, path)) in parsed_lora_specs.iter().enumerate() {
             eprintln!("  Loading adapter '{}' from: {}", name, path);
@@ -1499,6 +1510,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         max_logprobs,
         mm_limits,
         stream_interval,
+        enable_lora,
     );
 
     let start_time = SystemTime::now()
