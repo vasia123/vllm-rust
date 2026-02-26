@@ -646,7 +646,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(Qwen3ASRForConditionalGeneration::new(cfg, vb)?))
         }
         "UltravoxModel" => Ok(Box::new(UltravoxModel::new(cfg, vb)?)),
-        "VoxtralForConditionalGeneration" => {
+        // VoxtralRealtimeGeneration extends VoxtralForConditionalGeneration with
+        // async streaming but shares the same weights and architecture.
+        "VoxtralForConditionalGeneration" | "VoxtralRealtimeGeneration" => {
             Ok(Box::new(VoxtralForConditionalGeneration::new(cfg, vb)?))
         }
         "Qwen2VLForConditionalGeneration" | "Tarsier2ForConditionalGeneration" => Ok(Box::new(
@@ -1244,6 +1246,34 @@ pub fn eagle1_from_config(
         "EagleDeepSeekMTPModel" => Ok(Box::new(EagleDeepSeekForCausalLM::new(cfg, vb)?)),
         "EagleMistralLarge3ForCausalLM" => {
             Ok(Box::new(EagleMistralLarge3ForCausalLM::new(cfg, vb)?))
+        }
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
+/// Create an Eagle-3 draft model from a model configuration.
+///
+/// Dispatches to the correct Eagle-3 variant based on the architecture name.
+/// All current Python Eagle-3 variants (`Eagle3LlamaForCausalLM`,
+/// `LlamaForCausalLMEagle3`, `Eagle3Qwen2_5vlForCausalLM`,
+/// `Eagle3Qwen3vlForCausalLM`) use the same underlying Llama-based
+/// `Eagle3LlamaForCausalLM` implementation.
+///
+/// Eagle-3 variants for non-Llama target models use the
+/// `Eagle3MistralLarge3ForCausalLM` path (DeepSeek V2 layers + fc projection).
+pub fn eagle3_from_config(
+    cfg: &ModelConfig,
+    vb: VarBuilder,
+) -> Result<Box<dyn Eagle3DraftModel>, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        // All Llama-family Eagle-3 variants share the same implementation.
+        "Eagle3LlamaForCausalLM"
+        | "LlamaForCausalLMEagle3"
+        | "Eagle3Qwen2_5vlForCausalLM"
+        | "Eagle3Qwen3vlForCausalLM" => Ok(Box::new(Eagle3LlamaForCausalLM::new(cfg, vb)?)),
+        "Eagle3MistralLarge3ForCausalLM" => {
+            Ok(Box::new(Eagle3MistralLarge3ForCausalLM::new(cfg, vb)?))
         }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
