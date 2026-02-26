@@ -41,6 +41,7 @@ pub mod eagle_deepseek;
 pub mod eagle_llama;
 pub mod eagle_llama4;
 pub mod eagle_minicpm;
+pub mod eagle_mistral_large3;
 pub mod ernie45_moe;
 pub mod ernie45_vl;
 pub mod ernie_mtp;
@@ -279,6 +280,7 @@ pub use eagle_deepseek::EagleDeepSeekForCausalLM;
 pub use eagle_llama::{Eagle1DraftModel, EagleLlamaForCausalLM};
 pub use eagle_llama4::EagleLlama4ForCausalLM;
 pub use eagle_minicpm::EagleMiniCPMForCausalLM;
+pub use eagle_mistral_large3::EagleMistralLarge3ForCausalLM;
 pub use ernie45_moe::Ernie45MoeForCausalLM;
 pub use ernie45_vl::Ernie4_5_VLForConditionalGeneration;
 pub use ernie_mtp::ErnieMtpModel;
@@ -1226,6 +1228,8 @@ pub fn mtp_from_config(
 /// - `EagleMiniCPMForCausalLM` → MiniCPM-based Eagle-1
 /// - `EagleDeepSeekMTPModel` → DeepSeek V2/V3 MLA Eagle-1 (Eagle-1 protocol
 ///   despite the name; see Python registry entry `deepseek_eagle.py`)
+/// - `EagleMistralLarge3ForCausalLM` → MistralLarge3 target + DeepSeek V2 MLA
+///   draft (simpler fc-fusion: no enorm/hnorm vs the DeepSeek variant)
 ///
 /// Used by the speculative decoding engine to load the correct Eagle-1 model.
 pub fn eagle1_from_config(
@@ -1238,6 +1242,9 @@ pub fn eagle1_from_config(
         "EagleLlama4ForCausalLM" => Ok(Box::new(EagleLlama4ForCausalLM::new(cfg, vb)?)),
         "EagleMiniCPMForCausalLM" => Ok(Box::new(EagleMiniCPMForCausalLM::new(cfg, vb)?)),
         "EagleDeepSeekMTPModel" => Ok(Box::new(EagleDeepSeekForCausalLM::new(cfg, vb)?)),
+        "EagleMistralLarge3ForCausalLM" => {
+            Ok(Box::new(EagleMistralLarge3ForCausalLM::new(cfg, vb)?))
+        }
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
