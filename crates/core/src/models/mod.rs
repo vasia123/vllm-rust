@@ -28,6 +28,7 @@ pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_lora;
 pub mod deepseek_mtp;
+pub mod deepseek_ocr;
 pub mod deepseek_ocr2;
 pub mod deepseek_quantized;
 pub mod deepseek_vl2;
@@ -269,6 +270,7 @@ pub use dbrx::DbrxForCausalLM;
 pub use deepseek::{DeepSeekForCausalLM, GlmMoeDsaForCausalLM};
 pub use deepseek_lora::DeepSeekWithLora;
 pub use deepseek_mtp::DeepSeekMtpModel;
+pub use deepseek_ocr::DeepseekOCRForCausalLM;
 pub use deepseek_ocr2::DeepseekOCR2ForCausalLM;
 pub use deepseek_quantized::QuantizedDeepSeekForCausalLM;
 pub use deepseek_vl2::DeepSeekVLV2ForConditionalGeneration;
@@ -719,6 +721,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "DeepseekVLV2ForConditionalGeneration" => Ok(Box::new(
             DeepSeekVLV2ForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "DeepseekOCRForCausalLM" => Ok(Box::new(DeepseekOCRForCausalLM::new(cfg, vb)?)),
         "DeepseekOCR2ForCausalLM" => Ok(Box::new(DeepseekOCR2ForCausalLM::new(cfg, vb)?)),
         "InternS1ForConditionalGeneration" | "InternVLForConditionalGeneration" => Ok(Box::new(
             InternS1ForConditionalGeneration::from_model_config(cfg, vb)?,
