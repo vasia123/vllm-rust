@@ -56,6 +56,8 @@ pub enum QuantizationMethod {
     Inc,
     /// FP-Quant: FP4 E2M1 weights + per-group scales + optional global scale (Hadamard rotation)
     FpQuant,
+    /// QUARK quantization (AMD/Qualcomm): W8A8-FP8, W8A8-INT8, or OCP-MX schemes
+    Quark,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -82,6 +84,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::CpuWna16 => write!(f, "cpu_awq"),
             Self::Inc => write!(f, "inc"),
             Self::FpQuant => write!(f, "fp_quant"),
+            Self::Quark => write!(f, "quark"),
         }
     }
 }

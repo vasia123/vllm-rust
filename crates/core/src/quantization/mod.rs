@@ -52,6 +52,7 @@ pub mod moe_wna16;
 pub mod mxfp4;
 pub mod mxfp8;
 pub mod ptpc_fp8;
+pub mod quark;
 pub mod torchao;
 pub mod weight_loader;
 
@@ -100,6 +101,7 @@ pub use moe_wna16::{MoeWNA16Config, MoeWNA16Format};
 pub use mxfp4::{MxFp4Config, MxFp4Linear, FP4_LUT, MXFP4_BLOCK_SIZE};
 pub use mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 pub use ptpc_fp8::PtpcFp8Config;
+pub use quark::{QuarkConfig, QuarkLinear};
 pub use torchao::TorchaoConfig;
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
@@ -190,6 +192,9 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
         )),
         QuantizationMethod::Torchao => Box::new(TorchaoConfig::from_detected(&detected.raw_config)),
         QuantizationMethod::FpQuant => Box::new(FpQuantConfig::from_detected(&detected.raw_config)),
+        QuantizationMethod::Quark => QuarkConfig::from_detected(&detected.raw_config)
+            .map(|c| Box::new(c) as Box<dyn QuantizationConfig>)
+            .unwrap_or_else(|| Box::new(NoQuantizationConfig::default())),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -239,6 +244,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::CpuWna16 => 0,      // CPU-only, no GPU required
         QuantizationMethod::Inc => 70,          // Volta minimum (delegates to GPTQ/AWQ)
         QuantizationMethod::FpQuant => 0,       // CPU dequant path works anywhere
+        QuantizationMethod::Quark => 75,        // W8A8-INT8 minimum; W8A8-FP8 needs 89
     };
     capability >= min_cap
 }

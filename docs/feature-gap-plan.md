@@ -294,7 +294,8 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 - ✅ `inc.rs` DONE — `IncConfig` routes to `GptqConfig`/`AwqConfig` based on `packing_format`; detection keys `"inc"`/`"auto-round"`; 7 tests
 - ✅ `torchao.rs` DONE — `TorchaoConfig` wraps `NoQuantizationConfig` (standard BF16 matmul); detection already wired; 5 tests
 - ✅ `fp_quant.rs` DONE — `FpQuantConfig`, `FpQuantLinear` (FP4 E2M1 + per-group E8M0/FP8 scales + global scale); MxFp4/NvFp4 variants; CPU dequant→F32 matmul; detection key `"fp_quant"`; 7 tests — commit `89b94e8`
-- AWQ-Triton (kernel-only, no separate config), Petit (AMD-only external kernel — skip), QUARK (6 files, complex)
+- ✅ `quark.rs` DONE — `QuarkConfig`, `QuarkLinear`; W8A8-FP8 and W8A8-INT8 schemes; per-tensor or per-channel weight scales; detection key `"quark"`; CPU dequant→F32 matmul; min_capability=75 (INT8) or 89 (FP8); 6 tests — commit (pending)
+- AWQ-Triton (kernel-only, no separate config), Petit (AMD-only external kernel — skip)
 - All in `crates/core/src/quantization/`
 
 ### 3.2 Server API — Speech & Realtime
@@ -338,10 +339,10 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 
 ### 4.2 RoPE Variants
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
-- ~~**MRoPE Interleaved**~~ ✅ DONE — `mrope_interleaved.py`; `get_mrope_interleaved_id_list` + `MRoPEInterleaved` in `layers/rotary.rs`; 8 tests — commit pending
+- ~~**MRoPE Interleaved**~~ ✅ DONE — `mrope_interleaved.py`; `get_mrope_interleaved_id_list` + `MRoPEInterleaved` in `layers/rotary.rs`; 8 tests — commit 8c3225b
 - **FoPE** — `fope.py`; ~200 LOC; factored positional encoding
 - ~~**XDRoPE**~~ ✅ DONE — `xdrope.py`; `XDRotaryEmbedding` in `layers/rotary.rs`, 5 tests — commit 94ada76
-- **ERNIE4.5-VL RoPE** — `ernie45_vl_rope.py`; ~150 LOC; unblocks ERNIE4.5-VL
+- ~~**ERNIE4.5-VL RoPE**~~ ✅ DONE — implemented inline in `ernie45_vl.rs` as `Ernie4_5_VisionRotaryEmbedding`; fully functional
 
 ### 4.3 Resolve P1 Code TODOs
 **Effort:** 3–5 days

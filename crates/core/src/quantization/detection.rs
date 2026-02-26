@@ -136,6 +136,7 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         // INC (Intel Neural Compressor) and auto-round format route to GPTQ/AWQ delegate
         Some("inc") | Some("auto-round") => QuantizationMethod::Inc,
         Some("fp_quant") => QuantizationMethod::FpQuant,
+        Some("quark") => QuantizationMethod::Quark,
         // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
         Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {

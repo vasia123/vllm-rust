@@ -163,6 +163,7 @@ pub fn quantization_info(files: &ModelFiles) -> String {
             )
         }
         QuantizationMethod::FpQuant => "FP-Quant (FP4 E2M1 + Hadamard rotation)".to_string(),
+        QuantizationMethod::Quark => "QUARK (W8A8-FP8 / W8A8-INT8)".to_string(),
     }
 }
 
