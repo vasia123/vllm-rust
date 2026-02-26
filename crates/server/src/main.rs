@@ -1091,7 +1091,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eprintln!("Using random seed: {seed}");
     }
     let _ = disable_log_requests; // TODO: wire to per-request logging suppression
-    let _ = response_role; // TODO: wire to chat completion response role field
     let _ = max_lora_rank; // TODO: validate adapter rank on load
 
     // Acknowledge new args (wire as features are implemented)
@@ -1434,6 +1433,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         api::create_tool_call_parser(&tool_call_parser),
         api::create_reasoning_parser_arc(&reasoning_parser),
         accepting.clone(),
+        response_role.clone(),
     );
 
     let start_time = SystemTime::now()

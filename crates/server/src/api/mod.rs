@@ -66,6 +66,8 @@ pub struct AppState {
     pub response_store: Arc<RwLock<HashMap<String, ResponsesResponse>>>,
     /// In-memory store for batch jobs (batch_id → job).
     pub batch_store: batch::BatchStore,
+    /// Role name used in chat completion responses (default: "assistant").
+    pub response_role: String,
 }
 
 impl AppState {
@@ -80,6 +82,7 @@ impl AppState {
         tool_call_parser: Arc<dyn ToolCallParser>,
         reasoning_parser: Option<Arc<dyn ReasoningParser>>,
         accepting: Arc<AtomicBool>,
+        response_role: String,
     ) -> Self {
         Self {
             engine,
@@ -96,6 +99,7 @@ impl AppState {
             next_lora_id: Arc::new(AtomicUsize::new(1)),
             response_store: Arc::new(RwLock::new(HashMap::new())),
             batch_store: batch::new_batch_store(),
+            response_role,
         }
     }
 
@@ -922,6 +926,7 @@ mod tests {
             create_tool_call_parser("hermes"),
             None,
             accepting,
+            "assistant".to_string(),
         )
     }
 

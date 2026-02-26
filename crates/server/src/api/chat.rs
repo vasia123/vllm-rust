@@ -380,7 +380,7 @@ pub async fn create_chat_completion(
 
             choices.push(ChatCompletionChoice {
                 message: ChatMessageResponse {
-                    role: "assistant".to_string(),
+                    role: state.response_role.clone(),
                     content,
                     refusal: None,
                     reasoning,
