@@ -17,7 +17,9 @@ use candle_nn::{layer_norm, LayerNorm, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
-use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
+use crate::kv_cache::{
+    config::CacheConfig, quantization::KVCacheDtype, BlockTable, CacheEngine, KVCacheManager,
+};
 use crate::layers::{causal_mask, paged_attention, RotaryEmbedding};
 use crate::multimodal::MultimodalInputs;
 
@@ -1268,6 +1270,61 @@ impl Qwen2VLForConditionalGeneration {
         }
 
         Tensor::new(merged, &self.device)?.to_dtype(self.dtype)
+    }
+
+    /// Run the Qwen2-VL backbone (text-only) and return hidden states without lm_head.
+    ///
+    /// Creates a temporary per-sequence KV cache; processes each batch item independently
+    /// because the paged prefill attention backend only supports batch_size=1.
+    /// Returns [batch, seq_len, hidden_size].
+    pub(crate) fn forward_text_hidden_states(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let (batch_size, seq_len) = input_ids.dims2()?;
+        let block_size = seq_len.max(1);
+        let cache_config = CacheConfig {
+            block_size,
+            num_blocks: 2,
+            num_layers: self.layers.len(),
+            num_kv_heads: self.config.model_config.num_key_value_heads,
+            head_dim: self.config.model_config.head_dim,
+            dtype: self.dtype,
+            device: self.device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(causal_mask(seq_len, 0, self.dtype, &self.device)?)
+        };
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+        let mut outputs = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let ids_b = input_ids.narrow(0, b, 1)?;
+            let mut kv_cache_mgr = KVCacheManager::new(&cache_config).map_err(|e| {
+                candle_core::Error::Msg(format!("forward_text_hidden_states: cache alloc: {e}"))
+            })?;
+            let mut block_table = BlockTable::new(block_size);
+            kv_cache_mgr
+                .allocate_for_request(&mut block_table, seq_len)
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("forward_text_hidden_states: block alloc: {e}"))
+                })?;
+            let mut xs = self.embed_tokens.forward(&ids_b)?;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                xs = layer.forward(
+                    &xs,
+                    attention_mask.as_ref(),
+                    None, // text-only: no 3D positions
+                    0,
+                    &mut kv_cache_mgr,
+                    layer_idx,
+                    &block_table,
+                    &slot_mapping,
+                )?;
+            }
+            outputs.push(self.norm.forward(&xs)?);
+        }
+        Tensor::cat(&outputs, 0)
     }
 }
 

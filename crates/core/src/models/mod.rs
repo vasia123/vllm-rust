@@ -117,6 +117,7 @@ pub mod jais2;
 pub mod jais2_quantized;
 pub mod jais_quantized;
 pub mod jamba;
+pub mod jina_vl;
 pub mod kanana_v;
 pub mod keye_vl;
 pub mod kimi_k25;
@@ -357,6 +358,7 @@ pub use jais2::Jais2ForCausalLM;
 pub use jais2_quantized::QuantizedJais2ForCausalLM;
 pub use jais_quantized::QuantizedJAISLMHeadModel;
 pub use jamba::JambaForCausalLM;
+pub use jina_vl::JinaVLForRanking;
 pub use kanana_v::KananaVForConditionalGeneration;
 pub use keye_vl::{KeyeForConditionalGeneration, KeyeVL1_5ForConditionalGeneration};
 pub use kimi_k25::KimiK25ForConditionalGeneration;
@@ -823,6 +825,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "GraniteMoeForCausalLM" => Ok(Box::new(GraniteMoeForCausalLM::new(cfg, vb)?)),
         "GraniteMoeSharedForCausalLM" => Ok(Box::new(GraniteMoeSharedForCausalLM::new(cfg, vb)?)),
         "GritLM" => Ok(Box::new(GritLM::new(cfg, vb)?)),
+        "JinaVLForRanking" => Ok(Box::new(JinaVLForRanking::new(cfg, vb)?)),
         "Grok1ForCausalLM"
         | "Grok1ModelForCausalLM"
         // Grok2 and GrokForCausalLM share the same architecture as Grok1

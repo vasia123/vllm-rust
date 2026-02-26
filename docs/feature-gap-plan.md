@@ -77,7 +77,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - Output `[n_mels, n_frames]` matches HuggingFace `WhisperFeatureExtractor`
 - `crates/core/src/multimodal/audio.rs` has `AudioData`/`AudioSpec` + normalize/resample but NO audio file loading (see `audio` feature below)
 - Add WAV/MP3 loading (hound + symphonia crates)
-- **Encoder models (12 total):**
+- **Encoder models (13 total):**
   - `whisper.rs` ✅ DONE — `WhisperForConditionalGeneration`, implements `ModelForEncoderDecoder`; Conv1d×2 encoder + sinusoidal pos + cross-attn decoder; 5 tests; 3972 total — 2026-02-23
   - `qwen2_audio.rs` ✅ DONE — `Qwen2AudioForConditionalGeneration`; Conv1d(s=1)+Conv1d(s=2)+AvgPool1d(k=2,s=2) encoder; 5 tests; 3977 total — 2026-02-23
   - `ultravox.rs` ✅ DONE — `UltravoxModel`; WhisperEncoder + StackAudioFrames + FFProjector(SwiGLU) + Llama LLM; 5 tests; 3982 total — 2026-02-23
@@ -92,6 +92,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
   - `phi4mm_audio.rs` ✅ DONE — `Phi4MMAudioEmbedding` (ConformerEncoder stub + MLP/linear AudioProjection); 11 tests — commit 727e7dc
   - `gemma3n_audio` ✅ DONE — extended `gemma3n_vlm.rs` with `Gemma3nAudioEncoder` stub + `embed_audio` projector; audio scatter in `forward_multimodal`; 1 new test — commit f5856bb
   - `musicflamingo.rs` ✅ DONE — `MusicFlamingoForConditionalGeneration` = type alias for `AudioFlamingo3ForConditionalGeneration`; 3 tests — commit f5856bb
+  - `midashenglm.rs` ✅ DONE — `MiDashengLMModel`; DashengAudioTransformer (ViT-style: BatchNorm2D + Conv2d + LayerScale blocks) + DashengProjector (subsample-k + GELU MLP) + Qwen2ForCausalLM; 7 tests; 4205 total — commit 064377c
 - **Files:** extend `multimodal/audio.rs`, new `multimodal/audio_encoder.rs`, per-model files
 
 ---
@@ -271,7 +272,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
   - `eagle_llama4.rs` — `EagleLlama4ForCausalLM` ✅ (5 tests) — commit 614ebc3
   - `eagle_minicpm.rs` — `EagleMiniCPMForCausalLM` ✅ (5 tests) — commit 614ebc3
   - `eagle_deepseek.rs` — `EagleDeepSeekForCausalLM` (arch: `EagleDeepSeekMTPModel`) ✅ (5 tests) — commit abd76b0
-  - `eagle1_from_config()` factory ✅ (4 variants: Llama, Llama4, MiniCPM, DeepSeek)
+  - `eagle1_from_config()` factory ✅ (5 variants: Llama, Llama4, MiniCPM, DeepSeek, MistralLarge3)
   - Fix: `EagleDeepSeekMTPModel` moved from `mtp_from_config()` to `eagle1_from_config()`
   - `models/medusa.rs` — `MedusaModel` + `MedusaDraftModel` trait + `medusa_from_config()` ✅ (5 tests)
 - **Architecture notes:**
@@ -279,6 +280,9 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
   - EagleLlama4: `fc(cat(embed, hidden)) → Llama4 layers → norm`; uses `TpContext::single_gpu()`
   - EagleMiniCPM: `fc(cat(norm1(embed), norm2(hidden))) → MiniCPM layers`; no final norm, divide by `scale_width`
   - Medusa: K independent residual blocks (`x += SiLU(Wx)`) + K lm_heads; weights at `blocks.{i}.layers.{j}` / `lm_heads.{i}`
+  - `eagle_mistral_large3.rs` — `EagleMistralLarge3ForCausalLM` ✅ (5 tests) — commit 629ec86
+    - Uses DeepSeek V2 MLA layers; fusion: `fc(cat(embed, hidden))` (no enorm/hnorm)
+    - Weight remapping: `eagle_linear.weight` → `model.fc.weight`
 
 ### 2.5 SSM/Mamba2 Ops
 **Difficulty:** ★★★☆☆ | **Effort:** 2–3 weeks
