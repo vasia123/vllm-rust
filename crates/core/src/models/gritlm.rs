@@ -12,7 +12,7 @@
 //!
 //! Reference: reference/vllm/vllm/model_executor/models/gritlm.py
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
@@ -140,26 +140,11 @@ impl GritLM {
 
     /// Run the backbone and return hidden states (before LM head).
     ///
-    /// For embedding mode, we need the hidden states rather than logits.
-    /// Since LlamaForCausalLM always applies the LM head, we re-run the
-    /// backbone layers directly.
-    fn get_hidden_states(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        // TODO: The proper approach would be to expose Llama's internal hidden
-        // states (before the LM head). For now, we return zero-initialized
-        // hidden states. With actual weights, the full forward through the
-        // Llama backbone produces meaningful representations.
-        let _ = attention_mask;
-
-        let (batch, seq_len) = input_ids.dims2()?;
-        Tensor::zeros(
-            (batch, seq_len, self.hidden_size),
-            DType::F32,
-            input_ids.device(),
-        )
+    /// GritLM operates with causal attention in both generation and embedding
+    /// modes — the model is trained autoregressively. A temporary KV cache
+    /// sized to the input sequence is allocated and freed after each call.
+    fn get_hidden_states(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.inner.forward_hidden_states(input_ids)
     }
 
     /// Mean pool hidden states, skipping instruction tokens.
@@ -236,8 +221,8 @@ impl crate::engine::ModelForward for GritLM {
 
 /// ModelForEmbedding implementation: embedding mode.
 impl ModelForEmbedding for GritLM {
-    fn embed(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        self.get_hidden_states(input_ids, attention_mask)
+    fn embed(&self, input_ids: &Tensor, _attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        self.get_hidden_states(input_ids)
     }
 
     fn pooling_strategy(&self) -> PoolingStrategy {
@@ -276,6 +261,7 @@ mod tests {
     use super::*;
     use crate::engine::ModelForward;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use candle_core::DType;
 
     fn test_gritlm_config() -> ModelConfig {
         ModelConfig {

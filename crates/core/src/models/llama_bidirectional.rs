@@ -18,6 +18,7 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::engine::{ModelForEmbedding, PoolingStrategy};
+use crate::kv_cache::{config::CacheConfig, quantization::KVCacheDtype};
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::layers::{rms_norm, RmsNorm};
 
@@ -41,6 +42,10 @@ pub struct LlamaBidirectionalModel {
     max_position_embeddings: usize,
     pooling: PoolingStrategy,
     device: Device,
+    // Stored for temporary cache creation in embed().
+    num_kv_heads: usize,
+    head_dim: usize,
+    dtype: candle_core::DType,
 }
 
 impl LlamaBidirectionalModel {
@@ -88,6 +93,9 @@ impl LlamaBidirectionalModel {
             max_position_embeddings: cfg.max_position_embeddings,
             pooling,
             device: vb.device().clone(),
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            dtype: vb.dtype(),
         })
     }
 
@@ -149,11 +157,41 @@ impl crate::engine::ModelForward for LlamaBidirectionalModel {
 
 impl ModelForEmbedding for LlamaBidirectionalModel {
     fn embed(&self, input_ids: &Tensor, _attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        // For embedding, we need KV cache but the bidirectional model doesn't
-        // really use it (writes to cache but the cached values aren't read back
-        // since seqlen_offset=0). We return the raw token embeddings here
-        // since full hidden states require the KV cache infrastructure.
-        self.embed_tokens.forward(input_ids, &self.tp_ctx)
+        let (batch_size, seq_len) = input_ids.dims2()?;
+
+        // Prefill attention only supports batch_size=1 (paged cache write is
+        // per-sequence). Process each item independently and stack.
+        let block_size = seq_len.max(1);
+        let cache_config = CacheConfig {
+            block_size,
+            num_blocks: 2, // 1 active + 1 spare (pool requires ≥1 free)
+            num_layers: self.layers.len(),
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            dtype: self.dtype,
+            device: self.device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+
+        let mut outputs = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let ids_b = input_ids.narrow(0, b, 1)?;
+            let mut kv_cache_mgr = KVCacheManager::new(&cache_config)
+                .map_err(|e| candle_core::Error::Msg(format!("embed: cache alloc: {e}")))?;
+            let mut block_table = BlockTable::new(block_size);
+            kv_cache_mgr
+                .allocate_for_request(&mut block_table, seq_len)
+                .map_err(|e| candle_core::Error::Msg(format!("embed: block alloc: {e}")))?;
+            let slot_mapping = block_table.slot_mapping(0, seq_len);
+            outputs.push(self.forward_hidden(
+                &ids_b,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )?);
+        }
+        Tensor::cat(&outputs, 0)
     }
 
     fn pooling_strategy(&self) -> PoolingStrategy {

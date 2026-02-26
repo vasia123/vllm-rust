@@ -5,6 +5,7 @@ use candle_nn::VarBuilder;
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
+use crate::kv_cache::{config::CacheConfig, quantization::KVCacheDtype};
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding};
 
@@ -376,6 +377,9 @@ pub struct LlamaForCausalLM {
     tp_ctx: TpContext,
     device: Device,
     dtype: DType,
+    // Stored for temporary cache creation in forward_hidden_states.
+    num_kv_heads: usize,
+    head_dim: usize,
 }
 
 impl LlamaForCausalLM {
@@ -453,6 +457,8 @@ impl LlamaForCausalLM {
             tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
         })
     }
 
@@ -506,6 +512,70 @@ impl LlamaForCausalLM {
     /// Embed token IDs → hidden states (for VLM: embed only, no layers).
     pub fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.forward(input_ids, &self.tp_ctx)
+    }
+
+    /// Run the full backbone and return hidden states before the LM head.
+    ///
+    /// Used by embedding models (GritLM) that share the Llama backbone but pool
+    /// hidden states instead of projecting to vocabulary logits. A temporary
+    /// KV cache sized exactly to the input is created and discarded after use.
+    pub(crate) fn forward_hidden_states(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let (batch_size, seq_len) = input_ids.dims2()?;
+
+        // Prefill attention only supports batch_size=1 (paged cache write is
+        // per-sequence). Process each item independently and stack.
+        let block_size = seq_len.max(1);
+        let cache_config = CacheConfig {
+            block_size,
+            num_blocks: 2, // 1 active + 1 spare (pool requires ≥1 free)
+            num_layers: self.layers.len(),
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            dtype: self.dtype,
+            device: self.device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                0,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+
+        let mut outputs = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let ids_b = input_ids.narrow(0, b, 1)?;
+            let mut kv_cache_mgr = KVCacheManager::new(&cache_config).map_err(|e| {
+                candle_core::Error::Msg(format!("forward_hidden_states: cache alloc: {e}"))
+            })?;
+            let mut block_table = BlockTable::new(block_size);
+            kv_cache_mgr
+                .allocate_for_request(&mut block_table, seq_len)
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("forward_hidden_states: block alloc: {e}"))
+                })?;
+            let mut xs = self.embed_tokens.forward(&ids_b, &self.tp_ctx)?;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                xs = layer.forward(
+                    &xs,
+                    attention_mask.as_ref(),
+                    0,
+                    &mut kv_cache_mgr,
+                    layer_idx,
+                    &block_table,
+                    &slot_mapping,
+                    &self.tp_ctx,
+                )?;
+            }
+            outputs.push(self.norm.forward(&xs)?);
+        }
+        Tensor::cat(&outputs, 0)
     }
 
     /// Run layers + norm + lm_head on pre-computed embeddings (for VLM).
