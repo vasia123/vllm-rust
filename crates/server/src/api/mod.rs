@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod anthropic;
 pub mod audio;
 pub mod batch;
 pub mod chat;
@@ -700,6 +701,7 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
             "/v1/chat/completions/render",
             post(chat::render_chat_completion),
         )
+        .route("/v1/messages", post(anthropic::create_messages))
         .route("/v1/responses", post(responses::create_response))
         .route("/v1/responses/{response_id}", get(get_response))
         .route("/v1/responses/{response_id}/cancel", post(cancel_response))
@@ -825,6 +827,7 @@ pub fn create_full_router_with_all_options(
             "/v1/chat/completions/render",
             post(chat::render_chat_completion),
         )
+        .route("/v1/messages", post(anthropic::create_messages))
         .route("/v1/responses", post(responses::create_response))
         .route("/v1/responses/{response_id}", get(get_response))
         .route("/v1/responses/{response_id}/cancel", post(cancel_response))
