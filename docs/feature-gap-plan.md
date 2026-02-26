@@ -299,10 +299,11 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 
 ### 3.2 Server API — Speech & Realtime
 **Effort:** 2–3 weeks
-- `POST /v1/audio/transcriptions` + `POST /v1/audio/translations` — ~250 LOC handler
-  - Multipart form upload → decode audio → audio encoder → text response
-  - **Requires:** Audio pipeline (§1.5) complete
-  - `crates/server/src/api/audio.rs` (new file)
+- ✅ `POST /v1/audio/transcriptions` + `POST /v1/audio/translations` DONE — commit `3a5bd10`
+  - `crates/server/src/api/audio.rs`: multipart/form-data upload (axum multipart), WAV PCM decoding (hound), normalize to 16 kHz mono, `build_audio_prompt`, `run_audio_task`, 7 tests; 4550 total
+  - `GenerationRequest.audio_inputs: Vec<AudioData>` added; all struct literals updated
+  - `AudioData` re-exported from `vllm_core::multimodal`
+  - NOTE: model forward passes need to consume `audio_inputs` to embed via encoder+projector (see doc comment)
 - `WebSocket /v1/realtime` — ~500 LOC
   - Persistent connection, delta-streaming, session state machine
   - `crates/server/src/api/realtime.rs` (new file)
@@ -337,7 +338,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 
 ### 4.2 RoPE Variants
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
-- **MRoPE Interleaved** — `mrope_interleaved.py`; ~200 LOC; interleaved frequency layout
+- ~~**MRoPE Interleaved**~~ ✅ DONE — `mrope_interleaved.py`; `get_mrope_interleaved_id_list` + `MRoPEInterleaved` in `layers/rotary.rs`; 8 tests — commit pending
 - **FoPE** — `fope.py`; ~200 LOC; factored positional encoding
 - ~~**XDRoPE**~~ ✅ DONE — `xdrope.py`; `XDRotaryEmbedding` in `layers/rotary.rs`, 5 tests — commit 94ada76
 - **ERNIE4.5-VL RoPE** — `ernie45_vl_rope.py`; ~150 LOC; unblocks ERNIE4.5-VL

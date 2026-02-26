@@ -1409,3 +1409,349 @@ mod tests {
         }
     }
 }
+
+// ─── MRoPEInterleaved ────────────────────────────────────────────────────────
+
+/// Generate an interleaved index sequence for multi-modal rotary embedding.
+///
+/// Given per-dimension counts `a`, `b`, `c`, produces a sequence of dimension
+/// indices `[0..total)` that is balanced (each index appears its count times)
+/// and avoids placing the same index consecutively wherever possible.
+///
+/// Algorithm: greedy minimum-placed selection — at each step, from all
+/// dimensions that still have remaining budget and are not equal to `last`,
+/// pick the one that has been placed the fewest times relative to its total
+/// count. If no non-`last` candidate remains, relax the constraint.
+///
+/// When `force_last` is true, one unit is reserved from count `a` and
+/// appended unconditionally at the end (used for the temporal dimension in
+/// 3-section setups to ensure the last position is always temporal).
+///
+/// Reference: `MRotaryEmbeddingInterleaved.get_mrope_interleaved_id_list`
+/// in `vllm/model_executor/layers/rotary_embedding/mrope_interleaved.py`.
+pub fn get_mrope_interleaved_id_list(a: usize, b: usize, c: usize, force_last: bool) -> Vec<usize> {
+    let mut counts = [a, b, c];
+    if force_last {
+        if counts[0] == 0 {
+            // Cannot force_last when a == 0; just skip.
+        } else {
+            counts[0] -= 1;
+        }
+    }
+
+    let totals = counts;
+    let total: usize = counts.iter().sum();
+    let mut placed = [0usize; 3];
+    let mut remaining = counts;
+    let mut seq = Vec::with_capacity(total + if force_last { 1 } else { 0 });
+    let mut last: Option<usize> = None;
+
+    for _ in 0..total {
+        // Prefer candidates that differ from the previous choice.
+        let mut cands: Vec<usize> = (0..3)
+            .filter(|&k| remaining[k] > 0 && Some(k) != last)
+            .collect();
+        if cands.is_empty() {
+            // Only the last dimension has remaining budget.
+            cands = (0..3).filter(|&k| remaining[k] > 0).collect();
+        }
+
+        // Greedy: pick the dimension that has been placed the least fraction
+        // of its total. Break ties by index (lower = first).
+        let best = cands
+            .into_iter()
+            .min_by(|&x, &y| {
+                let fx = if totals[x] == 0 {
+                    f64::MAX
+                } else {
+                    placed[x] as f64 / totals[x] as f64
+                };
+                let fy = if totals[y] == 0 {
+                    f64::MAX
+                } else {
+                    placed[y] as f64 / totals[y] as f64
+                };
+                fx.partial_cmp(&fy)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(x.cmp(&y))
+            })
+            .unwrap_or(0);
+
+        seq.push(best);
+        placed[best] += 1;
+        remaining[best] -= 1;
+        last = Some(best);
+    }
+
+    if force_last {
+        seq.push(0);
+    }
+
+    seq
+}
+
+/// Multimodal Rotary Embedding with interleaved frequency assignment.
+///
+/// Differs from section-based MRoPE (which assigns contiguous frequency blocks
+/// to each dimension) by interleaving: each individual frequency `i` is
+/// assigned to dimension `mrope_dim[i]` ∈ {0, 1, 2} (temporal/height/width)
+/// via the balanced greedy algorithm [`get_mrope_interleaved_id_list`].
+///
+/// This produces a more even distribution of positional information across the
+/// full frequency spectrum, which can improve performance for video/image inputs
+/// where all three spatial dimensions are important.
+///
+/// Reference: `MRotaryEmbeddingInterleaved`
+/// in `vllm/model_executor/layers/rotary_embedding/mrope_interleaved.py`.
+pub struct MRoPEInterleaved {
+    sin: Tensor,
+    cos: Tensor,
+    /// Per-frequency dimension assignment; length == head_dim / 2.
+    /// `mrope_dim[i]` ∈ {0, 1, 2} tells which of the three position channels
+    /// (temporal/height/width) supplies the position index for frequency `i`.
+    mrope_dim: Vec<usize>,
+}
+
+impl MRoPEInterleaved {
+    /// Create a new interleaved MRoPE embedding.
+    ///
+    /// # Arguments
+    /// * `head_dim` - Full head dimension; rotation uses all `head_dim` dims
+    /// * `max_seq_len` - Maximum sequence length (cache size)
+    /// * `rope_theta` - RoPE base frequency
+    /// * `mrope_section` - Per-dimension frequency count; length 2 or 3;
+    ///   must sum to `head_dim / 2`
+    /// * `dtype` - Data type for the sin/cos tables
+    /// * `device` - Target device
+    pub fn new(
+        head_dim: usize,
+        max_seq_len: usize,
+        rope_theta: f64,
+        mrope_section: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let half_dim = head_dim / 2;
+        let section_sum: usize = mrope_section.iter().sum();
+        if section_sum != half_dim {
+            return Err(candle_core::Error::Msg(format!(
+                "mrope_section sum ({section_sum}) must equal head_dim/2 ({half_dim})"
+            )));
+        }
+        if mrope_section.len() < 2 || mrope_section.len() > 3 {
+            return Err(candle_core::Error::Msg(
+                "mrope_section must have length 2 or 3".to_string(),
+            ));
+        }
+
+        // Build cos/sin cache [max_seq_len, half_dim].
+        let inv_freq: Vec<f32> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1.0 / (rope_theta as f32).powf(i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq =
+            Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+
+        // Build interleaved dimension-assignment indices of length half_dim.
+        let (a, b, c, force_last) = if mrope_section.len() == 2 {
+            (mrope_section[0], mrope_section[1], 0, false)
+        } else {
+            (mrope_section[0], mrope_section[1], mrope_section[2], true)
+        };
+        let mrope_dim = get_mrope_interleaved_id_list(a, b, c, force_last);
+        debug_assert_eq!(mrope_dim.len(), half_dim);
+
+        Ok(Self {
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            mrope_dim,
+        })
+    }
+
+    /// Apply interleaved MRoPE to prefill tokens.
+    ///
+    /// # Arguments
+    /// * `q` - `[num_tokens, num_heads, head_dim]`
+    /// * `k` - `[num_tokens, num_kv_heads, head_dim]`
+    /// * `position_ids` - `[3, num_tokens]` (temporal/height/width positions; u32/i64)
+    pub fn apply(&self, q: &Tensor, k: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        let half_dim = self.mrope_dim.len();
+
+        // For each of the 3 dimensions pre-fetch the per-token, full-half_dim
+        // cos and sin rows:  dim_cos[d] = cos.index_select(position_ids[d], 0)
+        // Shape: [num_tokens, half_dim]
+        let mut dim_cos = Vec::with_capacity(3);
+        let mut dim_sin = Vec::with_capacity(3);
+        for d in 0..3 {
+            let pos_d = position_ids
+                .narrow(0, d, 1)?
+                .squeeze(0)?
+                .to_dtype(DType::U32)?;
+            dim_cos.push(self.cos.index_select(&pos_d, 0)?);
+            dim_sin.push(self.sin.index_select(&pos_d, 0)?);
+        }
+
+        // Interleave: for each freq i, pick the column from the right dim.
+        // Result: [num_tokens, half_dim]
+        let mut cos_cols = Vec::with_capacity(half_dim);
+        let mut sin_cols = Vec::with_capacity(half_dim);
+        for (i, &d) in self.mrope_dim.iter().enumerate() {
+            cos_cols.push(dim_cos[d].narrow(1, i, 1)?);
+            sin_cols.push(dim_sin[d].narrow(1, i, 1)?);
+        }
+        let cos = Tensor::cat(&cos_cols, 1)?.contiguous()?;
+        let sin = Tensor::cat(&sin_cols, 1)?.contiguous()?;
+
+        // rope() expects [b, h, t, d]; input is [num_tokens, num_heads, head_dim].
+        // Reshape: [T, H, D] → [1, H, T, D], call rope, then back to [T, H, D].
+        let q4 = q.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let k4 = k.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let q_rot = candle_nn::rotary_emb::rope(&q4, &cos, &sin)?
+            .squeeze(0)?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let k_rot = candle_nn::rotary_emb::rope(&k4, &cos, &sin)?
+            .squeeze(0)?
+            .transpose(0, 1)?
+            .contiguous()?;
+        Ok((q_rot, k_rot))
+    }
+
+    /// Apply interleaved MRoPE at a scalar decode position.
+    ///
+    /// For decode steps where all 3 position dimensions share the same offset
+    /// (text-only tokens), this is equivalent to standard RoPE.
+    pub fn apply_scalar(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // All dimensions use the same position → standard RoPE from the cache.
+        // q: [num_tokens, num_heads, head_dim]; rope() expects [b, h, t, d].
+        let seq_len = q.dim(0)?;
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let q4 = q.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let k4 = k.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let q_rot = candle_nn::rotary_emb::rope(&q4, &cos, &sin)?
+            .squeeze(0)?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let k_rot = candle_nn::rotary_emb::rope(&k4, &cos, &sin)?
+            .squeeze(0)?
+            .transpose(0, 1)?
+            .contiguous()?;
+        Ok((q_rot, k_rot))
+    }
+}
+
+#[cfg(test)]
+mod mrope_interleaved_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    // ─── get_mrope_interleaved_id_list ────────────────────────────────────────
+
+    #[test]
+    fn id_list_2d_balanced() {
+        // 2-section [3, 3]: should alternate 0 and 1 as much as possible.
+        let ids = get_mrope_interleaved_id_list(3, 3, 0, false);
+        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.iter().filter(|&&x| x == 0).count(), 3);
+        assert_eq!(ids.iter().filter(|&&x| x == 1).count(), 3);
+        assert_eq!(ids.iter().filter(|&&x| x == 2).count(), 0);
+        // No two adjacent duplicates when counts are equal.
+        for w in ids.windows(2) {
+            assert_ne!(w[0], w[1], "adjacent duplicate in 2D balanced");
+        }
+    }
+
+    #[test]
+    fn id_list_3d_force_last() {
+        // 3-section [4, 3, 3], force_last: last element must be 0.
+        let ids = get_mrope_interleaved_id_list(4, 3, 3, true);
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.iter().filter(|&&x| x == 0).count(), 4);
+        assert_eq!(ids.iter().filter(|&&x| x == 1).count(), 3);
+        assert_eq!(ids.iter().filter(|&&x| x == 2).count(), 3);
+        assert_eq!(*ids.last().unwrap(), 0, "force_last violated");
+    }
+
+    #[test]
+    fn id_list_zero_counts() {
+        // c == 0: effectively a 2-section list.
+        let ids = get_mrope_interleaved_id_list(4, 4, 0, false);
+        assert_eq!(ids.len(), 8);
+        assert!(ids.iter().all(|&x| x < 2), "c=0 should only produce 0/1");
+    }
+
+    // ─── MRoPEInterleaved ─────────────────────────────────────────────────────
+
+    fn make_interleaved_rope(head_dim: usize, mrope_section: &[usize]) -> MRoPEInterleaved {
+        MRoPEInterleaved::new(
+            head_dim,
+            128,
+            10000.0,
+            mrope_section,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn construction_2d() {
+        let rope = make_interleaved_rope(64, &[16, 16]);
+        assert_eq!(rope.mrope_dim.len(), 32);
+    }
+
+    #[test]
+    fn construction_3d() {
+        let rope = make_interleaved_rope(64, &[10, 11, 11]);
+        assert_eq!(rope.mrope_dim.len(), 32);
+    }
+
+    #[test]
+    fn construction_mismatched_section_fails() {
+        let result = MRoPEInterleaved::new(64, 128, 10000.0, &[10, 10], DType::F32, &Device::Cpu);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_output_shape_3d() {
+        let head_dim = 64;
+        let rope = make_interleaved_rope(head_dim, &[10, 11, 11]);
+        let num_tokens = 12;
+        let num_heads = 4;
+        let q =
+            Tensor::randn(0.0f32, 1.0, (num_tokens, num_heads, head_dim), &Device::Cpu).unwrap();
+        let k = Tensor::zeros((num_tokens, num_heads, head_dim), DType::F32, &Device::Cpu).unwrap();
+        // position_ids: [3, num_tokens]
+        let pos: Vec<u32> = (0..num_tokens as u32)
+            .cycle()
+            .take(3 * num_tokens)
+            .collect();
+        let position_ids = Tensor::from_vec(pos, (3, num_tokens), &Device::Cpu).unwrap();
+        let (q_rot, k_rot) = rope.apply(&q, &k, &position_ids).unwrap();
+        assert_eq!(q_rot.shape().dims(), &[num_tokens, num_heads, head_dim]);
+        assert_eq!(k_rot.shape().dims(), &[num_tokens, num_heads, head_dim]);
+    }
+
+    #[test]
+    fn apply_scalar_matches_standard_rope_at_zero() {
+        // When all position dims use offset 0, scalar apply should match
+        // regular rope at position 0.
+        let head_dim = 32;
+        let rope = make_interleaved_rope(head_dim, &[8, 8]);
+        let q = Tensor::ones((1, 4, head_dim), DType::F32, &Device::Cpu).unwrap();
+        let k = Tensor::ones((1, 4, head_dim), DType::F32, &Device::Cpu).unwrap();
+        let (q_rot, _) = rope.apply_scalar(&q, &k, 0).unwrap();
+        assert_eq!(q_rot.dims(), &[1, 4, head_dim]);
+    }
+}
