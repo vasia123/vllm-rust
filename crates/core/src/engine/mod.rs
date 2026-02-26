@@ -537,6 +537,7 @@ mod tests {
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..crate::scheduler::SchedulerConfig::default()
             },
             None,
         )
@@ -686,6 +687,7 @@ mod tests {
                 enable_chunked_prefill: true,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..crate::scheduler::SchedulerConfig::default()
             },
             None,
         )
@@ -1160,6 +1162,7 @@ mod tests {
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..crate::scheduler::SchedulerConfig::default()
             },
             None,
         )
@@ -1271,6 +1274,7 @@ mod tests {
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..crate::scheduler::SchedulerConfig::default()
             },
             None,
         )
@@ -1301,6 +1305,7 @@ mod tests {
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..crate::scheduler::SchedulerConfig::default()
             },
             None,
         )
@@ -2081,6 +2086,7 @@ mod tests {
                     enable_chunked_prefill: false,
                     scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                     max_loras_per_batch: 0,
+                    ..crate::scheduler::SchedulerConfig::default()
                 },
                 None,
             )
@@ -2141,6 +2147,7 @@ mod tests {
                 enable_chunked_prefill: false,
                 scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..crate::scheduler::SchedulerConfig::default()
             },
             None,
         )
@@ -2305,6 +2312,7 @@ mod tests {
                     enable_chunked_prefill: false,
                     scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
                     max_loras_per_batch: 0,
+                    ..crate::scheduler::SchedulerConfig::default()
                 },
                 None,
             )

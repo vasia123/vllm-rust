@@ -14,6 +14,22 @@ pub enum SchedulingPolicy {
     Priority,
 }
 
+/// How to handle in-flight requests when KV cache memory is exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreemptionMode {
+    /// Free the KV blocks and recompute the prefill on next scheduling.
+    ///
+    /// No CPU memory is required. Recomputation wastes GPU cycles on re-prefill
+    /// but avoids the PCIe transfer latency of the Swap path.
+    #[default]
+    Recompute,
+    /// Copy KV blocks to CPU swap space and restore them on resumption.
+    ///
+    /// Preserves computed KV state at the cost of CPU memory and PCIe bandwidth.
+    /// Falls back to Recompute when CPU offload is not configured.
+    Swap,
+}
+
 /// Priority level for a request. Lower values indicate higher priority.
 pub type RequestPriority = i32;
 
@@ -327,6 +343,20 @@ pub struct SchedulerConfig {
     /// Requests exceeding this limit are deferred to the next step.
     /// 0 means unlimited.
     pub max_loras_per_batch: usize,
+    /// Preemption strategy when KV cache is exhausted.
+    pub preemption_mode: PreemptionMode,
+    /// Maximum number of simultaneously active "long" chunked prefill requests.
+    ///
+    /// When chunked prefill is enabled and `long_prefill_token_threshold > 0`,
+    /// at most this many requests whose remaining prompt tokens exceed the
+    /// threshold are scheduled concurrently. Default 1. Must be ≥ 1.
+    pub max_num_partial_prefills: usize,
+    /// Remaining-token threshold for classifying a partial prefill as "long".
+    ///
+    /// 0 disables long-prefill throttling entirely. When non-zero, requests
+    /// with more remaining tokens than this value compete for the shared
+    /// `max_num_partial_prefills` budget instead of being admitted freely.
+    pub long_prefill_token_threshold: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -337,6 +367,9 @@ impl Default for SchedulerConfig {
             enable_chunked_prefill: false,
             scheduling_policy: SchedulingPolicy::Fcfs,
             max_loras_per_batch: 0,
+            preemption_mode: PreemptionMode::Recompute,
+            max_num_partial_prefills: 1,
+            long_prefill_token_threshold: 0,
         }
     }
 }
@@ -547,6 +580,26 @@ impl Scheduler {
         // Simulate running_set size after preemptions
         let running_count = self.running_set.len() - to_preempt.len();
 
+        // Count running chunked-prefill requests that exceed the long-prefill
+        // threshold. These consume capacity from `max_num_partial_prefills`.
+        // Preempted requests are excluded since they leave the running set.
+        let threshold = self.config.long_prefill_token_threshold;
+        let active_long_prefills: usize = if threshold > 0 {
+            running_snapshot
+                .iter()
+                .filter(|id| !preempted_set.contains(id))
+                .filter(|id| {
+                    states.get(id).is_some_and(|s| {
+                        s.status == RequestStatus::Prefilling
+                            && (s.prompt_token_ids.len() - s.num_computed_tokens) > threshold
+                    })
+                })
+                .count()
+        } else {
+            0
+        };
+        let mut long_prefill_count = active_long_prefills;
+
         let candidates: Vec<RequestId> = self.waiting_queue.iter_in_order();
 
         for req_id in candidates {
@@ -578,6 +631,13 @@ impl Scheduler {
                 continue;
             }
 
+            // Long-prefill throttling: skip (not break) so shorter waiting
+            // requests can still be admitted this step.
+            let is_long_prefill = threshold > 0 && remaining > threshold;
+            if is_long_prefill && long_prefill_count >= self.config.max_num_partial_prefills {
+                continue;
+            }
+
             let chunk_size = if self.config.enable_chunked_prefill {
                 remaining.min(budget)
             } else {
@@ -593,6 +653,9 @@ impl Scheduler {
                 newly_admitted.push(req_id);
                 free_blocks -= blocks_needed;
                 budget -= chunk_size;
+                if is_long_prefill {
+                    long_prefill_count += 1;
+                }
                 output.prefill_requests.push(PrefillSchedule {
                     request_id: req_id,
                     chunk_size,
@@ -721,6 +784,7 @@ mod tests {
             enable_chunked_prefill: chunked,
             scheduling_policy: SchedulingPolicy::Fcfs,
             max_loras_per_batch: 0,
+            ..SchedulerConfig::default()
         }
     }
 
@@ -731,6 +795,7 @@ mod tests {
             enable_chunked_prefill: chunked,
             scheduling_policy: SchedulingPolicy::Priority,
             max_loras_per_batch: 0,
+            ..SchedulerConfig::default()
         }
     }
 
@@ -1631,5 +1696,112 @@ mod tests {
         // Request 0 should still be scheduled for decode
         assert_eq!(decision.output.decode_requests.len(), 1);
         assert_eq!(decision.output.decode_requests[0], 0);
+    }
+
+    // ==================== PreemptionMode / Partial Prefill Tests ====================
+
+    #[test]
+    fn preemption_mode_default_is_recompute() {
+        let cfg = SchedulerConfig::default();
+        assert_eq!(cfg.preemption_mode, PreemptionMode::Recompute);
+        assert_eq!(cfg.max_num_partial_prefills, 1);
+        assert_eq!(cfg.long_prefill_token_threshold, 0);
+    }
+
+    #[test]
+    fn long_prefill_threshold_zero_admits_all() {
+        // When threshold == 0, long-prefill throttling is disabled and all
+        // waiting requests are admitted according to the normal budget rules.
+        let config = SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 1024,
+            enable_chunked_prefill: true,
+            scheduling_policy: SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
+            max_num_partial_prefills: 1, // limit = 1 but threshold = 0 so inactive
+            long_prefill_token_threshold: 0,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut states = HashMap::new();
+        // Two long requests (600 tokens each) — both admitted since threshold == 0
+        states.insert(0, make_state(0, 600, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 600, RequestStatus::Waiting, 16, 1));
+        scheduler.add_request(0);
+        scheduler.add_request(1);
+
+        let output = scheduler.schedule(&refs(&states), 1000);
+        assert_eq!(output.prefill_requests.len(), 2);
+    }
+
+    #[test]
+    fn long_prefill_limit_one_blocks_second_long_request() {
+        // With threshold=100 and max_num_partial_prefills=1, only one long
+        // request can be in-flight; the second is skipped this step.
+        let config = SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 2048,
+            enable_chunked_prefill: true,
+            scheduling_policy: SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
+            max_num_partial_prefills: 1,
+            long_prefill_token_threshold: 100,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut states = HashMap::new();
+        // Two long requests (500 tokens each), both fit in budget/blocks
+        states.insert(0, make_state(0, 500, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 500, RequestStatus::Waiting, 16, 1));
+        scheduler.add_request(0);
+        scheduler.add_request(1);
+
+        let output = scheduler.schedule(&refs(&states), 1000);
+        // Only one long prefill admitted
+        assert_eq!(output.prefill_requests.len(), 1);
+        assert_eq!(output.prefill_requests[0].request_id, 0);
+    }
+
+    #[test]
+    fn long_prefill_limit_short_request_still_admitted() {
+        // The long-prefill limit must not block short requests. A short request
+        // that arrives after a long one must be admitted even when the long-
+        // prefill slot is full.
+        let config = SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 2048,
+            enable_chunked_prefill: true,
+            scheduling_policy: SchedulingPolicy::Fcfs,
+            max_loras_per_batch: 0,
+            max_num_partial_prefills: 1,
+            long_prefill_token_threshold: 100,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut states = HashMap::new();
+        // long request (arrival 0), another long (arrival 1), short (arrival 2)
+        states.insert(0, make_state(0, 500, RequestStatus::Waiting, 16, 0));
+        states.insert(1, make_state(1, 500, RequestStatus::Waiting, 16, 1));
+        states.insert(2, make_state(2, 50, RequestStatus::Waiting, 16, 2)); // short
+        scheduler.add_request(0);
+        scheduler.add_request(1);
+        scheduler.add_request(2);
+
+        let output = scheduler.schedule(&refs(&states), 1000);
+        let ids: Vec<RequestId> = output
+            .prefill_requests
+            .iter()
+            .map(|p| p.request_id)
+            .collect();
+        // First long + short admitted; second long skipped
+        assert!(ids.contains(&0), "long request 0 should be admitted");
+        assert!(
+            ids.contains(&2),
+            "short request 2 should be admitted despite long-prefill limit"
+        );
+        assert!(
+            !ids.contains(&1),
+            "second long request 1 should be throttled"
+        );
     }
 }

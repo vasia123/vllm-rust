@@ -2064,6 +2064,7 @@ mod tests {
             enable_chunked_prefill: false,
             scheduling_policy: crate::scheduler::SchedulingPolicy::Fcfs,
             max_loras_per_batch: 0,
+            ..crate::scheduler::SchedulerConfig::default()
         });
         let mut requests = HashMap::new();
         let mut next_id = 0;

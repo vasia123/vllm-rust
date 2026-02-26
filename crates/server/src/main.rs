@@ -14,7 +14,7 @@ use vllm_core::{
     loader,
     lora::LoraLoader,
     models,
-    scheduler::SchedulerConfig,
+    scheduler::{PreemptionMode, SchedulerConfig},
     tokenizer::{ChatTemplateEngine, TokenizerWrapper},
 };
 
@@ -823,6 +823,16 @@ async fn main() -> anyhow::Result<()> {
                 ),
             };
 
+            // Parse preemption mode
+            let parsed_preemption_mode = match preemption_mode.as_str() {
+                "recompute" => PreemptionMode::Recompute,
+                "swap" => PreemptionMode::Swap,
+                other => anyhow::bail!(
+                    "Unknown preemption mode '{}'. Supported: recompute, swap",
+                    other
+                ),
+            };
+
             // Parse dtype
             let compute_dtype = match dtype.as_str() {
                 "auto" | "bf16" | "bfloat16" => DType::BF16,
@@ -881,7 +891,7 @@ async fn main() -> anyhow::Result<()> {
                 code_revision,
                 hf_token,
                 max_parallel_loading_workers,
-                preemption_mode,
+                preemption_mode: parsed_preemption_mode,
                 max_num_partial_prefills,
                 long_prefill_token_threshold,
                 stream_interval,
@@ -982,7 +992,7 @@ struct ServerLaunchConfig {
     hf_token: Option<String>,
     max_parallel_loading_workers: usize,
     // Scheduler Tuning
-    preemption_mode: String,
+    preemption_mode: PreemptionMode,
     max_num_partial_prefills: Option<usize>,
     long_prefill_token_threshold: Option<usize>,
     stream_interval: usize,
@@ -1100,14 +1110,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = &tokenizer_mode; // TODO: wire to tokenizer selection
     let _ = &code_revision; // TODO: wire to custom code loading
     let _ = max_parallel_loading_workers; // TODO: wire to parallel weight loading
-    let _ = &preemption_mode; // TODO: wire to scheduler preemption strategy
-    let _ = max_num_partial_prefills; // TODO: wire to partial prefill limits
-    let _ = long_prefill_token_threshold; // TODO: wire to long prefill classification
                                           // max_loras: wired to SchedulerConfig.max_loras_per_batch below
     let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
-    let _ = max_cpu_loras; // TODO: wire to CPU LoRA cache limit
     let _ = &spec_decoding_acceptance_method; // TODO: wire to acceptance sampler type
-    let _ = disable_log_stats; // TODO: wire to periodic stats suppression
     let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
                                    // Parse --limit-mm-per-prompt JSON ("{"image": 5, "video": 1}") into per-modality limits.
     let mm_limits: std::collections::HashMap<String, usize> =
@@ -1157,6 +1162,21 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     eprintln!("Loading weights to GPU ({dtype_label})...");
     let vb = loader::load_weights(&files.weights, dtype, &device)?;
+
+    // Validate max_cpu_loras against the number of startup adapters.
+    // Dynamic LoRA loading with an LRU cache is not yet implemented; this
+    // check ensures the user-supplied limit is not violated at startup.
+    // TODO: implement a proper LRU CPU adapter cache for dynamic loading.
+    if let Some(max_cpu) = max_cpu_loras {
+        if lora_adapters.len() > max_cpu {
+            anyhow::bail!(
+                "--max-cpu-loras {} is less than the number of adapters being loaded ({}). \
+                 Either raise the limit or reduce the number of startup adapters.",
+                max_cpu,
+                lora_adapters.len()
+            );
+        }
+    }
 
     // Parse LoRA adapter specs first
     let parsed_lora_specs: Vec<(&str, &str)> = lora_adapters
@@ -1376,6 +1396,18 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let eos_token_id = files.config.eos_token_id;
     let engine_tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
 
+    // Build scheduler config once; reused for all engine start paths.
+    let scheduler_config = SchedulerConfig {
+        max_running_requests: max_requests,
+        max_tokens_per_step: max_num_batched_tokens,
+        enable_chunked_prefill,
+        scheduling_policy,
+        max_loras_per_batch: max_loras,
+        preemption_mode,
+        max_num_partial_prefills: max_num_partial_prefills.unwrap_or(1),
+        long_prefill_token_threshold: long_prefill_token_threshold.unwrap_or(0),
+    };
+
     let handle = if let Some(ref draft_id) = draft_model_id {
         eprintln!("Loading draft model: {draft_id}");
         let draft_files =
@@ -1399,13 +1431,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             let proposer = MLPSpeculatorDraftProposer::new(mlp_model);
 
             let engine_config = EngineConfig::builder(
-                SchedulerConfig {
-                    max_running_requests: max_requests,
-                    max_tokens_per_step: max_num_batched_tokens,
-                    enable_chunked_prefill,
-                    scheduling_policy,
-                    max_loras_per_batch: max_loras,
-                },
+                scheduler_config,
                 Some(SpeculativeConfig {
                     num_speculative_tokens,
                 }),
@@ -1446,13 +1472,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
 
             let engine_config = EngineConfig::builder(
-                SchedulerConfig {
-                    max_running_requests: max_requests,
-                    max_tokens_per_step: max_num_batched_tokens,
-                    enable_chunked_prefill,
-                    scheduling_policy,
-                    max_loras_per_batch: max_loras,
-                },
+                scheduler_config,
                 Some(SpeculativeConfig {
                     num_speculative_tokens,
                 }),
@@ -1481,19 +1501,10 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         let spec_config = SpeculativeConfig {
             num_speculative_tokens,
         };
-        let engine_config = EngineConfig::builder(
-            SchedulerConfig {
-                max_running_requests: max_requests,
-                max_tokens_per_step: max_num_batched_tokens,
-                enable_chunked_prefill,
-                scheduling_policy,
-                max_loras_per_batch: max_loras,
-            },
-            Some(spec_config),
-        )
-        .multi_step_count(multi_step_count)
-        .enable_prefix_caching(enable_prefix_caching)
-        .build();
+        let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config))
+            .multi_step_count(multi_step_count)
+            .enable_prefix_caching(enable_prefix_caching)
+            .build();
 
         eprintln!(
             "Starting engine (NGram speculative, K={num_speculative_tokens}, n={min_n}..{max_n})..."
@@ -1506,19 +1517,10 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             engine_config,
         )
     } else {
-        let engine_config = EngineConfig::builder(
-            SchedulerConfig {
-                max_running_requests: max_requests,
-                max_tokens_per_step: max_num_batched_tokens,
-                enable_chunked_prefill,
-                scheduling_policy,
-                max_loras_per_batch: max_loras,
-            },
-            None,
-        )
-        .multi_step_count(multi_step_count)
-        .enable_prefix_caching(enable_prefix_caching)
-        .build();
+        let engine_config = EngineConfig::builder(scheduler_config, None)
+            .multi_step_count(multi_step_count)
+            .enable_prefix_caching(enable_prefix_caching)
+            .build();
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
         start_engine(model, engine_tokenizer, kv_cache_mgr, engine_config)
@@ -1527,6 +1529,32 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let (atomic_engine, engine_controller) = AtomicEngineHandle::new(handle);
     let accepting = Arc::new(AtomicBool::new(true));
     let engine_builder: Arc<ProductionEngineBuilder> = Arc::new(ProductionEngineBuilder);
+
+    // Periodic engine stats logging. Logs running/waiting queue depths and
+    // KV cache occupancy every 5 seconds. Suppressed by --disable-log-stats.
+    if !disable_log_stats {
+        let stats_handle = atomic_engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Ok(stats) = stats_handle.get().get_stats().await {
+                    let used = stats.num_total_blocks.saturating_sub(stats.num_free_blocks);
+                    let pct = if stats.num_total_blocks > 0 {
+                        100.0 * used as f64 / stats.num_total_blocks as f64
+                    } else {
+                        0.0
+                    };
+                    tracing::info!(
+                        num_running = stats.num_running_requests,
+                        num_waiting = stats.num_waiting_requests,
+                        gpu_cache_usage_perc = format_args!("{:.1}", pct),
+                        "Engine stats",
+                    );
+                }
+            }
+        });
+    }
 
     // max_model_len: CLI override > model's max_position_embeddings > blocks * block_size
     let default_max_model_len = std::cmp::min(
@@ -1790,6 +1818,7 @@ async fn run_generate(
                     enable_chunked_prefill: false,
                     scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                     max_loras_per_batch: 0,
+                    ..SchedulerConfig::default()
                 },
                 Some(SpeculativeConfig {
                     num_speculative_tokens,
@@ -1841,6 +1870,7 @@ async fn run_generate(
                     enable_chunked_prefill: false,
                     scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                     max_loras_per_batch: 0,
+                    ..SchedulerConfig::default()
                 },
                 Some(SpeculativeConfig {
                     num_speculative_tokens,
@@ -1871,6 +1901,7 @@ async fn run_generate(
                 enable_chunked_prefill: false,
                 scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
                 max_loras_per_batch: 0,
+                ..SchedulerConfig::default()
             },
             None,
         )

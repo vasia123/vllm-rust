@@ -99,6 +99,7 @@ fn stress_engine_config(max_running: usize) -> EngineConfig {
             enable_chunked_prefill: false,
             scheduling_policy: SchedulingPolicy::Fcfs,
             max_loras_per_batch: 0,
+            ..vllm_core::scheduler::SchedulerConfig::default()
         },
         None,
     )
