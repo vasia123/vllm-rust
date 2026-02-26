@@ -498,11 +498,23 @@ impl crate::engine::ModelForward for OPTForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        // For batch decode, embed each sequence with its own offset
-        // Since batch decode input is [batch, 1], we take the first sequence's offset for embedding
-        // TODO: handle heterogeneous offsets in batch
-        let first_offset = sequences.first().map(|s| s.seqlen_offset).unwrap_or(0);
-        let mut xs = self.embed(input_ids, first_offset)?;
+        // Each sequence has its own seqlen_offset; compute per-sequence position
+        // embeddings (OPT offset = +2) then stack as [batch, 1, hidden].
+        let batch_size = sequences.len();
+        let word_embeds = self.embed_tokens.forward(input_ids)?; // [batch, 1, hidden]
+        let mut pos_rows = Vec::with_capacity(batch_size);
+        for seq in sequences {
+            let pos_id = (seq.seqlen_offset + 2) as u32;
+            let pos_ids = Tensor::new(&[pos_id], input_ids.device())?;
+            pos_rows.push(self.embed_positions.forward(&pos_ids)?); // [1, hidden]
+        }
+        let pos_embeds = Tensor::stack(&pos_rows, 0)?.contiguous()?; // [batch, 1, hidden]
+
+        let mut xs = if let Some(ref proj_in) = self.project_in {
+            proj_in.forward(&word_embeds)?.broadcast_add(&pos_embeds)?
+        } else {
+            word_embeds.broadcast_add(&pos_embeds)?
+        };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
@@ -611,5 +623,70 @@ mod tests {
         .expect("forward pass");
 
         assert_eq!(logits.dims(), &[batch_size, seq_len, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_opt_decode_batch_heterogeneous_offsets() {
+        // Two sequences with different sequence lengths, verifying that each
+        // gets the correct positional embedding (not both using the first offset).
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = OPTForCausalLM::new(&cfg, vb).expect("build model");
+
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 16,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            dtype: DType::F32,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+
+        // Sequence A: offset 3 (prefilled 3 tokens)
+        let mut bt_a = BlockTable::new(cache_config.block_size);
+        kv_cache_mgr
+            .allocate_for_request(&mut bt_a, 4)
+            .expect("alloc A");
+
+        // Sequence B: offset 7 (prefilled 7 tokens)
+        let mut bt_b = BlockTable::new(cache_config.block_size);
+        kv_cache_mgr
+            .allocate_for_request(&mut bt_b, 8)
+            .expect("alloc B");
+
+        let sequences = vec![
+            crate::engine::DecodeSequenceMetadata {
+                request_id: 1,
+                seqlen_offset: 3,
+                slot_mapping: bt_a.slot_mapping(3, 1),
+                block_ids: bt_a.block_ids().to_vec(),
+            },
+            crate::engine::DecodeSequenceMetadata {
+                request_id: 2,
+                seqlen_offset: 7,
+                slot_mapping: bt_b.slot_mapping(7, 1),
+                block_ids: bt_b.block_ids().to_vec(),
+            },
+        ];
+
+        let input_ids = Tensor::zeros((2usize, 1usize), DType::U32, &device).expect("input");
+        let logits = crate::engine::ModelForward::forward_decode_batch(
+            &model,
+            &input_ids,
+            &sequences,
+            &mut kv_cache_mgr,
+        )
+        .expect("decode batch");
+
+        assert_eq!(
+            logits.dims(),
+            &[2, 1, cfg.vocab_size],
+            "batch decode should return [batch, 1, vocab]"
+        );
     }
 }
