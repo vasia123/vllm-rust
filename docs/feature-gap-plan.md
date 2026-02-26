@@ -291,6 +291,7 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 
 ### 3.2 Server API — Speech & Realtime
 **Effort:** 2–3 weeks
+- ✅ `POST /v1/messages` (Anthropic Messages API) DONE — `crates/server/src/api/anthropic.rs`; protocol types, request conversion (system/blocks/tool_use/tool_result), streaming (message_start/content_block_start/delta/stop/message_delta/message_stop events), 5 tests; commit `ed8854b` — 2026-02-26
 - ✅ `POST /v1/audio/transcriptions` + `POST /v1/audio/translations` DONE — commit `3a5bd10`
   - `crates/server/src/api/audio.rs`: multipart/form-data upload (axum multipart), WAV PCM decoding (hound), normalize to 16 kHz mono, `build_audio_prompt`, `run_audio_task`, 7 tests; 4550 total
   - `GenerationRequest.audio_inputs: Vec<AudioData>` added; all struct literals updated
