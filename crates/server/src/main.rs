@@ -6,7 +6,8 @@ use candle_core::{DType, Device};
 use clap::{Parser, Subcommand};
 use vllm_core::{
     engine::{
-        start_engine, start_engine_with_draft, EngineConfig, GenerationRequest, SpeculativeConfig,
+        start_engine, start_engine_with_draft, start_engine_with_proposer, EngineConfig,
+        GenerationRequest, NGramConfig, NGramProposer, SpeculativeConfig,
     },
     kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
     loader,
@@ -1077,7 +1078,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         disable_log_stats,
         max_logprobs,
         otlp_traces_endpoint,
-        log_level,
+        log_level: _, // already consumed above via cfg.log_level
         limit_mm_per_prompt,
         disable_mm_preprocessor_cache,
         guided_decoding_backend,
@@ -1111,8 +1112,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = &lora_dtype; // TODO: wire to LoRA weight dtype
     let _ = max_cpu_loras; // TODO: wire to CPU LoRA cache limit
     let _ = &spec_decoding_acceptance_method; // TODO: wire to acceptance sampler type
-    let _ = ngram_prompt_lookup_max; // TODO: wire to NGram proposer config
-    let _ = ngram_prompt_lookup_min; // TODO: wire to NGram proposer config
     let _ = disable_log_stats; // TODO: wire to periodic stats suppression
     let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
     let _ = &limit_mm_per_prompt; // TODO: wire to multimodal limits
@@ -1394,6 +1393,41 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             engine_tokenizer,
             kv_cache_mgr,
             draft_kv_cache,
+            engine_config,
+        )
+    } else if let Some(max_n) = ngram_prompt_lookup_max {
+        // N-gram prompt-lookup speculative decoding (no draft model required)
+        let min_n = ngram_prompt_lookup_min.unwrap_or(1);
+        let ngram_config = NGramConfig {
+            min_n,
+            max_n,
+            num_speculative_tokens,
+        };
+        let spec_config = SpeculativeConfig {
+            num_speculative_tokens,
+        };
+        let engine_config = EngineConfig::builder(
+            SchedulerConfig {
+                max_running_requests: max_requests,
+                max_tokens_per_step: max_num_batched_tokens,
+                enable_chunked_prefill,
+                scheduling_policy,
+                max_loras_per_batch: max_loras,
+            },
+            Some(spec_config),
+        )
+        .multi_step_count(multi_step_count)
+        .enable_prefix_caching(enable_prefix_caching)
+        .build();
+
+        eprintln!(
+            "Starting engine (NGram speculative, K={num_speculative_tokens}, n={min_n}..{max_n})..."
+        );
+        start_engine_with_proposer(
+            model,
+            Box::new(NGramProposer::new(ngram_config)),
+            engine_tokenizer,
+            kv_cache_mgr,
             engine_config,
         )
     } else {
