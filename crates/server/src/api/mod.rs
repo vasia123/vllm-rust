@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod audio;
 pub mod batch;
 pub mod chat;
 pub mod completions;
@@ -681,6 +682,11 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
             get(batch::get_batch_output),
         )
         .route("/v1/batches/{batch_id}/cancel", post(batch::cancel_batch))
+        .route(
+            "/v1/audio/transcriptions",
+            post(audio::create_transcription),
+        )
+        .route("/v1/audio/translations", post(audio::create_translation))
         .layer(axum::middleware::from_fn_with_state(
             accepting,
             middleware::reject_during_restart,

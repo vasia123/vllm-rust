@@ -151,6 +151,7 @@ pub async fn create_chat_completion(
             prompt_adapter_request: None,
             constraint,
             image_inputs,
+            audio_inputs: Vec::new(),
             skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
                 || req.prompt_logprobs.is_some(),
         };
@@ -270,6 +271,7 @@ pub async fn create_chat_completion(
                 prompt_adapter_request: None,
                 constraint,
                 image_inputs: image_inputs.clone(),
+                audio_inputs: Vec::new(),
                 skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
                     || req.prompt_logprobs.is_some(),
             }

@@ -33,6 +33,7 @@ mod projector;
 pub mod video;
 mod vision;
 
+pub use audio::AudioData;
 pub use inputs::{
     ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedAudio, ProcessedImage,
     ProcessedVideo, VideoData, VideoSource, VideoUrl,

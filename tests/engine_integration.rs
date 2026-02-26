@@ -153,6 +153,7 @@ fn make_request(prompt: &str, max_new_tokens: usize, eos_token_id: u32) -> Gener
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        audio_inputs: Vec::new(),
         skip_prefix_cache: false,
     }
 }
@@ -316,6 +317,7 @@ async fn test_engine_generation_stops_at_stop_token() {
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        audio_inputs: Vec::new(),
         skip_prefix_cache: false,
     };
 
@@ -371,6 +373,7 @@ async fn test_engine_generation_stops_at_stop_string() {
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        audio_inputs: Vec::new(),
         skip_prefix_cache: false,
     };
 

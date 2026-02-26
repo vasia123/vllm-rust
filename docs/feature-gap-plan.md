@@ -221,6 +221,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 `model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
 
 - **P2 models (~2 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), ~~Hunyuan-Vision~~ ✅ DONE (`hunyuan_vision.rs`, 5 tests + XDRoPE — commit 94ada76), ~~LFM2-VL~~ ✅ DONE (`lfm2_vl.rs`, 6 tests — commit f0ac8f7 — Siglip2VisionTransformer + pixel-shuffle projector + Lfm2ForCausalLM)
+- **NemotronNAS / DeciLM** ✅ DONE (`nemotron_nas.rs`, 5 tests — commit cb28bb0): `DeciLMForCausalLM`/`NemotronNasForCausalLM`; per-layer `block_configs` JSON (no_op_attention, no_op_ffn, n_heads_in_group, intermediate_size/ffn_mult); `NasAttention` with explicit per-layer num_kv_heads; `NasDecoderLayer` with optional attn+FFN; separate `kv_layer_idx` counter for KV cache (num_kv_layers ≤ num_hidden_layers)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
 
 ### 2.2 MoE Infrastructure: Advanced

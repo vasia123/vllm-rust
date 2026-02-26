@@ -121,6 +121,7 @@ fn make_stress_request(id: usize, max_tokens: usize, eos_token: u32) -> Generati
         prompt_adapter_request: None,
         constraint: None,
         image_inputs: Vec::new(),
+        audio_inputs: Vec::new(),
         skip_prefix_cache: false,
     }
 }

@@ -113,6 +113,7 @@ pub async fn create_response(
             prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
+            audio_inputs: Vec::new(),
             skip_prefix_cache: false,
         };
 
@@ -188,6 +189,7 @@ pub async fn create_response(
             prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
+            audio_inputs: Vec::new(),
             skip_prefix_cache: false,
         };
 

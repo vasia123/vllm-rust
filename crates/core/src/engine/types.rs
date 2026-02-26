@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::distributed::{DpContext, ExpertParallelContext};
 use crate::kv_cache::{MetricsSnapshot, PrefixCacheStatsSnapshot, SlidingWindowSnapshot};
 use crate::lora::LoraRequest;
-use crate::multimodal::ImageData;
+use crate::multimodal::{AudioData, ImageData};
 use crate::prompt_adapter::PromptAdapterRequest;
 use crate::request::{FinishReason, RequestId};
 use crate::sampling::{SamplingConstraint, SamplingParams};
@@ -74,6 +74,16 @@ pub struct GenerationRequest {
     /// Image inputs for multimodal models (e.g. LLaVA).
     /// Extracted from chat message content parts and decoded from data URIs.
     pub image_inputs: Vec<ImageData>,
+    /// Audio inputs for audio-language models (e.g. Qwen2-Audio, Ultravox).
+    ///
+    /// Each element is raw PCM audio that the model encoder will convert to
+    /// hidden states and splice into the token sequence at the appropriate
+    /// placeholder position.
+    ///
+    /// NOTE: Model forward passes that handle audio must read this field and
+    /// embed audio via their audio encoder + projector. Currently handled as
+    /// a TODO in model_forward.rs — image embedding is the reference pattern.
+    pub audio_inputs: Vec<AudioData>,
     /// When true, skip reading from the prefix cache for this request.
     /// Useful when prompt_logprobs are requested (cached blocks have no logits).
     pub skip_prefix_cache: bool,
@@ -96,6 +106,7 @@ impl Default for GenerationRequest {
             prompt_adapter_request: None,
             constraint: None,
             image_inputs: Vec::new(),
+            audio_inputs: Vec::new(),
             skip_prefix_cache: false,
         }
     }

@@ -126,6 +126,7 @@ pub async fn create_completion(
             prompt_adapter_request: None,
             constraint,
             image_inputs: Vec::new(),
+            audio_inputs: Vec::new(),
             skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
                 || req.prompt_logprobs.is_some(),
         };
@@ -246,6 +247,7 @@ pub async fn create_completion(
                     prompt_adapter_request: None,
                     constraint,
                     image_inputs: Vec::new(),
+                    audio_inputs: Vec::new(),
                     skip_prefix_cache: req.skip_reading_prefix_cache.unwrap_or(false)
                         || req.prompt_logprobs.is_some(),
                 }

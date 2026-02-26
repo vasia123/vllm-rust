@@ -36,7 +36,7 @@ candle-flash-attn = "0.9"
 hf-hub = "0.4"
 tokenizers = "0.22"
 ahash = "0.8"
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio-stream = "0.1"
