@@ -1091,14 +1091,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     if seed != 0 {
         eprintln!("Using random seed: {seed}");
     }
-    let _ = max_lora_rank; // TODO: validate adapter rank on load
 
     // Acknowledge new args (wire as features are implemented)
     let _ = &kv_cache_dtype; // Used below in CacheConfig
     let _ = enforce_eager; // TODO: wire to CUDA graph control
     let _ = &load_format; // TODO: wire to weight loading strategy
     let _ = &tokenizer_mode; // TODO: wire to tokenizer selection
-    let _ = &tokenizer_revision; // TODO: wire to tokenizer revision
     let _ = &code_revision; // TODO: wire to custom code loading
     let _ = max_parallel_loading_workers; // TODO: wire to parallel weight loading
     let _ = &preemption_mode; // TODO: wire to scheduler preemption strategy
@@ -1197,6 +1195,14 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         for (idx, (name, path)) in parsed_lora_specs.iter().enumerate() {
             eprintln!("  Loading adapter '{}' from: {}", name, path);
             let adapter = lora_loader.load(path, *name, (idx + 1) as u32)?;
+            if adapter.rank > max_lora_rank {
+                anyhow::bail!(
+                    "LoRA adapter '{}' rank {} exceeds --max-lora-rank {}",
+                    name,
+                    adapter.rank,
+                    max_lora_rank
+                );
+            }
             eprintln!(
                 "    Loaded {} layer adapters (rank={}, alpha={})",
                 adapter.num_adapters(),
@@ -1213,22 +1219,31 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         models::from_config(&files.config, vb)?
     };
 
-    // Resolve tokenizer: CLI override > model default
+    // Resolve tokenizer: CLI override > tokenizer_revision > model default.
+    // --tokenizer-revision allows fetching tokenizer files at a different
+    // revision than the model weights (useful when a tokenizer is updated
+    // independently of model weights).
     let tokenizer_path = if let Some(ref tok_override) = tokenizer_override {
-        // Load from override path (could be a HuggingFace model ID or local path)
         let tok_path = std::path::Path::new(tok_override);
         if tok_path.exists() {
             tok_path.to_path_buf()
         } else {
-            // Try as HuggingFace model ID
+            // Try as HuggingFace model ID; use tokenizer_revision if specified.
+            let tok_rev = tokenizer_revision.as_deref().unwrap_or("main");
             let tok_files = loader::fetch_model_with_auth(
                 tok_override,
-                "main",
+                tok_rev,
                 hf_token.as_deref(),
                 cache_dir,
             )?;
             tok_files.tokenizer
         }
+    } else if let Some(ref tok_rev) = tokenizer_revision {
+        // No override but a different tokenizer revision was requested;
+        // re-fetch just the tokenizer files at the specified revision.
+        let tok_files =
+            loader::fetch_model_with_auth(&model_id, tok_rev, hf_token.as_deref(), cache_dir)?;
+        tok_files.tokenizer
     } else {
         files.tokenizer.clone()
     };
