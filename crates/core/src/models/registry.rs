@@ -920,7 +920,12 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["GLM4VForCausalLM", "Glm4VForConditionalGeneration"],
+        arch_names: &[
+            "GLM4VForCausalLM",
+            "Glm4VForConditionalGeneration",
+            // glm4_1v arch name (lowercase v)
+            "Glm4vForConditionalGeneration",
+        ],
         display_name: "GLM-4V",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
@@ -1207,6 +1212,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
     },
     ArchitectureInfo {
+        arch_names: &["DeepseekOCRForCausalLM"],
+        display_name: "DeepSeek-OCR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["DeepseekOCR2ForCausalLM"],
         display_name: "DeepSeek-OCR2",
         capabilities: ModelCapabilities::new().with_multimodal(),
@@ -1214,6 +1224,16 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
         arch_names: &["DotsOCRForCausalLM"],
         display_name: "Dots-OCR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MiDashengLMModel"],
+        display_name: "MiDasheng",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["LightOnOCRForConditionalGeneration"],
+        display_name: "LightOn-OCR",
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
 ];
@@ -1626,8 +1646,12 @@ mod tests {
             "HunYuanVLForConditionalGeneration",
             "GlmOcrForConditionalGeneration",
             "Glm4vMoeForConditionalGeneration",
+            "DeepseekOCRForCausalLM",
             "DeepseekOCR2ForCausalLM",
             "DotsOCRForCausalLM",
+            "Glm4vForConditionalGeneration",
+            "MiDashengLMModel",
+            "LightOnOCRForConditionalGeneration",
         ];
         for arch in &expected {
             assert!(
