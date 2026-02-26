@@ -377,7 +377,11 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 - ~~`tokenizer_revision`~~ ✅ DONE (commit 3ab9db4): `fetch_model_with_auth` uses explicit revision for tokenizer-override HF fetches; re-fetches at specified revision when no override
 - ~~`enable_lora`~~ ✅ DONE (commit 5bbeabf): gates `/v1/load_lora_adapter` endpoint; 1 new test
 - ~~`lora_dtype`~~ ✅ DONE (commit 5bbeabf): string → DType conversion, passed to `LoraLoader::new()`
-- **Remaining (complex infrastructure required):** `enforce_eager` (CUDA graphs), `preemption_mode` (SchedulerConfig), `spec_decoding_acceptance_method` (acceptance sampler), `guided_decoding_backend` (structured output), `max_seq_len_to_capture` (CUDA graph), `disable_log_stats` (stats goroutine), `otlp_traces_endpoint` (OpenTelemetry), `max_num_partial_prefills`/`long_prefill_token_threshold` (SchedulerConfig), `lora_extra_vocab_size`/`max_cpu_loras` (LoRA infra), `load_format`/`tokenizer_mode` (loader strategy), `disable_mm_preprocessor_cache` (VLM cache)
+- ~~`preemption_mode`~~ ✅ DONE (commit 03de85d): `PreemptionMode` enum (Recompute/Swap) in `SchedulerConfig`; parsed from CLI string; Recompute is default (existing behavior)
+- ~~`max_num_partial_prefills`/`long_prefill_token_threshold`~~ ✅ DONE (commit 03de85d): `SchedulerConfig` fields; long-prefill throttle in `compute_schedule` (continue-not-break so short requests still admitted); 4 new tests
+- ~~`disable_log_stats`~~ ✅ DONE (commit 03de85d): tokio background task logging num_running/num_waiting/GPU-KV-cache% every 5s via `EngineHandle::get_stats()`; suppressed by flag
+- ~~`max_cpu_loras`~~ ✅ DONE (commit 03de85d): validates startup adapter count ≤ limit; TODO: LRU cache for dynamic adapter loading
+- **Remaining (complex infrastructure required):** `enforce_eager` (CUDA graphs), `spec_decoding_acceptance_method` (acceptance sampler), `guided_decoding_backend` (structured output), `max_seq_len_to_capture` (CUDA graph), `otlp_traces_endpoint` (OpenTelemetry), `lora_extra_vocab_size` (LoRA vocab extension), `load_format`/`tokenizer_mode` (loader strategy), `disable_mm_preprocessor_cache` (VLM cache)
 
 ---
 
