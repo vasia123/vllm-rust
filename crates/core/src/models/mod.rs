@@ -21,6 +21,7 @@ pub mod bloom_quantized;
 pub mod chameleon;
 pub mod chatglm;
 pub mod chatglm_quantized;
+pub mod clip;
 pub mod cohere;
 pub mod cohere_quantized;
 pub mod colbert;
@@ -224,6 +225,7 @@ pub mod qwen_quantized;
 pub mod qwen_vl;
 pub mod registry;
 pub mod seed_oss;
+pub mod siglip;
 pub mod starcoder2;
 pub mod starcoder2_quantized;
 pub mod step1;
@@ -264,6 +266,7 @@ pub use bloom_quantized::QuantizedBloomForCausalLM;
 pub use chameleon::ChameleonForConditionalGeneration;
 pub use chatglm::ChatGLMForCausalLM;
 pub use chatglm_quantized::QuantizedChatGLMForCausalLM;
+pub use clip::CLIPEmbeddingModel;
 pub use cohere::CohereForCausalLM;
 pub use cohere_quantized::QuantizedCohereForCausalLM;
 pub use colbert::ColBERTForRetrieval;
@@ -469,6 +472,7 @@ pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
 pub use seed_oss::SeedOssForCausalLM;
+pub use siglip::SiglipEmbeddingModel;
 pub use starcoder2::StarCoder2ForCausalLM;
 pub use starcoder2_quantized::QuantizedStarCoder2ForCausalLM;
 pub use step1::Step1ForCausalLM;
@@ -761,6 +765,10 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(BertSpladeSparseEmbeddingModel::new(cfg, vb)?))
         }
         "HF_ColBERT" | "ColBERTModel" => Ok(Box::new(ColBERTForRetrieval::new(cfg, vb)?)),
+        "CLIPModel" | "CLIPEmbeddingModel" => Ok(Box::new(CLIPEmbeddingModel::new(cfg, vb)?)),
+        "SiglipModel" | "SiglipEmbeddingModel" => {
+            Ok(Box::new(SiglipEmbeddingModel::new(cfg, vb)?))
+        }
         "GteNewModel" | "GteModel" | "SnowflakeGteNewModel" => {
             Ok(Box::new(GteNewForEmbedding::new(cfg, vb)?))
         }
