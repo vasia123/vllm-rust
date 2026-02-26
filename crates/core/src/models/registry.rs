@@ -965,6 +965,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["KeyeForConditionalGeneration"],
+        display_name: "Keye",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["KeyeVL1_5ForConditionalGeneration"],
         display_name: "Keye-VL 1.5",
         capabilities: ModelCapabilities::new().with_multimodal(),

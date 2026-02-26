@@ -294,7 +294,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 - ✅ `inc.rs` DONE — `IncConfig` routes to `GptqConfig`/`AwqConfig` based on `packing_format`; detection keys `"inc"`/`"auto-round"`; 7 tests
 - ✅ `torchao.rs` DONE — `TorchaoConfig` wraps `NoQuantizationConfig` (standard BF16 matmul); detection already wired; 5 tests
 - ✅ `fp_quant.rs` DONE — `FpQuantConfig`, `FpQuantLinear` (FP4 E2M1 + per-group E8M0/FP8 scales + global scale); MxFp4/NvFp4 variants; CPU dequant→F32 matmul; detection key `"fp_quant"`; 7 tests — commit `89b94e8`
-- ✅ `quark.rs` DONE — `QuarkConfig`, `QuarkLinear`; W8A8-FP8 and W8A8-INT8 schemes; per-tensor or per-channel weight scales; detection key `"quark"`; CPU dequant→F32 matmul; min_capability=75 (INT8) or 89 (FP8); 6 tests — commit (pending)
+- ✅ `quark.rs` DONE — `QuarkConfig`, `QuarkLinear`; W8A8-FP8 and W8A8-INT8 schemes; per-tensor or per-channel weight scales; detection key `"quark"`; CPU dequant→F32 matmul; min_capability=75 (INT8) or 89 (FP8); 6 tests — commit `7344aa6`
 - AWQ-Triton (kernel-only, no separate config), Petit (AMD-only external kernel — skip)
 - All in `crates/core/src/quantization/`
 
@@ -340,7 +340,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 ### 4.2 RoPE Variants
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
 - ~~**MRoPE Interleaved**~~ ✅ DONE — `mrope_interleaved.py`; `get_mrope_interleaved_id_list` + `MRoPEInterleaved` in `layers/rotary.rs`; 8 tests — commit 8c3225b
-- **FoPE** — `fope.py`; ~200 LOC; factored positional encoding
+- ~~**FoPE**~~ ✅ DONE — `fope.py`; implemented inline in `interns1_pro.rs` as `FoPE` struct; `apply` + `apply_decode_batch`; only user is `interns1_pro.py` → no extraction needed
 - ~~**XDRoPE**~~ ✅ DONE — `xdrope.py`; `XDRotaryEmbedding` in `layers/rotary.rs`, 5 tests — commit 94ada76
 - ~~**ERNIE4.5-VL RoPE**~~ ✅ DONE — implemented inline in `ernie45_vl.rs` as `Ernie4_5_VisionRotaryEmbedding`; fully functional
 
@@ -364,7 +364,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
   - Format: `<|channel|>analysis<|message|>{reasoning}<|end|>` / `<|channel|>final<|message|>{content}<|end|>`
   - Streaming: re-parse + diff (mirrors Python `parse_chat_output` approach)
   - Aliases: `gpt_oss`, `gpt-oss`, `gptoss`
-- **Qwen-VL tool parser (legacy)** — add to `crates/core/src/tool_parser/`; ~150 LOC
+- **Qwen-VL tool parser (legacy)** — N/A: Qwen-VL (legacy) has no tool calling support in Python vLLM either; not implemented upstream
 
 ### 4.5 Medusa Model Loader ✅ DONE
 **Effort:** 0.5 day

@@ -460,6 +460,55 @@ impl KeyeVL1_5Projector {
     }
 }
 
+// ─── Keye base projector ──────────────────────────────────────────────────────
+
+/// Keye base spatial projector: LayerNorm per-patch → 2×2 spatial merge → linear_1 → GELU → linear_2.
+///
+/// Unlike `KeyeVL1_5Projector`, `pre_norm` operates on the raw patch dimension (`embed_dim`)
+/// BEFORE the spatial merge, matching `keye.py` `Projector`.
+///
+/// Weight paths: `mlp_AR.{pre_norm,linear_1,linear_2}.*`.
+struct KeyeProjector {
+    pre_norm: LayerNorm,
+    linear_1: Linear,
+    linear_2: Linear,
+    merge: usize,
+}
+
+impl KeyeProjector {
+    fn new(embed_dim: usize, text_hidden: usize, vb: VarBuilder) -> Result<Self> {
+        let merge = 2usize;
+        let merge_dim = embed_dim * merge * merge;
+        Ok(Self {
+            pre_norm: layer_norm(embed_dim, 1e-5, vb.pp("pre_norm"))?,
+            linear_1: linear(merge_dim, merge_dim, vb.pp("linear_1"))?,
+            linear_2: linear(merge_dim, text_hidden, vb.pp("linear_2"))?,
+            merge,
+        })
+    }
+
+    /// `x`: `[t*h*w, embed_dim]`; `grid`: `(t, h, w)` where h, w in raw patch counts.
+    /// Returns `[t * (h/m) * (w/m), text_hidden]`.
+    fn forward(&self, x: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
+        // Norm each patch independently before merging — key difference vs VL1.5.
+        let x = self.pre_norm.forward(x)?;
+
+        let (t, h, w) = grid;
+        let m = self.merge;
+        let embed_dim = x.dim(1)?;
+        let h_out = h / m;
+        let w_out = w / m;
+        let x = x.reshape((t, h_out, m, w_out, m, embed_dim))?;
+        let x = x.permute((0, 1, 3, 2, 4, 5))?.contiguous()?;
+        let merge_dim = m * m * embed_dim;
+        let x = x.reshape((t * h_out * w_out, merge_dim))?;
+
+        let x = self.linear_1.forward(&x)?;
+        let x = x.gelu_erf()?;
+        self.linear_2.forward(&x)
+    }
+}
+
 // ─── merge_multimodal ─────────────────────────────────────────────────────────
 
 /// Replace image-patch positions in `text_embeds` with encoded image embeddings.
@@ -587,6 +636,115 @@ impl crate::engine::ModelForward for KeyeVL1_5ForConditionalGeneration {
             text_embeddings
         };
 
+        self.language_model.forward_with_embeddings(
+            &embeddings,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+}
+
+// ─── Keye base model ──────────────────────────────────────────────────────────
+
+/// Keye vision-language model (base variant — `keye.py`).
+///
+/// Identical to `KeyeVL1_5ForConditionalGeneration` except the projector applies
+/// LayerNorm on individual patches BEFORE the 2×2 spatial merge.
+pub struct KeyeForConditionalGeneration {
+    visual: KeyeSiglipVisionTransformer,
+    mlp_ar: KeyeProjector,
+    language_model: Qwen3ForCausalLM,
+    device: Device,
+}
+
+impl KeyeForConditionalGeneration {
+    pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let vis_json = cfg
+            .extra
+            .get("vision_config")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let vis_cfg = KeyeVisionConfig::from_json(&vis_json);
+
+        let visual = KeyeSiglipVisionTransformer::new(&vis_cfg, vb.pp("visual"))?;
+        let mlp_ar = KeyeProjector::new(vis_cfg.embed_dim, cfg.hidden_size, vb.pp("mlp_AR"))?;
+        let language_model = Qwen3ForCausalLM::new(cfg, vb.pp("language_model"))?;
+
+        Ok(Self {
+            visual,
+            mlp_ar,
+            language_model,
+            device: vb.device().clone(),
+        })
+    }
+
+    /// Encode image patches: `patches [t*h*w, in_ch*ps²]`, grid `(t, h, w)`.
+    /// Returns `[t*(h/2)*(w/2), text_hidden]`.
+    pub fn encode_images(&self, patches: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
+        let (t, h, w) = grid;
+        let vis_feats = self.visual.forward(patches, (h, w))?;
+        self.mlp_ar.forward(&vis_feats, (t, h, w))
+    }
+}
+
+impl crate::engine::ModelForward for KeyeForConditionalGeneration {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let embeddings = self.language_model.embed_text(input_ids)?;
+        self.language_model.forward_with_embeddings(
+            &embeddings,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Tensor> {
+        let embeddings = self.language_model.embed_text(input_ids)?;
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        true
+    }
+
+    fn forward_multimodal(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let text_embeddings = self.language_model.embed_text(input_ids)?;
+        let embeddings = if let Some(mm) = multimodal_inputs {
+            merge_multimodal(&text_embeddings, mm, &self.device)?
+        } else {
+            text_embeddings
+        };
         self.language_model.forward_with_embeddings(
             &embeddings,
             seqlen_offset,
@@ -765,5 +923,55 @@ mod tests {
         let result = model.forward_decode_batch(&tok, &[seq], &mut kv);
         assert!(result.is_ok(), "decode_batch failed: {:?}", result.err());
         assert_eq!(result.unwrap().dims(), &[1, 1, 64]);
+    }
+
+    // ── KeyeForConditionalGeneration (base variant) tests ──────────────────
+
+    #[test]
+    fn test_keye_new() {
+        let device = Device::Cpu;
+        let cfg = test_cfg();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = KeyeForConditionalGeneration::new(&cfg, vb);
+        assert!(model.is_ok(), "construction failed: {:?}", model.err());
+        assert!(model.unwrap().supports_multimodal());
+    }
+
+    #[test]
+    fn test_keye_vision_encode() {
+        let device = Device::Cpu;
+        let cfg = test_cfg();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = KeyeForConditionalGeneration::new(&cfg, vb).unwrap();
+
+        // 16 patches (4×4 grid), patch_input_dim = 1*2*2 = 4
+        let patches = Tensor::zeros((16usize, 4), DType::F32, &device).unwrap();
+        let result = model.encode_images(&patches, (1, 4, 4));
+        assert!(result.is_ok(), "encode_images failed: {:?}", result.err());
+        // 4×4 → 2×2 after 2×2 merge → 4 merged tokens, text_hidden=32
+        assert_eq!(result.unwrap().dims(), &[4, 32]);
+    }
+
+    #[test]
+    fn test_keye_text_only() {
+        let device = Device::Cpu;
+        let cfg = test_cfg();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = KeyeForConditionalGeneration::new(&cfg, vb).unwrap();
+
+        let seq_len = 4usize;
+        let mut kv = make_cache(&cfg, &device);
+        let mut bt = BlockTable::new(4);
+        kv.allocate_for_request(&mut bt, seq_len).unwrap();
+        let slot_mapping = bt.slot_mapping(0, seq_len);
+
+        let input_ids = Tensor::zeros((1usize, seq_len), DType::U32, &device).unwrap();
+        let result = model.forward(&input_ids, 0, &mut kv, &bt, &slot_mapping);
+        assert!(
+            result.is_ok(),
+            "text-only forward failed: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().dims(), &[1, seq_len, 64]);
     }
 }
