@@ -574,6 +574,7 @@ impl BailingMoEBlock {
             use_grouped_topk: bm_cfg.use_grouped_topk(),
             num_expert_groups: bm_cfg.n_group,
             topk_per_group: bm_cfg.topk_group,
+            routed_scaling_factor: bm_cfg.routed_scaling_factor,
         };
 
         let bias = if has_correction_bias {

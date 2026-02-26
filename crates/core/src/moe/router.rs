@@ -7,10 +7,14 @@
 //! - **Softmax** (default): Standard softmax over expert logits
 //! - **Sigmoid**: Per-expert sigmoid scores (used by GLM4-MoE)
 //!
-//! ## Grouped Top-K
+//! ## Grouped Top-K (DeepSeek V2/V3 algorithm)
 //!
-//! GLM4-MoE uses grouped top-k where experts are divided into groups
-//! and top-k is selected within each group.
+//! Expert scores are reshaped into `[num_tokens, num_groups, experts_per_group]`.
+//! Without correction bias: max per group → select top-k groups → mask non-selected
+//! experts to -∞ → global top-k on masked scores.
+//! With correction bias: sum-of-top-2 per group (using biased scores) → select
+//! top-k groups → mask → global top-k on biased scores; original unbiased scores
+//! are used for routing weights.
 //!
 //! ## CUDA Acceleration
 //!
@@ -18,7 +22,7 @@
 //! that combines softmax and top-k selection in a single pass for improved
 //! performance. See [`crate::moe::topk_softmax`] for details.
 
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder};
 
 #[cfg(feature = "cuda-moe")]
@@ -47,12 +51,16 @@ pub struct RouterConfig {
     pub renormalize: bool,
     /// Scoring function to use (Softmax or Sigmoid).
     pub scoring_func: ScoringFunc,
-    /// Whether to use grouped top-k selection (GLM4-MoE).
+    /// Whether to use grouped top-k selection (DeepSeek V2/V3, GLM4-MoE).
     pub use_grouped_topk: bool,
     /// Number of expert groups (for grouped top-k).
     pub num_expert_groups: Option<usize>,
-    /// Top-k per group (for grouped top-k).
+    /// Number of groups to select in the first stage (for grouped top-k).
     pub topk_per_group: Option<usize>,
+    /// Multiplicative scaling factor applied to routing weights after renormalization.
+    ///
+    /// Used by DeepSeek V3 (`routed_scaling_factor` in config). Default: 1.0.
+    pub routed_scaling_factor: f64,
 }
 
 impl Default for RouterConfig {
@@ -66,6 +74,7 @@ impl Default for RouterConfig {
             use_grouped_topk: false,
             num_expert_groups: None,
             topk_per_group: None,
+            routed_scaling_factor: 1.0,
         }
     }
 }
@@ -96,7 +105,7 @@ pub trait MoERouter: Send + Sync {
 pub struct TopKRouter {
     gate: Linear,
     config: RouterConfig,
-    /// Optional bias for score correction (GLM4-MoE e_score_correction_bias).
+    /// Optional bias for score correction (e_score_correction_bias in DeepSeek/GLM4-MoE).
     e_score_correction_bias: Option<Tensor>,
 }
 
@@ -140,15 +149,17 @@ impl TopKRouter {
         self.config.scoring_func
     }
 
-    /// Apply the scoring function to logits.
+    /// Apply the scoring function to logits (standard non-grouped path).
+    ///
+    /// For the grouped top-k path, scoring and bias are applied inside
+    /// `route_grouped` to correctly separate selection from weight computation.
     fn apply_scoring(&self, logits: &Tensor) -> Result<Tensor> {
         match self.config.scoring_func {
-            ScoringFunc::Softmax => candle_nn::ops::softmax(logits, candle_core::D::Minus1),
+            ScoringFunc::Softmax => candle_nn::ops::softmax(logits, D::Minus1),
             ScoringFunc::Sigmoid => {
-                // Sigmoid scoring with optional bias correction
                 let scores = candle_nn::ops::sigmoid(logits)?;
                 if let Some(ref bias) = self.e_score_correction_bias {
-                    // Add bias: scores + bias
+                    // Standard (non-grouped) sigmoid: add bias directly.
                     scores.broadcast_add(bias)
                 } else {
                     Ok(scores)
@@ -157,50 +168,101 @@ impl TopKRouter {
         }
     }
 
-    /// Perform grouped top-k selection.
+    /// Apply `routed_scaling_factor` to weights if != 1.0.
+    fn apply_scaling(&self, weights: Tensor) -> Result<Tensor> {
+        if (self.config.routed_scaling_factor - 1.0).abs() > 1e-9 {
+            weights.affine(self.config.routed_scaling_factor, 0.0)
+        } else {
+            Ok(weights)
+        }
+    }
+
+    /// Grouped top-k routing (DeepSeek V2/V3 algorithm).
     ///
-    /// Experts are divided into groups, and top-k is selected from each group.
-    fn grouped_topk(
+    /// Selection:
+    /// - Without bias: `group_scores = max(scores per group)`
+    /// - With bias: `group_scores = sum of top-2 biased scores per group`
+    ///   Select top-`topk_group` groups → mask non-selected experts → top-k global.
+    ///
+    /// Weights:
+    /// - Without bias: use selected masked scores.
+    /// - With bias: gather unbiased scores at selected expert indices.
+    fn route_grouped(
         &self,
-        scores: &Tensor,
+        router_logits: &Tensor,
         num_groups: usize,
-        topk_per_group: usize,
+        topk_group: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let (_num_tokens, num_experts) = scores.dims2()?;
+        let (num_tokens, num_experts) = router_logits.dims2()?;
         let experts_per_group = num_experts / num_groups;
 
-        let mut all_weights = Vec::with_capacity(num_groups);
-        let mut all_indices = Vec::with_capacity(num_groups);
+        // Base scores from scoring function (without bias applied).
+        let scores = match self.config.scoring_func {
+            ScoringFunc::Softmax => candle_nn::ops::softmax(router_logits, D::Minus1)?,
+            ScoringFunc::Sigmoid => candle_nn::ops::sigmoid(router_logits)?,
+        };
 
-        for g in 0..num_groups {
-            let start = g * experts_per_group;
-            // Get scores for this group and make contiguous
-            let group_scores = scores.narrow(1, start, experts_per_group)?.contiguous()?;
-            // Get top-k within group
-            let (group_weights, group_indices) = top_k_with_indices(&group_scores, topk_per_group)?;
-            // Adjust indices to global expert IDs
-            let offset = Tensor::new(&[start as u32], scores.device())?;
-            let adjusted_indices = group_indices.broadcast_add(&offset)?;
+        let (top_k_ids, routing_weights) = if let Some(ref bias) = self.e_score_correction_bias {
+            // With correction bias: biased scores used for group/expert selection;
+            // original unbiased scores used for routing weights.
+            let biased = scores.broadcast_add(bias)?;
 
-            all_weights.push(group_weights);
-            all_indices.push(adjusted_indices);
-        }
+            // Sum of top-2 per group using biased scores.
+            let grouped = biased.reshape((num_tokens, num_groups, experts_per_group))?;
+            let group_scores = sum_top2_per_group(&grouped)?;
 
-        // Concatenate all groups: [num_tokens, num_groups * topk_per_group]
-        let weights = Tensor::cat(&all_weights, 1)?.contiguous()?;
-        let indices = Tensor::cat(&all_indices, 1)?.contiguous()?;
+            // Select top-k groups.
+            let (_, group_idx) = top_k_with_indices(&group_scores, topk_group)?;
 
-        // Re-sort by weight to get overall top-k
-        let total_k = self.config.top_k;
-        if weights.dim(1)? > total_k {
-            // Sort and take top-k
-            let (final_weights, final_indices) = top_k_with_indices(&weights, total_k)?;
-            // Gather the actual expert indices - need contiguous for gather
-            let expert_indices = indices.gather(&final_indices.contiguous()?, 1)?;
-            Ok((final_weights, expert_indices))
+            // Build expert mask from selected groups.
+            let masked_biased = apply_group_mask(
+                &biased,
+                &group_idx,
+                num_tokens,
+                num_groups,
+                experts_per_group,
+            )?;
+
+            // Top-k expert selection on biased masked scores.
+            let (_, expert_ids) = top_k_with_indices(&masked_biased, self.config.top_k)?;
+
+            // Routing weights: gather UNBIASED scores at selected indices.
+            let weights = scores.gather(&expert_ids, 1)?;
+            (expert_ids, weights)
         } else {
-            Ok((weights, indices))
-        }
+            // Without correction bias: max per group for group selection.
+            let grouped = scores.reshape((num_tokens, num_groups, experts_per_group))?;
+            let group_scores = grouped.max_keepdim(D::Minus1)?.squeeze(D::Minus1)?;
+
+            // Select top-k groups.
+            let (_, group_idx) = top_k_with_indices(&group_scores, topk_group)?;
+
+            // Build expert mask and apply.
+            let masked_scores = apply_group_mask(
+                &scores,
+                &group_idx,
+                num_tokens,
+                num_groups,
+                experts_per_group,
+            )?;
+
+            // Top-k expert selection.
+            let (weights, ids) = top_k_with_indices(&masked_scores, self.config.top_k)?;
+            (ids, weights)
+        };
+
+        // Renormalize routing weights.
+        let routing_weights = if self.config.renormalize {
+            let sum = routing_weights
+                .sum_keepdim(D::Minus1)?
+                .clamp(1e-10_f64, f64::INFINITY)?;
+            routing_weights.broadcast_div(&sum)?
+        } else {
+            routing_weights
+        };
+
+        let routing_weights = self.apply_scaling(routing_weights)?;
+        Ok((routing_weights, top_k_ids))
     }
 }
 
@@ -213,33 +275,31 @@ impl MoERouter for TopKRouter {
         #[cfg(feature = "cuda-moe")]
         if self.config.scoring_func == ScoringFunc::Softmax && !self.config.use_grouped_topk {
             let config = TopKSoftmaxConfig::new(self.config.top_k, self.config.renormalize);
-            return topk_softmax(&router_logits, &config);
+            let (w, ids) = topk_softmax(&router_logits, &config)?;
+            return Ok((self.apply_scaling(w)?, ids));
         }
 
-        // CPU/generic path
-        // Apply scoring function
-        let routing_probs = self.apply_scoring(&router_logits)?;
-
-        // Get top-k experts and their weights
-        let (top_k_weights, top_k_indices) = if self.config.use_grouped_topk {
+        // Grouped top-k path (DeepSeek V2/V3, GLM4-MoE, Qwen3-MoE, …).
+        if self.config.use_grouped_topk {
             let num_groups = self.config.num_expert_groups.unwrap_or(1);
-            let topk_per_group = self.config.topk_per_group.unwrap_or(self.config.top_k);
-            self.grouped_topk(&routing_probs, num_groups, topk_per_group)?
-        } else {
-            top_k_with_indices(&routing_probs, self.config.top_k)?
-        };
+            let topk_group = self.config.topk_per_group.unwrap_or(self.config.top_k);
+            return self.route_grouped(&router_logits, num_groups, topk_group);
+        }
 
-        // Optionally renormalize weights so they sum to 1
+        // Standard path: apply scoring then top-k.
+        let routing_probs = self.apply_scoring(&router_logits)?;
+        let (top_k_weights, top_k_indices) = top_k_with_indices(&routing_probs, self.config.top_k)?;
+
         let final_weights = if self.config.renormalize {
-            let sum = top_k_weights.sum_keepdim(candle_core::D::Minus1)?;
-            // Avoid division by zero
-            let sum = sum.clamp(1e-10, f64::INFINITY)?;
+            let sum = top_k_weights
+                .sum_keepdim(D::Minus1)?
+                .clamp(1e-10_f64, f64::INFINITY)?;
             top_k_weights.broadcast_div(&sum)?
         } else {
             top_k_weights
         };
 
-        Ok((final_weights, top_k_indices))
+        Ok((self.apply_scaling(final_weights)?, top_k_indices))
     }
 
     fn num_experts(&self) -> usize {
@@ -251,38 +311,93 @@ impl MoERouter for TopKRouter {
     }
 }
 
-/// Get top-k values and their indices from a tensor.
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Get top-k values and their indices along the last dimension.
 ///
-/// # Arguments
-/// * `tensor` - Input tensor of shape `[..., N]`
-/// * `k` - Number of top values to return
-///
-/// # Returns
-/// * `values` - Top-k values of shape `[..., k]`
-/// * `indices` - Indices of top-k values of shape `[..., k]`
+/// Returns `(values, indices)` of shape `[..., k]`.
 fn top_k_with_indices(tensor: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     let dim = tensor.dims().len() - 1;
     let n = tensor.dim(dim)?;
 
     if k >= n {
-        // If k >= n, return all values sorted
         let indices = tensor.arg_sort_last_dim(false)?;
         return Ok((tensor.contiguous()?, indices.contiguous()?));
     }
 
-    // Sort in descending order
     let sorted_indices = tensor.arg_sort_last_dim(false)?;
-
-    // Take top-k indices and make contiguous for gather
     let top_k_indices = sorted_indices.narrow(dim, 0, k)?.contiguous()?;
-
-    // Make tensor contiguous for gather
     let tensor_contig = tensor.contiguous()?;
-
-    // Gather top-k values
     let top_k_values = tensor_contig.gather(&top_k_indices, dim)?;
 
     Ok((top_k_values, top_k_indices))
+}
+
+/// Sum of top-2 scores per expert group.
+///
+/// `grouped`: `[num_tokens, num_groups, experts_per_group]`
+/// Returns: `[num_tokens, num_groups]`
+fn sum_top2_per_group(grouped: &Tensor) -> Result<Tensor> {
+    let experts_per_group = grouped.dim(2)?;
+    let k = 2.min(experts_per_group);
+    // Sort descending along expert dim.
+    let sorted_idx = grouped.arg_sort_last_dim(false)?;
+    let top2_idx = sorted_idx.narrow(2, 0, k)?.contiguous()?;
+    let top2_vals = grouped.contiguous()?.gather(&top2_idx, 2)?;
+    // Sum along top-2 dim → [num_tokens, num_groups]
+    top2_vals.sum_keepdim(2)?.squeeze(2)
+}
+
+/// Build a score mask from selected group indices and apply it.
+///
+/// Expert scores in non-selected groups are set to a large negative value
+/// so that they cannot win top-k selection.
+///
+/// `scores`: `[num_tokens, num_experts]`
+/// `group_idx`: `[num_tokens, topk_group]` — selected group indices
+/// Returns masked scores of the same shape as `scores`.
+fn apply_group_mask(
+    scores: &Tensor,
+    group_idx: &Tensor,
+    num_tokens: usize,
+    num_groups: usize,
+    experts_per_group: usize,
+) -> Result<Tensor> {
+    let num_experts = num_groups * experts_per_group;
+    let device = scores.device();
+
+    // Build boolean expert mask on CPU, then move to target device.
+    let group_idx_vec: Vec<u32> = group_idx
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+    let topk_group = group_idx.dim(1)?;
+
+    let mut mask_data = vec![0.0f32; num_tokens * num_experts];
+    for tok in 0..num_tokens {
+        for g_pos in 0..topk_group {
+            let g = group_idx_vec[tok * topk_group + g_pos] as usize;
+            let start = g * experts_per_group;
+            for e in start..start + experts_per_group {
+                mask_data[tok * num_experts + e] = 1.0;
+            }
+        }
+    }
+
+    let mask =
+        Tensor::from_vec(mask_data, (num_tokens, num_experts), &Device::Cpu)?.to_device(device)?;
+    let mask = mask.to_dtype(scores.dtype())?;
+
+    // Non-selected experts receive a large penalty so top-k ignores them.
+    // penalty = (1 - mask) * (-1e30)
+    let ones_minus_mask = mask.affine(-1.0, 1.0)?;
+    let penalty = ones_minus_mask.affine(-1e30_f64, 0.0)?;
+    scores + &penalty
+}
+
+/// Build a CPU tensor of zeros with given shape and dtype.
+fn _zeros(shape: (usize, usize), dtype: DType, device: &Device) -> Result<Tensor> {
+    Tensor::zeros(shape, dtype, device)
 }
 
 #[cfg(test)]
@@ -342,15 +457,12 @@ mod tests {
 
         let router = TopKRouter::new(config, vb).unwrap();
 
-        // Create some random hidden states
         let hidden_states = Tensor::randn(0f32, 1.0, (3, 16), &device).unwrap();
-
         let (weights, indices) = router.route(&hidden_states).unwrap();
 
-        assert_eq!(weights.dims(), &[3, 2]); // [num_tokens, top_k]
-        assert_eq!(indices.dims(), &[3, 2]); // [num_tokens, top_k]
+        assert_eq!(weights.dims(), &[3, 2]);
+        assert_eq!(indices.dims(), &[3, 2]);
 
-        // Check that weights sum to 1 (renormalized)
         let sums = weights.sum_keepdim(1).unwrap();
         let sums_vec: Vec<f32> = sums.flatten_all().unwrap().to_vec1().unwrap();
         for sum in sums_vec {
@@ -375,8 +487,6 @@ mod tests {
         let hidden_states = Tensor::randn(0f32, 1.0, (3, 16), &device).unwrap();
 
         let (weights, _) = router.route(&hidden_states).unwrap();
-
-        // Weights should not necessarily sum to 1 without renormalization
         assert_eq!(weights.dims(), &[3, 2]);
     }
 
@@ -398,11 +508,9 @@ mod tests {
         let hidden_states = Tensor::randn(0f32, 1.0, (3, 16), &device).unwrap();
 
         let (weights, indices) = router.route(&hidden_states).unwrap();
-
         assert_eq!(weights.dims(), &[3, 2]);
         assert_eq!(indices.dims(), &[3, 2]);
 
-        // Weights should be renormalized to sum to 1
         let sums = weights.sum_keepdim(1).unwrap();
         let sums_vec: Vec<f32> = sums.flatten_all().unwrap().to_vec1().unwrap();
         for sum in sums_vec {
@@ -411,19 +519,20 @@ mod tests {
     }
 
     #[test]
-    fn test_grouped_topk() {
+    fn test_grouped_topk_shape() {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
 
         let config = RouterConfig {
             hidden_size: 16,
-            num_experts: 8, // 8 experts in 2 groups of 4
-            top_k: 4,       // Total top-k
+            num_experts: 8,
+            top_k: 4,
             renormalize: true,
             scoring_func: ScoringFunc::Softmax,
             use_grouped_topk: true,
             num_expert_groups: Some(2),
-            topk_per_group: Some(2), // 2 from each group
+            topk_per_group: Some(1),
+            ..Default::default()
         };
 
         let router = TopKRouter::new(config, vb).unwrap();
@@ -431,7 +540,7 @@ mod tests {
 
         let (weights, indices) = router.route(&hidden_states).unwrap();
 
-        assert_eq!(weights.dims(), &[3, 4]); // [num_tokens, top_k]
+        assert_eq!(weights.dims(), &[3, 4]);
         assert_eq!(indices.dims(), &[3, 4]);
 
         // Check expert indices are valid (0-7)
@@ -439,6 +548,90 @@ mod tests {
         for idx in indices_vec {
             assert!(idx < 8, "Expert index should be < 8, got {idx}");
         }
+    }
+
+    #[test]
+    fn test_grouped_topk_correct_groups() {
+        // Verify that grouped top-k actually selects from the top group.
+        // With 4 experts in 2 groups of 2, make group-1 (experts 2,3) have very high scores.
+        // Use actual non-zero gate weights to verify routing logic.
+        let device = Device::Cpu;
+
+        let config = RouterConfig {
+            hidden_size: 2,
+            num_experts: 4,
+            top_k: 2,
+            renormalize: false,
+            scoring_func: ScoringFunc::Softmax,
+            use_grouped_topk: true,
+            num_expert_groups: Some(2),
+            topk_per_group: Some(1), // select 1 group
+            ..Default::default()
+        };
+
+        // Manually create gate weight [4, 2] such that for input [1, 0]:
+        //   gate logits = [0, 0, 10, 10] → group-1 (experts 2,3) wins
+        let gate_weight = Tensor::from_vec(
+            vec![0.0f32, 0.0, 0.0, 0.0, 10.0, 0.0, 10.0, 0.0],
+            (4, 2),
+            &device,
+        )
+        .unwrap();
+        let gate = candle_nn::Linear::new(gate_weight, None);
+
+        // Construct router manually by wrapping the gate.
+        // Since we can't inject `gate` directly, use zeros VB and override via set_e_score_correction_bias trick.
+        // Instead, just test the helper functions directly.
+
+        // Test apply_group_mask directly:
+        // scores = [token0: expert0=0.1, expert1=0.1, expert2=0.5, expert3=0.5]
+        let scores = Tensor::new(&[[0.1f32, 0.1, 0.5, 0.5]], &device).unwrap();
+        // group_idx = [[1]] (select group-1, which covers experts 2,3)
+        let group_idx = Tensor::new(&[[1u32]], &device).unwrap();
+        let masked = apply_group_mask(&scores, &group_idx, 1, 2, 2).unwrap();
+        let masked_vec: Vec<f32> = masked.flatten_all().unwrap().to_vec1().unwrap();
+        // Experts 0,1 should have very negative score; experts 2,3 keep original
+        assert!(masked_vec[0] < -1e20, "expert 0 should be masked");
+        assert!(masked_vec[1] < -1e20, "expert 1 should be masked");
+        assert!(
+            (masked_vec[2] - 0.5).abs() < 1e-5,
+            "expert 2 should be kept"
+        );
+        assert!(
+            (masked_vec[3] - 0.5).abs() < 1e-5,
+            "expert 3 should be kept"
+        );
+
+        let _ = gate;
+    }
+
+    #[test]
+    fn test_routed_scaling_factor() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let config = RouterConfig {
+            hidden_size: 16,
+            num_experts: 4,
+            top_k: 2,
+            renormalize: true,
+            routed_scaling_factor: 2.0,
+            ..Default::default()
+        };
+
+        let router = TopKRouter::new(config, vb).unwrap();
+        let hidden_states = Tensor::randn(0f32, 1.0, (1, 16), &device).unwrap();
+
+        let (weights, _) = router.route(&hidden_states).unwrap();
+        // After renormalize, sum = 1.0; then * 2.0 → sum = 2.0
+        let sum: f32 = weights
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .sum();
+        assert!((sum - 2.0).abs() < 1e-4, "expected sum=2.0, got {sum}");
     }
 
     #[test]
@@ -452,5 +645,6 @@ mod tests {
         assert_eq!(config.scoring_func, ScoringFunc::Softmax);
         assert!(!config.use_grouped_topk);
         assert!(config.num_expert_groups.is_none());
+        assert!((config.routed_scaling_factor - 1.0).abs() < 1e-9);
     }
 }

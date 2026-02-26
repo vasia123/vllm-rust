@@ -547,6 +547,7 @@ impl MiMoV2MoEBlock {
             use_grouped_topk: mimo_cfg.n_group.is_some(),
             num_expert_groups: mimo_cfg.n_group,
             topk_per_group: mimo_cfg.topk_group,
+            routed_scaling_factor: 1.0,
         };
 
         // Load optional score correction bias stored alongside the gate weights.

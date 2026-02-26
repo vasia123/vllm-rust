@@ -584,6 +584,7 @@ impl AfmoeMoEBlock {
             } else {
                 None
             },
+            routed_scaling_factor: 1.0,
         };
 
         // Expert bias for load balancing

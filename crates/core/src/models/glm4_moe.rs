@@ -436,6 +436,7 @@ impl Glm4MoeBlock {
             use_grouped_topk: n_group.is_some(),
             num_expert_groups: n_group,
             topk_per_group: topk_group,
+            routed_scaling_factor: cfg.routed_scaling_factor(),
         };
         let router = TopKRouter::new(router_config, vb.pp("gate"))?;
 

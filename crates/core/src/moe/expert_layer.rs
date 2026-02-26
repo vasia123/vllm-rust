@@ -540,6 +540,7 @@ impl MoELayerWithShared {
             use_grouped_topk: config.use_grouped_topk,
             num_expert_groups: config.num_expert_groups,
             topk_per_group: config.topk_per_group,
+            routed_scaling_factor: config.routed_scaling_factor,
         };
 
         let router = TopKRouter::new(router_config, vb.pp("gate"))?;

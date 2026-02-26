@@ -385,7 +385,7 @@ impl KimiAttention {
 enum KimiMlp {
     Dense(TpSwiGluMlp),
     Moe {
-        moe: MoELayer,
+        moe: Box<MoELayer>,
         shared_experts: Option<TpSwiGluMlp>,
         routed_scaling_factor: f64,
     },
@@ -442,7 +442,7 @@ impl KimiDecoderLayer {
             };
 
             KimiMlp::Moe {
-                moe,
+                moe: Box::new(moe),
                 shared_experts,
                 routed_scaling_factor: extra_cfg.routed_scaling_factor,
             }
