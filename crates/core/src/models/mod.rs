@@ -170,6 +170,7 @@ pub mod nano_nemotron_vl;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
+pub mod nemotron_parse;
 pub mod nemotron_quantized;
 pub mod nvlm_d;
 pub mod olmo2;
@@ -969,6 +970,9 @@ pub fn from_config_encoder_decoder(
         "WhisperForConditionalGeneration" => {
             Ok(Box::new(WhisperForConditionalGeneration::new(cfg, vb)?))
         }
+        "NemotronParseForConditionalGeneration" => Ok(Box::new(
+            nemotron_parse::NemotronParseForConditionalGeneration::new(cfg, vb)?,
+        )),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
