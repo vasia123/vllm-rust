@@ -1114,7 +1114,18 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = &spec_decoding_acceptance_method; // TODO: wire to acceptance sampler type
     let _ = disable_log_stats; // TODO: wire to periodic stats suppression
     let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
-    let _ = &limit_mm_per_prompt; // TODO: wire to multimodal limits
+                                   // Parse --limit-mm-per-prompt JSON ("{"image": 5, "video": 1}") into per-modality limits.
+    let mm_limits: std::collections::HashMap<String, usize> =
+        if let Some(ref json_str) = limit_mm_per_prompt {
+            serde_json::from_str(json_str).map_err(|e| {
+                anyhow::anyhow!(
+                    "--limit-mm-per-prompt must be a JSON object like '{{\"image\": 5}}': {}",
+                    e
+                )
+            })?
+        } else {
+            std::collections::HashMap::new()
+        };
     let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache
     let _ = &guided_decoding_backend; // TODO: wire to structured output backend
     let _ = max_seq_len_to_capture; // TODO: wire to CUDA graph capture
@@ -1473,6 +1484,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         enable_auto_tool_choice,
         return_tokens_as_token_ids,
         max_logprobs,
+        mm_limits,
     );
 
     let start_time = SystemTime::now()

@@ -54,6 +54,18 @@ pub async fn create_chat_completion(
         prometheus::inc_requests_error();
     })?;
 
+    // Enforce per-modality limits (--limit-mm-per-prompt)
+    if let Some(&image_limit) = state.mm_limits.get("image") {
+        if image_inputs.len() > image_limit {
+            prometheus::inc_requests_error();
+            return Err(ApiError::InvalidRequest(format!(
+                "too many images in prompt: {} > limit {}",
+                image_inputs.len(),
+                image_limit
+            )));
+        }
+    }
+
     // Inject system prompt for JSON response format enforcement.
     // This must happen before template application so the system message
     // is included in the rendered prompt.

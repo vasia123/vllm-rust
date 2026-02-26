@@ -77,6 +77,9 @@ pub struct AppState {
     /// Maximum number of log probabilities per token the server will return.
     /// Caps both `top_logprobs` (chat) and `logprobs` (completions).
     pub max_logprobs: usize,
+    /// Per-modality count limits for multimodal inputs in a single request.
+    /// Keys: "image", "video", "audio". Empty map means unlimited.
+    pub mm_limits: HashMap<String, usize>,
 }
 
 impl AppState {
@@ -95,6 +98,7 @@ impl AppState {
         enable_auto_tool_choice: bool,
         return_tokens_as_token_ids: bool,
         max_logprobs: usize,
+        mm_limits: HashMap<String, usize>,
     ) -> Self {
         Self {
             engine,
@@ -115,6 +119,7 @@ impl AppState {
             enable_auto_tool_choice,
             return_tokens_as_token_ids,
             max_logprobs,
+            mm_limits,
         }
     }
 
@@ -945,6 +950,7 @@ mod tests {
             false,
             false,
             20,
+            HashMap::new(),
         )
     }
 
