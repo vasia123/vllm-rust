@@ -80,6 +80,10 @@ pub struct AppState {
     /// Per-modality count limits for multimodal inputs in a single request.
     /// Keys: "image", "video", "audio". Empty map means unlimited.
     pub mm_limits: HashMap<String, usize>,
+    /// Minimum number of tokens to buffer before sending a streaming chunk.
+    /// Value of 1 (default) sends every token immediately; higher values batch
+    /// tokens to reduce SSE/HTTP overhead. Mirrors vLLM `--stream-interval`.
+    pub stream_interval: usize,
 }
 
 impl AppState {
@@ -99,6 +103,7 @@ impl AppState {
         return_tokens_as_token_ids: bool,
         max_logprobs: usize,
         mm_limits: HashMap<String, usize>,
+        stream_interval: usize,
     ) -> Self {
         Self {
             engine,
@@ -120,6 +125,7 @@ impl AppState {
             return_tokens_as_token_ids,
             max_logprobs,
             mm_limits,
+            stream_interval: stream_interval.max(1),
         }
     }
 
@@ -744,6 +750,7 @@ pub fn create_full_router_with_cors_and_rate_limit(
         cors,
         rate_limit_state,
         DEFAULT_MAX_BODY_SIZE,
+        true,
     )
 }
 
@@ -754,6 +761,7 @@ pub fn create_full_router_with_options(
     cors: CorsLayer,
     rate_limit_state: middleware::RateLimitState,
     max_body_size: usize,
+    enable_request_logging: bool,
 ) -> Router {
     create_full_router_with_all_options(
         app_state,
@@ -762,6 +770,7 @@ pub fn create_full_router_with_options(
         rate_limit_state,
         max_body_size,
         middleware::ApiKeyState::disabled(),
+        enable_request_logging,
     )
 }
 
@@ -773,9 +782,10 @@ pub fn create_full_router_with_all_options(
     rate_limit_state: middleware::RateLimitState,
     max_body_size: usize,
     api_key_state: middleware::ApiKeyState,
+    enable_request_logging: bool,
 ) -> Router {
     let accepting = app_state.accepting.clone();
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_check))
         .route("/version", get(version))
         .route("/load", get(get_server_load))
@@ -844,7 +854,15 @@ pub fn create_full_router_with_all_options(
         ))
         .layer(cors)
         .with_state(app_state)
-        .nest("/admin", create_admin_router(admin_state))
+        .nest("/admin", create_admin_router(admin_state));
+
+    // http_logging is the outermost layer so it captures the final status code
+    // (set by inner layers). Applied last so it wraps everything.
+    if enable_request_logging {
+        router.layer(axum::middleware::from_fn(middleware::http_logging))
+    } else {
+        router
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +969,7 @@ mod tests {
             false,
             20,
             HashMap::new(),
+            1,
         )
     }
 

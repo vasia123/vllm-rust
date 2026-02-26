@@ -222,6 +222,7 @@ pub async fn create_chat_completion(
                 None
             },
             abort_handle: Some(streaming::AbortHandle::new(engine, engine_request_id)),
+            stream_interval: state.stream_interval,
         };
         Ok(
             chat_completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)

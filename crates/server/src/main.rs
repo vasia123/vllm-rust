@@ -1091,7 +1091,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     if seed != 0 {
         eprintln!("Using random seed: {seed}");
     }
-    let _ = disable_log_requests; // TODO: wire to per-request logging suppression
     let _ = max_lora_rank; // TODO: validate adapter rank on load
 
     // Acknowledge new args (wire as features are implemented)
@@ -1105,7 +1104,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = &preemption_mode; // TODO: wire to scheduler preemption strategy
     let _ = max_num_partial_prefills; // TODO: wire to partial prefill limits
     let _ = long_prefill_token_threshold; // TODO: wire to long prefill classification
-    let _ = stream_interval; // TODO: wire to streaming interval
     let _ = enable_lora; // TODO: wire to global LoRA enable
                          // max_loras: wired to SchedulerConfig.max_loras_per_batch below
     let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
@@ -1485,6 +1483,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         return_tokens_as_token_ids,
         max_logprobs,
         mm_limits,
+        stream_interval,
     );
 
     let start_time = SystemTime::now()
@@ -1524,6 +1523,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         cors_layer,
         api::middleware::RateLimitState::unlimited(),
         max_body_size,
+        !disable_log_requests,
     );
     let addr = format!("{host}:{port}");
 

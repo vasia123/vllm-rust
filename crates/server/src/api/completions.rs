@@ -154,6 +154,7 @@ pub async fn create_completion(
                 .unwrap_or(state.return_tokens_as_token_ids),
             reasoning_parser: None,
             abort_handle: Some(streaming::AbortHandle::new(engine, engine_request_id)),
+            stream_interval: state.stream_interval,
         };
         Ok(
             completion_sse_stream(request_id, state.model_id.clone(), rx, streaming_opts)
