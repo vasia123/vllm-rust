@@ -22,13 +22,14 @@
 
 use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::VarBuilder;
+use candle_nn::{linear_no_bias, VarBuilder};
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::moe::{MoERouter, RouterConfig, TopKRouter};
 
 pub use super::tp_layers::TpContext;
 use super::tp_layers::{TpEmbedding, TpLinear, TpSwiGluMlp};
@@ -275,32 +276,137 @@ impl LongcatAttention {
     }
 }
 
-// ─── MoE Layer (simplified) ─────────────────────────────────────────────────
+// ─── MoE Layer ───────────────────────────────────────────────────────────────
 //
-// Simplified MoE: uses a gate (router) and top-k expert selection.
-// Each expert is a SwiGLU MLP. For simplicity, we use a dense MLP
-// as a stand-in since the full FusedMoE with ZeroExpert routing
-// requires infrastructure not available in the basic model setup.
+// LongCat MoE: router (gate.weight + gate.e_score_correction_bias) selects
+// top-k experts per token. Each expert is a SwiGLU MLP with separate
+// gate_proj / up_proj / down_proj weights (HuggingFace checkpoint format).
+//
+// Weight paths under `mlp`:
+//   gate.weight                     — router linear [n_experts, hidden]
+//   gate.e_score_correction_bias    — bias [n_experts] (optional)
+//   experts.{i}.gate_proj.weight    — [intermediate, hidden]
+//   experts.{i}.up_proj.weight      — [intermediate, hidden]
+//   experts.{i}.down_proj.weight    — [hidden, intermediate]
 
+/// Single SwiGLU expert with standard HuggingFace weight naming.
+struct LongcatMoeExpert {
+    gate_proj: candle_nn::Linear,
+    up_proj: candle_nn::Linear,
+    down_proj: candle_nn::Linear,
+}
+
+impl LongcatMoeExpert {
+    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
+        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
+        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs)?)?;
+        let up = self.up_proj.forward(xs)?;
+        self.down_proj.forward(&(gate * up)?)
+    }
+}
+
+/// Top-k MoE block.
+///
+/// Router weights at `gate.weight` and optional correction bias at
+/// `gate.e_score_correction_bias`. Experts at `experts.{i}.*`.
 struct LongcatMoE {
-    mlp: TpSwiGluMlp,
+    router: TopKRouter,
+    experts: Vec<LongcatMoeExpert>,
+    num_experts: usize,
+    top_k: usize,
 }
 
 impl LongcatMoE {
     fn new(
         hidden_size: usize,
         intermediate_size: usize,
+        num_experts: usize,
+        top_k: usize,
         vb: VarBuilder,
-        pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        // Use a single dense MLP as a stand-in for the full MoE block
-        // TODO: Implement full MoE with ZeroExpert routing when infrastructure is ready
-        let mlp = TpSwiGluMlp::new(hidden_size, intermediate_size, vb, pg)?;
-        Ok(Self { mlp })
+        let router_config = RouterConfig {
+            hidden_size,
+            num_experts,
+            top_k,
+            renormalize: false,
+            ..RouterConfig::default()
+        };
+
+        // e_score_correction_bias is zero-initialized in the checkpoint;
+        // try to load it and fall back to no bias if absent.
+        let bias = vb
+            .pp("gate")
+            .get((num_experts,), "e_score_correction_bias")
+            .ok();
+        let router = TopKRouter::new_with_bias(router_config, vb.pp("gate"), bias)?;
+
+        let mut experts = Vec::with_capacity(num_experts);
+        let vb_exp = vb.pp("experts");
+        for i in 0..num_experts {
+            experts.push(LongcatMoeExpert::new(
+                hidden_size,
+                intermediate_size,
+                vb_exp.pp(i),
+            )?);
+        }
+
+        Ok(Self {
+            router,
+            experts,
+            num_experts,
+            top_k,
+        })
     }
 
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        self.mlp.forward(xs, tp_ctx)
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let orig_shape = xs.dims().to_vec();
+        let hidden_size = *orig_shape.last().unwrap();
+        let num_tokens: usize = orig_shape.iter().take(orig_shape.len() - 1).product();
+        let flat = xs.reshape((num_tokens, hidden_size))?;
+
+        let (routing_weights, expert_indices) = self.router.route(&flat)?;
+
+        // routing_weights: [T, top_k], expert_indices: [T, top_k]
+        let weights_data: Vec<f32> = routing_weights
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let indices_data: Vec<u32> = expert_indices
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        let device = xs.device();
+        let dtype = xs.dtype();
+
+        let mut output = Tensor::zeros((num_tokens, hidden_size), dtype, device)?;
+
+        for tok in 0..num_tokens {
+            let tok_input = flat.narrow(0, tok, 1)?;
+            for k in 0..self.top_k {
+                let expert_id = indices_data[tok * self.top_k + k] as usize;
+                let weight = weights_data[tok * self.top_k + k];
+                if expert_id < self.num_experts {
+                    let expert_out = self.experts[expert_id].forward(&tok_input)?;
+                    let scaled = expert_out.affine(weight as f64, 0.0)?;
+                    let row = output.narrow(0, tok, 1)?;
+                    output =
+                        output.slice_assign(&[tok..tok + 1, 0..hidden_size], &(row + scaled)?)?;
+                }
+            }
+        }
+
+        output.reshape(orig_shape)
     }
 }
 
@@ -349,8 +455,9 @@ impl LongcatFlashDecoderLayer {
         let moe = LongcatMoE::new(
             cfg.hidden_size,
             longcat_cfg.moe_intermediate_size,
+            longcat_cfg.n_routed_experts,
+            longcat_cfg.moe_top_k,
             vb.pp("mlp"),
-            pg,
         )?;
 
         // Dual norms
@@ -512,7 +619,7 @@ impl LongcatFlashForCausalLM {
             // Step 2: Post-attention norm -> fork: MoE + first MLP
             let residual = &hidden;
             let normed = layer.post_attention_layernorm_0.forward(&hidden)?;
-            let moe_out = layer.moe.forward(&normed, &self.tp_ctx)?;
+            let moe_out = layer.moe.forward(&normed)?;
             let hidden = layer.mlps_0.forward(&normed, &self.tp_ctx)?;
 
             // Step 3: Second attention
@@ -587,7 +694,7 @@ impl crate::engine::ModelForward for LongcatFlashForCausalLM {
 
             let residual = &hidden;
             let normed = layer.post_attention_layernorm_0.forward(&hidden)?;
-            let moe_out = layer.moe.forward(&normed, &self.tp_ctx)?;
+            let moe_out = layer.moe.forward(&normed)?;
             let hidden = layer.mlps_0.forward(&normed, &self.tp_ctx)?;
 
             let hidden = layer.input_layernorm_1.forward(&(hidden + residual)?)?;
