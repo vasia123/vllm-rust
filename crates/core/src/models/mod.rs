@@ -611,12 +611,16 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2AudioForConditionalGeneration" => {
             Ok(Box::new(Qwen2AudioForConditionalGeneration::new(cfg, vb)?))
         }
-        "Qwen2_5OmniThinkerForConditionalGeneration" => Ok(Box::new(
+        "Qwen2_5OmniThinkerForConditionalGeneration"
+        | "Qwen2_5OmniModel"
+        | "Qwen2_5OmniForConditionalGeneration" => Ok(Box::new(
             Qwen2_5OmniThinkerForConditionalGeneration::new(cfg, vb)?,
         )),
-        "Qwen3OmniMoeThinkerForConditionalGeneration" => Ok(Box::new(
-            Qwen3OmniMoeThinkerForConditionalGeneration::new(cfg, vb)?,
-        )),
+        "Qwen3OmniMoeThinkerForConditionalGeneration" | "Qwen3OmniMoeForConditionalGeneration" => {
+            Ok(Box::new(Qwen3OmniMoeThinkerForConditionalGeneration::new(
+                cfg, vb,
+            )?))
+        }
         "Qwen3ASRForConditionalGeneration" => {
             Ok(Box::new(Qwen3ASRForConditionalGeneration::new(cfg, vb)?))
         }
@@ -838,7 +842,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "OlmoeForCausalLM" => Ok(Box::new(OlmoeForCausalLM::new(cfg, vb)?)),
         "OPTForCausalLM" => Ok(Box::new(OPTForCausalLM::new(cfg, vb)?)),
         "OuroForCausalLM" => Ok(Box::new(OuroForCausalLM::new(cfg, vb)?)),
-        "OvisForConditionalGeneration" => Ok(Box::new(OvisForConditionalGeneration::new(cfg, vb)?)),
+        "OvisForConditionalGeneration" | "Ovis" => {
+            Ok(Box::new(OvisForConditionalGeneration::new(cfg, vb)?))
+        }
         "PanguEmbeddedForCausalLM" => Ok(Box::new(PanguEmbeddedForCausalLM::new(cfg, vb)?)),
         "PanguProMoEV2ForCausalLM" => Ok(Box::new(PanguProMoEV2ForCausalLM::new(cfg, vb)?)),
         "PanguUltraMoEForCausalLM" => Ok(Box::new(PanguUltraMoEForCausalLM::new(cfg, vb)?)),
@@ -1516,7 +1522,7 @@ pub fn from_config_with_tp(
         "Lfm2MoeForCausalLM" => Ok(Box::new(Lfm2MoeForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "Lfm2VLForConditionalGeneration" => {
+        "Lfm2VLForConditionalGeneration" | "Lfm2VlForConditionalGeneration" => {
             Ok(Box::new(Lfm2VLForConditionalGeneration::new(cfg, vb)?))
         }
         "Llama4ForCausalLM" => Ok(Box::new(Llama4ForCausalLM::new_with_tp(

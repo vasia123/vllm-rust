@@ -1038,6 +1038,159 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             .with_encoder_only()
             .with_multimodal(),
     },
+    // ─── Audio Models ──────────────────────────────────────────────────────────
+    ArchitectureInfo {
+        arch_names: &["WhisperForConditionalGeneration"],
+        display_name: "Whisper",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen2AudioForConditionalGeneration"],
+        display_name: "Qwen2-Audio",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["UltravoxModel"],
+        display_name: "Ultravox",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["VoxtralForConditionalGeneration"],
+        display_name: "Voxtral",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GlmAsrForConditionalGeneration"],
+        display_name: "GLM-ASR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GraniteSpeechForConditionalGeneration"],
+        display_name: "Granite Speech",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["FunAudioChatForConditionalGeneration"],
+        display_name: "FunAudioChat",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["AudioFlamingo3ForConditionalGeneration"],
+        display_name: "AudioFlamingo3",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MusicFlamingoForConditionalGeneration"],
+        display_name: "MusicFlamingo",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+            "Qwen2_5OmniModel",
+            "Qwen2_5OmniForConditionalGeneration",
+        ],
+        display_name: "Qwen2.5-Omni Thinker",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "Qwen3OmniMoeThinkerForConditionalGeneration",
+            "Qwen3OmniMoeForConditionalGeneration",
+        ],
+        display_name: "Qwen3-Omni-MoE Thinker",
+        capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Qwen3ASRForConditionalGeneration"],
+        display_name: "Qwen3-ASR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    // ─── Additional VLMs ───────────────────────────────────────────────────────
+    ArchitectureInfo {
+        arch_names: &[
+            "InternS1ForConditionalGeneration",
+            "InternVLForConditionalGeneration",
+        ],
+        display_name: "InternS1",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["InternS1ProForConditionalGeneration"],
+        display_name: "InternS1-Pro",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "Step3VLForConditionalGeneration",
+            "StepVLForConditionalGeneration",
+        ],
+        display_name: "Step3-VL",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Ernie4_5_VLMoeForConditionalGeneration"],
+        display_name: "ERNIE 4.5 VL MoE",
+        capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["KimiVLForConditionalGeneration"],
+        display_name: "Kimi-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["KimiK25ForConditionalGeneration"],
+        display_name: "Kimi-K2.5",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["KananaVForConditionalGeneration"],
+        display_name: "Kanana-V",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Ovis", "OvisForConditionalGeneration"],
+        display_name: "Ovis",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "Lfm2VlForConditionalGeneration",
+            "Lfm2VLForConditionalGeneration",
+        ],
+        display_name: "LFM2-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["MiniCPMO"],
+        display_name: "MiniCPM-O",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["HunYuanVLForConditionalGeneration"],
+        display_name: "HunYuan-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["GlmOcrForConditionalGeneration"],
+        display_name: "GLM-OCR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Glm4vMoeForConditionalGeneration"],
+        display_name: "GLM-4.1V MoE",
+        capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
+    },
+    ArchitectureInfo {
+        arch_names: &["DeepseekOCR2ForCausalLM"],
+        display_name: "DeepSeek-OCR2",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["DotsOCRForCausalLM"],
+        display_name: "Dots-OCR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
 ];
 
 /// Returns the full catalog of supported architectures.
@@ -1411,6 +1564,39 @@ mod tests {
             "JinaVLForRanking",
             "PrithviGeoSpatialMAE",
             "Terratorch",
+            // Audio models
+            "WhisperForConditionalGeneration",
+            "Qwen2AudioForConditionalGeneration",
+            "UltravoxModel",
+            "VoxtralForConditionalGeneration",
+            "GlmAsrForConditionalGeneration",
+            "GraniteSpeechForConditionalGeneration",
+            "FunAudioChatForConditionalGeneration",
+            "AudioFlamingo3ForConditionalGeneration",
+            "MusicFlamingoForConditionalGeneration",
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+            "Qwen2_5OmniModel",
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen3ASRForConditionalGeneration",
+            // Additional VLMs
+            "InternS1ForConditionalGeneration",
+            "InternVLForConditionalGeneration",
+            "InternS1ProForConditionalGeneration",
+            "Step3VLForConditionalGeneration",
+            "StepVLForConditionalGeneration",
+            "Ernie4_5_VLMoeForConditionalGeneration",
+            "KimiVLForConditionalGeneration",
+            "KimiK25ForConditionalGeneration",
+            "KananaVForConditionalGeneration",
+            "Ovis",
+            "OvisForConditionalGeneration",
+            "Lfm2VlForConditionalGeneration",
+            "MiniCPMO",
+            "HunYuanVLForConditionalGeneration",
+            "GlmOcrForConditionalGeneration",
+            "Glm4vMoeForConditionalGeneration",
+            "DeepseekOCR2ForCausalLM",
+            "DotsOCRForCausalLM",
         ];
         for arch in &expected {
             assert!(
