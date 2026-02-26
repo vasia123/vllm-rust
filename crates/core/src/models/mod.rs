@@ -137,6 +137,7 @@ pub mod longcat_flash_mtp;
 pub mod mamba;
 pub mod mamba2;
 pub mod medusa;
+pub mod midashenglm;
 pub mod mimo_mtp;
 pub mod mimo_v2_flash;
 pub mod minicpm;
@@ -378,6 +379,7 @@ pub use longcat_flash_mtp::LongCatFlashMtpModel;
 pub use mamba::MambaForCausalLM;
 pub use mamba2::Mamba2ForCausalLM;
 pub use medusa::{MedusaDraftModel, MedusaModel};
+pub use midashenglm::MiDashengLMModel;
 pub use mimo_mtp::MiMoMtpModel;
 pub use mimo_v2_flash::MiMoV2FlashForCausalLM;
 pub use minicpm::MiniCPMForCausalLM;
@@ -578,6 +580,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "MiMoForCausalLM" | "MiMoV2FlashForCausalLM" => {
             Ok(Box::new(MiMoV2FlashForCausalLM::new(cfg, vb)?))
         }
+        "MiDashengLMModel" => Ok(Box::new(MiDashengLMModel::new(cfg, vb)?)),
         "CohereForCausalLM" | "Cohere2ForCausalLM" => {
             Ok(Box::new(CohereForCausalLM::new(cfg, vb)?))
         }
