@@ -545,7 +545,10 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2ForCausalLM" | "Qwen2Model" => Ok(Box::new(Qwen2ForCausalLM::new(cfg, vb)?)),
         "Qwen2MoeForCausalLM" => Ok(Box::new(Qwen2MoeForCausalLM::new(cfg, vb)?)),
         "Qwen3ForCausalLM" => Ok(Box::new(Qwen3ForCausalLM::new(cfg, vb)?)),
-        "Qwen3MoeForCausalLM" => Ok(Box::new(Qwen3MoeForCausalLM::new(cfg, vb)?)),
+        // InternS1ProMoeLLMForCausalLM uses Qwen3Moe architecture internally
+        "Qwen3MoeForCausalLM" | "InternS1ProMoeLLMForCausalLM" => {
+            Ok(Box::new(Qwen3MoeForCausalLM::new(cfg, vb)?))
+        }
         "Phi3ForCausalLM" => Ok(Box::new(Phi3ForCausalLM::new(cfg, vb)?)),
         "Phi3VForCausalLM" => Ok(Box::new(Phi3VForCausalLM::new(cfg, vb)?)),
         "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => Ok(Box::new(Olmo2ForCausalLM::new(cfg, vb)?)),
@@ -576,7 +579,11 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "CohereForCausalLM" | "Cohere2ForCausalLM" => {
             Ok(Box::new(CohereForCausalLM::new(cfg, vb)?))
         }
-        "GPTNeoXForCausalLM" | "StableLMEpochForCausalLM" | "StableLmForCausalLM" => {
+        "GPTNeoXForCausalLM"
+        | "StableLMEpochForCausalLM"
+        | "StableLmForCausalLM"
+        // stablelm.py uses lowercase "Stablelm" (no capital 'L') in some checkpoints
+        | "StablelmForCausalLM" => {
             Ok(Box::new(GPTNeoXForCausalLM::new(cfg, vb)?))
         }
         "SeedOssForCausalLM" => Ok(Box::new(SeedOssForCausalLM::new(cfg, vb)?)),
@@ -603,7 +610,10 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "GraniteMoeHybridForCausalLM" => Ok(Box::new(GraniteMoeHybridForCausalLM::new(cfg, vb)?)),
         "LlavaForConditionalGeneration"
         | "LlavaNextForConditionalGeneration"
-        | "MantisForConditionalGeneration" => Ok(Box::new(
+        | "MantisForConditionalGeneration"
+        // TarsierForConditionalGeneration (Tarsier-original) uses LLaVA-style
+        // architecture (vision tower + TarsierMultiModalProjector + generic LLM)
+        | "TarsierForConditionalGeneration" => Ok(Box::new(
             LLaVAForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "LlavaOnevisionForConditionalGeneration" | "LlavaNextVideoForConditionalGeneration" => {
@@ -806,7 +816,12 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "GraniteMoeForCausalLM" => Ok(Box::new(GraniteMoeForCausalLM::new(cfg, vb)?)),
         "GraniteMoeSharedForCausalLM" => Ok(Box::new(GraniteMoeSharedForCausalLM::new(cfg, vb)?)),
         "GritLM" => Ok(Box::new(GritLM::new(cfg, vb)?)),
-        "Grok1ForCausalLM" | "Grok1ModelForCausalLM" => {
+        "Grok1ForCausalLM"
+        | "Grok1ModelForCausalLM"
+        // Grok2 and GrokForCausalLM share the same architecture as Grok1
+        // (weight naming differences in MLP gate_proj/up_proj are handled at load time)
+        | "Grok2ForCausalLM"
+        | "GrokForCausalLM" => {
             Ok(Box::new(Grok1ForCausalLM::new(cfg, vb)?))
         }
         "HunYuanDenseV1ForCausalLM" => Ok(Box::new(HunYuanDenseV1ForCausalLM::new(cfg, vb)?)),
@@ -1032,9 +1047,14 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
-        "GPTNeoXForCausalLM" | "StableLMEpochForCausalLM" | "StableLmForCausalLM" => Ok(Box::new(
-            QuantizedGPTNeoXForCausalLM::new(cfg, vb, weight_loader.as_ref())?,
-        )),
+        "GPTNeoXForCausalLM"
+        | "StableLMEpochForCausalLM"
+        | "StableLmForCausalLM"
+        | "StablelmForCausalLM" => Ok(Box::new(QuantizedGPTNeoXForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
         "Qwen2MoeForCausalLM" => Ok(Box::new(QuantizedQwen2MoeForCausalLM::new(
             cfg,
             vb,
@@ -1450,9 +1470,12 @@ pub fn from_config_with_tp(
         "CohereForCausalLM" | "Cohere2ForCausalLM" => Ok(Box::new(CohereForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "GPTNeoXForCausalLM" | "StableLMEpochForCausalLM" | "StableLmForCausalLM" => Ok(Box::new(
-            GPTNeoXForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
+        "GPTNeoXForCausalLM"
+        | "StableLMEpochForCausalLM"
+        | "StableLmForCausalLM"
+        | "StablelmForCausalLM" => Ok(Box::new(GPTNeoXForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
         "SeedOssForCausalLM" => Ok(Box::new(SeedOssForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
@@ -1512,9 +1535,11 @@ pub fn from_config_with_tp(
         "GraniteMoeSharedForCausalLM" => Ok(Box::new(GraniteMoeSharedForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
-        "Grok1ForCausalLM" | "Grok1ModelForCausalLM" => Ok(Box::new(
-            Grok1ForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?,
-        )),
+        "Grok1ForCausalLM" | "Grok1ModelForCausalLM" | "Grok2ForCausalLM" | "GrokForCausalLM" => {
+            Ok(Box::new(Grok1ForCausalLM::new_with_tp(
+                cfg, vb, pg, tp_ctx,
+            )?))
+        }
         "HunYuanDenseV1ForCausalLM" => Ok(Box::new(HunYuanDenseV1ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
