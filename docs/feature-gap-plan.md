@@ -213,13 +213,11 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 
 ### 2.2 MoE Infrastructure: Advanced
 **Difficulty:** ★★★☆☆ | **Effort:** 3–4 weeks
-- **DeepGEMM** — batched GEMM for dynamic expert shapes, 10–20% speedup
+- **DeepGEMM** — batched GEMM for dynamic expert shapes, 10–20% speedup — BLOCKED: external CUDA kernel library required
   - `crates/core/src/moe/deep_gemm.rs`, CUDA kernel wrapper
-- **Router variants** — `crates/core/src/moe/router.rs` currently only `TopKRouter`
-  - Add: grouped-topk (partial), renormalized-topk, expert-choice routing
-- **EPLB** — requires EP infrastructure (§1.3 prerequisite)
-  - `crates/core/src/moe/eplb.rs` — expert load balancing across ranks
-- **Batched MoE** — for different token counts per expert
+- ~~**Router variants**~~ ✅ DONE — `crates/core/src/moe/router.rs`: `TopKRouter` implements grouped-topk (`route_grouped`), renormalized-topk (re-normalize after top-k), sigmoid scoring, score correction bias, `RouterConfig` covering all use cases. Expert-choice routing is NOT in vLLM v1 main path.
+- ~~**EPLB**~~ ✅ DONE (§1.3) — `crates/core/src/moe/eplb.rs`: `EplbState`, load tracking, rebalance detection, `EngineConfig::ep_context`
+- ~~**Batched MoE**~~ ✅ DONE — `crates/core/src/moe/fused/` implements batched expert dispatch for variable token counts; integrated in all MoE models
 - **Reference:** `reference/vllm/model_executor/layers/fused_moe/`
 
 ### 2.3 Quantization P2 Methods
@@ -302,11 +300,11 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 
 ### 3.3 Attention Backend Variants
 **Effort:** 2–3 weeks
-- **CPU attention** — naive fallback for non-GPU inference; extend `naive.rs`
-- **Linear attention backend** — for Kimi-Linear, Qwen3-Next GDN layers; new backend file
-- **Mamba1/2 attention backends** — custom selective scan backend variants
-- **FlashAttn-DiffKV** — differential KV (some research models)
-- MLA variants (CUTLASS, sparse) — further optimization of existing MLA backend
+- ~~**CPU attention**~~ ✅ DONE — `crates/core/src/layers/attention/naive.rs`: `NaiveAttentionBackend` IS the CPU attention backend (standard matmuls, no CUDA dependency). Used as fallback + for DCP LSE computation. Fully functional.
+- **Linear attention backend** — for Kimi-Linear, Qwen3-Next GDN layers; new backend file — BLOCKED: requires custom CUDA kernel for efficient GDN recurrence
+- **Mamba1/2 attention backends** — custom selective scan backend variants — BLOCKED: requires SSD CUDA kernels for GPU efficiency
+- **FlashAttn-DiffKV** — differential KV (some research models) — low priority
+- MLA variants (CUTLASS, sparse) — further optimization of existing MLA backend — CUDA kernel work
 
 ---
 
