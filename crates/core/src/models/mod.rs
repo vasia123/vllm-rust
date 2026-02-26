@@ -361,14 +361,16 @@ pub use kimi_linear::KimiLinearForCausalLM;
 pub use kimi_vl::KimiVLForConditionalGeneration;
 pub use lfm2::{Lfm2ForCausalLM, Lfm2MoeForCausalLM};
 pub use lfm2_vl::Lfm2VLForConditionalGeneration;
-pub use llama::LlamaForCausalLM;
+pub use llama::{LlamaForCausalLM, TeleFLMForCausalLM};
 pub use llama4::Llama4ForCausalLM;
 pub use llama4_vl::Llama4VLForConditionalGeneration;
 pub use llama_bidirectional::LlamaBidirectionalModel;
 pub use llama_lora::LlamaWithLora;
 pub use llama_quantized::QuantizedLlamaForCausalLM;
 pub use llava::LLaVAForConditionalGeneration;
-pub use llava_onevision::LlavaOnevisionForConditionalGeneration;
+pub use llava_onevision::{
+    BeeForConditionalGeneration, LlavaOnevisionForConditionalGeneration, RForConditionalGeneration,
+};
 pub use longcat_flash::LongcatFlashForCausalLM;
 pub use longcat_flash_mtp::LongCatFlashMtpModel;
 pub use mamba::MambaForCausalLM;
@@ -536,8 +538,8 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "OrionForCausalLM"
         | "TeleChatForCausalLM"
         | "TeleChat2ForCausalLM"
-        | "TeleFLMForCausalLM"
         | "OlmoForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
+        "TeleFLMForCausalLM" => Ok(Box::new(TeleFLMForCausalLM::new(cfg, vb)?)),
         "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new(cfg, vb)?)),
         "MixtralForCausalLM" => Ok(Box::new(MixtralForCausalLM::new(cfg, vb)?)),
         "Qwen2ForCausalLM" | "Qwen2Model" => Ok(Box::new(Qwen2ForCausalLM::new(cfg, vb)?)),
@@ -604,11 +606,16 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "MantisForConditionalGeneration" => Ok(Box::new(
             LLaVAForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
-        "LlavaOnevisionForConditionalGeneration"
-        | "LlavaNextVideoForConditionalGeneration"
-        | "RForConditionalGeneration"
-        | "BeeForConditionalGeneration" => Ok(Box::new(
-            LlavaOnevisionForConditionalGeneration::from_model_config(cfg, vb)?,
+        "LlavaOnevisionForConditionalGeneration" | "LlavaNextVideoForConditionalGeneration" => {
+            Ok(Box::new(
+                LlavaOnevisionForConditionalGeneration::from_model_config(cfg, vb)?,
+            ))
+        }
+        "RForConditionalGeneration" => Ok(Box::new(RForConditionalGeneration::from_model_config(
+            cfg, vb,
+        )?)),
+        "BeeForConditionalGeneration" => Ok(Box::new(
+            BeeForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
         "Qwen2AudioForConditionalGeneration" => {
             Ok(Box::new(Qwen2AudioForConditionalGeneration::new(cfg, vb)?))
@@ -2178,6 +2185,66 @@ mod tests {
         assert!(
             result.is_ok(),
             "Lfm2VLForConditionalGeneration should build: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_bee() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let cfg = minimal_config("BeeForConditionalGeneration");
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "BeeForConditionalGeneration should build with custom projector: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_rvl() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let cfg = minimal_config("RForConditionalGeneration");
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "RForConditionalGeneration should build with custom projector: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_teleflm_no_mup() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let cfg = minimal_config("TeleFLMForCausalLM");
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "TeleFLMForCausalLM (no muP) should build: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_config_teleflm_with_mup() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let mut cfg = minimal_config("TeleFLMForCausalLM");
+        cfg.extra
+            .insert("use_mup".to_string(), serde_json::json!(true));
+        cfg.extra
+            .insert("input_mult".to_string(), serde_json::json!(2.0));
+        cfg.extra
+            .insert("output_mult".to_string(), serde_json::json!(4.0));
+        cfg.extra
+            .insert("mup_scale_factor".to_string(), serde_json::json!(2.0));
+        let result = from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "TeleFLMForCausalLM (with muP) should build: {:?}",
             result.err()
         );
     }

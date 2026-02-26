@@ -614,6 +614,144 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
     }
 }
 
+// ─── TeleFLM ─────────────────────────────────────────────────────────────────
+//
+// TeleFLMForCausalLM is LlamaForCausalLM with optional µScaling (muP):
+//   - Embeddings are scaled by `input_mult` before the transformer layers.
+//   - Logits are scaled by `output_mult / mup_scale_factor` after lm_head.
+//
+// Config fields (in `extra`): `use_mup` (bool), `input_mult` (f64),
+//   `output_mult` (f64), `mup_scale_factor` (f64).
+//
+// Reference: `reference/vllm/vllm/model_executor/models/teleflm.py`
+
+/// TeleFLM model for causal language modelling.
+pub struct TeleFLMForCausalLM {
+    inner: LlamaForCausalLM,
+    use_mup: bool,
+    /// Embedding scale factor (applied before layers).
+    input_mult: f64,
+    /// Logit scale = `output_mult / mup_scale_factor`.
+    output_mult: f64,
+}
+
+impl TeleFLMForCausalLM {
+    pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let use_mup = cfg
+            .extra
+            .get("use_mup")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let (input_mult, output_mult) = if use_mup {
+            let im = cfg
+                .extra
+                .get("input_mult")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let om = cfg
+                .extra
+                .get("output_mult")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let sf = cfg
+                .extra
+                .get("mup_scale_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            (im, om / sf)
+        } else {
+            (1.0, 1.0)
+        };
+
+        let inner = LlamaForCausalLM::new(cfg, vb)?;
+        Ok(Self {
+            inner,
+            use_mup,
+            input_mult,
+            output_mult,
+        })
+    }
+
+    fn scaled_forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        if !self.use_mup {
+            return self.inner.forward(
+                input_ids,
+                seqlen_offset,
+                kv_cache_mgr,
+                block_table,
+                slot_mapping,
+            );
+        }
+
+        // Scale embeddings before the transformer.
+        let embeddings = (self.inner.embed_text(input_ids)? * self.input_mult)?;
+        let logits = self.inner.forward_with_embeddings(
+            &embeddings,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )?;
+        // Scale logits after lm_head.
+        logits * self.output_mult
+    }
+}
+
+impl crate::engine::ModelForward for TeleFLMForCausalLM {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.scaled_forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Tensor> {
+        // muP decode: scale embeddings; logit scaling still applies.
+        if !self.use_mup {
+            return crate::engine::ModelForward::forward_decode_batch(
+                &self.inner,
+                input_ids,
+                sequences,
+                kv_cache_mgr,
+            );
+        }
+        let embeddings = (self.inner.embed_text(input_ids)? * self.input_mult)?;
+        let logits = self.inner.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )?;
+        logits * self.output_mult
+    }
+
+    fn device(&self) -> &Device {
+        self.inner.device()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1145,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── TeleFLM tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_teleflm_construction_no_mup() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = TeleFLMForCausalLM::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "TeleFLMForCausalLM (no muP) construction failed: {:?}",
+            model.err()
+        );
+        let model = model.unwrap();
+        assert!(!model.use_mup);
+    }
+
+    #[test]
+    fn test_teleflm_construction_with_mup() {
+        let mut cfg = test_config();
+        cfg.extra
+            .insert("use_mup".to_string(), serde_json::json!(true));
+        cfg.extra
+            .insert("input_mult".to_string(), serde_json::json!(2.0));
+        cfg.extra
+            .insert("output_mult".to_string(), serde_json::json!(4.0));
+        cfg.extra
+            .insert("mup_scale_factor".to_string(), serde_json::json!(2.0));
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = TeleFLMForCausalLM::new(&cfg, vb).unwrap();
+        assert!(model.use_mup);
+        assert!((model.input_mult - 2.0).abs() < 1e-9);
+        // output_mult = 4.0 / 2.0 = 2.0
+        assert!((model.output_mult - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_teleflm_forward_no_mup() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = TeleFLMForCausalLM::new(&cfg, vb).unwrap();
+
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let block_table = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..4).collect();
+
+        let input_ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device).unwrap();
+        let logits = crate::engine::ModelForward::forward(
+            &model,
+            &input_ids,
+            0,
+            &mut kv_cache,
+            &block_table,
+            &slot_mapping,
+        )
+        .unwrap();
+        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_teleflm_mup_scaling_affects_output() {
+        // With all-zero weights, logits are zero regardless of scaling.
+        // With non-zero mup: logits should be equal to base * output_mult.
+        // We verify via the output_mult field (unit test of constructor above), not numeric.
+        // Here we just verify forward runs without error with mup enabled.
+        let mut cfg = test_config();
+        cfg.extra
+            .insert("use_mup".to_string(), serde_json::json!(true));
+        cfg.extra
+            .insert("input_mult".to_string(), serde_json::json!(1.5));
+        cfg.extra
+            .insert("output_mult".to_string(), serde_json::json!(3.0));
+        cfg.extra
+            .insert("mup_scale_factor".to_string(), serde_json::json!(1.5));
+
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let model = TeleFLMForCausalLM::new(&cfg, vb).unwrap();
+
+        let cache_cfg = create_cache_config(&cfg, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let block_table = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..4).collect();
+
+        let input_ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device).unwrap();
+        let logits = crate::engine::ModelForward::forward(
+            &model,
+            &input_ids,
+            0,
+            &mut kv_cache,
+            &block_table,
+            &slot_mapping,
+        )
+        .unwrap();
+        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
     }
 }

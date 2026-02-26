@@ -422,6 +422,389 @@ impl crate::engine::ModelForward for LlavaOnevisionForConditionalGeneration {
     }
 }
 
+// ─── BEE ─────────────────────────────────────────────────────────────────────
+//
+// BeeForConditionalGeneration is LlavaOnevision with a different projector:
+//   LayerNorm(vis_hidden) → Linear[vis_hidden → text*4] → GELU → Linear[text*4 → text]
+//
+// Reference: `reference/vllm/vllm/model_executor/models/bee.py`
+
+/// BEE multi-modal projector.
+///
+/// Weight paths: `multi_modal_projector.{pre_norm,linear_1,linear_2}`
+struct BeeMultiModalProjector {
+    pre_norm: candle_nn::LayerNorm,
+    linear1: candle_nn::Linear,
+    linear2: candle_nn::Linear,
+}
+
+impl BeeMultiModalProjector {
+    fn new(vision_hidden_size: usize, llm_hidden_size: usize, vb: VarBuilder) -> Result<Self> {
+        let pre_norm = candle_nn::layer_norm(vision_hidden_size, 1e-6, vb.pp("pre_norm"))?;
+        let linear1 =
+            candle_nn::linear(vision_hidden_size, llm_hidden_size * 4, vb.pp("linear_1"))?;
+        let linear2 = candle_nn::linear(llm_hidden_size * 4, llm_hidden_size, vb.pp("linear_2"))?;
+        Ok(Self {
+            pre_norm,
+            linear1,
+            linear2,
+        })
+    }
+
+    fn project(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.pre_norm.forward(x)?;
+        let x = self.linear1.forward(&x)?;
+        let x = x.gelu_erf()?;
+        self.linear2.forward(&x)
+    }
+}
+
+/// BEE model for conditional generation.
+///
+/// Identical to LLaVA-OneVision but uses `BeeMultiModalProjector`
+/// (LN + 4× expansion MLP) instead of the standard 2-layer MLP projector.
+pub struct BeeForConditionalGeneration {
+    #[allow(dead_code)]
+    vision_encoder: VisionEncoder,
+    projector: BeeMultiModalProjector,
+    #[allow(dead_code)]
+    image_newline: Tensor,
+    language_model: Qwen2ForCausalLM,
+    #[allow(dead_code)]
+    image_token_id: u32,
+    device: Device,
+    dtype: DType,
+}
+
+impl BeeForConditionalGeneration {
+    pub fn new(cfg: &LlavaOnevisionConfig, vb: VarBuilder) -> Result<Self> {
+        let vision_encoder = VisionEncoder::new(&cfg.vision_config, vb.pp("vision_tower"))?;
+        let projector = BeeMultiModalProjector::new(
+            cfg.projector_config.vision_hidden_size,
+            cfg.projector_config.llm_hidden_size,
+            vb.pp("multi_modal_projector"),
+        )?;
+        let image_newline = vb.get(cfg.model_config.hidden_size, "image_newline")?;
+        let language_model = Qwen2ForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
+        Ok(Self {
+            vision_encoder,
+            projector,
+            image_newline,
+            language_model,
+            image_token_id: cfg.image_token_id,
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
+        })
+    }
+
+    pub fn from_model_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new(&LlavaOnevisionConfig::from_model_config(cfg), vb)
+    }
+
+    fn merge_multimodal(
+        &self,
+        text_embeddings: &Tensor,
+        mm_inputs: &MultimodalInputs,
+    ) -> Result<Tensor> {
+        if !mm_inputs.has_images() {
+            return Ok(text_embeddings.clone());
+        }
+        let (_batch_size, seq_len, _hidden) = text_embeddings.dims3()?;
+        let mut merged = text_embeddings.to_vec3::<f32>()?;
+
+        for (position, processed) in &mm_inputs.image_embeddings {
+            let emb = processed.embedding.unsqueeze(0)?;
+            let projected = self.projector.project(&emb)?.squeeze(0)?;
+            let emb_vec: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
+            let batch_idx = *position / seq_len;
+            let start_pos = *position % seq_len;
+            for (i, emb) in emb_vec.iter().enumerate() {
+                let target = start_pos + i;
+                if target < seq_len && batch_idx < merged.len() {
+                    merged[batch_idx][target] = emb.clone();
+                }
+            }
+        }
+        Tensor::new(merged, &self.device)?.to_dtype(self.dtype)
+    }
+
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let text_embeddings = self.language_model.embed_text(input_ids)?;
+        let embeddings = match multimodal_inputs {
+            Some(mm) if mm.has_images() => self.merge_multimodal(&text_embeddings, mm)?,
+            _ => text_embeddings,
+        };
+        self.language_model.forward_with_embeddings(
+            &embeddings,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+}
+
+impl crate::engine::ModelForward for BeeForConditionalGeneration {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            None,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Tensor> {
+        let embeddings = self.language_model.embed_text(input_ids)?;
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        true
+    }
+
+    fn forward_multimodal(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            multimodal_inputs,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+// ─── RVL ─────────────────────────────────────────────────────────────────────
+//
+// RForConditionalGeneration is LlavaOnevision with:
+//   LayerNorm(vis_hidden) → Linear[vis_hidden → text] → GELU → Linear[text → text]
+//
+// Reference: `reference/vllm/vllm/model_executor/models/rvl.py`
+
+/// RVL multi-modal projector.
+///
+/// Weight paths: `multi_modal_projector.{pre_norm,linear_1,linear_2}`
+struct RvlMultiModalProjector {
+    pre_norm: candle_nn::LayerNorm,
+    linear1: candle_nn::Linear,
+    linear2: candle_nn::Linear,
+}
+
+impl RvlMultiModalProjector {
+    fn new(vision_hidden_size: usize, llm_hidden_size: usize, vb: VarBuilder) -> Result<Self> {
+        let pre_norm = candle_nn::layer_norm(vision_hidden_size, 1e-6, vb.pp("pre_norm"))?;
+        let linear1 = candle_nn::linear(vision_hidden_size, llm_hidden_size, vb.pp("linear_1"))?;
+        let linear2 = candle_nn::linear(llm_hidden_size, llm_hidden_size, vb.pp("linear_2"))?;
+        Ok(Self {
+            pre_norm,
+            linear1,
+            linear2,
+        })
+    }
+
+    fn project(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.pre_norm.forward(x)?;
+        let x = self.linear1.forward(&x)?;
+        let x = x.gelu_erf()?;
+        self.linear2.forward(&x)
+    }
+}
+
+/// RVL model for conditional generation (`RForConditionalGeneration`).
+///
+/// Identical to LLaVA-OneVision but uses `RvlMultiModalProjector`
+/// (LN + same-dim MLP) instead of the standard 2-layer MLP projector.
+pub struct RForConditionalGeneration {
+    #[allow(dead_code)]
+    vision_encoder: VisionEncoder,
+    projector: RvlMultiModalProjector,
+    #[allow(dead_code)]
+    image_newline: Tensor,
+    language_model: Qwen2ForCausalLM,
+    #[allow(dead_code)]
+    image_token_id: u32,
+    device: Device,
+    dtype: DType,
+}
+
+impl RForConditionalGeneration {
+    pub fn new(cfg: &LlavaOnevisionConfig, vb: VarBuilder) -> Result<Self> {
+        let vision_encoder = VisionEncoder::new(&cfg.vision_config, vb.pp("vision_tower"))?;
+        let projector = RvlMultiModalProjector::new(
+            cfg.projector_config.vision_hidden_size,
+            cfg.projector_config.llm_hidden_size,
+            vb.pp("multi_modal_projector"),
+        )?;
+        let image_newline = vb.get(cfg.model_config.hidden_size, "image_newline")?;
+        let language_model = Qwen2ForCausalLM::new(&cfg.model_config, vb.pp("language_model"))?;
+        Ok(Self {
+            vision_encoder,
+            projector,
+            image_newline,
+            language_model,
+            image_token_id: cfg.image_token_id,
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
+        })
+    }
+
+    pub fn from_model_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new(&LlavaOnevisionConfig::from_model_config(cfg), vb)
+    }
+
+    fn merge_multimodal(
+        &self,
+        text_embeddings: &Tensor,
+        mm_inputs: &MultimodalInputs,
+    ) -> Result<Tensor> {
+        if !mm_inputs.has_images() {
+            return Ok(text_embeddings.clone());
+        }
+        let (_batch_size, seq_len, _hidden) = text_embeddings.dims3()?;
+        let mut merged = text_embeddings.to_vec3::<f32>()?;
+
+        for (position, processed) in &mm_inputs.image_embeddings {
+            let emb = processed.embedding.unsqueeze(0)?;
+            let projected = self.projector.project(&emb)?.squeeze(0)?;
+            let emb_vec: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
+            let batch_idx = *position / seq_len;
+            let start_pos = *position % seq_len;
+            for (i, emb) in emb_vec.iter().enumerate() {
+                let target = start_pos + i;
+                if target < seq_len && batch_idx < merged.len() {
+                    merged[batch_idx][target] = emb.clone();
+                }
+            }
+        }
+        Tensor::new(merged, &self.device)?.to_dtype(self.dtype)
+    }
+
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let text_embeddings = self.language_model.embed_text(input_ids)?;
+        let embeddings = match multimodal_inputs {
+            Some(mm) if mm.has_images() => self.merge_multimodal(&text_embeddings, mm)?,
+            _ => text_embeddings,
+        };
+        self.language_model.forward_with_embeddings(
+            &embeddings,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+}
+
+impl crate::engine::ModelForward for RForConditionalGeneration {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            None,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn forward_decode_batch(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Tensor> {
+        let embeddings = self.language_model.embed_text(input_ids)?;
+        self.language_model.forward_decode_batch_with_embeddings(
+            &embeddings,
+            sequences,
+            kv_cache_mgr,
+        )
+    }
+
+    fn supports_multimodal(&self) -> bool {
+        true
+    }
+
+    fn forward_multimodal(
+        &self,
+        input_ids: &Tensor,
+        multimodal_inputs: Option<&MultimodalInputs>,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward(
+            input_ids,
+            multimodal_inputs,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,5 +1361,111 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
         let model = LlavaOnevisionForConditionalGeneration::new(&cfg, vb);
         assert!(model.is_ok(), "Model with bias=false should construct");
+    }
+
+    // ── BEE tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_bee_projector_shape() {
+        // BeeMultiModalProjector: vis_hidden→text*4→text
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let proj = BeeMultiModalProjector::new(32, 64, vb).unwrap();
+
+        let input = Tensor::zeros((1, 4, 32), DType::F32, &device).unwrap();
+        let output = proj.project(&input).unwrap();
+        assert_eq!(output.dims(), &[1, 4, 64]);
+    }
+
+    #[test]
+    fn test_bee_model_construction() {
+        let device = Device::Cpu;
+        let cfg = test_onevision_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = BeeForConditionalGeneration::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "BeeForConditionalGeneration construction failed: {:?}",
+            model.err()
+        );
+        assert!(model.unwrap().supports_multimodal());
+    }
+
+    #[test]
+    fn test_bee_text_only_forward() {
+        let device = Device::Cpu;
+        let cfg = test_onevision_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = BeeForConditionalGeneration::new(&cfg, vb).unwrap();
+
+        let cache_cfg = create_cache_config(&cfg.model_config, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let block_table = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..4).collect();
+
+        let input_ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device).unwrap();
+        let logits = ModelForward::forward(
+            &model,
+            &input_ids,
+            0,
+            &mut kv_cache,
+            &block_table,
+            &slot_mapping,
+        )
+        .unwrap();
+        assert_eq!(logits.dims(), &[1, 4, cfg.model_config.vocab_size]);
+    }
+
+    // ── RVL tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rvl_projector_shape() {
+        // RvlMultiModalProjector: vis_hidden→text_hidden→text_hidden (with LN)
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let proj = RvlMultiModalProjector::new(32, 64, vb).unwrap();
+
+        let input = Tensor::zeros((1, 4, 32), DType::F32, &device).unwrap();
+        let output = proj.project(&input).unwrap();
+        assert_eq!(output.dims(), &[1, 4, 64]);
+    }
+
+    #[test]
+    fn test_rvl_model_construction() {
+        let device = Device::Cpu;
+        let cfg = test_onevision_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = RForConditionalGeneration::new(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "RForConditionalGeneration construction failed: {:?}",
+            model.err()
+        );
+        assert!(model.unwrap().supports_multimodal());
+    }
+
+    #[test]
+    fn test_rvl_text_only_forward() {
+        let device = Device::Cpu;
+        let cfg = test_onevision_config();
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = RForConditionalGeneration::new(&cfg, vb).unwrap();
+
+        let cache_cfg = create_cache_config(&cfg.model_config, &device);
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).unwrap();
+        let block_table = BlockTable::from_block_ids(vec![0, 1], 0);
+        let slot_mapping: Vec<usize> = (0..4).collect();
+
+        let input_ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device).unwrap();
+        let logits = ModelForward::forward(
+            &model,
+            &input_ids,
+            0,
+            &mut kv_cache,
+            &block_table,
+            &slot_mapping,
+        )
+        .unwrap();
+        assert_eq!(logits.dims(), &[1, 4, cfg.model_config.vocab_size]);
     }
 }
