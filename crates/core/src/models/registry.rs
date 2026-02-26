@@ -302,8 +302,8 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
-        arch_names: &["EagleDeepSeekMTPModel"],
-        display_name: "Eagle DeepSeek MTP",
+        arch_names: &["EagleDeepSeekMTPModel", "EagleDeepseekV3ForCausalLM"],
+        display_name: "Eagle DeepSeek V3",
         capabilities: ModelCapabilities::new(),
     },
     ArchitectureInfo {
@@ -1156,7 +1156,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["Ernie4_5_VLMoeForConditionalGeneration"],
+        arch_names: &[
+            "Ernie4_5_VLMoeForConditionalGeneration",
+            "Ernie4_5_VLForConditionalGeneration",
+            "Ernie4_5_VLMoeForCausalLM",
+        ],
         display_name: "ERNIE 4.5 VL MoE",
         capabilities: ModelCapabilities::new().with_multimodal().with_moe(),
     },
@@ -1643,6 +1647,8 @@ mod tests {
             "Step3VLForConditionalGeneration",
             "StepVLForConditionalGeneration",
             "Ernie4_5_VLMoeForConditionalGeneration",
+            "Ernie4_5_VLForConditionalGeneration",
+            "Ernie4_5_VLMoeForCausalLM",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
             "KananaVForConditionalGeneration",

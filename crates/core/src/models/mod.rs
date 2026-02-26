@@ -928,7 +928,11 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "Ernie4_5MoeForCausalLM"
         | "Ernie4_5_MoeForCausalLM"
         | "Ernie4_5ForCausalLM" => Ok(Box::new(Ernie45MoeForCausalLM::new(cfg, vb)?)),
-        "Ernie4_5_VLMoeForConditionalGeneration" => {
+        // Ernie4_5_VLForConditionalGeneration is the checkpoint arch name;
+        // Ernie4_5_VLMoeForCausalLM is the Python class name in ernie45_vl.py.
+        "Ernie4_5_VLMoeForConditionalGeneration"
+        | "Ernie4_5_VLForConditionalGeneration"
+        | "Ernie4_5_VLMoeForCausalLM" => {
             Ok(Box::new(Ernie4_5_VLForConditionalGeneration::new(cfg, vb)?))
         }
         "OpenPanguVLForConditionalGeneration" => {
@@ -1307,7 +1311,11 @@ pub fn eagle1_from_config(
         "EagleLlamaForCausalLM" => Ok(Box::new(EagleLlamaForCausalLM::new(cfg, vb)?)),
         "EagleLlama4ForCausalLM" => Ok(Box::new(EagleLlama4ForCausalLM::new(cfg, vb)?)),
         "EagleMiniCPMForCausalLM" => Ok(Box::new(EagleMiniCPMForCausalLM::new(cfg, vb)?)),
-        "EagleDeepSeekMTPModel" => Ok(Box::new(EagleDeepSeekForCausalLM::new(cfg, vb)?)),
+        // EagleDeepseekV3ForCausalLM is the current Python class name (deepseek_eagle.py);
+        // EagleDeepSeekMTPModel is the legacy checkpoint name for the same Eagle-1 DeepSeek variant.
+        "EagleDeepSeekMTPModel" | "EagleDeepseekV3ForCausalLM" => {
+            Ok(Box::new(EagleDeepSeekForCausalLM::new(cfg, vb)?))
+        }
         "EagleMistralLarge3ForCausalLM" => {
             Ok(Box::new(EagleMistralLarge3ForCausalLM::new(cfg, vb)?))
         }
