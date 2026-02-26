@@ -76,8 +76,8 @@ pub async fn create_completion(
         let continuous_usage_stats =
             stream_opts_ref.is_some_and(|opts| opts.continuous_usage_stats);
 
-        // Capture logprobs count before req fields are moved
-        let logprobs_count = req.logprobs;
+        // Capture logprobs count before req fields are moved, capped at server max
+        let logprobs_count = req.logprobs.map(|n| n.min(state.max_logprobs as u32));
 
         // Convert lora_name to LoraRequest (references a pre-loaded adapter by name)
         let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
@@ -164,7 +164,7 @@ pub async fn create_completion(
         let n = req.n;
         // best_of defaults to n when not specified
         let best_of = req.best_of.unwrap_or(n);
-        let user_requested_logprobs = req.logprobs;
+        let user_requested_logprobs = req.logprobs.map(|n| n.min(state.max_logprobs as u32));
 
         // When best_of > n, we need logprobs to score candidates even if the
         // user didn't ask for them. Request at least 1 logprob internally.

@@ -74,6 +74,9 @@ pub struct AppState {
     /// If true, include raw `token_ids` in non-streaming choices and format logprob
     /// token strings as `"token_{id}"`. Mirrors vLLM `--return-tokens-as-token-ids`.
     pub return_tokens_as_token_ids: bool,
+    /// Maximum number of log probabilities per token the server will return.
+    /// Caps both `top_logprobs` (chat) and `logprobs` (completions).
+    pub max_logprobs: usize,
 }
 
 impl AppState {
@@ -91,6 +94,7 @@ impl AppState {
         response_role: String,
         enable_auto_tool_choice: bool,
         return_tokens_as_token_ids: bool,
+        max_logprobs: usize,
     ) -> Self {
         Self {
             engine,
@@ -110,6 +114,7 @@ impl AppState {
             response_role,
             enable_auto_tool_choice,
             return_tokens_as_token_ids,
+            max_logprobs,
         }
     }
 
@@ -939,6 +944,7 @@ mod tests {
             "assistant".to_string(),
             false,
             false,
+            20,
         )
     }
 

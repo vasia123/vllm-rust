@@ -43,12 +43,28 @@ impl LogFormat {
 /// - `RUST_LOG`: Log level filter (default: "info")
 /// - `VLLM_LOG_FORMAT`: "json" for JSON output, anything else for pretty output
 pub fn init() {
-    init_with_format(LogFormat::from_env());
+    init_with_level_and_format(None, LogFormat::from_env());
+}
+
+/// Initialize the logging subsystem with an explicit log level.
+///
+/// `level` overrides `RUST_LOG` when provided (e.g. `"debug"`, `"warn"`).
+pub fn init_with_level(level: &str) {
+    init_with_level_and_format(Some(level), LogFormat::from_env());
 }
 
 /// Initialize the logging subsystem with a specific format.
 pub fn init_with_format(format: LogFormat) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    init_with_level_and_format(None, format);
+}
+
+/// Initialize the logging subsystem with an explicit level and format.
+pub fn init_with_level_and_format(level: Option<&str>, format: LogFormat) {
+    let env_filter = if let Some(lvl) = level {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(lvl))
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
 
     match format {
         LogFormat::Pretty => {

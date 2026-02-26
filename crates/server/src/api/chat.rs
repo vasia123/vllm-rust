@@ -92,7 +92,7 @@ pub async fn create_chat_completion(
 
     // Determine logprobs count: if logprobs=true, use top_logprobs (default 1, max 20)
     let logprobs_count = if req.logprobs.unwrap_or(false) {
-        Some(req.top_logprobs.unwrap_or(1).min(20))
+        Some(req.top_logprobs.unwrap_or(1).min(state.max_logprobs as u32))
     } else {
         None
     };

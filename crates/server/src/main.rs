@@ -1012,7 +1012,7 @@ struct ServerLaunchConfig {
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
-    logging::init();
+    logging::init_with_level(&cfg.log_level);
     prometheus::init_metrics();
 
     let ServerLaunchConfig {
@@ -1114,9 +1114,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = ngram_prompt_lookup_max; // TODO: wire to NGram proposer config
     let _ = ngram_prompt_lookup_min; // TODO: wire to NGram proposer config
     let _ = disable_log_stats; // TODO: wire to periodic stats suppression
-    let _ = max_logprobs; // TODO: wire to logprobs cap
     let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
-    let _ = &log_level; // TODO: wire to tracing log level
     let _ = &limit_mm_per_prompt; // TODO: wire to multimodal limits
     let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache
     let _ = &guided_decoding_backend; // TODO: wire to structured output backend
@@ -1440,6 +1438,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         response_role.clone(),
         enable_auto_tool_choice,
         return_tokens_as_token_ids,
+        max_logprobs,
     );
 
     let start_time = SystemTime::now()
