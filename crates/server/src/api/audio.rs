@@ -6,7 +6,7 @@
 //! # Request format
 //!
 //! Both endpoints accept `multipart/form-data` with the following fields:
-//! - `file` (required): audio file bytes (WAV format currently supported)
+//! - `file` (required): audio file bytes (WAV, MP3, FLAC, OGG, AAC supported)
 //! - `model` (optional): model identifier (must match the loaded model)
 //! - `language` (optional): ISO-639-1 language code of the source audio
 //! - `prompt` (optional): text to guide transcription style
@@ -21,8 +21,9 @@
 //!
 //! # Architecture
 //!
-//! The handler parses audio bytes into raw PCM samples (WAV via hound),
-//! wraps them in `AudioData`, and submits a `GenerationRequest` to the
+//! The handler parses audio bytes into raw PCM samples (via symphonia;
+//! WAV, MP3, FLAC, OGG, AAC are all supported), wraps them in `AudioData`,
+//! and submits a `GenerationRequest` to the
 //! existing engine with `audio_inputs` populated.
 //!
 //! NOTE: The model's `forward_prefill_batch` must read `audio_inputs` from
@@ -38,7 +39,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use vllm_core::engine::{GenerationRequest, GenerationResult};
-use vllm_core::multimodal::audio::{normalize_audio, AudioData, AudioSpec};
+use vllm_core::multimodal::audio::{load_audio_bytes, normalize_audio, AudioData, AudioSpec};
 use vllm_core::sampling::SamplingParams;
 
 use super::error::ApiError;
@@ -208,63 +209,16 @@ async fn parse_audio_form(mut multipart: Multipart) -> Result<AudioFormData, Api
 
 /// Parse audio bytes to `AudioData`.
 ///
-/// Currently supports PCM WAV files via `hound`. For other formats (MP3, FLAC,
-/// OGG, WEBM), returns an error with a TODO noting that symphonia integration
-/// is needed for full OpenAI API format support.
+/// Supports WAV, MP3, FLAC, OGG, AAC, and other formats handled by
+/// the `symphonia` crate. The optional `file_name` is used to hint the
+/// format when the magic bytes are ambiguous.
 fn parse_audio_bytes(bytes: &[u8], file_name: Option<&str>) -> Result<AudioData, ApiError> {
-    // WAV detection: RIFF...WAVE magic bytes.
-    let is_wav = bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE";
-
-    if is_wav {
-        return parse_wav_bytes(bytes);
-    }
-
-    // Hint from filename extension as fallback.
     let ext = file_name
         .and_then(|n| n.rfind('.').map(|i| &n[i + 1..]))
-        .unwrap_or("")
-        .to_ascii_lowercase();
+        .map(|s| s.to_ascii_lowercase());
 
-    match ext.as_str() {
-        "wav" => parse_wav_bytes(bytes),
-        _ => Err(ApiError::InvalidRequest(
-            // TODO: Add MP3/FLAC/OGG/WEBM support via the `symphonia` crate.
-            // Only WAV (PCM) is supported. Use `ffmpeg -i input.mp3 output.wav`
-            // to convert before uploading.
-            "unsupported audio format — only PCM WAV is currently supported. \
-             Convert with: ffmpeg -i input.mp3 -ar 16000 -ac 1 output.wav"
-                .to_string(),
-        )),
-    }
-}
-
-/// Decode a WAV file to interleaved f32 PCM samples using `hound`.
-fn parse_wav_bytes(bytes: &[u8]) -> Result<AudioData, ApiError> {
-    let cursor = std::io::Cursor::new(bytes);
-    let mut reader = hound::WavReader::new(cursor)
-        .map_err(|e| ApiError::InvalidRequest(format!("invalid WAV file: {}", e)))?;
-
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ApiError::InvalidRequest(format!("WAV read error: {}", e)))?,
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1i64 << (bits - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / max_val))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| ApiError::InvalidRequest(format!("WAV read error: {}", e)))?
-        }
-    };
-
-    Ok(AudioData::new(samples, sample_rate, channels))
+    load_audio_bytes(bytes, ext.as_deref())
+        .map_err(|e| ApiError::InvalidRequest(format!("failed to decode audio: {}", e)))
 }
 
 /// Duration of `AudioData` in seconds.
@@ -478,7 +432,7 @@ mod tests {
     fn parse_wav_mono_16bit() {
         let samples: Vec<i16> = (0..16_000).map(|i| (i % 100) as i16).collect();
         let bytes = make_wav_bytes(16_000, 1, &samples);
-        let audio = parse_wav_bytes(&bytes).expect("should parse WAV");
+        let audio = parse_audio_bytes(&bytes, Some("audio.wav")).expect("should parse WAV");
         assert_eq!(audio.sample_rate, 16_000);
         assert_eq!(audio.channels, 1);
         assert_eq!(audio.samples.len(), 16_000);
@@ -490,7 +444,7 @@ mod tests {
     fn parse_wav_stereo() {
         let samples: Vec<i16> = vec![100, -100, 200, -200, 300, -300];
         let bytes = make_wav_bytes(44_100, 2, &samples);
-        let audio = parse_wav_bytes(&bytes).expect("should parse stereo WAV");
+        let audio = parse_audio_bytes(&bytes, Some("audio.wav")).expect("should parse stereo WAV");
         assert_eq!(audio.channels, 2);
         assert_eq!(audio.samples.len(), 6);
     }
@@ -499,17 +453,17 @@ mod tests {
     fn parse_audio_bytes_detects_wav_magic() {
         let samples: Vec<i16> = vec![0i16; 100];
         let bytes = make_wav_bytes(16_000, 1, &samples);
-        // Should succeed even without a filename extension.
+        // Should succeed even without a filename extension (symphonia probes magic bytes).
         let audio = parse_audio_bytes(&bytes, None).expect("WAV magic bytes detected");
         assert_eq!(audio.sample_rate, 16_000);
     }
 
     #[test]
-    fn parse_audio_bytes_rejects_non_wav() {
-        let fake_mp3 = b"\xff\xfb\x90\x00fake mp3 data";
-        let err = parse_audio_bytes(fake_mp3, Some("audio.mp3")).unwrap_err();
+    fn parse_audio_bytes_rejects_garbage() {
+        let garbage = b"\x00\x01\x02\x03garbage data that is not audio";
+        let err = parse_audio_bytes(garbage, Some("audio.mp3")).unwrap_err();
         let msg = format!("{:?}", err);
-        assert!(msg.contains("WAV") || msg.contains("wav") || msg.contains("unsupported"));
+        assert!(msg.contains("decode") || msg.contains("probe") || msg.contains("audio"));
     }
 
     #[test]

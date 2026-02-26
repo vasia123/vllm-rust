@@ -8,7 +8,7 @@ cuda = ["vllm-core/cuda", "candle-core/cuda"]
 cuda-kernels = ["cuda", "vllm-core/cuda-kernels"]
 
 [dependencies]
-vllm-core = { path = "../core" }
+vllm-core = { path = "../core", features = ["audio"] }
 tokio.workspace = true
 anyhow.workspace = true
 candle-core.workspace = true
@@ -33,9 +33,9 @@ prometheus = "0.13"
 once_cell = "1.19"
 governor = "0.6"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-hound = "3"
 
 [dev-dependencies]
 vllm-core = { path = "../core", features = ["test-utils"] }
 tower.workspace = true
 tempfile = "3"
+hound = "3"
