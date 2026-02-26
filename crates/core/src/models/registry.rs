@@ -1154,6 +1154,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["Ovis2_5"],
+        display_name: "Ovis2.5",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &[
             "Lfm2VlForConditionalGeneration",
             "Lfm2VLForConditionalGeneration",
@@ -1590,6 +1595,7 @@ mod tests {
             "KananaVForConditionalGeneration",
             "Ovis",
             "OvisForConditionalGeneration",
+            "Ovis2_5",
             "Lfm2VlForConditionalGeneration",
             "MiniCPMO",
             "HunYuanVLForConditionalGeneration",
