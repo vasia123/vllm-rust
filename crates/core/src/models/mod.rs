@@ -172,6 +172,7 @@ pub mod nemotron_h;
 pub mod nemotron_nas;
 pub mod nemotron_parse;
 pub mod nemotron_quantized;
+pub mod nemotron_vl;
 pub mod nvlm_d;
 pub mod olmo2;
 pub mod olmo2_lora;
@@ -420,6 +421,7 @@ pub use nemotron::NemotronForCausalLM;
 pub use nemotron_h::NemotronHForCausalLM;
 pub use nemotron_nas::NemotronNasForCausalLM;
 pub use nemotron_quantized::QuantizedNemotronForCausalLM;
+pub use nemotron_vl::LlamaNemotronVLForConditionalGeneration;
 pub use nvlm_d::NVLMDModel;
 pub use olmo2::Olmo2ForCausalLM;
 pub use olmo2_lora::Olmo2WithLora;
@@ -891,6 +893,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "NemotronH_Nano_VL_V2" => Ok(Box::new(
             nano_nemotron_vl::NemotronH_Nano_VL_V2ForConditionalGeneration::new(cfg, vb)?,
+        )),
+        "Llama_Nemotron_Nano_VL" => Ok(Box::new(
+            nemotron_vl::LlamaNemotronVLForConditionalGeneration::new(cfg, vb)?,
         )),
         "DeciLMForCausalLM" | "NemotronNasForCausalLM" => {
             Ok(Box::new(NemotronNasForCausalLM::new(cfg, vb)?))
