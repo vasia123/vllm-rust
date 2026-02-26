@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use vllm_core::{
     engine::{
         spec_decode::MLPSpeculatorDraftProposer, start_engine, start_engine_with_draft,
-        start_engine_with_proposer, EngineConfig, GenerationRequest, NGramConfig, NGramProposer,
-        SpeculativeConfig,
+        start_engine_with_proposer, AcceptanceMethod, EngineConfig, GenerationRequest, NGramConfig,
+        NGramProposer, SpeculativeConfig,
     },
     kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
     loader,
@@ -833,6 +833,23 @@ async fn main() -> anyhow::Result<()> {
                 ),
             };
 
+            // Parse spec-decode acceptance method
+            let parsed_acceptance_method =
+                match spec_decoding_acceptance_method.to_lowercase().as_str() {
+                    "rejection_sampler" | "rejection" => AcceptanceMethod::RejectionSampler,
+                    "typical_acceptance_sampler" | "typical_acceptance" | "typical" => {
+                        AcceptanceMethod::TypicalAcceptance {
+                            posterior_threshold: 0.09,
+                            posterior_alpha: 0.3,
+                        }
+                    }
+                    other => anyhow::bail!(
+                        "Unknown spec_decoding_acceptance_method '{}'. \
+                         Supported: rejection_sampler, typical_acceptance_sampler",
+                        other
+                    ),
+                };
+
             // Parse dtype
             let compute_dtype = match dtype.as_str() {
                 "auto" | "bf16" | "bfloat16" => DType::BF16,
@@ -894,13 +911,13 @@ async fn main() -> anyhow::Result<()> {
                 preemption_mode: parsed_preemption_mode,
                 max_num_partial_prefills,
                 long_prefill_token_threshold,
+                acceptance_method: parsed_acceptance_method,
                 stream_interval,
                 enable_lora,
                 max_loras,
                 lora_extra_vocab_size,
                 lora_dtype,
                 max_cpu_loras,
-                spec_decoding_acceptance_method,
                 ngram_prompt_lookup_max,
                 ngram_prompt_lookup_min,
                 disable_log_stats,
@@ -995,6 +1012,8 @@ struct ServerLaunchConfig {
     preemption_mode: PreemptionMode,
     max_num_partial_prefills: Option<usize>,
     long_prefill_token_threshold: Option<usize>,
+    // Spec-decode acceptance
+    acceptance_method: AcceptanceMethod,
     stream_interval: usize,
     // LoRA
     enable_lora: bool,
@@ -1003,7 +1022,6 @@ struct ServerLaunchConfig {
     lora_dtype: Option<String>,
     max_cpu_loras: Option<usize>,
     // Speculative Decoding
-    spec_decoding_acceptance_method: String,
     ngram_prompt_lookup_max: Option<usize>,
     ngram_prompt_lookup_min: Option<usize>,
     // Observability
@@ -1077,13 +1095,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         preemption_mode,
         max_num_partial_prefills,
         long_prefill_token_threshold,
+        acceptance_method,
         stream_interval,
         enable_lora,
         max_loras,
         lora_extra_vocab_size,
         lora_dtype,
         max_cpu_loras,
-        spec_decoding_acceptance_method,
         ngram_prompt_lookup_max,
         ngram_prompt_lookup_min,
         disable_log_stats,
@@ -1112,7 +1130,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = max_parallel_loading_workers; // TODO: wire to parallel weight loading
                                           // max_loras: wired to SchedulerConfig.max_loras_per_batch below
     let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
-    let _ = &spec_decoding_acceptance_method; // TODO: wire to acceptance sampler type
     let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
                                    // Parse --limit-mm-per-prompt JSON ("{"image": 5, "video": 1}") into per-modality limits.
     let mm_limits: std::collections::HashMap<String, usize> =
@@ -1396,6 +1413,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let eos_token_id = files.config.eos_token_id;
     let engine_tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
 
+    // Build speculative config once; acceptance_method is always carried through.
+    let spec_config_base = SpeculativeConfig {
+        num_speculative_tokens,
+        acceptance_method,
+    };
+
     // Build scheduler config once; reused for all engine start paths.
     let scheduler_config = SchedulerConfig {
         max_running_requests: max_requests,
@@ -1430,14 +1453,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             let mlp_model = models::mlp_speculator_from_config(&draft_files.config, draft_vb)?;
             let proposer = MLPSpeculatorDraftProposer::new(mlp_model);
 
-            let engine_config = EngineConfig::builder(
-                scheduler_config,
-                Some(SpeculativeConfig {
-                    num_speculative_tokens,
-                }),
-            )
-            .enable_prefix_caching(enable_prefix_caching)
-            .build();
+            let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
+                .enable_prefix_caching(enable_prefix_caching)
+                .build();
 
             eprintln!("Starting engine (MLP Speculator, K={num_speculative_tokens})...");
             start_engine_with_proposer(
@@ -1471,14 +1489,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             );
             let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
 
-            let engine_config = EngineConfig::builder(
-                scheduler_config,
-                Some(SpeculativeConfig {
-                    num_speculative_tokens,
-                }),
-            )
-            .enable_prefix_caching(enable_prefix_caching)
-            .build();
+            let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
+                .enable_prefix_caching(enable_prefix_caching)
+                .build();
 
             eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
             start_engine_with_draft(
@@ -1498,10 +1511,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             max_n,
             num_speculative_tokens,
         };
-        let spec_config = SpeculativeConfig {
-            num_speculative_tokens,
-        };
-        let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config))
+        let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
             .multi_step_count(multi_step_count)
             .enable_prefix_caching(enable_prefix_caching)
             .build();
@@ -1822,6 +1832,7 @@ async fn run_generate(
                 },
                 Some(SpeculativeConfig {
                     num_speculative_tokens,
+                    acceptance_method: AcceptanceMethod::RejectionSampler,
                 }),
             )
             .build();
@@ -1874,6 +1885,7 @@ async fn run_generate(
                 },
                 Some(SpeculativeConfig {
                     num_speculative_tokens,
+                    acceptance_method: AcceptanceMethod::RejectionSampler,
                 }),
             )
             .build();

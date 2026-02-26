@@ -57,8 +57,8 @@ pub use spec_decode::{
     SuffixArrayConfig, SuffixArrayProposer,
 };
 pub use types::{
-    EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest, GenerationResult,
-    PauseMode, SpecDecodingStats, SpeculativeConfig, StreamEvent,
+    AcceptanceMethod, EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest,
+    GenerationResult, PauseMode, SpecDecodingStats, SpeculativeConfig, StreamEvent,
 };
 pub use warmup::{
     DefaultDummyInputGenerator, DummyInputGenerator, DummySequence, RandomDummyInputGenerator,
@@ -145,7 +145,11 @@ pub fn start_engine_with_proposer<M: ModelForward>(
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let state = OwnedExecutionState::new(&config);
-    let strategy = SpeculativeExecution::new(target_model, proposer);
+    let acceptance_method = config
+        .speculative_config
+        .map(|c| c.acceptance_method)
+        .unwrap_or_default();
+    let strategy = SpeculativeExecution::with_acceptance(target_model, proposer, acceptance_method);
 
     tokio::spawn(strategy::run_engine_loop(
         strategy,

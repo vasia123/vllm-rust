@@ -344,6 +344,93 @@ fn gpu_verify_stochastic(
     Ok((accepted, tokens))
 }
 
+/// GPU-accelerated typical acceptance sampler (Medusa, arxiv:2401.10774).
+///
+/// Accepts draft token t at position i when:
+///   target_prob[i, t] >= posterior_threshold  AND
+///   target_prob[i, t] >= posterior_alpha * max(target_prob[i])
+///
+/// Does not require the draft model's probabilities, making it applicable to
+/// any draft strategy (including greedy or n-gram). On rejection, the token
+/// is re-sampled from the full target distribution.
+///
+/// Returns (accepted_count, tokens_to_push).
+fn gpu_verify_typical(
+    logits: &Tensor,
+    draft_tokens: &[u32],
+    actual_k: usize,
+    posterior_threshold: f32,
+    posterior_alpha: f32,
+    state: &mut SequenceState,
+) -> Result<(usize, Vec<u32>), EngineError> {
+    let map_err = |e: candle_core::Error| EngineError::Model(e.to_string());
+
+    // logits: [1, K+1, vocab_size] → [K+1, vocab_size]
+    let logits_2d = logits.squeeze(0).map_err(map_err)?;
+
+    let temperature = state.sampling_params.temperature;
+    let inv_temp = if temperature > 1e-6 {
+        1.0 / temperature
+    } else {
+        1.0
+    };
+    let inv_temps = vec![inv_temp; actual_k + 1];
+    let scaled = gpu::gpu_temperature_scale(&logits_2d, &inv_temps).map_err(map_err)?;
+    let probs = gpu::gpu_softmax(&scaled).map_err(map_err)?; // [K+1, vocab]
+
+    // Transfer to CPU for the acceptance test (K+1 full probability rows).
+    // This is more expensive than rejection sampling's gather, but the typical
+    // sampler needs max(p) per row which requires the full row on CPU.
+    let all_probs: Vec<f32> = probs
+        .to_dtype(candle_core::DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1())
+        .map_err(map_err)?;
+
+    let vocab_size = all_probs.len() / (actual_k + 1);
+    let mut accepted = 0;
+    let mut tokens = Vec::with_capacity(actual_k + 1);
+
+    for (i, &draft_token) in draft_tokens.iter().enumerate().take(actual_k) {
+        let row = &all_probs[i * vocab_size..(i + 1) * vocab_size];
+        let p_draft = row[draft_token as usize];
+        let p_max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        if p_draft >= posterior_threshold && p_draft >= posterior_alpha * p_max {
+            accepted += 1;
+            tokens.push(draft_token);
+        } else {
+            // Rejected — sample from the full target distribution at this position.
+            let r: f32 = state.sampler_state.rng_mut().gen();
+            let mut cumsum = 0.0f32;
+            let mut sampled = vocab_size as u32 - 1;
+            for (idx, &p) in row.iter().enumerate() {
+                cumsum += p;
+                if r < cumsum {
+                    sampled = idx as u32;
+                    break;
+                }
+            }
+            tokens.push(sampled);
+            return Ok((accepted, tokens));
+        }
+    }
+
+    // All K accepted → sample bonus from position K using the target distribution
+    // via GPU top-k/top-p sampling for consistency with rejection sampler bonus.
+    let sp = &state.sampling_params;
+    let r: f32 = state.sampler_state.rng_mut().gen();
+    let rand_tensor = Tensor::from_vec(vec![r], 1, probs.device()).map_err(map_err)?;
+    let top_k = vec![sp.top_k as i32];
+    let top_p = vec![sp.top_p];
+    let bonus_probs = probs.narrow(0, actual_k, 1).map_err(map_err)?;
+    let bonus_id = gpu::gpu_top_k_top_p_sample(&bonus_probs, &rand_tensor, &top_k, &top_p)
+        .and_then(|t| t.to_vec1::<u32>())
+        .map_err(map_err)?;
+    tokens.push(bonus_id[0]);
+    Ok((accepted, tokens))
+}
+
 /// Speculative decoding execution strategy.
 ///
 /// Uses a [`DraftProposer`] to speculatively generate tokens, then verifies
@@ -353,15 +440,21 @@ pub struct SpeculativeExecution<M: ModelForward> {
     target_model: M,
     proposer: Box<dyn DraftProposer>,
     stats: SpecDecodingStats,
+    acceptance_method: super::types::AcceptanceMethod,
 }
 
 impl<M: ModelForward> SpeculativeExecution<M> {
-    pub fn new(target_model: M, proposer: Box<dyn DraftProposer>) -> Self {
+    pub fn with_acceptance(
+        target_model: M,
+        proposer: Box<dyn DraftProposer>,
+        acceptance_method: super::types::AcceptanceMethod,
+    ) -> Self {
         let k = proposer.num_speculative_tokens();
         Self {
             target_model,
             proposer,
             stats: SpecDecodingStats::new(k),
+            acceptance_method,
         }
     }
 
@@ -460,7 +553,7 @@ impl<M: ModelForward> SpeculativeExecution<M> {
 
         req.state.block_table.advance(k_plus_1);
 
-        // --- Verification via rejection sampling (arxiv:2211.17192) ---
+        // --- Verification (rejection sampling or typical acceptance) ---
         //
         // GPU fast path: when logits are on GPU and no CPU-side penalties/constraints
         // are needed, run argmax (greedy) or softmax+gather (stochastic) on GPU.
@@ -475,10 +568,25 @@ impl<M: ModelForward> SpeculativeExecution<M> {
 
         if use_gpu {
             // GPU-accelerated verification path
-            let (gpu_accepted, tokens) = if is_greedy {
-                gpu_verify_greedy(&logits, &draft_tokens, actual_k)?
-            } else {
-                gpu_verify_stochastic(&logits, &draft_tokens, actual_k, &mut req.state)?
+            let (gpu_accepted, tokens) = match self.acceptance_method {
+                super::types::AcceptanceMethod::TypicalAcceptance {
+                    posterior_threshold,
+                    posterior_alpha,
+                } => gpu_verify_typical(
+                    &logits,
+                    &draft_tokens,
+                    actual_k,
+                    posterior_threshold,
+                    posterior_alpha,
+                    &mut req.state,
+                )?,
+                super::types::AcceptanceMethod::RejectionSampler => {
+                    if is_greedy {
+                        gpu_verify_greedy(&logits, &draft_tokens, actual_k)?
+                    } else {
+                        gpu_verify_stochastic(&logits, &draft_tokens, actual_k, &mut req.state)?
+                    }
+                }
             };
             accepted = gpu_accepted;
             req.state.generated_token_ids.extend_from_slice(&tokens);
@@ -489,32 +597,73 @@ impl<M: ModelForward> SpeculativeExecution<M> {
                     .narrow(1, i, 1)
                     .map_err(|e| EngineError::Model(e.to_string()))?;
 
-                if is_greedy {
-                    let target_token = sample_speculative(&pos_logits, &mut req.state, tokenizer)?;
-                    if target_token == draft_token {
-                        accepted += 1;
-                        req.state.generated_token_ids.push(draft_token);
-                    } else {
-                        req.state.generated_token_ids.push(target_token);
-                        break;
+                match self.acceptance_method {
+                    super::types::AcceptanceMethod::TypicalAcceptance {
+                        posterior_threshold,
+                        posterior_alpha,
+                    } => {
+                        let target_probs =
+                            compute_target_probs(&pos_logits, &mut req.state, tokenizer)?;
+                        let p_draft = target_probs
+                            .get(draft_token as usize)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let p_max = target_probs
+                            .iter()
+                            .cloned()
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        if p_draft >= posterior_threshold && p_draft >= posterior_alpha * p_max {
+                            accepted += 1;
+                            req.state.generated_token_ids.push(draft_token);
+                        } else {
+                            // Sample from the full target distribution (no adjustment).
+                            let r: f32 = req.state.sampler_state.rng_mut().gen();
+                            let mut cumsum = 0.0f32;
+                            let mut sampled = target_probs.len() as u32 - 1;
+                            for (idx, &p) in target_probs.iter().enumerate() {
+                                cumsum += p;
+                                if r < cumsum {
+                                    sampled = idx as u32;
+                                    break;
+                                }
+                            }
+                            req.state.generated_token_ids.push(sampled);
+                            break;
+                        }
                     }
-                } else {
-                    let target_probs =
-                        compute_target_probs(&pos_logits, &mut req.state, tokenizer)?;
-                    let target_prob_of_draft = target_probs
-                        .get(draft_token as usize)
-                        .copied()
-                        .unwrap_or(0.0);
+                    super::types::AcceptanceMethod::RejectionSampler => {
+                        if is_greedy {
+                            let target_token =
+                                sample_speculative(&pos_logits, &mut req.state, tokenizer)?;
+                            if target_token == draft_token {
+                                accepted += 1;
+                                req.state.generated_token_ids.push(draft_token);
+                            } else {
+                                req.state.generated_token_ids.push(target_token);
+                                break;
+                            }
+                        } else {
+                            let target_probs =
+                                compute_target_probs(&pos_logits, &mut req.state, tokenizer)?;
+                            let target_prob_of_draft = target_probs
+                                .get(draft_token as usize)
+                                .copied()
+                                .unwrap_or(0.0);
 
-                    let u: f64 = req.state.sampler_state.rng_mut().gen();
-                    if (target_prob_of_draft as f64) >= u {
-                        accepted += 1;
-                        req.state.generated_token_ids.push(draft_token);
-                    } else {
-                        let recovered =
-                            sample_recovered_token(&target_probs, draft_token, &mut req.state);
-                        req.state.generated_token_ids.push(recovered);
-                        break;
+                            let u: f64 = req.state.sampler_state.rng_mut().gen();
+                            if (target_prob_of_draft as f64) >= u {
+                                accepted += 1;
+                                req.state.generated_token_ids.push(draft_token);
+                            } else {
+                                let recovered = sample_recovered_token(
+                                    &target_probs,
+                                    draft_token,
+                                    &mut req.state,
+                                );
+                                req.state.generated_token_ids.push(recovered);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1116,5 +1265,108 @@ mod tests {
         );
         assert_eq!(gpu_tokens[0], pos0_argmax);
         assert_eq!(gpu_tokens[1], pos1_argmax);
+    }
+
+    // ---- TypicalAcceptanceSampler tests ----
+
+    #[test]
+    fn test_typical_accepts_high_prob_draft() {
+        // Token 1 has overwhelming probability → should always be accepted
+        // logits: [K+1=2, vocab=4] → [1, 2, 4]
+        // Position 0: logits [-10, 10, -10, -10] → p ≈ [~0, ~1, ~0, ~0]
+        // Position 1 (bonus): uniform
+        let logits_data = vec![
+            -10.0f32, 10.0, -10.0, -10.0, // position 0
+            1.0, 1.0, 1.0, 1.0, // bonus position
+        ];
+        let logits = Tensor::from_vec(logits_data, (1, 2, 4), &candle_core::Device::Cpu).unwrap();
+        let draft_tokens = vec![1u32];
+        let mut state = make_state_with_temp(1.0, 42);
+
+        let (accepted, tokens) =
+            gpu_verify_typical(&logits, &draft_tokens, 1, 0.09, 0.3, &mut state).unwrap();
+        assert_eq!(accepted, 1, "high-prob draft should be accepted");
+        assert_eq!(tokens[0], 1u32, "first token is the accepted draft token");
+        assert_eq!(tokens.len(), 2, "accepted all K + bonus");
+    }
+
+    #[test]
+    fn test_typical_rejects_low_prob_draft() {
+        // Token 3 has near-zero probability → should always be rejected
+        // Position 0: logits [10, 10, 10, -10] → p of token 3 ≈ 0
+        // Threshold 0.09, alpha 0.3 → p[3] fails both conditions
+        let logits_data = vec![
+            10.0f32, 10.0, 10.0, -10.0, // position 0: token 3 nearly zero
+            1.0, 1.0, 1.0, 1.0, // bonus (not reached)
+        ];
+        let logits = Tensor::from_vec(logits_data, (1, 2, 4), &candle_core::Device::Cpu).unwrap();
+        let draft_tokens = vec![3u32];
+        let mut state = make_state_with_temp(1.0, 42);
+
+        let (accepted, tokens) =
+            gpu_verify_typical(&logits, &draft_tokens, 1, 0.09, 0.3, &mut state).unwrap();
+        assert_eq!(accepted, 0, "low-prob draft should be rejected");
+        assert_eq!(tokens.len(), 1, "rejected → only recovery token");
+        // Recovery token should be from {0,1,2} (token 3 has negligible prob)
+        assert!(tokens[0] < 3, "recovery should come from high-prob tokens");
+    }
+
+    #[test]
+    fn test_typical_all_accepted_produces_bonus() {
+        // Two draft tokens both have high probability → accepted, bonus produced
+        // K=2, shape [1, 3, 4]
+        let logits_data = vec![
+            -10.0f32, 10.0, -10.0, -10.0, // pos 0: token 1 dominates
+            -10.0, -10.0, 10.0, -10.0, // pos 1: token 2 dominates
+            1.0, 1.0, 1.0, 1.0, // bonus (pos 2)
+        ];
+        let logits = Tensor::from_vec(logits_data, (1, 3, 4), &candle_core::Device::Cpu).unwrap();
+        let draft_tokens = vec![1u32, 2];
+        let mut state = make_state_with_temp(1.0, 7);
+
+        let (accepted, tokens) =
+            gpu_verify_typical(&logits, &draft_tokens, 2, 0.09, 0.3, &mut state).unwrap();
+        assert_eq!(accepted, 2, "both drafts accepted");
+        assert_eq!(tokens[0], 1u32);
+        assert_eq!(tokens[1], 2u32);
+        assert_eq!(tokens.len(), 3, "accepted all K + bonus");
+    }
+
+    #[test]
+    fn test_typical_threshold_zero_accepts_any_positive_prob() {
+        // With threshold=0 and alpha=0, every token with p > 0 is accepted.
+        // Token 3 has -5 logit → positive but small prob → still accepted
+        let logits_data = vec![
+            1.0f32, 1.0, 1.0, -5.0, // pos 0: token 3 has lower but positive prob
+            1.0, 1.0, 1.0, 1.0, // bonus
+        ];
+        let logits = Tensor::from_vec(logits_data, (1, 2, 4), &candle_core::Device::Cpu).unwrap();
+        let draft_tokens = vec![3u32];
+        let mut state = make_state_with_temp(1.0, 42);
+
+        let (accepted, _tokens) =
+            gpu_verify_typical(&logits, &draft_tokens, 1, 0.0, 0.0, &mut state).unwrap();
+        assert_eq!(
+            accepted, 1,
+            "threshold=0/alpha=0 accepts any positive-prob draft"
+        );
+    }
+
+    #[test]
+    fn test_typical_deterministic_with_seed() {
+        // Same seed → same results across two identical calls
+        let logits_data = vec![
+            2.0f32, 1.0, 0.5, -5.0, // pos 0
+            1.0, 2.0, 1.0, 0.5, // pos 1: token 1 dominates
+            1.0, 1.0, 1.0, 1.0, // bonus
+        ];
+        let logits = Tensor::from_vec(logits_data, (1, 3, 4), &candle_core::Device::Cpu).unwrap();
+        let draft_tokens = vec![3u32, 0]; // token 3 at pos 0 likely rejected
+
+        let mut state1 = make_state_with_temp(1.0, 99);
+        let mut state2 = make_state_with_temp(1.0, 99);
+        let r1 = gpu_verify_typical(&logits, &draft_tokens, 2, 0.09, 0.3, &mut state1).unwrap();
+        let r2 = gpu_verify_typical(&logits, &draft_tokens, 2, 0.09, 0.3, &mut state2).unwrap();
+        assert_eq!(r1, r2, "same seed must produce identical results");
     }
 }

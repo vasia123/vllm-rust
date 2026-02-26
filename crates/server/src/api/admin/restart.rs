@@ -152,6 +152,7 @@ impl EngineBuilder for ProductionEngineBuilder {
                 },
                 Some(SpeculativeConfig {
                     num_speculative_tokens: config.num_speculative_tokens,
+                    acceptance_method: vllm_core::engine::AcceptanceMethod::RejectionSampler,
                 }),
             )
             .block_size(config.block_size)

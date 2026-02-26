@@ -128,8 +128,37 @@ pub struct GenerationResult {
 
 // ─── Engine configuration ─────────────────────────────────────────────────
 
+/// How to decide whether a draft token is accepted during speculative decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum AcceptanceMethod {
+    /// Standard rejection sampler (arxiv:2211.17192).
+    ///
+    /// Accepts draft token t with probability min(1, q(t)/p(t)) where q is the
+    /// target distribution and p is the draft distribution. Guarantees that the
+    /// output distribution is identical to the target model's distribution.
+    #[default]
+    RejectionSampler,
+    /// Typical acceptance sampler (Medusa, arxiv:2401.10774).
+    ///
+    /// Accepts draft token t when its probability under the target distribution
+    /// exceeds both an absolute threshold (`posterior_threshold`) and a relative
+    /// threshold (`posterior_alpha` × max target probability). Does not require
+    /// draft token probabilities; applicable to any draft method. Produces a
+    /// slightly different distribution than the target but achieves higher
+    /// acceptance rates on well-calibrated models.
+    TypicalAcceptance {
+        /// Absolute probability threshold for acceptance. Default 0.09.
+        posterior_threshold: f32,
+        /// Fraction of maximum token probability used as relative threshold. Default 0.3.
+        posterior_alpha: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct SpeculativeConfig {
     pub num_speculative_tokens: usize,
+    /// Token acceptance criterion. Defaults to rejection sampling.
+    pub acceptance_method: AcceptanceMethod,
 }
 
 pub struct EngineConfig {
@@ -644,6 +673,7 @@ mod tests {
             },
             Some(SpeculativeConfig {
                 num_speculative_tokens: 5,
+                acceptance_method: AcceptanceMethod::RejectionSampler,
             }),
         )
         .block_size(4)
