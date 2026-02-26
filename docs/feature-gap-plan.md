@@ -197,30 +197,10 @@ format [E, H, 2I] (fc1) and [E, I, H] (fc2) — direct matmul `x @ fc[e]` (no tr
 Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model.*` / `language_model.lm_head.*`.
 `LlamaAttention` made `pub(crate)` to allow reuse from `AriaDecoderLayer`.
 
-- **P1 models remaining (in order):**
-Keye-VL 1.5: `KeyeSiglipVisionTransformer` (Conv2d patch embed + `packing_position_embedding` (Embedding, 32768 entries) +
-SigLIP encoder with 2D RoPE (`SigLipRotaryEmbedding`, split-half rotation, head_dim/2 freqs) + `post_layernorm`) +
-`KeyeVL1_5Projector` (2×2 spatial merge → `pre_norm` LayerNorm → `linear_1`(bias) → GELU → `linear_2`(bias)) +
-`Qwen3ForCausalLM`. qkv_proj has bias; out_proj has no bias.
-Weight paths: `visual.vision_model.embeddings.*`, `visual.vision_model.encoder.layers.{i}.*`,
-`mlp_AR.{pre_norm,linear_1,linear_2}.*`, `language_model.{model.*,lm_head.*}`.
-VL helpers added to `Qwen3ForCausalLM` (embed_text, forward_with_embeddings, forward_decode_batch_with_embeddings).
-
-Isaac: `Siglip2VisionTransformer` (Linear patch embed + bilinear-interp `position_embedding` (Embedding, `num_patches` entries, grid=√num_patches) +
-N pre-norm encoder layers (GELU-erf MLP, separate q/k/v proj with bias, out_proj with bias, `layer_norm1/2`) + `post_layernorm` + `pixel_shuffle` spatial merge (scale²× channel expand)) +
-`IsaacVisionEmbedding` projector (ViT at `transformer.*` + `linear_fc1` (SiLU, no bias) + `linear_fc2` (no bias)) + `Qwen3ForCausalLM`.
-`bilinear_interp_pos_emb`: align_corners=False CPU loop (no antialias); fast path when tgt==src.
-Weight paths: `vision_embedding.transformer.{embeddings,encoder,post_layernorm}.*`,
-`vision_embedding.linear_fc{1,2}.weight`, `language_model.{model,lm_head}.*`.
-HF mapper: `model.vision_embedding.{0→transformer,1→linear_fc1,3→linear_fc2}`, `model.text_model.→language_model.model.`.
-
-DeepSeek-OCR2: `SamImageEncoderViT` (Conv2d patch embed + abs pos embed + 12 blocks with decomposed relative pos embeds,
-window=14 for non-global, global attn at [2,5,8,11] → neck Conv2d×4 + net_2/net_3 stride-2 Conv2d → `[B, 896, H/64, W/64]`) +
-`Ocr2Qwen2Encoder` (24 Qwen2 decoder layers as visual encoder: flatten SAM output → cat with learnable queries [144 or 256] →
-custom dual-mode mask [image=full non-causal, query=causal] → return query tokens `[B, n_query, 896]`) +
-`Ocr2MlpProjector` (spatial unfold dr² patches into channel dim + 2-layer GELU MLP) + `view_seperator` token +
-`Qwen2ForCausalLM`. Weight paths: `model.sam_model.*` (SAM), `model.qwen2_model.*` (encoder), `model.projector.*`,
-`model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
+- ~~**P1 models**~~ ✅ ALL DONE:
+  - ~~**Keye-VL 1.5**~~ ✅ DONE (`keye_vl.rs`, 5 tests — commit 0d3767d): `KeyeSiglipViT` + 2D RoPE (`SigLipRotaryEmbedding`) + `KeyeVL1_5Projector` (2×2 spatial merge + pre_norm + GELU) + `Qwen3ForCausalLM`.
+  - ~~**Isaac**~~ ✅ DONE (`isaac.rs`, 5 tests — commit 3641eee): `Siglip2VisionTransformer` + bilinear pos-emb + pixel_shuffle + `IsaacVisionEmbedding` (linear_fc1 SiLU + linear_fc2) + `Qwen3ForCausalLM`.
+  - ~~**DeepSeek-OCR2**~~ ✅ DONE (`deepseek_ocr2.rs`, 5 tests — commit in memory): `SamImageEncoderViT` (windowed+global attn, decomposed rel-pos) + `Ocr2Qwen2Encoder` (24-layer dual-mode mask) + `Ocr2MlpProjector` + `Qwen2ForCausalLM`.
 
 - ~~**Ovis2_5**~~ ✅ DONE (`ovis2_5.rs`, 3 tests — commit 0135a75): `Siglip2NavitVisionTransformer` (Linear/Conv2d patch embed + N pre-norm layers, full attn on CPU) + `Ovis25VisualTokenizer` (reshape stride² + Linear+LN head → softmax → pad indicators) + vte.weight matmul + Qwen2/Qwen3 LLM. Registry aliases: `"Ovis2_5"`.
 - ~~**Registry/factory audit**~~ ✅ DONE (commit 0852e48): Added 27 missing registry entries (all implemented audio models + VLMs) and 4 factory aliases (Qwen2.5-Omni, Qwen3-Omni, Lfm2VlFor, Ovis).
@@ -378,6 +358,17 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 **Effort:** 0.5 day
 - `models/medusa.rs` — `MedusaModel` + `MedusaDraftModel` trait + `medusa_from_config()` ✅ (5 tests)
 - Proposer (`medusa_proposer.rs`) already complete
+
+### 4.6 Server CLI Arg Wiring ✅ DONE (2026-02-26)
+**Effort:** 1 day
+- ~~`response_role`~~ ✅ DONE (commit 3ed8d2e): threads `--response-role` through `AppState` to chat completion handler
+- ~~Audio multi-format~~ ✅ DONE (commit prev session): symphonia WAV/MP3/FLAC/OGG/AAC via `vllm-core/audio` feature
+- ~~`enable_auto_tool_choice`~~ ✅ DONE (commit cd09e2b): tool-call parsing decision based on `tool_choice` + server flag
+- ~~`return_tokens_as_token_ids`~~ ✅ DONE (commit cd09e2b): `token_ids` field + `"token_{id}"` logprob format; streaming + non-streaming
+- ~~`hf_token` + `download_dir`~~ ✅ DONE (commit 8ee2508): `fetch_model_with_auth()` in core loader, `ApiBuilder::with_token/cache_dir`
+- ~~`log_level`~~ ✅ DONE (commit e5e7843): `logging::init_with_level()` uses CLI arg as default level
+- ~~`max_logprobs`~~ ✅ DONE (commit e5e7843): caps `top_logprobs` (chat) and `logprobs` (completions) at server-wide limit
+- ~~`ngram_prompt_lookup_max/min`~~ ✅ DONE (commit 549d0dc): starts `NGramProposer` via `start_engine_with_proposer()` when set
 
 ---
 
