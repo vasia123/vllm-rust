@@ -322,7 +322,8 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 - Removed error gate at `crates/server/src/main.rs` ✅
 - 27 pipeline tests pass (2 new: `decode_meta_constants_consistent`, `send_worker_signal_decode_encodes_correctly`) ✅
 
-**Remaining:** `pipeline_parallel_size` wired through `ServerLaunchConfig` → `run_server` (commit see below); rejects `pp > 1` with clear error (identical to `tensor_parallel_size` handling). Stage-model construction not yet implemented.
+- ~~`pipeline_parallel_size` wiring~~ ✅ DONE: destructured from `ServerLaunchConfig`, rejects `pp > 1` with clear error; `ParallelConfig::pipeline_parallel_size` field + `uses_pipeline_parallelism()` accessor wired through `EngineConfig`.
+- **Remaining:** stage-model construction (layer slicing by rank) — BLOCKED: requires multi-process launch + NCCL rank negotiation, not yet implemented.
 
 ### 4.2 RoPE Variants
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`
@@ -379,7 +380,8 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 - ~~`max_num_partial_prefills`/`long_prefill_token_threshold`~~ ✅ DONE (commit 03de85d): `SchedulerConfig` fields; long-prefill throttle in `compute_schedule` (continue-not-break so short requests still admitted); 4 new tests
 - ~~`disable_log_stats`~~ ✅ DONE (commit 03de85d): tokio background task logging num_running/num_waiting/GPU-KV-cache% every 5s via `EngineHandle::get_stats()`; suppressed by flag
 - ~~`max_cpu_loras`~~ ✅ DONE (commit 03de85d): validates startup adapter count ≤ limit; TODO: LRU cache for dynamic adapter loading
-- **Remaining (complex infrastructure required):** `enforce_eager` (CUDA graphs), `spec_decoding_acceptance_method` (acceptance sampler), `guided_decoding_backend` (structured output), `max_seq_len_to_capture` (CUDA graph), `otlp_traces_endpoint` (OpenTelemetry), `lora_extra_vocab_size` (LoRA vocab extension), `load_format`/`tokenizer_mode` (loader strategy), `disable_mm_preprocessor_cache` (VLM cache)
+- ~~`spec_decoding_acceptance_method`~~ ✅ DONE (commit 40eb3cd): `AcceptanceMethod` enum (`RejectionSampler` | `TypicalAcceptance {posterior_threshold, posterior_alpha}`); `gpu_verify_typical()` CPU-side acceptance test on full K+1 prob rows; `SpeculativeExecution::with_acceptance()`; `acceptance_method` wired from `SpeculativeConfig` through `start_engine_with_proposer`; 5 unit tests
+- **Remaining (complex infrastructure required):** `enforce_eager` (CUDA graphs), `guided_decoding_backend` (structured output), `max_seq_len_to_capture` (CUDA graph), `otlp_traces_endpoint` (OpenTelemetry), `lora_extra_vocab_size` (LoRA vocab extension), `load_format`/`tokenizer_mode` (loader strategy), `disable_mm_preprocessor_cache` (VLM cache)
 
 ---
 
