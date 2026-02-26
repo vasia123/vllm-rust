@@ -149,7 +149,9 @@ pub async fn create_completion(
             } else {
                 None
             },
-            return_token_ids: req.return_tokens_as_token_ids.unwrap_or(false),
+            return_token_ids: req
+                .return_tokens_as_token_ids
+                .unwrap_or(state.return_tokens_as_token_ids),
             reasoning_parser: None,
             abort_handle: Some(streaming::AbortHandle::new(engine, engine_request_id)),
         };
@@ -272,8 +274,16 @@ pub async fn create_completion(
                 prometheus::inc_requests_error();
                 return Err(ApiError::InvalidRequest(e.to_string()));
             }
+            let return_token_ids = req
+                .return_tokens_as_token_ids
+                .unwrap_or(state.return_tokens_as_token_ids);
             let first_logprobs = if internal_logprobs.is_some() {
-                Some(build_logprobs(&first_result, &state.tokenizer, req.echo))
+                Some(build_logprobs(
+                    &first_result,
+                    &state.tokenizer,
+                    req.echo,
+                    return_token_ids,
+                ))
             } else {
                 None
             };
@@ -299,7 +309,12 @@ pub async fn create_completion(
                         return Err(ApiError::InvalidRequest(e.to_string()));
                     }
                     let logprobs_data = if internal_logprobs.is_some() {
-                        Some(build_logprobs(&result, &state.tokenizer, req.echo))
+                        Some(build_logprobs(
+                            &result,
+                            &state.tokenizer,
+                            req.echo,
+                            return_token_ids,
+                        ))
                     } else {
                         None
                     };
@@ -320,13 +335,18 @@ pub async fn create_completion(
                     None
                 };
 
+                let token_ids = if return_token_ids {
+                    Some(result.generated_token_ids.clone())
+                } else {
+                    None
+                };
                 choices.push(CompletionChoice {
                     text: result.generated_text,
                     index: choice_index,
                     finish_reason: Some(finish_reason_str(&result.finish_reason)),
                     stop_reason: result.stop_reason.map(serde_json::Value::from),
                     logprobs: final_logprobs,
-                    token_ids: None,
+                    token_ids,
                 });
                 choice_index += 1;
             }
@@ -474,6 +494,7 @@ fn build_logprobs(
     result: &GenerationResult,
     tokenizer: &TokenizerWrapper,
     echo: bool,
+    return_token_ids: bool,
 ) -> CompletionLogProbs {
     let mut text_offset = Vec::new();
     let mut token_logprobs = Vec::new();
@@ -487,9 +508,13 @@ fn build_logprobs(
         if let Some(ref prompt_ids) = result.prompt_token_ids {
             let prompt_lps = result.prompt_logprobs.as_ref();
             for (i, &token_id) in prompt_ids.iter().enumerate() {
-                let token_str = tokenizer
-                    .decode(&[token_id])
-                    .unwrap_or_else(|_| format!("<unk:{}>", token_id));
+                let token_str = if return_token_ids {
+                    format!("token_{}", token_id)
+                } else {
+                    tokenizer
+                        .decode(&[token_id])
+                        .unwrap_or_else(|_| format!("<unk:{}>", token_id))
+                };
 
                 text_offset.push(current_offset);
                 current_offset += token_str.len();
@@ -525,9 +550,13 @@ fn build_logprobs(
     let gen_top_lps = result.top_logprobs.as_ref();
 
     for (i, &token_id) in gen_token_ids.iter().enumerate() {
-        let token_str = tokenizer
-            .decode(&[token_id])
-            .unwrap_or_else(|_| format!("<unk:{}>", token_id));
+        let token_str = if return_token_ids {
+            format!("token_{}", token_id)
+        } else {
+            tokenizer
+                .decode(&[token_id])
+                .unwrap_or_else(|_| format!("<unk:{}>", token_id))
+        };
 
         text_offset.push(current_offset);
         current_offset += token_str.len();
@@ -543,9 +572,13 @@ fn build_logprobs(
                 token_lps
                     .iter()
                     .map(|&(tid, lp)| {
-                        let t = tokenizer
-                            .decode(&[tid])
-                            .unwrap_or_else(|_| format!("<unk:{}>", tid));
+                        let t = if return_token_ids {
+                            format!("token_{}", tid)
+                        } else {
+                            tokenizer
+                                .decode(&[tid])
+                                .unwrap_or_else(|_| format!("<unk:{}>", tid))
+                        };
                         (t, lp)
                     })
                     .collect::<HashMap<String, f32>>()

@@ -68,6 +68,12 @@ pub struct AppState {
     pub batch_store: batch::BatchStore,
     /// Role name used in chat completion responses (default: "assistant").
     pub response_role: String,
+    /// If true, automatically attempt tool-call parsing when tools are provided but
+    /// `tool_choice` is not set. Mirrors vLLM `--enable-auto-tool-choice`.
+    pub enable_auto_tool_choice: bool,
+    /// If true, include raw `token_ids` in non-streaming choices and format logprob
+    /// token strings as `"token_{id}"`. Mirrors vLLM `--return-tokens-as-token-ids`.
+    pub return_tokens_as_token_ids: bool,
 }
 
 impl AppState {
@@ -83,6 +89,8 @@ impl AppState {
         reasoning_parser: Option<Arc<dyn ReasoningParser>>,
         accepting: Arc<AtomicBool>,
         response_role: String,
+        enable_auto_tool_choice: bool,
+        return_tokens_as_token_ids: bool,
     ) -> Self {
         Self {
             engine,
@@ -100,6 +108,8 @@ impl AppState {
             response_store: Arc::new(RwLock::new(HashMap::new())),
             batch_store: batch::new_batch_store(),
             response_role,
+            enable_auto_tool_choice,
+            return_tokens_as_token_ids,
         }
     }
 
@@ -927,6 +937,8 @@ mod tests {
             None,
             accepting,
             "assistant".to_string(),
+            false,
+            false,
         )
     }
 

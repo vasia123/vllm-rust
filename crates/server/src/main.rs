@@ -1123,8 +1123,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache
     let _ = &guided_decoding_backend; // TODO: wire to structured output backend
     let _ = max_seq_len_to_capture; // TODO: wire to CUDA graph capture
-    let _ = enable_auto_tool_choice; // TODO: wire to auto tool selection
-    let _ = return_tokens_as_token_ids; // TODO: wire to default response format
 
     // Pipeline parallelism validation.
     // TODO: wire pipeline_parallel_size to PipelineStagedModel stage construction.
@@ -1434,6 +1432,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         api::create_reasoning_parser_arc(&reasoning_parser),
         accepting.clone(),
         response_role.clone(),
+        enable_auto_tool_choice,
+        return_tokens_as_token_ids,
     );
 
     let start_time = SystemTime::now()

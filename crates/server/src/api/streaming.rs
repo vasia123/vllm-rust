@@ -96,60 +96,87 @@ impl Drop for AbortGuard {
 
 /// Build a single `CompletionLogProbs` entry for one streaming token.
 fn build_completion_token_logprobs(
+    token_id: u32,
     token_text: &str,
     text_offset: usize,
     logprob: Option<f32>,
     top_logprobs_raw: Option<&Vec<(u32, f32)>>,
     tokenizer: &TokenizerWrapper,
+    return_token_ids: bool,
 ) -> CompletionLogProbs {
     let top = top_logprobs_raw.map(|entries| {
         entries
             .iter()
             .map(|&(tid, lp)| {
-                let t = tokenizer
-                    .decode(&[tid])
-                    .unwrap_or_else(|_| format!("<unk:{}>", tid));
+                let t = if return_token_ids {
+                    format!("token_{}", tid)
+                } else {
+                    tokenizer
+                        .decode(&[tid])
+                        .unwrap_or_else(|_| format!("<unk:{}>", tid))
+                };
                 (t, lp)
             })
             .collect::<HashMap<String, f32>>()
     });
 
+    let token_str = if return_token_ids {
+        format!("token_{}", token_id)
+    } else {
+        token_text.to_string()
+    };
+
     CompletionLogProbs {
         text_offset: vec![text_offset],
         token_logprobs: vec![logprob],
-        tokens: vec![token_text.to_string()],
+        tokens: vec![token_str],
         top_logprobs: vec![top],
     }
 }
 
 /// Build a single `ChatLogProbs` entry for one streaming token.
 fn build_chat_token_logprobs(
+    token_id: u32,
     token_text: &str,
     logprob: f32,
     top_logprobs_raw: Option<&Vec<(u32, f32)>>,
     tokenizer: &TokenizerWrapper,
+    return_token_ids: bool,
 ) -> ChatLogProbs {
     let top = top_logprobs_raw.map(|entries| {
         entries
             .iter()
             .map(|&(tid, lp)| {
-                let t = tokenizer
-                    .decode(&[tid])
-                    .unwrap_or_else(|_| format!("<unk:{}>", tid));
+                let (t, tb) = if return_token_ids {
+                    (format!("token_{}", tid), None)
+                } else {
+                    let s = tokenizer
+                        .decode(&[tid])
+                        .unwrap_or_else(|_| format!("<unk:{}>", tid));
+                    let b = Some(s.as_bytes().to_vec());
+                    (s, b)
+                };
                 ChatTopLogProb {
-                    token: t.clone(),
+                    token: t,
                     logprob: lp,
-                    bytes: Some(t.as_bytes().to_vec()),
+                    bytes: tb,
                 }
             })
             .collect::<Vec<_>>()
     });
 
+    let (token_str, bytes) = if return_token_ids {
+        (format!("token_{}", token_id), None)
+    } else {
+        let b = Some(token_text.as_bytes().to_vec());
+        (token_text.to_string(), b)
+    };
+
     ChatLogProbs {
         content: vec![ChatLogProbToken {
-            token: token_text.to_string(),
+            token: token_str,
             logprob,
-            bytes: Some(token_text.as_bytes().to_vec()),
+            bytes,
             top_logprobs: top,
         }],
     }
@@ -180,11 +207,13 @@ pub fn completion_sse_stream(
                     let chunk_logprobs = if options.include_logprobs {
                         if let Some(ref tokenizer) = options.tokenizer {
                             let lp = build_completion_token_logprobs(
+                                token_id,
                                 &token_text,
                                 text_offset,
                                 logprob,
                                 top_lps.as_ref(),
                                 tokenizer,
+                                options.return_token_ids,
                             );
                             Some(lp)
                         } else {
@@ -304,10 +333,12 @@ pub fn chat_completion_sse_stream(
                     let chunk_logprobs = if options.include_logprobs {
                         if let (Some(lp), Some(ref tokenizer)) = (logprob, &options.tokenizer) {
                             Some(build_chat_token_logprobs(
+                                token_id,
                                 &token_text,
                                 lp,
                                 top_lps.as_ref(),
                                 tokenizer,
+                                options.return_token_ids,
                             ))
                         } else {
                             None

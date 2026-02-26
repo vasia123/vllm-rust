@@ -17,6 +17,8 @@ use vllm_core::tokenizer::{MessageContent, TokenizerWrapper};
 use super::admin::prometheus;
 use super::error::ApiError;
 use super::response_format::{inject_json_system_prompt, validate_response_format};
+use vllm_core::tool_parser::{ToolChoice, ToolChoiceAuto};
+
 use super::streaming::{self, chat_completion_sse_stream, StreamingOptions};
 use super::types::{
     finish_reason_str, system_fingerprint, timestamp_now, ChatCompletionChoice,
@@ -72,8 +74,18 @@ pub async fn create_chat_completion(
         state.tokenizer.max_chars_per_token(),
     )?;
 
-    // Determine if we should parse tool calls from the output
-    let has_tools = req.tools.is_some();
+    // Determine if we should parse tool calls from the output.
+    // Rules (mirrors vLLM `--enable-auto-tool-choice` behavior):
+    //   - No tools in request → never parse.
+    //   - tool_choice = "none" → never parse regardless of server flag.
+    //   - tool_choice = "auto" | "required" | specific function → always parse.
+    //   - tool_choice = None (not set) → parse only if server flag is set.
+    let should_parse_tools = match (req.tools.is_some(), req.tool_choice.as_ref()) {
+        (false, _) => false,
+        (true, None) => state.enable_auto_tool_choice,
+        (true, Some(ToolChoice::Auto(ToolChoiceAuto::None))) => false,
+        (true, _) => true,
+    };
 
     // Convert lora_name to LoraRequest (references a pre-loaded adapter by name)
     let lora_request = req.lora_name.as_ref().map(LoraRequest::by_name);
@@ -189,7 +201,9 @@ pub async fn create_chat_completion(
             } else {
                 None
             },
-            return_token_ids: req.return_tokens_as_token_ids.unwrap_or(false),
+            return_token_ids: req
+                .return_tokens_as_token_ids
+                .unwrap_or(state.return_tokens_as_token_ids),
             reasoning_parser: if req.include_reasoning {
                 state.reasoning_parser.clone()
             } else {
@@ -342,8 +356,8 @@ pub async fn create_chat_completion(
                 (None, None, result.generated_text.clone())
             };
 
-            // Parse tool calls if tools were provided
-            let (content, tool_calls, finish_reason) = if has_tools {
+            // Parse tool calls if tools were provided and parsing is enabled
+            let (content, tool_calls, finish_reason) = if should_parse_tools {
                 let parser = &state.tool_call_parser;
                 if let Ok(calls) = parser.parse(&effective_text) {
                     if !calls.is_empty() {
@@ -371,9 +385,23 @@ pub async fn create_chat_completion(
                 )
             };
 
+            let return_token_ids = req
+                .return_tokens_as_token_ids
+                .unwrap_or(state.return_tokens_as_token_ids);
+
             // Build logprobs if the user requested them
             let logprobs = if logprobs_count.is_some() {
-                Some(build_chat_logprobs(&result, &state.tokenizer))
+                Some(build_chat_logprobs(
+                    &result,
+                    &state.tokenizer,
+                    return_token_ids,
+                ))
+            } else {
+                None
+            };
+
+            let token_ids = if return_token_ids {
+                Some(result.generated_token_ids.clone())
             } else {
                 None
             };
@@ -393,7 +421,7 @@ pub async fn create_chat_completion(
                 finish_reason: Some(finish_reason),
                 stop_reason: result.stop_reason.map(serde_json::Value::from),
                 logprobs,
-                token_ids: None,
+                token_ids,
             });
         }
 
@@ -482,7 +510,11 @@ fn build_beam_config(
 }
 
 /// Build ChatLogProbs from GenerationResult (OpenAI chat completion format).
-fn build_chat_logprobs(result: &GenerationResult, tokenizer: &TokenizerWrapper) -> ChatLogProbs {
+fn build_chat_logprobs(
+    result: &GenerationResult,
+    tokenizer: &TokenizerWrapper,
+    return_token_ids: bool,
+) -> ChatLogProbs {
     let mut content = Vec::new();
 
     let gen_token_ids = &result.generated_token_ids;
@@ -490,15 +522,18 @@ fn build_chat_logprobs(result: &GenerationResult, tokenizer: &TokenizerWrapper) 
     let gen_top_lps = result.top_logprobs.as_ref();
 
     for (i, &token_id) in gen_token_ids.iter().enumerate() {
-        let token_str = tokenizer
-            .decode(&[token_id])
-            .unwrap_or_else(|_| format!("<unk:{}>", token_id));
+        let (token_str, bytes) = if return_token_ids {
+            (format!("token_{}", token_id), None)
+        } else {
+            let s = tokenizer
+                .decode(&[token_id])
+                .unwrap_or_else(|_| format!("<unk:{}>", token_id));
+            let b = Some(s.as_bytes().to_vec());
+            (s, b)
+        };
 
         // Get logprob for this token (default to 0.0 if not available)
         let logprob = gen_lps.and_then(|lps| lps.get(i).copied()).unwrap_or(0.0);
-
-        // Get UTF-8 bytes of the token
-        let bytes = Some(token_str.as_bytes().to_vec());
 
         // Get top-k logprobs and convert to ChatTopLogProb format
         let top_logprobs = gen_top_lps.and_then(|tops| {
@@ -506,13 +541,19 @@ fn build_chat_logprobs(result: &GenerationResult, tokenizer: &TokenizerWrapper) 
                 token_lps
                     .iter()
                     .map(|&(tid, lp)| {
-                        let t = tokenizer
-                            .decode(&[tid])
-                            .unwrap_or_else(|_| format!("<unk:{}>", tid));
+                        let (t, tb) = if return_token_ids {
+                            (format!("token_{}", tid), None)
+                        } else {
+                            let s = tokenizer
+                                .decode(&[tid])
+                                .unwrap_or_else(|_| format!("<unk:{}>", tid));
+                            let b = Some(s.as_bytes().to_vec());
+                            (s, b)
+                        };
                         ChatTopLogProb {
-                            token: t.clone(),
+                            token: t,
                             logprob: lp,
-                            bytes: Some(t.as_bytes().to_vec()),
+                            bytes: tb,
                         }
                     })
                     .collect::<Vec<_>>()
