@@ -556,6 +556,48 @@ impl QWenLMHeadModel {
         self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
+    /// Embed input token IDs → `[batch, seq, hidden]`.
+    pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.wte.forward(input_ids, &self.tp_ctx)
+    }
+
+    /// Forward from pre-computed embeddings (used for multimodal inputs).
+    pub fn forward_with_embeddings(
+        &self,
+        embeddings: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let seq_len = embeddings.dim(1)?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+        let mut xs = embeddings.clone();
+        for (layer_idx, layer) in self.h.iter().enumerate() {
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+                &self.tp_ctx,
+            )?;
+        }
+        let xs = self.ln_f.forward(&xs)?;
+        self.lm_head.forward(&xs, &self.tp_ctx)
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

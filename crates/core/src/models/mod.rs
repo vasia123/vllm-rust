@@ -221,6 +221,7 @@ pub mod qwen3_quantized;
 pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
 pub mod qwen_quantized;
+pub mod qwen_vl;
 pub mod registry;
 pub mod seed_oss;
 pub mod starcoder2;
@@ -463,6 +464,7 @@ pub use qwen3_quantized::QuantizedQwen3ForCausalLM;
 pub use qwen3_vl::Qwen3VLForConditionalGeneration;
 pub use qwen3_vl_moe::Qwen3VLMoeForConditionalGeneration;
 pub use qwen_quantized::QuantizedQWenLMHeadModel;
+pub use qwen_vl::QwenVLForConditionalGeneration;
 pub use registry::{
     find_architecture, supported_architectures, ArchitectureInfo, ModelCapabilities,
 };
@@ -888,6 +890,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "PanguUltraMoEForCausalLM" => Ok(Box::new(PanguUltraMoEForCausalLM::new(cfg, vb)?)),
         "PhiMoEForCausalLM" | "PhiMoeForCausalLM" => Ok(Box::new(PhiMoeForCausalLM::new(cfg, vb)?)),
         "QWenLMHeadModel" => Ok(Box::new(QWenLMHeadModel::new(cfg, vb)?)),
+        "QwenVLForConditionalGeneration" | "QWenVLForConditionalGeneration" => {
+            Ok(Box::new(QwenVLForConditionalGeneration::new(cfg, vb)?))
+        }
         "Qwen3NextForCausalLM" => Ok(Box::new(Qwen3NextForCausalLM::new(cfg, vb)?)),
         "Step1ForCausalLM" => Ok(Box::new(Step1ForCausalLM::new(cfg, vb)?)),
         "Step3TextForCausalLM" => Ok(Box::new(Step3TextForCausalLM::new(cfg, vb)?)),

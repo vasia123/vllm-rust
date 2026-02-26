@@ -122,6 +122,7 @@ Pattern B (Qwen3Next): `pre_fc_norm + fc + mtp_block + norm + shared lm_head`.
 - `openpangu_vl.rs` — `OpenPanguVLForConditionalGeneration` ✅ (5 tests) — commit 8e77a55
 - `keye_vl.rs` — `KeyeVL1_5ForConditionalGeneration` ✅ (5 tests) — commit 0d3767d
 - `isaac.rs` — `IsaacForConditionalGeneration` ✅ (5 tests) — commit 3641eee
+- `deepseek_ocr.rs` — `DeepseekOCRForCausalLM` ✅ (5 tests) — commit 95afd58 — SAM ViT-B + DeepCLIPVisionTransformer (24-layer CLIP with pre_layrnorm + SAM patch embed bypass) + MlpProjector + image_newline/view_seperator + Qwen2
 - `deepseek_ocr2.rs` — `DeepseekOCR2ForCausalLM` ✅ (5 tests) — 2026-02-23
 - `dots_ocr.rs` — `DotsOCRForCausalLM` ✅ (6 tests) — commit 6f8fbf4 — DotsVisionTransformer (Conv2d patchifier + VisionRoPE + SwiGLU blocks + PatchMerger) + Qwen2
 - `mistral3.rs` — `LightOnOCRForConditionalGeneration` ✅ (1 test) — commit 6f8fbf4 — Mistral3 variant with HF weight path remapping
