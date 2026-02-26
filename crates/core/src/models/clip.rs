@@ -72,8 +72,8 @@ impl ClipTextConfig {
 }
 
 #[allow(dead_code)]
-struct ClipVisionConfig {
-    hidden_size: usize,
+pub(crate) struct ClipVisionConfig {
+    pub(crate) hidden_size: usize,
     num_attention_heads: usize,
     num_hidden_layers: usize,
     intermediate_size: usize,
@@ -86,7 +86,7 @@ struct ClipVisionConfig {
 }
 
 impl ClipVisionConfig {
-    fn from_json(v: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(v: &serde_json::Value) -> Self {
         let g = |key, default: usize| {
             v.get(key)
                 .and_then(|x| x.as_u64())
@@ -402,7 +402,7 @@ impl ClipVisionEmbeddings {
     }
 }
 
-struct ClipVisionTransformer {
+pub(crate) struct ClipVisionTransformer {
     embeddings: ClipVisionEmbeddings,
     /// NOTE: `pre_layrnorm` is an intentional typo preserved from the HF
     /// checkpoint weight naming (matching `vision_model.pre_layrnorm.*`).
@@ -412,7 +412,7 @@ struct ClipVisionTransformer {
 }
 
 impl ClipVisionTransformer {
-    fn new(cfg: &ClipVisionConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &ClipVisionConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             embeddings: ClipVisionEmbeddings::new(cfg, vb.pp("embeddings"))?,
             pre_layrnorm: layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("pre_layrnorm"))?,

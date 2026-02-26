@@ -631,7 +631,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["Grok1ModelForCausalLM", "Grok1ForCausalLM"],
+        arch_names: &[
+            "Grok1ModelForCausalLM",
+            "Grok1ForCausalLM",
+            "GrokForCausalLM",
+        ],
         display_name: "Grok-1",
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
     },
@@ -689,6 +693,14 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         arch_names: &["QWenLMHeadModel"],
         display_name: "Qwen (v1)",
         capabilities: ModelCapabilities::new().with_tp(),
+    },
+    ArchitectureInfo {
+        arch_names: &[
+            "QwenVLForConditionalGeneration",
+            "QWenVLForConditionalGeneration",
+        ],
+        display_name: "Qwen-VL",
+        capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &["SeedOssForCausalLM"],
@@ -869,14 +881,14 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
     },
     // ─── Multimodal Embedding / Cross-Encoder ───────────────────────────────
     ArchitectureInfo {
-        arch_names: &["CLIPModel"],
+        arch_names: &["CLIPModel", "CLIPEmbeddingModel"],
         display_name: "CLIP",
         capabilities: ModelCapabilities::new()
             .with_encoder_only()
             .with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["SiglipModel"],
+        arch_names: &["SiglipModel", "SiglipEmbeddingModel"],
         display_name: "SigLIP",
         capabilities: ModelCapabilities::new()
             .with_encoder_only()
@@ -924,6 +936,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         ],
         display_name: "Qwen2-VL",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["TarsierForConditionalGeneration"],
+        display_name: "Tarsier",
+        capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
         arch_names: &[
@@ -1055,7 +1072,10 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["VoxtralForConditionalGeneration"],
+        arch_names: &[
+            "VoxtralForConditionalGeneration",
+            "VoxtralRealtimeGeneration",
+        ],
         display_name: "Voxtral",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
@@ -1476,6 +1496,7 @@ mod tests {
             "Plamo2ForCausalLM",
             "Plamo3ForCausalLM",
             "QWenLMHeadModel",
+            "QwenVLForConditionalGeneration",
             "SeedOssForCausalLM",
             "Step1ForCausalLM",
             "Step3TextForCausalLM",
@@ -1526,7 +1547,9 @@ mod tests {
             "HCXVisionForCausalLM",
             // Multimodal embedding / cross-encoder
             "CLIPModel",
+            "CLIPEmbeddingModel",
             "SiglipModel",
+            "SiglipEmbeddingModel",
             "Phi3VForCausalLM",
             "PaliGemmaForConditionalGeneration",
             "LlavaOnevisionForConditionalGeneration",
@@ -1538,6 +1561,7 @@ mod tests {
             "Glm4VForConditionalGeneration",
             "Qwen2VLForConditionalGeneration",
             "Tarsier2ForConditionalGeneration",
+            "TarsierForConditionalGeneration",
             // Qwen2.5-VL / OpenCUA
             "Qwen2_5_VLForConditionalGeneration",
             "Qwen25VLForConditionalGeneration",
@@ -1574,6 +1598,7 @@ mod tests {
             "Qwen2AudioForConditionalGeneration",
             "UltravoxModel",
             "VoxtralForConditionalGeneration",
+            "VoxtralRealtimeGeneration",
             "GlmAsrForConditionalGeneration",
             "GraniteSpeechForConditionalGeneration",
             "FunAudioChatForConditionalGeneration",

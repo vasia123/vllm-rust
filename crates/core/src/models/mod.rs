@@ -235,6 +235,7 @@ pub mod step3_vl;
 pub mod step3p5;
 pub mod step3p5_mtp;
 pub mod t5;
+pub mod tarsier;
 pub mod tp_layers;
 pub mod ultravox;
 pub mod voxtral;
@@ -482,6 +483,7 @@ pub use step3_vl::Step3VLForConditionalGeneration;
 pub use step3p5::Step3p5ForCausalLM;
 pub use step3p5_mtp::Step3p5MtpModel;
 pub use t5::T5ForConditionalGeneration;
+pub use tarsier::TarsierForConditionalGeneration;
 pub use ultravox::UltravoxModel;
 pub use voxtral::VoxtralForConditionalGeneration;
 pub use voyage::VoyageForEmbedding;
@@ -625,12 +627,12 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "GraniteMoeHybridForCausalLM" => Ok(Box::new(GraniteMoeHybridForCausalLM::new(cfg, vb)?)),
         "LlavaForConditionalGeneration"
         | "LlavaNextForConditionalGeneration"
-        | "MantisForConditionalGeneration"
-        // TarsierForConditionalGeneration (Tarsier-original) uses LLaVA-style
-        // architecture (vision tower + TarsierMultiModalProjector + generic LLM)
-        | "TarsierForConditionalGeneration" => Ok(Box::new(
+        | "MantisForConditionalGeneration" => Ok(Box::new(
             LLaVAForConditionalGeneration::from_model_config(cfg, vb)?,
         )),
+        "TarsierForConditionalGeneration" => {
+            Ok(Box::new(TarsierForConditionalGeneration::new(cfg, vb)?))
+        }
         "LlavaOnevisionForConditionalGeneration" | "LlavaNextVideoForConditionalGeneration" => {
             Ok(Box::new(
                 LlavaOnevisionForConditionalGeneration::from_model_config(cfg, vb)?,

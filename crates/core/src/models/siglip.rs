@@ -79,8 +79,8 @@ impl SiglipTextConfig {
 }
 
 #[allow(dead_code)]
-struct SiglipVisionConfig {
-    hidden_size: usize,
+pub(crate) struct SiglipVisionConfig {
+    pub(crate) hidden_size: usize,
     num_attention_heads: usize,
     num_hidden_layers: usize,
     intermediate_size: usize,
@@ -92,7 +92,7 @@ struct SiglipVisionConfig {
 }
 
 impl SiglipVisionConfig {
-    fn from_json(v: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(v: &serde_json::Value) -> Self {
         let g = |key, default: usize| {
             v.get(key)
                 .and_then(|x| x.as_u64())
@@ -389,14 +389,14 @@ impl SiglipVisionEmbeddings {
     }
 }
 
-struct SiglipVisionTransformer {
+pub(crate) struct SiglipVisionTransformer {
     embeddings: SiglipVisionEmbeddings,
     encoder: SiglipEncoder,
     post_layernorm: LayerNorm,
 }
 
 impl SiglipVisionTransformer {
-    fn new(cfg: &SiglipVisionConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &SiglipVisionConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             embeddings: SiglipVisionEmbeddings::new(cfg, vb.pp("embeddings"))?,
             encoder: SiglipEncoder::new(
