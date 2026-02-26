@@ -204,6 +204,8 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             "InternLM3ForCausalLM",
             "IQuestCoderForCausalLM",
             "XverseForCausalLM",
+            // SmolLM3 uses standard Llama architecture
+            "SmolLM3ForCausalLM",
         ],
         display_name: "Llama",
         capabilities: ModelCapabilities::new()
@@ -1232,6 +1234,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["NemotronH_Nano_VL_V2"],
+        display_name: "NemotronH-Nano-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["LightOnOCRForConditionalGeneration"],
         display_name: "LightOn-OCR",
         capabilities: ModelCapabilities::new().with_multimodal(),
@@ -1375,6 +1382,7 @@ mod tests {
             "InternLM3ForCausalLM",
             "IQuestCoderForCausalLM",
             "XverseForCausalLM",
+            "SmolLM3ForCausalLM",
             "Llama4ForCausalLM",
             "Llama4VLForConditionalGeneration",
             "MLlama4ForConditionalGeneration",
@@ -1652,6 +1660,8 @@ mod tests {
             "Glm4vForConditionalGeneration",
             "MiDashengLMModel",
             "LightOnOCRForConditionalGeneration",
+            "SmolLM3ForCausalLM",
+            "NemotronH_Nano_VL_V2",
         ];
         for arch in &expected {
             assert!(

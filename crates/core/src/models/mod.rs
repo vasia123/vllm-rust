@@ -554,7 +554,8 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         | "OrionForCausalLM"
         | "TeleChatForCausalLM"
         | "TeleChat2ForCausalLM"
-        | "OlmoForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
+        | "OlmoForCausalLM"
+        | "SmolLM3ForCausalLM" => Ok(Box::new(LlamaForCausalLM::new(cfg, vb)?)),
         "TeleFLMForCausalLM" => Ok(Box::new(TeleFLMForCausalLM::new(cfg, vb)?)),
         "MistralForCausalLM" => Ok(Box::new(MistralForCausalLM::new(cfg, vb)?)),
         "MixtralForCausalLM" => Ok(Box::new(MixtralForCausalLM::new(cfg, vb)?)),
@@ -885,6 +886,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "NemotronHForCausalLM" | "NemotronHPuzzleForCausalLM" => {
             Ok(Box::new(NemotronHForCausalLM::new(cfg, vb)?))
         }
+        // TODO: Implement NemotronH_Nano_VL_V2 with RadioModel vision encoder.
+        // Temporarily routes to the NemotronH text backbone; multimodal path not yet wired.
+        "NemotronH_Nano_VL_V2" => Ok(Box::new(NemotronHForCausalLM::new(cfg, vb)?)),
         "DeciLMForCausalLM" | "NemotronNasForCausalLM" => {
             Ok(Box::new(NemotronNasForCausalLM::new(cfg, vb)?))
         }
@@ -1036,7 +1040,8 @@ pub fn from_config_with_quant(
         | "YiForCausalLM"
         | "BaichuanForCausalLM"
         | "BaiChuanForCausalLM"
-        | "SeedOssForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
+        | "SeedOssForCausalLM"
+        | "SmolLM3ForCausalLM" => Ok(Box::new(QuantizedLlamaForCausalLM::new(
             cfg,
             vb,
             weight_loader.as_ref(),
