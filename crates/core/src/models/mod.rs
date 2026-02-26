@@ -1367,6 +1367,28 @@ pub fn medusa_from_config(
     }
 }
 
+/// Create an MLP Speculator draft model from a model configuration.
+///
+/// Reads speculator hyperparameters from `ModelConfig::extra`:
+/// - `emb_dim` — input dimension from target model (defaults to `hidden_size`)
+/// - `inner_dim` — speculator hidden size (0 → same as `emb_dim`)
+/// - `n_predict` — number of lookahead tokens (default 3)
+/// - `tie_weights` — share emb/proj/ln weights across heads (default false)
+/// - `scale_input` — L2-normalise input hidden states (default false)
+///
+/// HF checkpoints store weights under a `speculator.*` prefix which is
+/// handled internally by [`MLPSpeculatorModel::from_config`].
+pub fn mlp_speculator_from_config(
+    cfg: &ModelConfig,
+    vb: candle_nn::VarBuilder,
+) -> Result<MLPSpeculatorModel, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        "MLPSpeculatorPreTrainedModel" => Ok(MLPSpeculatorModel::from_config(cfg, vb)?),
+        other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
 /// Create a KVCacheManager appropriate for the given model configuration.
 ///
 /// For MLA models (DeepSeek V2/V3), this creates a compressed MLA cache.
@@ -2373,5 +2395,47 @@ mod tests {
             "TeleFLMForCausalLM (with muP) should build: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_mlp_speculator_from_config() {
+        let device = candle_core::Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+
+        let mut cfg = ModelConfig {
+            architectures: vec!["MLPSpeculatorPreTrainedModel".to_string()],
+            hidden_size: 64,
+            vocab_size: 256,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 0,
+            head_dim: 16,
+            max_position_embeddings: 128,
+            hidden_act: "gelu".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            sliding_window: None,
+            attention_bias: None,
+            extra: serde_json::Map::new(),
+        };
+        cfg.extra
+            .insert("emb_dim".to_string(), serde_json::json!(64));
+        cfg.extra
+            .insert("inner_dim".to_string(), serde_json::json!(32));
+        cfg.extra
+            .insert("n_predict".to_string(), serde_json::json!(3));
+
+        let result = mlp_speculator_from_config(&cfg, vb);
+        assert!(
+            result.is_ok(),
+            "mlp_speculator_from_config should build: {:?}",
+            result.err()
+        );
+        let model = result.unwrap();
+        assert_eq!(model.n_predict(), 3);
     }
 }

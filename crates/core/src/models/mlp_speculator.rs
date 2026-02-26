@@ -17,6 +17,8 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
 
+use crate::config::ModelConfig;
+
 // ─── L2 Layer Norm ──────────────────────────────────────────────────────────
 
 /// Custom L2 normalization with optional learnable scale and shift.
@@ -269,6 +271,50 @@ impl MLPSpeculatorModel {
         Ok(tokens)
     }
 
+    /// Build from a `ModelConfig`, reading speculator params from `extra`.
+    ///
+    /// HF checkpoints store all weights under a `speculator.*` prefix, so this
+    /// passes `vb.pp("speculator")` to the inner constructor.
+    ///
+    /// Config fields from `ModelConfig::extra`:
+    /// - `emb_dim` — input dim from target model (defaults to `hidden_size`)
+    /// - `inner_dim` — speculator hidden dim (0 → same as `emb_dim`)
+    /// - `n_predict` — draft tokens per step (default 3)
+    /// - `tie_weights` — share emb/proj/ln across heads (default false)
+    /// - `scale_input` — L2-normalise input before projection (default false)
+    pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let get_usize = |key: &str, default: usize| -> usize {
+            cfg.extra
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(default)
+        };
+        let get_bool = |key: &str| -> bool {
+            cfg.extra
+                .get(key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
+        let emb_dim = get_usize("emb_dim", cfg.hidden_size);
+        let inner_dim = get_usize("inner_dim", 0);
+        let n_predict = get_usize("n_predict", 3);
+        let tie_weights = get_bool("tie_weights");
+        let scale_input = get_bool("scale_input");
+
+        // HF checkpoints prefix all weights with "speculator."
+        Self::new(
+            cfg.vocab_size,
+            emb_dim,
+            inner_dim,
+            n_predict,
+            tie_weights,
+            scale_input,
+            vb.pp("speculator"),
+        )
+    }
+
     pub fn n_predict(&self) -> usize {
         self.n_predict
     }
@@ -435,5 +481,73 @@ mod tests {
         let hidden = Tensor::zeros((1, 1, EMB_DIM), DType::F32, &Device::Cpu).expect("hidden");
         let logits = model.forward(&hidden, 0).expect("forward");
         assert_eq!(logits.len(), N_PREDICT);
+    }
+
+    fn mlp_speculator_config() -> crate::config::ModelConfig {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "emb_dim".into(),
+            serde_json::Value::Number(serde_json::Number::from(EMB_DIM)),
+        );
+        extra.insert(
+            "inner_dim".into(),
+            serde_json::Value::Number(serde_json::Number::from(INNER_DIM)),
+        );
+        extra.insert(
+            "n_predict".into(),
+            serde_json::Value::Number(serde_json::Number::from(N_PREDICT)),
+        );
+        crate::config::ModelConfig {
+            architectures: vec!["MLPSpeculatorPreTrainedModel".to_string()],
+            hidden_size: EMB_DIM,
+            vocab_size: VOCAB_SIZE,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 0,
+            head_dim: 16,
+            max_position_embeddings: 512,
+            hidden_act: "gelu".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            bos_token_id: 1,
+            eos_token_id: 2,
+            sliding_window: None,
+            attention_bias: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn test_from_config_construction() {
+        let cfg = mlp_speculator_config();
+        let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        let model = MLPSpeculatorModel::from_config(&cfg, vb);
+        assert!(
+            model.is_ok(),
+            "from_config should construct: {:?}",
+            model.err()
+        );
+        let model = model.unwrap();
+        assert_eq!(model.n_predict(), N_PREDICT);
+    }
+
+    #[test]
+    fn test_from_config_forward() {
+        let cfg = mlp_speculator_config();
+        let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        let model = MLPSpeculatorModel::from_config(&cfg, vb).expect("build");
+
+        let hidden = Tensor::zeros((1, EMB_DIM), DType::F32, &Device::Cpu).expect("hidden");
+        let logits = model.forward(&hidden, 0).expect("forward");
+        assert_eq!(logits.len(), N_PREDICT);
+        for (i, l) in logits.iter().enumerate() {
+            assert_eq!(
+                l.dims(),
+                &[1, VOCAB_SIZE],
+                "head {i} should be [1, vocab_size]"
+            );
+        }
     }
 }

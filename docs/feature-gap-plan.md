@@ -369,6 +369,14 @@ Weight paths: `vision_tower.*`, `multi_modal_projector.*`, `language_model.model
 - ~~`log_level`~~ ✅ DONE (commit e5e7843): `logging::init_with_level()` uses CLI arg as default level
 - ~~`max_logprobs`~~ ✅ DONE (commit e5e7843): caps `top_logprobs` (chat) and `logprobs` (completions) at server-wide limit
 - ~~`ngram_prompt_lookup_max/min`~~ ✅ DONE (commit 549d0dc): starts `NGramProposer` via `start_engine_with_proposer()` when set
+- ~~`limit_mm_per_prompt`~~ ✅ DONE (commit a65e7ce): JSON → `HashMap<String,usize>` in `AppState`, image count check in chat handler
+- ~~`disable_log_requests`~~ ✅ DONE (commit db2940b): `http_logging` middleware added conditionally to production router
+- ~~`stream_interval`~~ ✅ DONE (commit db2940b): token batching in both `completion_sse_stream` and `chat_completion_sse_stream`; 3 new tests
+- ~~`max_lora_rank`~~ ✅ DONE (commit 3ab9db4): validates adapter rank at LoRA load time
+- ~~`tokenizer_revision`~~ ✅ DONE (commit 3ab9db4): `fetch_model_with_auth` uses explicit revision for tokenizer-override HF fetches; re-fetches at specified revision when no override
+- ~~`enable_lora`~~ ✅ DONE (commit 5bbeabf): gates `/v1/load_lora_adapter` endpoint; 1 new test
+- ~~`lora_dtype`~~ ✅ DONE (commit 5bbeabf): string → DType conversion, passed to `LoraLoader::new()`
+- **Remaining (complex infrastructure required):** `enforce_eager` (CUDA graphs), `preemption_mode` (SchedulerConfig), `spec_decoding_acceptance_method` (acceptance sampler), `guided_decoding_backend` (structured output), `max_seq_len_to_capture` (CUDA graph), `disable_log_stats` (stats goroutine), `otlp_traces_endpoint` (OpenTelemetry), `max_num_partial_prefills`/`long_prefill_token_threshold` (SchedulerConfig), `lora_extra_vocab_size`/`max_cpu_loras` (LoRA infra), `load_format`/`tokenizer_mode` (loader strategy), `disable_mm_preprocessor_cache` (VLM cache)
 
 ---
 

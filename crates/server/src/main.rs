@@ -6,8 +6,9 @@ use candle_core::{DType, Device};
 use clap::{Parser, Subcommand};
 use vllm_core::{
     engine::{
-        start_engine, start_engine_with_draft, start_engine_with_proposer, EngineConfig,
-        GenerationRequest, NGramConfig, NGramProposer, SpeculativeConfig,
+        spec_decode::MLPSpeculatorDraftProposer, start_engine, start_engine_with_draft,
+        start_engine_with_proposer, EngineConfig, GenerationRequest, NGramConfig, NGramProposer,
+        SpeculativeConfig,
     },
     kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
     loader,
@@ -1383,53 +1384,92 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eprintln!("Loading draft weights to GPU (bf16)...");
         let draft_vb = loader::load_weights(&draft_files.weights, dtype, &device)?;
 
-        eprintln!(
-            "Building draft model ({} layers)...",
-            draft_files.config.num_hidden_layers
-        );
-        let draft_model = models::from_config(&draft_files.config, draft_vb)?;
+        let draft_arch = draft_files
+            .config
+            .architectures
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
-        let draft_cache_config = CacheConfig {
-            block_size: 16,
-            num_blocks,
-            num_layers: draft_files.config.num_hidden_layers,
-            num_kv_heads: draft_files.config.num_key_value_heads,
-            head_dim: draft_files.config.head_dim,
-            dtype,
-            device: device.clone(),
-            kv_cache_dtype: KVCacheDtype::Auto,
-            cpu_offload: None,
-        };
-        eprintln!(
-            "Allocating draft KV cache ({} blocks)...",
-            draft_cache_config.num_blocks
-        );
-        let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
+        if draft_arch == "MLPSpeculatorPreTrainedModel" {
+            // MLP Speculator: stateless proposer backed by hidden-state MLP heads.
+            // No draft KV cache required — uses target model's hidden states directly.
+            eprintln!("Building MLP Speculator draft model...");
+            let mlp_model = models::mlp_speculator_from_config(&draft_files.config, draft_vb)?;
+            let proposer = MLPSpeculatorDraftProposer::new(mlp_model);
 
-        let engine_config = EngineConfig::builder(
-            SchedulerConfig {
-                max_running_requests: max_requests,
-                max_tokens_per_step: max_num_batched_tokens,
-                enable_chunked_prefill,
-                scheduling_policy,
-                max_loras_per_batch: max_loras,
-            },
-            Some(SpeculativeConfig {
-                num_speculative_tokens,
-            }),
-        )
-        .enable_prefix_caching(enable_prefix_caching)
-        .build();
+            let engine_config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: max_requests,
+                    max_tokens_per_step: max_num_batched_tokens,
+                    enable_chunked_prefill,
+                    scheduling_policy,
+                    max_loras_per_batch: max_loras,
+                },
+                Some(SpeculativeConfig {
+                    num_speculative_tokens,
+                }),
+            )
+            .enable_prefix_caching(enable_prefix_caching)
+            .build();
 
-        eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
-        start_engine_with_draft(
-            model,
-            draft_model,
-            engine_tokenizer,
-            kv_cache_mgr,
-            draft_kv_cache,
-            engine_config,
-        )
+            eprintln!("Starting engine (MLP Speculator, K={num_speculative_tokens})...");
+            start_engine_with_proposer(
+                model,
+                Box::new(proposer),
+                engine_tokenizer,
+                kv_cache_mgr,
+                engine_config,
+            )
+        } else {
+            eprintln!(
+                "Building draft model ({} layers)...",
+                draft_files.config.num_hidden_layers
+            );
+            let draft_model = models::from_config(&draft_files.config, draft_vb)?;
+
+            let draft_cache_config = CacheConfig {
+                block_size: 16,
+                num_blocks,
+                num_layers: draft_files.config.num_hidden_layers,
+                num_kv_heads: draft_files.config.num_key_value_heads,
+                head_dim: draft_files.config.head_dim,
+                dtype,
+                device: device.clone(),
+                kv_cache_dtype: KVCacheDtype::Auto,
+                cpu_offload: None,
+            };
+            eprintln!(
+                "Allocating draft KV cache ({} blocks)...",
+                draft_cache_config.num_blocks
+            );
+            let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
+
+            let engine_config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: max_requests,
+                    max_tokens_per_step: max_num_batched_tokens,
+                    enable_chunked_prefill,
+                    scheduling_policy,
+                    max_loras_per_batch: max_loras,
+                },
+                Some(SpeculativeConfig {
+                    num_speculative_tokens,
+                }),
+            )
+            .enable_prefix_caching(enable_prefix_caching)
+            .build();
+
+            eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
+            start_engine_with_draft(
+                model,
+                draft_model,
+                engine_tokenizer,
+                kv_cache_mgr,
+                draft_kv_cache,
+                engine_config,
+            )
+        }
     } else if let Some(max_n) = ngram_prompt_lookup_max {
         // N-gram prompt-lookup speculative decoding (no draft model required)
         let min_n = ngram_prompt_lookup_min.unwrap_or(1);
@@ -1731,57 +1771,98 @@ async fn run_generate(
         eprintln!("Loading draft weights to GPU (bf16)...");
         let draft_vb = loader::load_weights(&draft_files.weights, dtype, &device)?;
 
-        eprintln!(
-            "Building draft model ({} layers)...",
-            draft_files.config.num_hidden_layers
-        );
-        let draft_model = models::from_config(&draft_files.config, draft_vb)?;
+        let draft_arch = draft_files
+            .config
+            .architectures
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
-        let draft_cache_config = CacheConfig {
-            block_size: 16,
-            num_blocks: 512,
-            num_layers: draft_files.config.num_hidden_layers,
-            num_kv_heads: draft_files.config.num_key_value_heads,
-            head_dim: draft_files.config.head_dim,
-            dtype,
-            device: device.clone(),
-            kv_cache_dtype: KVCacheDtype::Auto,
-            cpu_offload: None,
-        };
-        eprintln!(
-            "Allocating draft KV cache ({} blocks)...",
-            draft_cache_config.num_blocks
-        );
-        let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
+        if draft_arch == "MLPSpeculatorPreTrainedModel" {
+            eprintln!("Building MLP Speculator draft model...");
+            let mlp_model = models::mlp_speculator_from_config(&draft_files.config, draft_vb)?;
+            let proposer = MLPSpeculatorDraftProposer::new(mlp_model);
 
-        let engine_config = EngineConfig::builder(
-            SchedulerConfig {
-                max_running_requests: 8,
-                max_tokens_per_step: 2048,
-                enable_chunked_prefill: false,
-                scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
-                max_loras_per_batch: 0,
-            },
-            Some(SpeculativeConfig {
+            let engine_config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: 8,
+                    max_tokens_per_step: 2048,
+                    enable_chunked_prefill: false,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                    max_loras_per_batch: 0,
+                },
+                Some(SpeculativeConfig {
+                    num_speculative_tokens,
+                }),
+            )
+            .build();
+
+            eprintln!(
+                "Starting engine ({} prompts, max {} tokens each, MLP Speculator K={})...",
+                prompts.len(),
+                max_tokens,
                 num_speculative_tokens,
-            }),
-        )
-        .build();
+            );
+            start_engine_with_proposer(
+                model,
+                Box::new(proposer),
+                tokenizer,
+                kv_cache_mgr,
+                engine_config,
+            )
+        } else {
+            eprintln!(
+                "Building draft model ({} layers)...",
+                draft_files.config.num_hidden_layers
+            );
+            let draft_model = models::from_config(&draft_files.config, draft_vb)?;
 
-        eprintln!(
-            "Starting engine ({} prompts, max {} tokens each, speculative K={})...",
-            prompts.len(),
-            max_tokens,
-            num_speculative_tokens,
-        );
-        start_engine_with_draft(
-            model,
-            draft_model,
-            tokenizer,
-            kv_cache_mgr,
-            draft_kv_cache,
-            engine_config,
-        )
+            let draft_cache_config = CacheConfig {
+                block_size: 16,
+                num_blocks: 512,
+                num_layers: draft_files.config.num_hidden_layers,
+                num_kv_heads: draft_files.config.num_key_value_heads,
+                head_dim: draft_files.config.head_dim,
+                dtype,
+                device: device.clone(),
+                kv_cache_dtype: KVCacheDtype::Auto,
+                cpu_offload: None,
+            };
+            eprintln!(
+                "Allocating draft KV cache ({} blocks)...",
+                draft_cache_config.num_blocks
+            );
+            let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
+
+            let engine_config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: 8,
+                    max_tokens_per_step: 2048,
+                    enable_chunked_prefill: false,
+                    scheduling_policy: vllm_core::scheduler::SchedulingPolicy::Fcfs,
+                    max_loras_per_batch: 0,
+                },
+                Some(SpeculativeConfig {
+                    num_speculative_tokens,
+                }),
+            )
+            .build();
+
+            eprintln!(
+                "Starting engine ({} prompts, max {} tokens each, speculative K={})...",
+                prompts.len(),
+                max_tokens,
+                num_speculative_tokens,
+            );
+            start_engine_with_draft(
+                model,
+                draft_model,
+                tokenizer,
+                kv_cache_mgr,
+                draft_kv_cache,
+                engine_config,
+            )
+        }
     } else {
         let engine_config = EngineConfig::builder(
             SchedulerConfig {
