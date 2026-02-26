@@ -955,6 +955,109 @@ impl NemotronHForCausalLM {
         let logits = self.lm_head.forward(&hidden)?;
         Ok(logits)
     }
+
+    /// Embed token ids into dense vectors. Used by VLMs to merge vision features.
+    pub(crate) fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    /// Forward pass starting from pre-computed embeddings (for VLM integration).
+    ///
+    /// Identical to `forward_with_request_id` but skips the embed_tokens step so
+    /// that callers can inject image embeddings before running the LLM layers.
+    pub(crate) fn forward_with_request_id_and_embeddings(
+        &self,
+        embeddings: &Tensor,
+        seqlen_offset: usize,
+        request_id: u64,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let seq_len = embeddings.dim(1)?;
+
+        let mut state_mgr = self
+            .state_mgr
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("state lock poisoned: {e}")))?;
+
+        if seqlen_offset == 0 {
+            state_mgr.free_state(request_id);
+            state_mgr.allocate_state(request_id).map_err(|e| {
+                candle_core::Error::Msg(format!("failed to allocate SSM state: {e}"))
+            })?;
+        }
+
+        let request_state = state_mgr
+            .get_state(request_id)
+            .ok_or_else(|| candle_core::Error::Msg("SSM state not found".into()))?;
+
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+
+        let mut hidden = embeddings.clone();
+        let mut residual: Option<Tensor> = None;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let (normed, new_residual) = if let Some(ref res) = residual {
+                let new_res = (&hidden + res)?;
+                let normed = layer.norm.forward(&new_res)?;
+                (normed, new_res)
+            } else {
+                let new_res = hidden.clone();
+                let normed = layer.norm.forward(&hidden)?;
+                (normed, new_res)
+            };
+            residual = Some(new_residual);
+
+            hidden = match &layer.mixer {
+                NemotronHLayerMixer::Mamba(mamba) => {
+                    let ssm_state = &request_state.ssm_states[layer_idx].tensor;
+                    let conv_state = &request_state.conv_states[layer_idx].tensor;
+                    let is_prefill = seq_len > 1;
+                    let (output, new_ssm, new_conv) = if is_prefill {
+                        mamba.forward_prefill(&normed, ssm_state)?
+                    } else {
+                        mamba.forward_decode(&normed, ssm_state, conv_state)?
+                    };
+                    request_state.ssm_states[layer_idx].tensor = new_ssm;
+                    request_state.conv_states[layer_idx].tensor = new_conv;
+                    output
+                }
+                NemotronHLayerMixer::Mlp(mlp) => mlp.forward(&normed)?,
+                NemotronHLayerMixer::Attention(attn) => {
+                    let cache_idx = self.attn_layer_cache_idx[layer_idx]
+                        .expect("attention layer should have cache index");
+                    attn.forward(
+                        &normed,
+                        attention_mask.as_ref(),
+                        seqlen_offset,
+                        kv_cache_mgr.engine_mut(cache_idx),
+                        block_table,
+                        slot_mapping,
+                    )?
+                }
+                NemotronHLayerMixer::MoE(moe) => moe.forward(&normed)?,
+            };
+        }
+
+        let hidden = if let Some(ref res) = residual {
+            self.norm_f.forward(&(hidden + res)?)?
+        } else {
+            self.norm_f.forward(&hidden)?
+        };
+
+        let logits = self.lm_head.forward(&hidden)?;
+        Ok(logits)
+    }
 }
 
 impl crate::engine::ModelForward for NemotronHForCausalLM {

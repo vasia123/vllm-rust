@@ -166,6 +166,7 @@ pub mod mpt;
 pub mod mpt_quantized;
 pub mod mtp_base;
 pub mod musicflamingo;
+pub mod nano_nemotron_vl;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
@@ -223,6 +224,7 @@ pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
 pub mod qwen_quantized;
 pub mod qwen_vl;
+pub mod radio;
 pub mod registry;
 pub mod seed_oss;
 pub mod siglip;
@@ -886,9 +888,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "NemotronHForCausalLM" | "NemotronHPuzzleForCausalLM" => {
             Ok(Box::new(NemotronHForCausalLM::new(cfg, vb)?))
         }
-        // TODO: Implement NemotronH_Nano_VL_V2 with RadioModel vision encoder.
-        // Temporarily routes to the NemotronH text backbone; multimodal path not yet wired.
-        "NemotronH_Nano_VL_V2" => Ok(Box::new(NemotronHForCausalLM::new(cfg, vb)?)),
+        "NemotronH_Nano_VL_V2" => Ok(Box::new(
+            nano_nemotron_vl::NemotronH_Nano_VL_V2ForConditionalGeneration::new(cfg, vb)?,
+        )),
         "DeciLMForCausalLM" | "NemotronNasForCausalLM" => {
             Ok(Box::new(NemotronNasForCausalLM::new(cfg, vb)?))
         }
