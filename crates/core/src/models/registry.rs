@@ -507,7 +507,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp().with_quantization(),
     },
     ArchitectureInfo {
-        arch_names: &["StableLMEpochForCausalLM", "StableLmForCausalLM"],
+        arch_names: &[
+            "StableLMEpochForCausalLM",
+            "StableLmForCausalLM",
+            "StablelmForCausalLM",
+        ],
         display_name: "StableLM",
         capabilities: ModelCapabilities::new().with_tp(),
     },
@@ -637,6 +641,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
             "Grok1ModelForCausalLM",
             "Grok1ForCausalLM",
             "GrokForCausalLM",
+            "Grok2ForCausalLM",
         ],
         display_name: "Grok-1",
         capabilities: ModelCapabilities::new().with_tp().with_moe(),
@@ -784,7 +789,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_tp(),
     },
     ArchitectureInfo {
-        arch_names: &["DeciLMForCausalLM"],
+        arch_names: &["DeciLMForCausalLM", "NemotronNasForCausalLM"],
         display_name: "DeciLM",
         capabilities: ModelCapabilities::new().with_tp(),
     },
@@ -1198,7 +1203,7 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
-        arch_names: &["MiniCPMO"],
+        arch_names: &["MiniCPMO", "MiniCPMOForCausalLM"],
         display_name: "MiniCPM-O",
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
@@ -1245,6 +1250,16 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
     ArchitectureInfo {
         arch_names: &["LightOnOCRForConditionalGeneration"],
         display_name: "LightOn-OCR",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["Llama_Nemotron_Nano_VL"],
+        display_name: "Llama-Nemotron-Nano-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
+        arch_names: &["NemotronParseForConditionalGeneration"],
+        display_name: "Nemotron Parse",
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
 ];
@@ -1464,6 +1479,7 @@ mod tests {
             "EagleMiniCPMForCausalLM",
             "EagleMistralLarge3ForCausalLM",
             "EagleDeepSeekMTPModel",
+            "EagleDeepseekV3ForCausalLM",
             "DeepSeekMTPModel",
             "ErnieMTPModel",
             "ExaoneMoeMTP",
@@ -1668,6 +1684,12 @@ mod tests {
             "LightOnOCRForConditionalGeneration",
             "SmolLM3ForCausalLM",
             "NemotronH_Nano_VL_V2",
+            "Llama_Nemotron_Nano_VL",
+            "NemotronParseForConditionalGeneration",
+            "NemotronNasForCausalLM",
+            "MiniCPMOForCausalLM",
+            "Grok2ForCausalLM",
+            "StablelmForCausalLM",
         ];
         for arch in &expected {
             assert!(
