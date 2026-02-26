@@ -980,6 +980,11 @@ static ARCHITECTURES: &[ArchitectureInfo] = &[
         capabilities: ModelCapabilities::new().with_multimodal(),
     },
     ArchitectureInfo {
+        arch_names: &["PaddleOCRVLForConditionalGeneration"],
+        display_name: "PaddleOCR-VL",
+        capabilities: ModelCapabilities::new().with_multimodal(),
+    },
+    ArchitectureInfo {
         arch_names: &["Idefics3ForConditionalGeneration"],
         display_name: "Idefics3",
         capabilities: ModelCapabilities::new().with_tp().with_multimodal(),

@@ -176,6 +176,7 @@ pub mod opt;
 pub mod opt_quantized;
 pub mod ouro;
 pub mod ovis;
+pub mod paddleocr_vl;
 pub mod paligemma;
 pub mod pangu;
 pub mod persimmon;
@@ -411,6 +412,7 @@ pub use opt::OPTForCausalLM;
 pub use opt_quantized::QuantizedOPTForCausalLM;
 pub use ouro::OuroForCausalLM;
 pub use ovis::OvisForConditionalGeneration;
+pub use paddleocr_vl::PaddleOCRVLForConditionalGeneration;
 pub use paligemma::PaliGemmaForConditionalGeneration;
 pub use pangu::{PanguEmbeddedForCausalLM, PanguProMoEV2ForCausalLM, PanguUltraMoEForCausalLM};
 pub use persimmon::PersimmonForCausalLM;
@@ -671,6 +673,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             Ok(Box::new(MiniCPMVForConditionalGeneration::new(cfg, vb)?))
         }
         "MiniCPMO" | "MiniCPMOForCausalLM" => Ok(Box::new(MiniCPMOForCausalLM::new(cfg, vb)?)),
+        "PaddleOCRVLForConditionalGeneration" => {
+            Ok(Box::new(PaddleOCRVLForConditionalGeneration::new(cfg, vb)?))
+        }
         "PaliGemmaForConditionalGeneration" => Ok(Box::new(
             PaliGemmaForConditionalGeneration::from_model_config(cfg, vb)?,
         )),

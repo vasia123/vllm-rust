@@ -41,18 +41,18 @@ use super::qwen3::Qwen3ForCausalLM;
 // ─── Vision Config ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct KeyeVisionConfig {
-    patch_size: usize,
-    in_channels: usize,
-    embed_dim: usize,
-    num_heads: usize,
-    intermediate_size: usize,
-    depth: usize,
-    layer_norm_eps: f64,
+pub(crate) struct KeyeVisionConfig {
+    pub(crate) patch_size: usize,
+    pub(crate) in_channels: usize,
+    pub(crate) embed_dim: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) depth: usize,
+    pub(crate) layer_norm_eps: f64,
 }
 
 impl KeyeVisionConfig {
-    fn from_json(json: &serde_json::Value) -> Self {
+    pub(crate) fn from_json(json: &serde_json::Value) -> Self {
         let patch_size = json
             .get("patch_size")
             .and_then(|v| v.as_u64())
@@ -381,14 +381,14 @@ impl KeyeSiglipEncoder {
 
 // ─── Vision Transformer ───────────────────────────────────────────────────────
 
-struct KeyeSiglipVisionTransformer {
+pub(crate) struct KeyeSiglipVisionTransformer {
     embeddings: KeyeVisionEmbeddings,
     encoder: KeyeSiglipEncoder,
     post_layernorm: LayerNorm,
 }
 
 impl KeyeSiglipVisionTransformer {
-    fn new(cfg: &KeyeVisionConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: &KeyeVisionConfig, vb: VarBuilder) -> Result<Self> {
         let vb_vm = vb.pp("vision_model");
         Ok(Self {
             embeddings: KeyeVisionEmbeddings::new(cfg, vb_vm.pp("embeddings"))?,
@@ -403,7 +403,7 @@ impl KeyeSiglipVisionTransformer {
 
     /// `patches`: `[N, patch_input_dim]`; `grid`: `(h, w)`.
     /// Returns `[N, embed_dim]`.
-    fn forward(&self, patches: &Tensor, grid: (usize, usize)) -> Result<Tensor> {
+    pub(crate) fn forward(&self, patches: &Tensor, grid: (usize, usize)) -> Result<Tensor> {
         let x = self.embeddings.forward(patches)?; // [N, embed_dim]
         let x = self.encoder.forward(&x, grid)?; // [N, embed_dim]
         self.post_layernorm.forward(&x)
@@ -468,7 +468,7 @@ impl KeyeVL1_5Projector {
 /// BEFORE the spatial merge, matching `keye.py` `Projector`.
 ///
 /// Weight paths: `mlp_AR.{pre_norm,linear_1,linear_2}.*`.
-struct KeyeProjector {
+pub(crate) struct KeyeProjector {
     pre_norm: LayerNorm,
     linear_1: Linear,
     linear_2: Linear,
@@ -476,7 +476,7 @@ struct KeyeProjector {
 }
 
 impl KeyeProjector {
-    fn new(embed_dim: usize, text_hidden: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(embed_dim: usize, text_hidden: usize, vb: VarBuilder) -> Result<Self> {
         let merge = 2usize;
         let merge_dim = embed_dim * merge * merge;
         Ok(Self {
@@ -489,7 +489,7 @@ impl KeyeProjector {
 
     /// `x`: `[t*h*w, embed_dim]`; `grid`: `(t, h, w)` where h, w in raw patch counts.
     /// Returns `[t * (h/m) * (w/m), text_hidden]`.
-    fn forward(&self, x: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
         // Norm each patch independently before merging — key difference vs VL1.5.
         let x = self.pre_norm.forward(x)?;
 
