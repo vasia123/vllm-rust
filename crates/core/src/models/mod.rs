@@ -904,6 +904,30 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "OpenPanguVLForConditionalGeneration" => {
             Ok(Box::new(OpenPanguVLForConditionalGeneration::new(cfg, vb)?))
         }
+        // Architectures removed from vLLM at the given version; provide actionable guidance.
+        "MotifForCausalLM" => Err(ModelError::UnsupportedArchitecture(
+            "MotifForCausalLM was removed in vLLM v0.10.2 and is no longer supported".into(),
+        )),
+        "Phi3SmallForCausalLM" => Err(ModelError::UnsupportedArchitecture(
+            "Phi3SmallForCausalLM was removed in vLLM v0.9.2 and is no longer supported".into(),
+        )),
+        "Phi4FlashForCausalLM" => Err(ModelError::UnsupportedArchitecture(
+            "Phi4FlashForCausalLM was removed in vLLM v0.10.2; use Phi4MMForCausalLM instead"
+                .into(),
+        )),
+        "Phi4MultimodalForCausalLM" => Err(ModelError::UnsupportedArchitecture(
+            "Phi4MultimodalForCausalLM was removed in vLLM v0.12.0; use Phi4MMForCausalLM instead"
+                .into(),
+        )),
+        "BartModel" | "BartForConditionalGeneration" | "MBartForConditionalGeneration"
+        | "DonutForConditionalGeneration" | "Florence2ForConditionalGeneration" => {
+            Err(ModelError::UnsupportedArchitecture(format!(
+                "{arch} (encoder-decoder) was removed in vLLM v0.10.2 due to V0 engine deprecation"
+            )))
+        }
+        "MllamaForConditionalGeneration" => Err(ModelError::UnsupportedArchitecture(
+            "MllamaForConditionalGeneration was removed in vLLM v0.10.2; use Llama4ForConditionalGeneration instead".into(),
+        )),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
     }
 }
