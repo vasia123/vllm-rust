@@ -779,9 +779,7 @@ async fn main() -> anyhow::Result<()> {
                 || file_config.disable_mm_preprocessor_cache.unwrap_or(false);
 
             // Pipeline Parallelism
-            // NOTE: merged value not yet wired into ServerLaunchConfig; plumbing
-            // through run_server is a follow-up once stage-model construction is added.
-            let _pipeline_parallel_size = if pipeline_parallel_size == 1 {
+            let pipeline_parallel_size = if pipeline_parallel_size == 1 {
                 file_config.pipeline_parallel_size.unwrap_or(1)
             } else {
                 pipeline_parallel_size
@@ -903,6 +901,7 @@ async fn main() -> anyhow::Result<()> {
                 max_seq_len_to_capture,
                 enable_auto_tool_choice,
                 return_tokens_as_token_ids,
+                pipeline_parallel_size,
             })
             .await
         }
@@ -1008,6 +1007,8 @@ struct ServerLaunchConfig {
     max_seq_len_to_capture: usize,
     enable_auto_tool_choice: bool,
     return_tokens_as_token_ids: bool,
+    // Parallelism
+    pipeline_parallel_size: usize,
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
@@ -1083,6 +1084,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         max_seq_len_to_capture,
         enable_auto_tool_choice,
         return_tokens_as_token_ids,
+        pipeline_parallel_size,
     } = cfg;
 
     if seed != 0 {
@@ -1124,6 +1126,16 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let _ = max_seq_len_to_capture; // TODO: wire to CUDA graph capture
     let _ = enable_auto_tool_choice; // TODO: wire to auto tool selection
     let _ = return_tokens_as_token_ids; // TODO: wire to default response format
+
+    // Pipeline parallelism validation.
+    // TODO: wire pipeline_parallel_size to PipelineStagedModel stage construction.
+    // Until stage-slicing is wired, reject pp > 1 gracefully.
+    if pipeline_parallel_size > 1 {
+        anyhow::bail!(
+            "--pipeline-parallel-size {} is not yet supported (only 1 is currently implemented)",
+            pipeline_parallel_size
+        );
+    }
 
     eprintln!("Loading model: {model_id}");
     let files = loader::fetch_model_with_revision(&model_id, &revision)?;

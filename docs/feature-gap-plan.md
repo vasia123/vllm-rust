@@ -220,6 +220,8 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 `Qwen2ForCausalLM`. Weight paths: `model.sam_model.*` (SAM), `model.qwen2_model.*` (encoder), `model.projector.*`,
 `model.view_seperator`, `model.*` / `lm_head.*` (Qwen2 LLM). GQA: 14 heads, 2 KV heads → ratio=7 broadcast.
 
+- ~~**Ovis2_5**~~ ✅ DONE (`ovis2_5.rs`, 3 tests — commit 0135a75): `Siglip2NavitVisionTransformer` (Linear/Conv2d patch embed + N pre-norm layers, full attn on CPU) + `Ovis25VisualTokenizer` (reshape stride² + Linear+LN head → softmax → pad indicators) + vte.weight matmul + Qwen2/Qwen3 LLM. Registry aliases: `"Ovis2_5"`.
+- ~~**Registry/factory audit**~~ ✅ DONE (commit 0852e48): Added 27 missing registry entries (all implemented audio models + VLMs) and 4 factory aliases (Qwen2.5-Omni, Qwen3-Omni, Lfm2VlFor, Ovis).
 - **P2 models (~2 remaining):** ~~MiniCPM-O~~ ✅ DONE (`minicpmo.rs`, 5 tests — commit 7763a99), MiniMax-VL-01 (BLOCKED: Lightning Attention), Nemotron-VL (BLOCKED: dynamic AutoModel), ~~Hunyuan-Vision~~ ✅ DONE (`hunyuan_vision.rs`, 5 tests + XDRoPE — commit 94ada76), ~~LFM2-VL~~ ✅ DONE (`lfm2_vl.rs`, 6 tests — commit f0ac8f7 — Siglip2VisionTransformer + pixel-shuffle projector + Lfm2ForCausalLM)
 - **NemotronNAS / DeciLM** ✅ DONE (`nemotron_nas.rs`, 5 tests — commit cb28bb0): `DeciLMForCausalLM`/`NemotronNasForCausalLM`; per-layer `block_configs` JSON (no_op_attention, no_op_ffn, n_heads_in_group, intermediate_size/ffn_mult); `NasAttention` with explicit per-layer num_kv_heads; `NasDecoderLayer` with optional attn+FFN; separate `kv_layer_idx` counter for KV cache (num_kv_layers ≤ num_hidden_layers)
 - **Pattern:** `crates/core/src/models/{name}.rs`, register in `mod.rs`, add alias if needed
@@ -281,8 +283,9 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 - **ShortConv** ✅ DONE — `ShortConvBlock` + `Lfm2ShortConvDecoderLayer` implemented inline in `lfm2.rs`; `Lfm2ForCausalLM` + `Lfm2MoeForCausalLM` now fully hybrid (SSMStateManager, attn_layer_cache_idx, forward_with_request_id); 24 tests (3951 total) — 2026-02-23
 - **Gated LayerNorm** ✅ DONE — `crates/core/src/ssm/gated_layer_norm.rs`; `rms_norm_gated(x, z, weight, eps, norm_before_gate)`; 6 tests — 2026-02-23
 - **`mamba2.rs` correctness fix** ✅ DONE — fixed `in_proj` size (added gate dim → `2*d_inner + 2*n*S + H`), conv on full `xBC`, post-SSM `Mixer2RMSNormGated` output norm, `Mamba2DecoderLayer` pre-norm at correct weight path, removed spurious `norm_b`/`norm_c`; `SSMStateManager::new_with_conv_channels` for `conv_dim` states; 11 tests (3958 total) — 2026-02-23
-- **SSD ops** (6 Python files) — chunked parallel SSD scan; required for GPU-efficient Mamba2
-  - `crates/core/src/ssm/ssd.rs` (~300 LOC); CPU sequential recurrence is already correct
+- **SSD ops** ✅ DONE — `ssd_sequential` + `ssd_chunk_scan` in `crates/core/src/ssm/ssd.rs`; 6 tests; chunked scan groups time-steps into blocks, inter-chunk state via full-chunk decay; numerically identical to sequential
+  - CPU sequential recurrence: reference implementation
+  - `ssd_chunk_scan`: intra-chunk sequential scan + state contribution from carry; enables GPU-kernel drop-in
 
 ---
 
@@ -305,10 +308,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
   - `GenerationRequest.audio_inputs: Vec<AudioData>` added; all struct literals updated
   - `AudioData` re-exported from `vllm_core::multimodal`
   - NOTE: model forward passes need to consume `audio_inputs` to embed via encoder+projector (see doc comment)
-- `WebSocket /v1/realtime` — ~500 LOC
-  - Persistent connection, delta-streaming, session state machine
-  - `crates/server/src/api/realtime.rs` (new file)
-  - Add `tokio-tungstenite` dependency
+- ~~`WebSocket /v1/realtime`~~ ✅ DONE — `crates/server/src/api/realtime.rs`; 9 tests; registered in `mod.rs` both routers; axum `ws` feature enabled; 4 MB audio buffer limit; PCM16→f32 decode; `generate_stream` delta streaming; `transcription.delta/done/error` events; `session.created/update` protocol
 - `POST /v1/images/generations` — P3, requires diffusion models
 
 ### 3.3 Attention Backend Variants
@@ -335,7 +335,7 @@ custom dual-mode mask [image=full non-causal, query=causal] → return query tok
 - Removed error gate at `crates/server/src/main.rs` ✅
 - 27 pipeline tests pass (2 new: `decode_meta_constants_consistent`, `send_worker_signal_decode_encodes_correctly`) ✅
 
-**Remaining:** `pipeline_parallel_size` not yet wired through `ServerLaunchConfig` → `run_server` (no model registry hook for stage slicing yet).
+**Remaining:** `pipeline_parallel_size` wired through `ServerLaunchConfig` → `run_server` (commit see below); rejects `pp > 1` with clear error (identical to `tensor_parallel_size` handling). Stage-model construction not yet implemented.
 
 ### 4.2 RoPE Variants
 **Effort:** 1 week | All in `crates/core/src/layers/rotary.rs`

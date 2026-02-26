@@ -7,6 +7,7 @@ pub mod embeddings;
 pub mod error;
 pub mod middleware;
 pub mod models;
+pub mod realtime;
 pub mod response_format;
 pub mod responses;
 pub mod responses_types;
@@ -687,6 +688,7 @@ pub fn create_router_with_cors(state: AppState, cors: CorsLayer) -> Router {
             post(audio::create_transcription),
         )
         .route("/v1/audio/translations", post(audio::create_translation))
+        .route("/v1/realtime", get(realtime::realtime_ws))
         .layer(axum::middleware::from_fn_with_state(
             accepting,
             middleware::reject_during_restart,
@@ -802,6 +804,7 @@ pub fn create_full_router_with_all_options(
             get(batch::get_batch_output),
         )
         .route("/v1/batches/{batch_id}/cancel", post(batch::cancel_batch))
+        .route("/v1/realtime", get(realtime::realtime_ws))
         .layer(DefaultBodyLimit::max(max_body_size))
         .layer(axum::middleware::from_fn_with_state(
             api_key_state,
