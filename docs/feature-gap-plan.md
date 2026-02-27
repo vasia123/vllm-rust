@@ -25,8 +25,8 @@ Meaningful new logic needed.
 | Item | What's Missing | Fix | Effort |
 |------|---------------|-----|--------|
 | 2.1 | `lora_extra_vocab_size` — LoRA vocab extension | Load extra embeddings from adapter, expand lm_head, per-request merge | 15–25h |
-| 2.2 | `disable_mm_preprocessor_cache` — VLM preprocessor cache | SHA-256 keyed cache for vision encoder outputs, LRU eviction | 8–15h |
-| 2.3 | `max_cpu_loras` — LRU adapter eviction | LRU map for dynamically loaded adapters, evict on `/v1/load_lora_adapter` | 4–8h |
+| 2.2 ✅ | `disable_mm_preprocessor_cache` — VLM preprocessor cache | SHA-256 keyed LRU cache in `PreprocessorCache`; `MultimodalProcessor` checks before encoding; `AppState.disable_mm_preprocessor_cache` propagates flag | `25652c3` |
+| 2.3 ✅ | `max_cpu_loras` — LRU adapter eviction | `LoraAdapterRegistry` with `VecDeque` LRU; evicts on `/v1/load_lora_adapter` | `e45fd81` |
 
 ---
 
