@@ -183,6 +183,10 @@ pub struct AppState {
     /// `/v1/load_lora_adapter` endpoint. When false, the endpoint rejects
     /// all requests. Mirrors vLLM `--enable-lora`.
     pub enable_lora: bool,
+    /// When `true`, `MultimodalProcessor` instances should be constructed with
+    /// `.without_preprocessor_cache()`, disabling the SHA-256-keyed LRU cache
+    /// for vision encoder outputs. Mirrors vLLM `--disable-mm-preprocessor-cache`.
+    pub disable_mm_preprocessor_cache: bool,
 }
 
 impl AppState {
@@ -205,6 +209,7 @@ impl AppState {
         stream_interval: usize,
         enable_lora: bool,
         max_cpu_loras: Option<usize>,
+        disable_mm_preprocessor_cache: bool,
     ) -> Self {
         Self {
             engine,
@@ -228,6 +233,7 @@ impl AppState {
             mm_limits,
             stream_interval: stream_interval.max(1),
             enable_lora,
+            disable_mm_preprocessor_cache,
         }
     }
 
@@ -1091,7 +1097,8 @@ mod tests {
             HashMap::new(),
             1,
             true,
-            None, // max_cpu_loras: unlimited in tests
+            None,  // max_cpu_loras: unlimited in tests
+            false, // disable_mm_preprocessor_cache: cache enabled in tests
         )
     }
 

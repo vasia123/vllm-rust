@@ -7,6 +7,8 @@
 //! 4. Tokenizing text with image placeholders
 //! 5. Preparing final inputs for the model
 
+use std::sync::{Arc, Mutex};
+
 use candle_core::{DType, Device, Result, Tensor};
 use thiserror::Error;
 
@@ -14,6 +16,7 @@ use super::inputs::{
     ContentPart, ImageData, ImageSource, MultimodalInputs, ProcessedImage, ProcessedVideo,
     VideoData, VideoSource,
 };
+use super::preprocessor_cache::{PreprocessorCache, DEFAULT_CACHE_CAPACITY};
 use super::vision::VisionEncoder;
 
 /// Error type for multimodal processing.
@@ -109,22 +112,36 @@ pub struct MultimodalProcessor {
     vision_encoder: Option<VisionEncoder>,
     device: Device,
     dtype: DType,
+    /// Optional LRU cache for vision encoder outputs.
+    ///
+    /// `None` when the cache is disabled via `--disable-mm-preprocessor-cache`.
+    /// Wrapped in `Arc<Mutex<>>` so the processor can be shared across threads
+    /// (e.g., multiple request handlers) while still mutating the cache.
+    preprocessor_cache: Option<Arc<Mutex<PreprocessorCache>>>,
 }
 
 impl MultimodalProcessor {
     /// Create a new processor without a vision encoder.
     ///
     /// Use this when images will be provided as pre-computed embeddings.
+    /// The preprocessor cache is enabled by default with `DEFAULT_CACHE_CAPACITY`
+    /// entries. Call `.without_preprocessor_cache()` to disable it.
     pub fn new(config: ProcessorConfig, device: &Device, dtype: DType) -> Self {
         Self {
             config,
             vision_encoder: None,
             device: device.clone(),
             dtype,
+            preprocessor_cache: Some(Arc::new(Mutex::new(PreprocessorCache::new(
+                DEFAULT_CACHE_CAPACITY,
+            )))),
         }
     }
 
     /// Create a new processor with a vision encoder.
+    ///
+    /// The preprocessor cache is enabled by default with `DEFAULT_CACHE_CAPACITY`
+    /// entries. Call `.without_preprocessor_cache()` to disable it.
     pub fn with_vision_encoder(config: ProcessorConfig, vision_encoder: VisionEncoder) -> Self {
         let device = vision_encoder.device().clone();
         let dtype = vision_encoder.dtype();
@@ -133,7 +150,19 @@ impl MultimodalProcessor {
             vision_encoder: Some(vision_encoder),
             device,
             dtype,
+            preprocessor_cache: Some(Arc::new(Mutex::new(PreprocessorCache::new(
+                DEFAULT_CACHE_CAPACITY,
+            )))),
         }
+    }
+
+    /// Disable the preprocessor cache for this processor instance.
+    ///
+    /// Called when `--disable-mm-preprocessor-cache` is set. Subsequent
+    /// `process_image` calls will always invoke the vision encoder.
+    pub fn without_preprocessor_cache(mut self) -> Self {
+        self.preprocessor_cache = None;
+        self
     }
 
     /// Process content parts into model inputs.
@@ -227,28 +256,50 @@ impl MultimodalProcessor {
     }
 
     /// Process a single image into embeddings.
+    ///
+    /// Pre-computed `ImageSource::Embedding` values bypass the encoder and
+    /// cache entirely. For all other sources the preprocessor cache is checked
+    /// first; a hit returns a clone of the cached `ProcessedImage` without
+    /// calling the vision encoder.
     pub fn process_image(
         &self,
         image: ImageData,
     ) -> std::result::Result<ProcessedImage, ProcessorError> {
-        match image.source {
-            ImageSource::Embedding(tensor) => {
-                // Pre-computed embedding
-                let num_tokens = tensor.dim(0).map_err(ProcessorError::Candle)?;
-                Ok(ProcessedImage::new(tensor, num_tokens))
-            }
-            _ => {
-                // Need to encode the image
-                let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
-                    ProcessorError::ImageEncode("No vision encoder configured".to_string())
-                })?;
+        // Fast path: already encoded, no need for the vision encoder or cache.
+        if let ImageSource::Embedding(tensor) = image.source {
+            let num_tokens = tensor.dim(0).map_err(ProcessorError::Candle)?;
+            return Ok(ProcessedImage::new(tensor, num_tokens));
+        }
+
+        let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
+            ProcessorError::ImageEncode("No vision encoder configured".to_string())
+        })?;
+
+        // Cache-enabled path: check for a hit before encoding.
+        if let Some(cache) = &self.preprocessor_cache {
+            if let Some(key) = PreprocessorCache::compute_key(&image) {
+                {
+                    let mut guard = cache.lock().unwrap();
+                    if let Some(cached) = guard.get(&key) {
+                        return Ok((*cached).clone());
+                    }
+                } // release lock before encoding
 
                 let pixel_values = self.load_and_preprocess_image(&image)?;
-                encoder
+                let encoded = encoder
                     .encode_image(&pixel_values)
-                    .map_err(|e| ProcessorError::ImageEncode(e.to_string()))
+                    .map_err(|e| ProcessorError::ImageEncode(e.to_string()))?;
+
+                cache.lock().unwrap().insert(key, encoded.clone());
+                return Ok(encoded);
             }
         }
+
+        // Cache disabled or source has no cacheable key — encode unconditionally.
+        let pixel_values = self.load_and_preprocess_image(&image)?;
+        encoder
+            .encode_image(&pixel_values)
+            .map_err(|e| ProcessorError::ImageEncode(e.to_string()))
     }
 
     /// Load and preprocess an image for the vision encoder.

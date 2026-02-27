@@ -1216,7 +1216,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         } else {
             std::collections::HashMap::new()
         };
-    let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache (Phase 2.2)
+    if disable_mm_preprocessor_cache {
+        tracing::info!(
+            "Multimodal preprocessor cache disabled \
+             (--disable-mm-preprocessor-cache). Vision encoder outputs will \
+             not be cached across requests."
+        );
+    }
 
     // Pipeline parallelism validation.
     // TODO: wire pipeline_parallel_size to PipelineStagedModel stage construction.
@@ -1676,6 +1682,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         stream_interval,
         enable_lora,
         max_cpu_loras,
+        disable_mm_preprocessor_cache,
     );
 
     let start_time = SystemTime::now()

@@ -28,6 +28,7 @@
 pub mod audio;
 mod inputs;
 pub mod mel_spectrogram;
+mod preprocessor_cache;
 mod processor;
 mod projector;
 pub mod video;
@@ -42,6 +43,7 @@ pub use mel_spectrogram::{
     build_mel_filterbank, hann_window, log_mel_spectrogram, stft_power_spectrum,
     MelSpectrogramConfig,
 };
+pub use preprocessor_cache::{PreprocessorCache, DEFAULT_CACHE_CAPACITY};
 pub use processor::{MultimodalProcessor, ProcessorConfig};
 pub use projector::{MultimodalProjector, ProjectorConfig, ProjectorType};
 pub use video::{FrameSamplingStrategy, VideoEncoder, VideoEncoderConfig, VideoPlaceholderConfig};
