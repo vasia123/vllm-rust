@@ -34,6 +34,8 @@
 use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
@@ -444,96 +446,276 @@ impl MiniMaxText01MoE {
     }
 }
 
-// ─── Simplified Linear Attention ─────────────────────────────────────────────
+// ─── Linear Attention (Lightning Attention recurrence) ───────────────────────
 //
-// The reference MiniMaxText01LinearAttention uses a recurrent SSM-like formulation.
-// For inference without the full CUDA kernel, we implement a simplified version
-// that performs the same Q*K*V computation pattern as a linear (non-softmax)
-// attention. This captures the essential semantics while being feasible on CPU.
+// Implements the MiniMaxText01 linear attention layer using the lightning
+// attention recurrence formula from the reference Python implementation.
+//
+// Algorithm:
+//   qkv = SiLU(qkv_proj(x))              [B, L, H, D] each
+//   kv_outer = k ⊗ v                      [B, H, D, D]
+//   state_t = exp(-slope_h) * state_{t-1} + kv_outer_t
+//   out_t = q_t @ state_t                 [B, H, D]
+//   hidden = norm(out) * sigmoid(gate)
+//   return out_proj(hidden)
+//
+// State shape per sequence: [H, D, D]
+// Decode state is stored per request_id in a Mutex<HashMap>.
+
+/// ALiBi-style slope rates for the linear attention decay.
+/// Returns a Vec of length `n` following the reference ALiBi geometric series.
+fn build_slope_rates(n: usize) -> Vec<f32> {
+    fn slopes_pow2(n: usize) -> Vec<f32> {
+        // start = 2^(-(2^(-(log2(n)-3))))
+        let log2n = (n as f32).log2();
+        let exp_inner = -(log2n - 3.0);
+        let start = 2.0f32.powf(-(2.0f32.powf(exp_inner)));
+        let ratio = start;
+        (0..n).map(|i| start * ratio.powi(i as i32)).collect()
+    }
+
+    fn slopes_recursive(n: usize) -> Vec<f32> {
+        if n.is_power_of_two() {
+            return slopes_pow2(n);
+        }
+        // Interpolate: take power-of-2 floor, then even entries from 2x
+        let closest = n.next_power_of_two() >> 1; // largest power_of_2 < n
+        let mut base = slopes_pow2(closest);
+        let extended: Vec<f32> = slopes_recursive(closest * 2)
+            .into_iter()
+            .step_by(2)
+            .take(n - closest)
+            .collect();
+        base.extend(extended);
+        base
+    }
+
+    slopes_recursive(n)
+}
 
 struct MiniMaxText01LinearAttention {
     qkv_proj: Linear,
-    o_proj: Linear,
+    output_gate: Linear,
+    out_proj: Linear,
+    norm: RmsNorm,
+    /// Per-head decay: exp(-slope_rate[h]), shape [H].
+    decay: Vec<f32>,
     num_heads: usize,
-    num_kv_heads: usize,
     head_dim: usize,
-    q_size: usize,
-    kv_size: usize,
+    hidden_inner_size: usize,
+    /// Per-sequence linear attention state: request_id → Tensor [H, D, D].
+    states: Mutex<HashMap<u64, Tensor>>,
 }
 
 impl MiniMaxText01LinearAttention {
     fn new(
         hidden_size: usize,
         num_heads: usize,
-        num_kv_heads: usize,
         head_dim: usize,
+        num_linear_layers: usize,
+        linear_layer_idx: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let q_size = num_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let total_qkv = q_size + 2 * kv_size;
+        let hidden_inner_size = num_heads * head_dim;
 
-        let qkv_proj = linear_no_bias(hidden_size, total_qkv, vb.pp("qkv_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
+        let qkv_proj = linear_no_bias(hidden_size, hidden_inner_size * 3, vb.pp("qkv_proj"))?;
+        let output_gate = linear_no_bias(hidden_size, hidden_inner_size, vb.pp("output_gate"))?;
+        let out_proj = linear_no_bias(hidden_inner_size, hidden_size, vb.pp("out_proj"))?;
+        let norm = rms_norm(hidden_inner_size, 1e-5, vb.pp("norm"))?;
+
+        // Layer-scaled slope rates: reference scales by (1 - idx/(n-1) + 1e-5)
+        let base_slopes = build_slope_rates(num_heads);
+        let scale = if num_linear_layers <= 1 {
+            1.0f32 + 1e-5
+        } else {
+            1.0 - linear_layer_idx as f32 / (num_linear_layers as f32 - 1.0) + 1e-5
+        };
+        let decay: Vec<f32> = base_slopes.iter().map(|&s| (-s * scale).exp()).collect();
 
         Ok(Self {
             qkv_proj,
-            o_proj,
+            output_gate,
+            out_proj,
+            norm,
+            decay,
             num_heads,
-            num_kv_heads,
             head_dim,
-            q_size,
-            kv_size,
+            hidden_inner_size,
+            states: Mutex::new(HashMap::new()),
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
+    /// Project + SiLU + split into q, k, v.
+    ///
+    /// Input: `[B, L, hidden_size]`
+    /// Output: three tensors each of shape `[B, L, H, D]` in F32.
+    fn qkv_split(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let dims = xs.dims();
+        let b = dims[0];
+        let l = dims[1];
 
         let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
+        // Cast to F32 before SiLU for numerical stability (matches reference).
+        let qkv = qkv.to_dtype(DType::F32)?;
+        let qkv = candle_nn::ops::silu(&qkv)?;
 
-        // Reshape to [batch, heads, seq, head_dim]
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let q = qkv.narrow(2, 0, self.hidden_inner_size)?.reshape((
+            b,
+            l,
+            self.num_heads,
+            self.head_dim,
+        ))?;
+        let k = qkv
+            .narrow(2, self.hidden_inner_size, self.hidden_inner_size)?
+            .reshape((b, l, self.num_heads, self.head_dim))?;
+        let v = qkv
+            .narrow(2, 2 * self.hidden_inner_size, self.hidden_inner_size)?
+            .reshape((b, l, self.num_heads, self.head_dim))?;
 
-        // GQA expansion: repeat K/V heads to match Q heads
-        let repeat_factor = self.num_heads / self.num_kv_heads;
-        let (k, v) = if repeat_factor > 1 {
-            let k = k
-                .unsqueeze(2)?
-                .expand((b_sz, self.num_kv_heads, repeat_factor, q_len, self.head_dim))?
-                .reshape((b_sz, self.num_heads, q_len, self.head_dim))?;
-            let v = v
-                .unsqueeze(2)?
-                .expand((b_sz, self.num_kv_heads, repeat_factor, q_len, self.head_dim))?
-                .reshape((b_sz, self.num_heads, q_len, self.head_dim))?;
-            (k, v)
-        } else {
-            (k, v)
+        Ok((q, k, v))
+    }
+
+    /// Build the decay tensor `[1, H, 1, 1]` on the target device.
+    fn decay_tensor(&self, device: &Device) -> Result<Tensor> {
+        Tensor::from_slice(&self.decay, (1, self.num_heads, 1, 1), device)
+    }
+
+    /// Apply gate + norm + out_proj and return `[B, L, hidden_size]`.
+    fn apply_gate_and_project(&self, xs: &Tensor, hidden: Tensor) -> Result<Tensor> {
+        let hidden = self.norm.forward(&hidden)?;
+        let gate = self.output_gate.forward(xs)?.to_dtype(DType::F32)?;
+        let gate = candle_nn::ops::sigmoid(&gate)?;
+        let mixed = hidden.broadcast_mul(&gate)?;
+        let mixed = mixed.to_dtype(xs.dtype())?;
+        self.out_proj.forward(&mixed)
+    }
+
+    /// Prefill forward: runs the linear recurrence from zero state over all
+    /// timesteps.  State is NOT persisted — each prefill starts from zero.
+    ///
+    /// `xs`: `[B, L, hidden_size]`, returns `[B, L, hidden_size]`.
+    fn forward_prefill(&self, xs: &Tensor) -> Result<Tensor> {
+        let dims = xs.dims();
+        let (b, l) = (dims[0], dims[1]);
+        let (q, k, v) = self.qkv_split(xs)?;
+        // q/k/v: [B, L, H, D]
+
+        let dev = xs.device();
+        let decay = self.decay_tensor(dev)?; // [1, H, 1, 1]
+
+        // Zero state: [B, H, D, D]
+        let mut state = Tensor::zeros(
+            (b, self.num_heads, self.head_dim, self.head_dim),
+            DType::F32,
+            dev,
+        )?;
+
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(l);
+        for t in 0..l {
+            // Slice time step t: [B, H, D]
+            let q_t = q.narrow(1, t, 1)?.squeeze(1)?;
+            let k_t = k.narrow(1, t, 1)?.squeeze(1)?;
+            let v_t = v.narrow(1, t, 1)?.squeeze(1)?;
+
+            // Outer product kv_t: [B, H, D, 1] × [B, H, 1, D] → [B, H, D, D]
+            let kv_t = k_t.unsqueeze(3)?.broadcast_mul(&v_t.unsqueeze(2)?)?;
+
+            // State update: state = decay * state + kv_t
+            state = (state.broadcast_mul(&decay)? + kv_t)?;
+
+            // out_t = q_t @ state: [B, H, 1, D] → [B, H, D]
+            let out_t = q_t.unsqueeze(2)?.matmul(&state)?.squeeze(2)?;
+            outputs.push(out_t);
+        }
+
+        // Stack: list of [B, H, D] → [B, L, H, D] → [B, L, H*D]
+        let hidden = Tensor::stack(&outputs, 1)?.reshape((b, l, self.hidden_inner_size))?;
+
+        // xs: [B, L, hidden_size] for gate projection
+        self.apply_gate_and_project(xs, hidden)
+    }
+
+    /// Decode forward for a batch of sequences, one token per sequence.
+    ///
+    /// Reads each sequence's state from the internal map (zero if absent),
+    /// runs one recurrence step, writes the updated state back.
+    ///
+    /// `xs`: `[B, 1, hidden_size]` — one token per sequence (L=1).
+    /// Returns `[B, 1, hidden_size]`.
+    fn forward_decode_batch(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+    ) -> Result<Tensor> {
+        // xs: [B, 1, hidden_size]
+        let batch = sequences.len();
+        let dev = xs.device();
+
+        let (q, k, v) = self.qkv_split(xs)?;
+        // q/k/v: [B, 1, H, D] — squeeze the L=1 dim
+        let q = q.squeeze(1)?; // [B, H, D]
+        let k = k.squeeze(1)?;
+        let v = v.squeeze(1)?;
+
+        let decay = self.decay_tensor(dev)?; // [1, H, 1, 1]
+
+        // Gather per-sequence states: each [H, D, D]
+        let per_seq_states: Vec<Tensor> = {
+            let guard = self.states.lock().unwrap();
+            sequences
+                .iter()
+                .map(|seq| -> Result<Tensor> {
+                    match guard.get(&seq.request_id) {
+                        Some(t) => t.to_device(dev),
+                        None => Tensor::zeros(
+                            (self.num_heads, self.head_dim, self.head_dim),
+                            DType::F32,
+                            dev,
+                        ),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
         };
 
-        // Linear attention: simplified Q @ K^T @ V / sqrt(d) (no softmax on Q*K^T)
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        // Stack states: [B, H, D, D]
+        let state_batch = Tensor::stack(&per_seq_states, 0)?;
 
-        // Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        // kv outer product: k[B,H,D,1] × v[B,H,1,D] → [B, H, D, D]
+        let kv = k.unsqueeze(3)?.broadcast_mul(&v.unsqueeze(2)?)?;
 
-        self.o_proj.forward(&attn_output)
+        // State update: [B, H, D, D]
+        let new_state = (state_batch.broadcast_mul(&decay)? + kv)?;
+
+        // Output: q[B, H, 1, D] @ state[B, H, D, D] → [B, H, 1, D] → [B, H, D]
+        let out = q.unsqueeze(2)?.matmul(&new_state)?.squeeze(2)?;
+
+        // Persist updated states.
+        {
+            let mut guard = self.states.lock().unwrap();
+            for (i, seq) in sequences.iter().enumerate() {
+                let s = new_state.narrow(0, i, 1)?.squeeze(0)?;
+                guard.insert(seq.request_id, s);
+            }
+        }
+
+        // Reshape: [B, H, D] → [B, H*D] → [B, 1, H*D] for gate projection
+        let hidden = out.reshape((batch, self.hidden_inner_size))?.unsqueeze(1)?; // [B, 1, H*D]
+
+        // apply_gate_and_project expects xs: [B, 1, hidden_size]
+        self.apply_gate_and_project(xs, hidden)
+        // Returns [B, 1, hidden_size]
+    }
+
+    /// Free the stored state for a completed sequence.
+    #[allow(dead_code)]
+    fn free_state(&self, request_id: u64) {
+        self.states.lock().unwrap().remove(&request_id);
+    }
+
+    /// Number of sequences with live state (test helper).
+    #[cfg(test)]
+    fn state_count(&self) -> usize {
+        self.states.lock().unwrap().len()
     }
 }
 
@@ -722,6 +904,8 @@ impl MiniMaxText01DecoderLayer {
         minimax_cfg: &MiniMaxText01Config,
         layer_idx: usize,
         cache_layer_idx: Option<usize>,
+        num_linear_layers: usize,
+        linear_layer_idx: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
         let is_linear = minimax_cfg.is_linear_attention(layer_idx);
@@ -730,8 +914,9 @@ impl MiniMaxText01DecoderLayer {
             AttentionVariant::Linear(MiniMaxText01LinearAttention::new(
                 cfg.hidden_size,
                 cfg.num_attention_heads,
-                cfg.num_key_value_heads,
                 cfg.head_dim,
+                num_linear_layers,
+                linear_layer_idx,
                 vb.pp("self_attn"),
             )?)
         } else {
@@ -809,7 +994,7 @@ impl MiniMaxText01DecoderLayer {
         };
 
         let attn_output = match &self.self_attn {
-            AttentionVariant::Linear(lin_attn) => lin_attn.forward(&layernorm_output)?,
+            AttentionVariant::Linear(lin_attn) => lin_attn.forward_prefill(&layernorm_output)?,
             AttentionVariant::Full(attn) => {
                 let cache_idx = self
                     .cache_layer_idx
@@ -865,7 +1050,9 @@ impl MiniMaxText01DecoderLayer {
         };
 
         let attn_output = match &self.self_attn {
-            AttentionVariant::Linear(lin_attn) => lin_attn.forward(&layernorm_output)?,
+            AttentionVariant::Linear(lin_attn) => {
+                lin_attn.forward_decode_batch(&layernorm_output, sequences)?
+            }
             AttentionVariant::Full(attn) => {
                 let cache_idx = self
                     .cache_layer_idx
@@ -955,17 +1142,28 @@ impl MiniMaxText01ForCausalLM {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_model.pp("embed_tokens"))?;
 
+        // Pre-count linear attention layers for slope rate scaling.
+        let num_linear_layers = minimax_cfg
+            .decoder_attention_types
+            .iter()
+            .filter(|&&t| t == 0)
+            .count()
+            .max(1);
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb_model.pp("layers");
         let mut attn_layer_count = 0;
+        let mut linear_layer_count = 0;
 
         for i in 0..cfg.num_hidden_layers {
-            let cache_layer_idx = if !minimax_cfg.is_linear_attention(i) {
+            let (cache_layer_idx, linear_layer_idx) = if minimax_cfg.is_linear_attention(i) {
+                let idx = linear_layer_count;
+                linear_layer_count += 1;
+                (None, idx)
+            } else {
                 let idx = attn_layer_count;
                 attn_layer_count += 1;
-                Some(idx)
-            } else {
-                None
+                (Some(idx), 0)
             };
 
             layers.push(MiniMaxText01DecoderLayer::new(
@@ -973,6 +1171,8 @@ impl MiniMaxText01ForCausalLM {
                 &minimax_cfg,
                 i,
                 cache_layer_idx,
+                num_linear_layers,
+                linear_layer_idx,
                 vb_layers.pp(i),
             )?);
         }
@@ -1275,15 +1475,89 @@ mod tests {
     // ─── Linear Attention Tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_linear_attention_forward() {
+    fn test_linear_attention_prefill() {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
 
-        let attn = MiniMaxText01LinearAttention::new(64, 4, 2, 16, vb.pp("attn")).expect("attn");
+        // hidden_size=64, num_heads=4, head_dim=16, 2 linear layers, this is layer 0
+        let attn = MiniMaxText01LinearAttention::new(64, 4, 16, 2, 0, vb.pp("attn")).expect("attn");
         let input = Tensor::zeros((1, 3, 64), DType::F32, &device).expect("input");
-        let output = attn.forward(&input);
-        assert!(output.is_ok(), "linear attn forward: {:?}", output.err());
+        let output = attn.forward_prefill(&input);
+        assert!(output.is_ok(), "linear attn prefill: {:?}", output.err());
         assert_eq!(output.unwrap().dims(), &[1, 3, 64]);
+    }
+
+    #[test]
+    fn test_linear_attention_decode_batch() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let attn = MiniMaxText01LinearAttention::new(64, 4, 16, 2, 0, vb.pp("attn")).expect("attn");
+        // Simulate 2 decode sequences, xs: [2, 1, hidden_size]
+        let input = Tensor::zeros((2, 1, 64), DType::F32, &device).expect("input");
+        let sequences = vec![
+            DecodeSequenceMetadata {
+                request_id: 1,
+                seqlen_offset: 10,
+                block_ids: vec![],
+                slot_mapping: vec![],
+            },
+            DecodeSequenceMetadata {
+                request_id: 2,
+                seqlen_offset: 5,
+                block_ids: vec![],
+                slot_mapping: vec![],
+            },
+        ];
+        let output = attn.forward_decode_batch(&input, &sequences);
+        assert!(output.is_ok(), "linear attn decode: {:?}", output.err());
+        assert_eq!(output.unwrap().dims(), &[2, 1, 64]);
+    }
+
+    #[test]
+    fn test_linear_attention_state_update() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let attn = MiniMaxText01LinearAttention::new(64, 4, 16, 1, 0, vb.pp("attn")).expect("attn");
+        let input = Tensor::zeros((1, 1, 64), DType::F32, &device).expect("input");
+        let seq = vec![DecodeSequenceMetadata {
+            request_id: 42,
+            seqlen_offset: 0,
+            block_ids: vec![],
+            slot_mapping: vec![],
+        }];
+
+        // Before any decode, no state stored.
+        assert_eq!(attn.state_count(), 0);
+
+        // First decode step allocates state for request 42.
+        let out1 = attn.forward_decode_batch(&input, &seq).expect("step1");
+        assert_eq!(out1.dims(), &[1, 1, 64]);
+        assert_eq!(
+            attn.state_count(),
+            1,
+            "state should be stored after first decode"
+        );
+
+        // Second decode step reuses the stored state.
+        let out2 = attn.forward_decode_batch(&input, &seq).expect("step2");
+        assert_eq!(out2.dims(), &[1, 1, 64]);
+        assert_eq!(
+            attn.state_count(),
+            1,
+            "still one state entry after second decode"
+        );
+
+        // free_state removes the entry.
+        attn.free_state(42);
+        assert_eq!(attn.state_count(), 0, "state should be gone after free");
+
+        // Third step starts from zero state again — same shape, no error.
+        let out3 = attn.forward_decode_batch(&input, &seq).expect("step3");
+        assert_eq!(out3.dims(), &[1, 1, 64]);
+        assert_eq!(attn.state_count(), 1, "new state entry after step3");
+        let _ = (out1, out2, out3);
     }
 
     // ─── MoE Tests ──────────────────────────────────────────────────────────────
