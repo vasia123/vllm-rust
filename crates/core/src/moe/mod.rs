@@ -20,6 +20,7 @@
 
 mod ep_layer;
 mod eplb;
+pub mod eplb_execute;
 mod expert_layer;
 mod expert_map;
 pub mod fused;
@@ -31,6 +32,7 @@ pub mod topk_softmax;
 
 pub use ep_layer::{EPMoEConfig, EPMoELayer};
 pub use eplb::{EplbConfig, EplbState, ExpertLoadStats};
+pub use eplb_execute::{rearrange_expert_weights_inplace, LayerExpertPlacement};
 pub use expert_layer::{
     MoEExpert, MoEExpertConfig, MoELayer, MoELayerConfig, MoELayerWithShared,
     MoELayerWithSharedConfig,

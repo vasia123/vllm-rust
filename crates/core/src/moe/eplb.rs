@@ -9,9 +9,8 @@
 //! ## Current Scope
 //!
 //! This module implements load tracking and rebalance detection. The actual weight
-//! migration (`rearrange_expert_weights_inplace`) is **not yet implemented** — it
-//! requires NCCL all-to-all transfers of model weight tensors, which depends on a
-//! weight-streaming infrastructure not yet available.
+//! migration is implemented in [`super::eplb_execute::rearrange_expert_weights_inplace`]
+//! and uses `all_to_all_v` on the EP group communicator.
 //!
 //! ## Reference
 //!
@@ -222,7 +221,6 @@ impl EplbState {
     /// Calling this does NOT trigger any weight migration. The actual rebalancing
     /// must be performed externally once this method returns `true`.
     ///
-    /// TODO: Implement `rearrange_weights()` once NCCL weight-streaming is available.
     pub fn should_rebalance(&self) -> bool {
         let interval = self.config.rebalance_interval;
         if interval == 0 {
