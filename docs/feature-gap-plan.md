@@ -58,7 +58,7 @@ Requires multi-GPU testing.
 | Item | What's Needed | Where | Effort |
 |------|--------------|-------|--------|
 | 5.1 | Linear / Lightning Attention | flashinfer-rs: GDN recurrence kernel; vllm-rust: `attention/linear.rs` backend | 40–80h |
-| 5.2 | Mamba SSD GPU | flashinfer-rs: parallel scan + chunk carry kernel; vllm-rust: wire in `ssm/ssd.rs` | 30–50h |
+| 5.2 ✅ | Mamba SSD GPU | `ssd_scan_f32` PTX kernel (sm_75+); Grid (B×H,1,1) × Block (P,1,1); shared b/c load per timestep; `ssd_forward()` dispatch; 3 CUDA tests + 6 CPU tests | `20ea1b9` |
 | 5.3 | DeepGEMM (grouped GEMM for MoE) | flashinfer-rs or new crate: variable-M grouped GEMM; vllm-rust: wire in `moe/` | 20–40h |
 
 ---
