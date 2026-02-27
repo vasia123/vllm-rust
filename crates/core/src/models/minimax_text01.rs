@@ -45,7 +45,7 @@ use crate::layers::{paged_attention, RotaryEmbedding};
 // ─── Config ─────────────────────────────────────────────────────────────────
 
 /// Parsed per-layer config from the HuggingFace MiniMax config.
-struct MiniMaxText01Config {
+pub(crate) struct MiniMaxText01Config {
     /// Per-layer attention type: 0 = linear, 1 = full attention
     decoder_attention_types: Vec<u8>,
     /// Per-layer number of experts (1 = dense MLP)
@@ -69,7 +69,7 @@ struct MiniMaxText01Config {
 }
 
 impl MiniMaxText01Config {
-    fn from_model_config(cfg: &ModelConfig) -> Self {
+    pub(crate) fn from_model_config(cfg: &ModelConfig) -> Self {
         let num_layers = cfg.num_hidden_layers;
 
         // Parse attention type list
@@ -250,7 +250,7 @@ impl MiniMaxText01Config {
         vec![0; num_layers]
     }
 
-    fn attn_alpha(&self, layer_idx: usize) -> f64 {
+    pub(crate) fn attn_alpha(&self, layer_idx: usize) -> f64 {
         if self.decoder_attention_types[layer_idx] == 0 {
             self.linear_attn_alpha
         } else {
@@ -258,7 +258,7 @@ impl MiniMaxText01Config {
         }
     }
 
-    fn attn_beta(&self, layer_idx: usize) -> f64 {
+    pub(crate) fn attn_beta(&self, layer_idx: usize) -> f64 {
         if self.decoder_attention_types[layer_idx] == 0 {
             self.linear_attn_beta
         } else {
@@ -266,7 +266,7 @@ impl MiniMaxText01Config {
         }
     }
 
-    fn is_linear_attention(&self, layer_idx: usize) -> bool {
+    pub(crate) fn is_linear_attention(&self, layer_idx: usize) -> bool {
         self.decoder_attention_types
             .get(layer_idx)
             .copied()
@@ -274,15 +274,24 @@ impl MiniMaxText01Config {
             == 0
     }
 
-    fn expert_count(&self, layer_idx: usize) -> usize {
+    pub(crate) fn expert_count(&self, layer_idx: usize) -> usize {
         self.num_local_experts.get(layer_idx).copied().unwrap_or(1)
     }
 
-    fn shared_intermediate(&self, layer_idx: usize) -> usize {
+    pub(crate) fn shared_intermediate(&self, layer_idx: usize) -> usize {
         self.shared_intermediate_sizes
             .get(layer_idx)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Count the number of linear-attention layers (used for slope-rate scaling).
+    pub(crate) fn num_linear_layers(&self) -> usize {
+        self.decoder_attention_types
+            .iter()
+            .filter(|&&t| t == 0)
+            .count()
+            .max(1)
     }
 
     #[cfg(test)]
@@ -883,7 +892,7 @@ struct SharedExpert {
 
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
-struct MiniMaxText01DecoderLayer {
+pub(crate) struct MiniMaxText01DecoderLayer {
     self_attn: AttentionVariant,
     ffn: FfnVariant,
     shared_expert: Option<SharedExpert>,
@@ -899,7 +908,7 @@ struct MiniMaxText01DecoderLayer {
 }
 
 impl MiniMaxText01DecoderLayer {
-    fn new(
+    pub(crate) fn new(
         cfg: &ModelConfig,
         minimax_cfg: &MiniMaxText01Config,
         layer_idx: usize,
@@ -977,7 +986,7 @@ impl MiniMaxText01DecoderLayer {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
@@ -1036,7 +1045,7 @@ impl MiniMaxText01DecoderLayer {
         residual + ffn_output
     }
 
-    fn forward_decode_batch(
+    pub(crate) fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],

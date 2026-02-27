@@ -24,18 +24,21 @@ is now wired end-to-end.
 
 ---
 
-## Phase 2: MiniMax-VL-01 (~2–4 weeks)
+## Phase 2: MiniMax-VL-01 — DONE
 
-Lightning Attention backend (§5.1, commit `1fa3229`) is complete. Remaining gap is the vision side.
+Vision encoder wiring implemented. All items complete:
 
-| Item | What's Missing | Fix | Effort |
-|------|---------------|-----|--------|
-| 2.1 | MiniMax-VL-01 vision encoder | Image patch projection → `MiniMaxText01ForCausalLM`; multimodal input routing; `MultimodalProcessor` registration | 20–40h |
+| Item | Status |
+|------|--------|
+| 2.1 | ✅ `MiniMaxVL01ForConditionalGeneration` in `crates/core/src/models/minimax_vl_01.rs` |
 
-**Key files:**
-- `crates/core/src/models/minimax_text01.rs` — text model to extend with vision input path
-- `reference/vllm/vllm/model_executor/models/minimax_vl.py` — reference implementation
-- `crates/core/src/multimodal/` — existing VLM pipeline to reuse
+CLIP/SigLIP vision tower → 2-layer MLP projector → `image_newline` append → MiniMaxText01 backbone.
+`MiniMaxText01Config` and `MiniMaxText01DecoderLayer` promoted to `pub(crate)` and reused directly
+so multimodal embeddings can be injected before the forward pass without wrapping the text model.
+
+**AnyRes note**: the single-image path (project all patches + append `image_newline`) is complete.
+Multi-resolution AnyRes packing (`pack_image_features` with sub-image grid reshaping) is deferred
+until the preprocessor pipeline surfaces `image_sizes` through `MultimodalInputs`.
 
 ---
 
@@ -55,7 +58,7 @@ Lightning Attention backend (§5.1, commit `1fa3229`) is complete. Remaining gap
 
 ```
 Phase 1 (TP > 1)     — DONE
-Phase 2 (MiniMax-VL) — independent; Lightning Attention already unblocks it
+Phase 2 (MiniMax-VL) — DONE
 Phase 3 (deferred)   — no dependencies; implement opportunistically
 ```
 
@@ -64,6 +67,6 @@ Phase 3 (deferred)   — no dependencies; implement opportunistically
 | Phase | Area | Effort |
 |-------|------|--------|
 | 1 | Tensor Parallelism runtime | ✅ DONE |
-| 2 | MiniMax-VL-01 vision wiring | 2–4 weeks |
+| 2 | MiniMax-VL-01 vision wiring | ✅ DONE |
 | 3 | Low priority / deferred | indefinite |
-| **Total** | | **~2–4 weeks** |
+| **Total** | | **✅ All actionable phases complete** |

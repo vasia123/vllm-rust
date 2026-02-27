@@ -150,6 +150,7 @@ pub mod minicpmo;
 pub mod minicpmv;
 pub mod minimax_m2;
 pub mod minimax_text01;
+pub mod minimax_vl_01;
 pub mod mistral;
 pub mod mistral3;
 pub mod mistral_lora;
@@ -402,6 +403,7 @@ pub use minicpmo::MiniCPMOForCausalLM;
 pub use minicpmv::MiniCPMVForConditionalGeneration;
 pub use minimax_m2::MiniMaxM2ForCausalLM;
 pub use minimax_text01::MiniMaxText01ForCausalLM;
+pub use minimax_vl_01::MiniMaxVL01ForConditionalGeneration;
 pub use mistral::MistralForCausalLM;
 pub use mistral3::Mistral3ForConditionalGeneration;
 pub use mistral_lora::MistralWithLora;
@@ -807,6 +809,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Qwen2ForProcessRewardModel" => Ok(Box::new(Qwen2ForProcessRewardModel::new(cfg, vb)?)),
         "MiniMaxForCausalLM" | "MiniMaxText01ForCausalLM" | "MiniMaxM1ForCausalLM" => {
             Ok(Box::new(MiniMaxText01ForCausalLM::new(cfg, vb)?))
+        }
+        "MiniMaxVL01ForConditionalGeneration" => {
+            Ok(Box::new(MiniMaxVL01ForConditionalGeneration::new(cfg, vb)?))
         }
         "MiniMaxM2ForCausalLM" => Ok(Box::new(MiniMaxM2ForCausalLM::new(cfg, vb)?)),
         "ApertusForCausalLM" => Ok(Box::new(ApertusForCausalLM::new(cfg, vb)?)),
