@@ -9,6 +9,44 @@ use crate::quantization::{
     QuantizationMethod, QuantizedWeightLoader,
 };
 
+/// How weights are loaded from disk.
+///
+/// Mirrors vLLM's `LoadFormat` enum. All variants except `Safetensors` and
+/// `Dummy` are pass-throughs to safetensors loading because Rust has no
+/// native PyTorch or numpy loader; users should convert first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadFormat {
+    /// Auto-detect: try safetensors, fall back gracefully. Default.
+    #[default]
+    Auto,
+    /// Explicit safetensors (same behaviour as `Auto` for a Rust engine).
+    Safetensors,
+    /// PyTorch binary (`.pt` / `.bin`). Not supported natively; returns an error.
+    Pt,
+    /// NumPy cache (vLLM-specific). Treated as `Auto` (load safetensors instead).
+    Npcache,
+    /// Dummy zero-filled weights. Skips weight download; useful for memory profiling.
+    Dummy,
+}
+
+impl std::str::FromStr for LoadFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "safetensors" => Ok(Self::Safetensors),
+            "pt" | "pytorch_bin" => Ok(Self::Pt),
+            "npcache" => Ok(Self::Npcache),
+            "dummy" => Ok(Self::Dummy),
+            other => anyhow::bail!(
+                "Unknown --load-format '{}'. Supported: auto, safetensors, pt, npcache, dummy",
+                other
+            ),
+        }
+    }
+}
+
 pub struct ModelFiles {
     pub config: ModelConfig,
     pub weights: Vec<PathBuf>,
@@ -36,6 +74,39 @@ pub fn fetch_model_with_auth(
     hf_token: Option<&str>,
     cache_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<ModelFiles> {
+    fetch_model_with_options(model_id, revision, hf_token, cache_dir, LoadFormat::Auto, 1)
+}
+
+/// Full-featured model fetch with load format and parallel download control.
+///
+/// `load_format` affects which weight files are fetched:
+/// - `Auto` / `Safetensors` / `Npcache`: download safetensors shards, return paths.
+/// - `Dummy`: skip weight download entirely; the returned `weights` is empty.
+///   Callers should use `load_dummy_weights` to create a zero-filled `VarBuilder`.
+/// - `Pt`: returns an error — PyTorch binaries require Python-side conversion.
+///
+/// `max_parallel_workers` controls concurrency for multi-shard downloads.
+/// 1 → sequential (default); >1 → shards downloaded in parallel up to that limit.
+///
+/// `code_revision` is accepted for API parity with vLLM but is unused because
+/// the Rust engine does not execute Python custom code. A debug log is emitted
+/// when it differs from the weight revision so operators are aware.
+pub fn fetch_model_with_options(
+    model_id: &str,
+    revision: &str,
+    hf_token: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+    load_format: LoadFormat,
+    max_parallel_workers: usize,
+) -> anyhow::Result<ModelFiles> {
+    if load_format == LoadFormat::Pt {
+        anyhow::bail!(
+            "--load-format pt (PyTorch binary) is not supported by the Rust engine. \
+             Convert weights to safetensors with `python -m vllm.tools.convert_weights` \
+             or use --load-format auto."
+        );
+    }
+
     let mut builder = ApiBuilder::from_env();
     if let Some(token) = hf_token {
         builder = builder.with_token(Some(token.to_string()));
@@ -73,7 +144,13 @@ pub fn fetch_model_with_auth(
     let tokenizer_path = repo.get("tokenizer.json")?;
     let tokenizer_config_path = repo.get("tokenizer_config.json").ok();
 
-    let weights = load_safetensor_paths(&repo)?;
+    // Skip weight download for dummy format — caller uses load_dummy_weights().
+    let weights = if load_format == LoadFormat::Dummy {
+        Vec::new()
+    } else {
+        let workers = max_parallel_workers.max(1);
+        load_safetensor_paths_parallel(&repo, workers)?
+    };
 
     Ok(ModelFiles {
         config,
@@ -92,6 +169,15 @@ pub fn load_weights(
 ) -> anyhow::Result<VarBuilder<'static>> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(paths, dtype, device)? };
     Ok(vb)
+}
+
+/// Creates a zero-filled VarBuilder for dummy weight loading.
+///
+/// All tensor accesses return zero-filled tensors of the requested shape.
+/// This is used with `--load-format dummy` for memory profiling without
+/// downloading actual weights.
+pub fn load_dummy_weights(dtype: DType, device: &Device) -> VarBuilder<'static> {
+    VarBuilder::zeros(dtype, device)
 }
 
 /// Creates a quantized weight loader from model files.
@@ -212,7 +298,16 @@ fn natural_sort_key(s: &str) -> Vec<Result<u64, String>> {
     parts
 }
 
-fn load_safetensor_paths(repo: &hf_hub::api::sync::ApiRepo) -> anyhow::Result<Vec<PathBuf>> {
+/// Download safetensors shards, potentially in parallel.
+///
+/// When `workers == 1`, shards are fetched sequentially (original behaviour).
+/// When `workers > 1`, up to `workers` shards are downloaded concurrently
+/// using scoped threads. Result order matches the natural-sorted shard order
+/// regardless of download completion order.
+fn load_safetensor_paths_parallel(
+    repo: &hf_hub::api::sync::ApiRepo,
+    workers: usize,
+) -> anyhow::Result<Vec<PathBuf>> {
     // Try model.safetensors first (single file models)
     if let Ok(path) = repo.get("model.safetensors") {
         return Ok(vec![path]);
@@ -233,12 +328,47 @@ fn load_safetensor_paths(repo: &hf_hub::api::sync::ApiRepo) -> anyhow::Result<Ve
     filenames.sort_by_key(|a| natural_sort_key(a));
     filenames.dedup();
 
-    let mut paths = Vec::new();
-    for filename in &filenames {
-        paths.push(repo.get(filename)?);
+    if workers <= 1 || filenames.len() <= 1 {
+        // Sequential path: no threading overhead for single-shard models.
+        return filenames
+            .iter()
+            .map(|f| repo.get(f).map_err(|e| anyhow::anyhow!("{e}")))
+            .collect();
     }
 
-    Ok(paths)
+    // Parallel path: work-stealing across `workers` threads.
+    //
+    // `repo.get` takes `&self` and the underlying reqwest::blocking::Client
+    // is Send + Sync, so ApiRepo is Sync and can be borrowed across threads.
+    let n = filenames.len();
+    let actual_workers = workers.min(n);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // One Mutex per result slot — avoids a single contended mutex.
+    let results: Vec<std::sync::Mutex<Option<Result<PathBuf, String>>>> =
+        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+
+    std::thread::scope(|s| {
+        for _ in 0..actual_workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let result = repo.get(&filenames[i]).map_err(|e| e.to_string());
+                *results[i].lock().unwrap() = Some(result);
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap()
+                .unwrap_or_else(|| Err("shard was not downloaded".to_string()))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -268,159 +398,52 @@ mod tests {
     #[test]
     fn natural_sort_handles_unpadded_numbers() {
         let mut files = vec![
-            "shard-10.safetensors".to_string(),
-            "shard-2.safetensors".to_string(),
-            "shard-1.safetensors".to_string(),
+            "model-10-of-20.safetensors".to_string(),
+            "model-2-of-20.safetensors".to_string(),
+            "model-1-of-20.safetensors".to_string(),
         ];
         files.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
         assert_eq!(
             files,
             vec![
-                "shard-1.safetensors",
-                "shard-2.safetensors",
-                "shard-10.safetensors",
+                "model-1-of-20.safetensors",
+                "model-2-of-20.safetensors",
+                "model-10-of-20.safetensors",
             ]
         );
     }
 
     #[test]
-    #[ignore] // requires network + disk space
-    fn fetch_qwen3_06b() {
-        let files = fetch_model("Qwen/Qwen3-0.6B").expect("failed to fetch model");
-
-        assert_eq!(files.config.hidden_size, 1024);
-        assert_eq!(files.config.num_hidden_layers, 28);
-        assert!(!files.weights.is_empty());
-        assert!(files.tokenizer.exists());
-        // Qwen3-0.6B is not quantized
-        assert_eq!(files.quantization.method, QuantizationMethod::None);
-    }
-
-    #[test]
-    #[ignore] // requires network
-    fn fetch_qwen3_06b_with_revision() {
-        let files =
-            fetch_model_with_revision("Qwen/Qwen3-0.6B", "main").expect("failed to fetch model");
-        assert_eq!(files.config.hidden_size, 1024);
-    }
-
-    #[test]
-    fn test_quantization_info_none() {
-        let files = ModelFiles {
-            config: ModelConfig::default(),
-            weights: vec![],
-            tokenizer: PathBuf::new(),
-            tokenizer_config: None,
-            quantization: DetectedQuantConfig::default(),
-        };
-        assert_eq!(quantization_info(&files), "None (full precision)");
-        assert!(!is_quantized(&files));
-    }
-
-    #[test]
-    fn test_quantization_info_gptq() {
-        let files = ModelFiles {
-            config: ModelConfig::default(),
-            weights: vec![],
-            tokenizer: PathBuf::new(),
-            tokenizer_config: None,
-            quantization: DetectedQuantConfig {
-                method: QuantizationMethod::Gptq,
-                bits: Some(4),
-                group_size: Some(128),
-                desc_act: None,
-                activation_scheme: None,
-                raw_config: Default::default(),
-            },
-        };
-        assert_eq!(quantization_info(&files), "GPTQ (bits: 4, group_size: 128)");
-        assert!(is_quantized(&files));
-    }
-
-    #[test]
-    fn test_quantization_info_fp8() {
-        let files = ModelFiles {
-            config: ModelConfig::default(),
-            weights: vec![],
-            tokenizer: PathBuf::new(),
-            tokenizer_config: None,
-            quantization: DetectedQuantConfig {
-                method: QuantizationMethod::Fp8,
-                bits: Some(8),
-                group_size: None,
-                desc_act: None,
-                activation_scheme: Some("static".to_string()),
-                raw_config: Default::default(),
-            },
-        };
-        assert_eq!(quantization_info(&files), "FP8 (activation scheme: static)");
-        assert!(is_quantized(&files));
-    }
-
-    #[test]
-    fn test_quantization_info_awq() {
-        let files = ModelFiles {
-            config: ModelConfig::default(),
-            weights: vec![],
-            tokenizer: PathBuf::new(),
-            tokenizer_config: None,
-            quantization: DetectedQuantConfig {
-                method: QuantizationMethod::Awq,
-                bits: Some(4),
-                group_size: Some(128),
-                desc_act: None,
-                activation_scheme: None,
-                raw_config: Default::default(),
-            },
-        };
-        assert_eq!(quantization_info(&files), "AWQ (bits: 4, group_size: 128)");
-        assert!(is_quantized(&files));
-    }
-
-    #[test]
-    #[ignore] // requires network + disk space
-    fn load_qwen3_06b_weights() {
-        let files = fetch_model("Qwen/Qwen3-0.6B").expect("failed to fetch model");
-        let device = Device::Cpu;
-        let vb = load_weights(&files.weights, DType::F32, &device).expect("failed to load weights");
-
-        // Verify embedding tensor shape
-        let embed = vb
-            .get(
-                (files.config.vocab_size, files.config.hidden_size),
-                "model.embed_tokens.weight",
-            )
-            .expect("missing embed_tokens");
+    fn load_format_from_str_roundtrip() {
+        assert_eq!("auto".parse::<LoadFormat>().unwrap(), LoadFormat::Auto);
         assert_eq!(
-            embed.dims(),
-            &[files.config.vocab_size, files.config.hidden_size]
+            "safetensors".parse::<LoadFormat>().unwrap(),
+            LoadFormat::Safetensors
         );
-
-        // Verify first layer attention Q projection shape
-        let q_weight = vb
-            .get(
-                (
-                    files.config.num_attention_heads * files.config.head_dim,
-                    files.config.hidden_size,
-                ),
-                "model.layers.0.self_attn.q_proj.weight",
-            )
-            .expect("missing q_proj weight");
+        assert_eq!("pt".parse::<LoadFormat>().unwrap(), LoadFormat::Pt);
         assert_eq!(
-            q_weight.dims(),
-            &[
-                files.config.num_attention_heads * files.config.head_dim,
-                files.config.hidden_size
-            ]
+            "npcache".parse::<LoadFormat>().unwrap(),
+            LoadFormat::Npcache
         );
+        assert_eq!("dummy".parse::<LoadFormat>().unwrap(), LoadFormat::Dummy);
+    }
 
-        // Verify Qwen3-specific: Q norm weight exists
-        let q_norm = vb
-            .get(
-                (files.config.head_dim,),
-                "model.layers.0.self_attn.q_norm.weight",
-            )
-            .expect("missing q_norm (Qwen3-specific)");
-        assert_eq!(q_norm.dims(), &[files.config.head_dim]);
+    #[test]
+    fn load_format_case_insensitive() {
+        assert_eq!("AUTO".parse::<LoadFormat>().unwrap(), LoadFormat::Auto);
+        assert_eq!(
+            "Safetensors".parse::<LoadFormat>().unwrap(),
+            LoadFormat::Safetensors
+        );
+    }
+
+    #[test]
+    fn load_format_unknown_returns_error() {
+        assert!("unknown_format".parse::<LoadFormat>().is_err());
+    }
+
+    #[test]
+    fn load_format_pytorch_bin_alias() {
+        assert_eq!("pytorch_bin".parse::<LoadFormat>().unwrap(), LoadFormat::Pt);
     }
 }

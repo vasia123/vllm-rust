@@ -1167,9 +1167,42 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     }
 
     let _ = &kv_cache_dtype; // Used below in CacheConfig
-    let _ = &load_format; // Used below in model loading
-    let _ = &tokenizer_mode; // Validated below
     let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension (Phase 2.1)
+
+    // ── 1.4: Load format validation ─────────────────────────────────────────
+    let parsed_load_format: loader::LoadFormat = load_format.parse()?;
+
+    // "slow" tokenizer mode forces the Hugging Face Python tokenizer, which does not
+    // exist in Rust. The fast tokenizer (backed by the Rust tokenizers crate) is always
+    // used. Warn and continue rather than abort so existing scripts that pass --tokenizer-mode
+    // are not broken unnecessarily.
+    if tokenizer_mode == "slow" {
+        tracing::warn!(
+            "--tokenizer-mode slow is not supported by the Rust engine; \
+             the fast tokenizer will be used instead"
+        );
+    } else if tokenizer_mode != "auto" {
+        anyhow::bail!(
+            "Unknown --tokenizer-mode '{}'. Supported: auto, slow",
+            tokenizer_mode
+        );
+    }
+
+    // ── 1.5: code_revision ──────────────────────────────────────────────────
+    // In vLLM Python, code_revision fetches custom model Python code (modeling.py)
+    // at a different revision than the weights. The Rust engine does not execute
+    // Python code, so this field is informational only. Log when it differs from
+    // the weight revision so operators are aware of the discrepancy.
+    if let Some(ref cr) = code_revision {
+        if cr != &revision {
+            tracing::debug!(
+                code_revision = %cr,
+                weight_revision = %revision,
+                "code_revision differs from weight revision; \
+                 custom Python code is not executed in the Rust engine"
+            );
+        }
+    }
 
     // Parse --limit-mm-per-prompt JSON ("{"image": 5, "video": 1}") into per-modality limits.
     let mm_limits: std::collections::HashMap<String, usize> =
@@ -1197,8 +1230,14 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     eprintln!("Loading model: {model_id}");
     let cache_dir = download_dir.as_deref().map(std::path::Path::new);
-    let files =
-        loader::fetch_model_with_auth(&model_id, &revision, hf_token.as_deref(), cache_dir)?;
+    let files = loader::fetch_model_with_options(
+        &model_id,
+        &revision,
+        hf_token.as_deref(),
+        cache_dir,
+        parsed_load_format,
+        max_parallel_loading_workers,
+    )?;
 
     let device = Device::new_cuda(0)?;
     let dtype_label = match dtype {
@@ -1216,7 +1255,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     };
 
     eprintln!("Loading weights to GPU ({dtype_label})...");
-    let vb = loader::load_weights(&files.weights, dtype, &device)?;
+    let vb = if parsed_load_format == loader::LoadFormat::Dummy {
+        tracing::info!("Using dummy zero-filled weights (--load-format dummy)");
+        loader::load_dummy_weights(dtype, &device)
+    } else {
+        loader::load_weights(&files.weights, dtype, &device)?
+    };
 
     // Validate max_cpu_loras against the number of startup adapters.
     // Dynamic LoRA loading with an LRU cache is not yet implemented; this
