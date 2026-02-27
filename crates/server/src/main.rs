@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 use vllm_core::{
     engine::{
         spec_decode::MLPSpeculatorDraftProposer, start_engine, start_engine_with_draft,
-        start_engine_with_proposer, AcceptanceMethod, EngineConfig, GenerationRequest, NGramConfig,
-        NGramProposer, SpeculativeConfig,
+        start_engine_with_proposer, AcceptanceMethod, CudaGraphConfig, EngineConfig,
+        GenerationRequest, NGramConfig, NGramProposer, RuntimeMode, SpeculativeConfig,
     },
     kv_cache::{config::CacheConfig, KVCacheDtype, KVCacheManager},
     loader,
@@ -1121,17 +1121,55 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eprintln!("Using random seed: {seed}");
     }
 
-    // Acknowledge new args (wire as features are implemented)
+    // ── 1.1: CUDA graph configuration ───────────────────────────────────────
+    // enforce_eager=true disables CUDA graphs (eager execution for every forward pass).
+    // max_seq_len_to_capture caps the batch sizes pre-captured during warmup; batches
+    // exceeding this threshold fall back to eager execution.
+    let cuda_graph_config = if enforce_eager {
+        CudaGraphConfig::default() // enabled: false — pure eager execution
+    } else {
+        CudaGraphConfig {
+            enabled: true,
+            mode: RuntimeMode::Full,
+            // Capture decode batches from 1 up to max_seq_len_to_capture tokens.
+            max_capture_size: max_seq_len_to_capture,
+            ..CudaGraphConfig::default()
+        }
+    };
+    if enforce_eager {
+        tracing::info!("CUDA graphs disabled (--enforce-eager)");
+    } else {
+        tracing::info!(
+            max_capture_size = max_seq_len_to_capture,
+            "CUDA graph capture enabled"
+        );
+    }
+
+    // ── 1.2: Guided decoding backend ────────────────────────────────────────
+    // All vLLM-compatible backends ("outlines", "lm-format-enforcer", "xgrammar")
+    // map to our internal DFA-based grammar compiler. The backend name is validated
+    // here so unknown values surface an error at startup rather than silently
+    // producing unconstrained output.
+    match guided_decoding_backend.as_str() {
+        "outlines" | "lm-format-enforcer" | "xgrammar" => {
+            tracing::debug!(
+                backend = %guided_decoding_backend,
+                "guided decoding: using internal DFA grammar compiler"
+            );
+        }
+        other => anyhow::bail!(
+            "Unknown --guided-decoding-backend '{}'. \
+             Supported: outlines, lm-format-enforcer, xgrammar",
+            other
+        ),
+    }
+
     let _ = &kv_cache_dtype; // Used below in CacheConfig
-    let _ = enforce_eager; // TODO: wire to CUDA graph control
-    let _ = &load_format; // TODO: wire to weight loading strategy
-    let _ = &tokenizer_mode; // TODO: wire to tokenizer selection
-    let _ = &code_revision; // TODO: wire to custom code loading
-    let _ = max_parallel_loading_workers; // TODO: wire to parallel weight loading
-                                          // max_loras: wired to SchedulerConfig.max_loras_per_batch below
-    let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension
-    let _ = &otlp_traces_endpoint; // TODO: wire to OpenTelemetry
-                                   // Parse --limit-mm-per-prompt JSON ("{"image": 5, "video": 1}") into per-modality limits.
+    let _ = &load_format; // Used below in model loading
+    let _ = &tokenizer_mode; // Validated below
+    let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension (Phase 2.1)
+
+    // Parse --limit-mm-per-prompt JSON ("{"image": 5, "video": 1}") into per-modality limits.
     let mm_limits: std::collections::HashMap<String, usize> =
         if let Some(ref json_str) = limit_mm_per_prompt {
             serde_json::from_str(json_str).map_err(|e| {
@@ -1143,9 +1181,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         } else {
             std::collections::HashMap::new()
         };
-    let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache
-    let _ = &guided_decoding_backend; // TODO: wire to structured output backend
-    let _ = max_seq_len_to_capture; // TODO: wire to CUDA graph capture
+    let _ = disable_mm_preprocessor_cache; // TODO: wire to VLM cache (Phase 2.2)
 
     // Pipeline parallelism validation.
     // TODO: wire pipeline_parallel_size to PipelineStagedModel stage construction.
@@ -1455,6 +1491,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
             let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
                 .enable_prefix_caching(enable_prefix_caching)
+                .cuda_graph_config(cuda_graph_config.clone())
                 .build();
 
             eprintln!("Starting engine (MLP Speculator, K={num_speculative_tokens})...");
@@ -1491,6 +1528,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
             let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
                 .enable_prefix_caching(enable_prefix_caching)
+                .cuda_graph_config(cuda_graph_config.clone())
                 .build();
 
             eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
@@ -1514,6 +1552,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
             .multi_step_count(multi_step_count)
             .enable_prefix_caching(enable_prefix_caching)
+            .cuda_graph_config(cuda_graph_config.clone())
             .build();
 
         eprintln!(
@@ -1530,6 +1569,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         let engine_config = EngineConfig::builder(scheduler_config, None)
             .multi_step_count(multi_step_count)
             .enable_prefix_caching(enable_prefix_caching)
+            .cuda_graph_config(cuda_graph_config)
             .build();
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
