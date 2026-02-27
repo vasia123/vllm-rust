@@ -1167,7 +1167,19 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     }
 
     let _ = &kv_cache_dtype; // Used below in CacheConfig
-    let _ = lora_extra_vocab_size; // TODO: wire to LoRA vocab extension (Phase 2.1)
+
+    // NOTE: vLLM reference (commit 3025b3c) explicitly removed LoRA extra vocab support
+    // ("NOTE We have remove lora extra vocab support for now. So we set extra_vocab_size
+    // always to 0, and extra_vocab_size will be removed." — punica_wrapper/punica_base.py).
+    // We preserve the CLI arg for forward compatibility but do not implement the feature
+    // until the reference re-introduces it with a stable spec.
+    if lora_extra_vocab_size > 0 {
+        tracing::warn!(
+            lora_extra_vocab_size,
+            "LoRA extra vocab extension is not implemented (removed in vLLM reference). \
+             The value is accepted but ignored; extra adapter tokens will not be available."
+        );
+    }
 
     // ── 1.4: Load format validation ─────────────────────────────────────────
     let parsed_load_format: loader::LoadFormat = load_format.parse()?;
