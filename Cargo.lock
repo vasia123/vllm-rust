@@ -4450,6 +4450,7 @@ dependencies = [
  "regex-automata",
  "serde",
  "serde_json",
+ "sha2",
  "symphonia",
  "thiserror 2.0.18",
  "tokenizers",

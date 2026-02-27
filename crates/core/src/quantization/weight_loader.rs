@@ -17,6 +17,7 @@ use super::fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
 use super::fp8::{Fp8Config, Fp8Linear};
 use super::gptq::{GptqConfig, GptqLinear};
 use super::marlin::MarlinLinear;
+use super::mxfp4::{MxFp4Config, MxFp4Linear, MXFP4_BLOCK_SIZE};
 use super::mxfp8::{MxFp8Config, MxFp8Linear, MXFP8_BLOCK_SIZE};
 use super::{create_config_from_directory, DetectedQuantConfig, QuantizationMethod};
 
@@ -1075,6 +1076,111 @@ impl QuantizedWeightLoader for FbgemmFp8WeightLoader {
     }
 }
 
+// ─── MxFp4 Weight Loader ──────────────────────────────────────────────────────
+
+/// Weight loader for OCP Microscaling FP4 (MXFP4 E2M1) quantized models.
+///
+/// Weight tensor layout on disk:
+///   - `weight`: `[out_features, in_features / 2]` U8 — two FP4 E2M1 nibbles per byte
+///     (lower nibble = first element, upper nibble = second element).
+///   - `weight_scale`: `[out_features, in_features / 32]` U8 — E8M0 block exponents
+///     (one scale per 32-element K-dimension block, bias 127).
+///   - `bias`: `[out_features]` BF16 — optional.
+///
+/// The CPU forward path dequantizes on every call (unpack → decode scales →
+/// BF16 matmul).  GPU-accelerated dispatch is tracked separately as Phase 3.3.
+pub struct MxFp4WeightLoader {
+    vb: VarBuilder<'static>,
+    config: MxFp4Config,
+    device: Device,
+    dtype: DType,
+}
+
+impl MxFp4WeightLoader {
+    /// Create a new MXFP4 weight loader.
+    pub fn new(vb: VarBuilder<'static>, config: MxFp4Config) -> Self {
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        Self {
+            vb,
+            config,
+            device,
+            dtype,
+        }
+    }
+}
+
+impl QuantizedWeightLoader for MxFp4WeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        if self.config.is_layer_skipped(prefix) {
+            let vb = self.vb.pp(prefix);
+            let weight = vb.get((out_features, in_features), "weight")?;
+            let bias_tensor = if bias {
+                Some(vb.get(out_features, "bias")?)
+            } else {
+                None
+            };
+            return Ok(Box::new(LoadedUnquantizedLinear {
+                weight,
+                bias: bias_tensor,
+                in_features,
+                out_features,
+            }));
+        }
+
+        if !in_features.is_multiple_of(MXFP4_BLOCK_SIZE) {
+            candle_core::bail!(
+                "MXFP4 requires in_features ({}) divisible by block_size ({})",
+                in_features,
+                MXFP4_BLOCK_SIZE,
+            );
+        }
+
+        let vb = self.vb.pp(prefix);
+        let mut linear = MxFp4Linear::new(in_features, out_features, bias, &self.device)?;
+        let mut weights = HashMap::new();
+
+        // Packed FP4: [out_features, in_features / 2] U8
+        let packed_k = in_features / 2;
+        if let Ok(weight) = vb.get((out_features, packed_k), "weight") {
+            weights.insert("weight".to_string(), weight);
+        }
+
+        // E8M0 block scales: [out_features, in_features / MXFP4_BLOCK_SIZE] U8
+        let num_blocks = in_features / MXFP4_BLOCK_SIZE;
+        if let Ok(scale) = vb.get((out_features, num_blocks), "weight_scale") {
+            weights.insert("weight_scale".to_string(), scale);
+        }
+
+        if bias {
+            if let Ok(b) = vb.get(out_features, "bias") {
+                weights.insert("bias".to_string(), b);
+            }
+        }
+
+        linear.load_weights(&weights)?;
+        Ok(Box::new(linear))
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::Mxfp4
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
 /// Create an appropriate weight loader for a model directory.
 ///
 /// This function detects the quantization method from the model config
@@ -1143,6 +1249,10 @@ pub fn create_weight_loader_from_config(
         QuantizationMethod::FbgemmFp8 => {
             let cfg = FbgemmFp8Config::from_detected(&HashMap::new());
             Box::new(FbgemmFp8WeightLoader::new(vb, cfg))
+        }
+        QuantizationMethod::Mxfp4 => {
+            let cfg = MxFp4Config::from_detected(&HashMap::new());
+            Box::new(MxFp4WeightLoader::new(vb, cfg))
         }
         QuantizationMethod::PtpcFp8 => {
             // Same weights as standard FP8 — reuse Fp8WeightLoader.
@@ -1227,6 +1337,10 @@ pub fn create_weight_loader_with_params(
         QuantizationMethod::FbgemmFp8 => {
             let cfg = FbgemmFp8Config::from_detected(&detected.raw_config);
             Box::new(FbgemmFp8WeightLoader::new(vb, cfg))
+        }
+        QuantizationMethod::Mxfp4 => {
+            let cfg = MxFp4Config::from_detected(&detected.raw_config);
+            Box::new(MxFp4WeightLoader::new(vb, cfg))
         }
         QuantizationMethod::PtpcFp8 => {
             // Same weight format as Fp8 — dynamic, no serialised FP8.
@@ -1399,5 +1513,68 @@ mod tests {
         };
         let loader = create_weight_loader_with_params(vb, &detected);
         assert_eq!(loader.method(), QuantizationMethod::ModelOpt);
+    }
+
+    // ─── MxFp4 Weight Loader tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_mxfp4_loader_method() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let config = MxFp4Config::default();
+        let loader = MxFp4WeightLoader::new(vb, config);
+        assert_eq!(loader.method(), QuantizationMethod::Mxfp4);
+    }
+
+    #[test]
+    fn test_create_weight_loader_mxfp4_from_config() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let config: Box<dyn QuantizationConfig> = Box::new(MxFp4Config::default());
+        let loader = create_weight_loader_from_config(vb, config);
+        assert_eq!(loader.method(), QuantizationMethod::Mxfp4);
+    }
+
+    #[test]
+    fn test_create_weight_loader_mxfp4_with_params() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::Mxfp4,
+            bits: Some(4),
+            group_size: Some(32),
+            desc_act: None,
+            activation_scheme: None,
+            raw_config: HashMap::new(),
+        };
+        let loader = create_weight_loader_with_params(vb, &detected);
+        assert_eq!(loader.method(), QuantizationMethod::Mxfp4);
+    }
+
+    #[test]
+    fn test_mxfp4_loader_load_linear_zeros() {
+        // Tests that load_linear succeeds when VarBuilder has no tensors —
+        // the linear layer is created with zero-initialised placeholders.
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let config = MxFp4Config::default();
+        let loader = MxFp4WeightLoader::new(vb, config);
+
+        // in_features must be divisible by MXFP4_BLOCK_SIZE (32)
+        let linear = loader.load_linear("layer", 64, 32, false).unwrap();
+        assert_eq!(linear.in_features(), 64);
+        assert_eq!(linear.out_features(), 32);
+        assert!(!linear.has_bias());
+    }
+
+    #[test]
+    fn test_mxfp4_loader_requires_divisible_in_features() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let config = MxFp4Config::default();
+        let loader = MxFp4WeightLoader::new(vb, config);
+        // in_features = 10 is not divisible by 32
+        let result = loader.load_linear("layer", 10, 4, false);
+        assert!(result.is_err());
     }
 }

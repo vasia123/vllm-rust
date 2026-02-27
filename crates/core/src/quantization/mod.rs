@@ -50,6 +50,8 @@ pub mod marlin_cuda;
 pub mod modelopt;
 pub mod moe_wna16;
 pub mod mxfp4;
+#[cfg(feature = "cuda-kernels")]
+pub mod mxfp4_cuda;
 pub mod mxfp8;
 pub mod ptpc_fp8;
 pub mod quark;

@@ -101,6 +101,12 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/marlin_gemm.ptx",
         min_sm: 80,
     },
+    // MXFP4 E2M1 × BF16 GEMM with blockwise E8M0 scales — uses bf16
+    KernelDef {
+        source: "kernels/mxfp4_gemm.cu",
+        output: "kernels/mxfp4_gemm.ptx",
+        min_sm: 80,
+    },
     // Fused LayerNorm/RMSNorm + FP8 quantization — requires sm_89+ for FP8
     KernelDef {
         source: "kernels/layernorm_quant.cu",

@@ -16,14 +16,18 @@
 //!   3. Reshape weights to `[N, K/32, 32]`, multiply by scales, flatten
 //!   4. Cast to BF16 and matmul
 //!
-//! NOTE: Linear layer dequantization is the CPU emulation path. MoE FP4 dispatch
-//! via FlashInfer/Marlin/Triton kernels is not yet wired (separate TODO).
+//! NOTE: The GPU path uses `mxfp4_cuda::mxfp4_gemm` (enabled via the
+//! `cuda-kernels` feature) and decodes FP4 + E8M0 on-the-fly in the kernel.
+//! The CPU emulation path remains as fallback.
 
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
+
+#[cfg(feature = "cuda-kernels")]
+use super::mxfp4_cuda;
 
 /// Block size along K dimension for MXFP4 quantization.
 pub const MXFP4_BLOCK_SIZE: usize = 32;
@@ -242,6 +246,25 @@ impl MxFp4Linear {
 
 impl QuantizedLinear for MxFp4Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // GPU path: on-the-fly FP4 decode + GEMM — available when cuda-kernels feature is
+        // enabled and weights have been loaded as packed FP4 on a CUDA device.
+        #[cfg(feature = "cuda-kernels")]
+        if self.is_fp4_weights {
+            if let Some(ref scale) = self.weight_scale {
+                if x.device().is_cuda() {
+                    let x_bf16 = x.to_dtype(DType::BF16)?;
+                    return mxfp4_cuda::mxfp4_gemm(
+                        &x_bf16,
+                        &self.weight,
+                        scale,
+                        self.bias.as_ref(),
+                        self.out_features,
+                    );
+                }
+            }
+        }
+
+        // CPU emulation fallback: dequantize weight → full BF16 → matmul.
         let weight = if self.is_fp4_weights && self.weight_scale.is_some() {
             self.dequantize()?.to_dtype(x.dtype())?
         } else {
