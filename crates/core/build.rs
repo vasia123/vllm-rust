@@ -168,6 +168,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_MULTI_ARCH");
 
+    // Declare custom cfg names so rustc knows they are intentional.
+    // These are emitted unconditionally; the values are set conditionally below.
+    println!("cargo::rustc-check-cfg=cfg(cuda_hopper_fp8)");
+    println!("cargo::rustc-check-cfg=cfg(cuda_ampere_fp8)");
+
     if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_err() {
         return;
     }
@@ -184,6 +189,15 @@ fn main() {
 
     // Export the detected SM version so Rust code can query it at build time
     println!("cargo:rustc-env=CUDA_TARGET_SM={target_sm}");
+
+    // Emit cfg flags for compile-time FP8 dispatch:
+    //   cuda_hopper_fp8  — sm_89+ (Ada Lovelace / Hopper): use native hardware FP8 GEMM
+    //   cuda_ampere_fp8  — sm_80..88 (Ampere): use software-decode FP8 kernel
+    if target_sm >= 89 {
+        println!("cargo:rustc-cfg=cuda_hopper_fp8");
+    } else if target_sm >= 80 {
+        println!("cargo:rustc-cfg=cuda_ampere_fp8");
+    }
 
     let mut compiled = 0;
     let mut skipped = 0;

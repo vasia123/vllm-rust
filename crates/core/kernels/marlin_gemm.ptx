@@ -17,6 +17,8 @@
 // _ZZ21marlin_gemm_int8_bf16E11smem_weight has been demoted
 // _ZZ24marlin_gemm_int4_zp_bf16E10smem_input has been demoted
 // _ZZ24marlin_gemm_int4_zp_bf16E11smem_weight has been demoted
+// _ZZ20marlin_gemm_fp8_bf16E10smem_input has been demoted
+// _ZZ20marlin_gemm_fp8_bf16E11smem_weight has been demoted
 
 .visible .entry marlin_gemm_int4_bf16(
 	.param .u64 marlin_gemm_int4_bf16_param_0,
@@ -5102,6 +5104,1790 @@ $L__BB2_87:
 	st.global.u16 	[%rd56], %rs19;
 
 $L__BB2_121:
+	ret;
+
+}
+	// .globl	awq_marlin_repack_int4
+.visible .entry awq_marlin_repack_int4(
+	.param .u64 awq_marlin_repack_int4_param_0,
+	.param .u64 awq_marlin_repack_int4_param_1,
+	.param .u32 awq_marlin_repack_int4_param_2,
+	.param .u32 awq_marlin_repack_int4_param_3
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .b32 	%r<32>;
+	.reg .b64 	%rd<8>;
+
+
+	ld.param.u64 	%rd1, [awq_marlin_repack_int4_param_0];
+	ld.param.u64 	%rd2, [awq_marlin_repack_int4_param_1];
+	ld.param.u32 	%r4, [awq_marlin_repack_int4_param_2];
+	ld.param.u32 	%r3, [awq_marlin_repack_int4_param_3];
+	mov.u32 	%r5, %ctaid.x;
+	mov.u32 	%r6, %ntid.x;
+	mov.u32 	%r7, %tid.x;
+	mad.lo.s32 	%r1, %r5, %r6, %r7;
+	mov.u32 	%r8, %ntid.y;
+	mov.u32 	%r9, %ctaid.y;
+	mov.u32 	%r10, %tid.y;
+	mad.lo.s32 	%r2, %r9, %r8, %r10;
+	setp.ge.s32 	%p1, %r2, %r4;
+	setp.ge.s32 	%p2, %r1, %r3;
+	or.pred  	%p3, %p1, %p2;
+	@%p3 bra 	$L__BB3_2;
+
+	cvta.to.global.u64 	%rd3, %rd2;
+	mad.lo.s32 	%r11, %r2, %r3, %r1;
+	mul.wide.s32 	%rd4, %r11, 4;
+	add.s64 	%rd5, %rd3, %rd4;
+	ld.global.nc.u32 	%r12, [%rd5];
+	shr.u32 	%r13, %r12, 12;
+	and.b32  	%r14, %r13, 240;
+	shl.b32 	%r15, %r12, 4;
+	and.b32  	%r16, %r15, 3840;
+	shr.u32 	%r17, %r12, 8;
+	and.b32  	%r18, %r17, 61440;
+	shl.b32 	%r19, %r12, 8;
+	and.b32  	%r20, %r19, 983040;
+	shr.u32 	%r21, %r12, 4;
+	and.b32  	%r22, %r21, 15728640;
+	shl.b32 	%r23, %r12, 12;
+	and.b32  	%r24, %r23, 251658240;
+	and.b32  	%r25, %r12, -268435441;
+	or.b32  	%r26, %r25, %r14;
+	or.b32  	%r27, %r26, %r16;
+	or.b32  	%r28, %r27, %r18;
+	or.b32  	%r29, %r28, %r20;
+	or.b32  	%r30, %r29, %r22;
+	or.b32  	%r31, %r30, %r24;
+	cvta.to.global.u64 	%rd6, %rd1;
+	add.s64 	%rd7, %rd6, %rd4;
+	st.global.u32 	[%rd7], %r31;
+
+$L__BB3_2:
+	ret;
+
+}
+	// .globl	marlin_gemm_fp8_bf16
+.visible .entry marlin_gemm_fp8_bf16(
+	.param .u64 marlin_gemm_fp8_bf16_param_0,
+	.param .u64 marlin_gemm_fp8_bf16_param_1,
+	.param .u64 marlin_gemm_fp8_bf16_param_2,
+	.param .u64 marlin_gemm_fp8_bf16_param_3,
+	.param .u32 marlin_gemm_fp8_bf16_param_4,
+	.param .u32 marlin_gemm_fp8_bf16_param_5,
+	.param .u32 marlin_gemm_fp8_bf16_param_6,
+	.param .u32 marlin_gemm_fp8_bf16_param_7,
+	.param .u64 marlin_gemm_fp8_bf16_param_8
+)
+{
+	.reg .pred 	%p<78>;
+	.reg .b16 	%rs<55>;
+	.reg .f32 	%f<1026>;
+	.reg .b32 	%r<158>;
+	.reg .b64 	%rd<85>;
+	// demoted variable
+	.shared .align 4 .b8 _ZZ20marlin_gemm_fp8_bf16E10smem_input[1024];
+	// demoted variable
+	.shared .align 4 .b8 _ZZ20marlin_gemm_fp8_bf16E11smem_weight[1024];
+
+	ld.param.u64 	%rd10, [marlin_gemm_fp8_bf16_param_0];
+	ld.param.u64 	%rd6, [marlin_gemm_fp8_bf16_param_1];
+	ld.param.u64 	%rd7, [marlin_gemm_fp8_bf16_param_2];
+	ld.param.u64 	%rd8, [marlin_gemm_fp8_bf16_param_3];
+	ld.param.u32 	%r70, [marlin_gemm_fp8_bf16_param_4];
+	ld.param.u32 	%r71, [marlin_gemm_fp8_bf16_param_5];
+	ld.param.u32 	%r72, [marlin_gemm_fp8_bf16_param_6];
+	cvta.to.global.u64 	%rd1, %rd10;
+	mov.u32 	%r74, %ctaid.x;
+	shl.b32 	%r1, %r74, 4;
+	mov.u32 	%r75, %ctaid.y;
+	shl.b32 	%r2, %r75, 4;
+	mov.u32 	%r3, %tid.x;
+	shr.s32 	%r76, %r3, 31;
+	shr.u32 	%r77, %r76, 28;
+	add.s32 	%r78, %r3, %r77;
+	and.b32  	%r79, %r78, -16;
+	sub.s32 	%r4, %r3, %r79;
+	setp.gt.s32 	%p1, %r72, 0;
+	@%p1 bra 	$L__BB4_2;
+	bra.uni 	$L__BB4_1;
+
+$L__BB4_2:
+	mov.u32 	%r5, %ntid.x;
+	add.s32 	%r6, %r1, %r4;
+	shl.b32 	%r81, %r4, 2;
+	mov.u32 	%r82, _ZZ20marlin_gemm_fp8_bf16E11smem_weight;
+	add.s32 	%r7, %r82, %r81;
+	add.s32 	%r8, %r2, 1;
+	add.s32 	%r9, %r2, 2;
+	add.s32 	%r10, %r2, 3;
+	add.s32 	%r11, %r2, 4;
+	add.s32 	%r12, %r2, 5;
+	add.s32 	%r13, %r2, 6;
+	add.s32 	%r14, %r2, 7;
+	add.s32 	%r15, %r2, 8;
+	add.s32 	%r16, %r2, 9;
+	add.s32 	%r17, %r2, 10;
+	add.s32 	%r18, %r2, 11;
+	add.s32 	%r19, %r2, 12;
+	add.s32 	%r20, %r2, 13;
+	add.s32 	%r21, %r2, 14;
+	add.s32 	%r22, %r2, 15;
+	cvta.to.global.u64 	%rd2, %rd7;
+	cvta.to.global.u64 	%rd3, %rd6;
+	cvta.to.global.u64 	%rd4, %rd8;
+	mov.u32 	%r155, 0;
+	mov.f32 	%f994, 0f00000000;
+	mov.f32 	%f995, %f994;
+	mov.f32 	%f996, %f994;
+	mov.f32 	%f997, %f994;
+	mov.f32 	%f998, %f994;
+	mov.f32 	%f999, %f994;
+	mov.f32 	%f1000, %f994;
+	mov.f32 	%f1001, %f994;
+	mov.f32 	%f1002, %f994;
+	mov.f32 	%f1003, %f994;
+	mov.f32 	%f1004, %f994;
+	mov.f32 	%f1005, %f994;
+	mov.f32 	%f1006, %f994;
+	mov.f32 	%f1007, %f994;
+	mov.f32 	%f1008, %f994;
+	mov.f32 	%f1009, %f994;
+
+$L__BB4_3:
+	setp.gt.s32 	%p2, %r3, 255;
+	@%p2 bra 	$L__BB4_8;
+
+	mov.u32 	%r156, %r3;
+
+$L__BB4_5:
+	shr.s32 	%r83, %r156, 31;
+	shr.u32 	%r84, %r83, 28;
+	add.s32 	%r85, %r156, %r84;
+	shr.s32 	%r25, %r85, 4;
+	add.s32 	%r26, %r25, %r2;
+	and.b32  	%r86, %r85, -16;
+	sub.s32 	%r27, %r156, %r86;
+	add.s32 	%r28, %r27, %r155;
+	setp.ge.s32 	%p3, %r26, %r70;
+	setp.ge.s32 	%p4, %r28, %r72;
+	mov.f32 	%f977, 0f00000000;
+	or.pred  	%p5, %p3, %p4;
+	@%p5 bra 	$L__BB4_7;
+
+	mad.lo.s32 	%r87, %r26, %r72, %r28;
+	mul.wide.s32 	%rd11, %r87, 2;
+	add.s64 	%rd12, %rd3, %rd11;
+	ld.global.nc.u16 	%rs3, [%rd12];
+	// begin inline asm
+	{ mov.b32 %f977, {0,%rs3};}
+
+	// end inline asm
+
+$L__BB4_7:
+	shl.b32 	%r88, %r25, 6;
+	mov.u32 	%r89, _ZZ20marlin_gemm_fp8_bf16E10smem_input;
+	add.s32 	%r90, %r89, %r88;
+	shl.b32 	%r91, %r27, 2;
+	add.s32 	%r92, %r90, %r91;
+	st.shared.f32 	[%r92], %f977;
+	add.s32 	%r156, %r156, %r5;
+	setp.lt.s32 	%p6, %r156, 256;
+	@%p6 bra 	$L__BB4_5;
+
+$L__BB4_8:
+	@%p2 bra 	$L__BB4_24;
+
+	mov.u32 	%r157, %r3;
+
+$L__BB4_10:
+	shr.s32 	%r93, %r157, 31;
+	shr.u32 	%r94, %r93, 28;
+	add.s32 	%r95, %r157, %r94;
+	shr.s32 	%r96, %r95, 4;
+	add.s32 	%r31, %r96, %r155;
+	and.b32  	%r97, %r95, -16;
+	sub.s32 	%r98, %r157, %r97;
+	add.s32 	%r32, %r98, %r1;
+	setp.lt.s32 	%p8, %r31, %r72;
+	setp.lt.s32 	%p9, %r32, %r71;
+	and.pred  	%p10, %p8, %p9;
+	shl.b32 	%r99, %r96, 6;
+	add.s32 	%r101, %r82, %r99;
+	shl.b32 	%r102, %r98, 2;
+	add.s32 	%r33, %r101, %r102;
+	@%p10 bra 	$L__BB4_12;
+	bra.uni 	$L__BB4_11;
+
+$L__BB4_12:
+	mad.lo.s32 	%r104, %r32, %r72, %r31;
+	cvt.s64.s32 	%rd13, %r104;
+	add.s64 	%rd14, %rd2, %rd13;
+	ld.global.nc.u8 	%rs4, [%rd14];
+	cvt.s16.s8 	%rs1, %rs4;
+	shr.u16 	%rs5, %rs4, 3;
+	and.b16  	%rs2, %rs5, 15;
+	cvt.u32.u16 	%r34, %rs2;
+	setp.eq.s16 	%p11, %rs2, 15;
+	mov.f32 	%f978, 0f7FC00000;
+	@%p11 bra 	$L__BB4_22;
+
+	and.b16  	%rs6, %rs1, 7;
+	cvt.rn.f32.u16 	%f19, %rs6;
+	setp.eq.s16 	%p12, %rs2, 0;
+	@%p12 bra 	$L__BB4_21;
+
+	fma.rn.ftz.f32 	%f20, %f19, 0f3E000000, 0f3F800000;
+	abs.ftz.f32 	%f21, %f20;
+	setp.eq.ftz.f32 	%p13, %f21, 0f00000000;
+	setp.eq.ftz.f32 	%p14, %f21, 0f7F800000;
+	or.pred  	%p15, %p13, %p14;
+	add.s32 	%r35, %r34, -7;
+	setp.eq.s32 	%p16, %r35, 0;
+	or.pred  	%p17, %p16, %p15;
+	@%p17 bra 	$L__BB4_20;
+	bra.uni 	$L__BB4_15;
+
+$L__BB4_20:
+	setp.gt.ftz.f32 	%p21, %f21, 0f00000000;
+	add.ftz.f32 	%f140, %f20, %f20;
+	selp.f32 	%f978, %f20, %f140, %p21;
+	bra.uni 	$L__BB4_22;
+
+$L__BB4_11:
+	mov.u32 	%r103, 0;
+	st.shared.u32 	[%r33], %r103;
+	bra.uni 	$L__BB4_23;
+
+$L__BB4_21:
+	mul.ftz.f32 	%f978, %f19, 0f3B000000;
+	bra.uni 	$L__BB4_22;
+
+$L__BB4_15:
+	mov.u32 	%r105, 7;
+	sub.s32 	%r106, %r105, %r34;
+	setp.lt.u16 	%p18, %rs2, 7;
+	selp.b32 	%r36, %r106, %r35, %p18;
+	setp.lt.s32 	%p19, %r36, 126;
+	@%p19 bra 	$L__BB4_19;
+	bra.uni 	$L__BB4_16;
+
+$L__BB4_19:
+	cvt.rn.f32.s32 	%f138, %r35;
+	ex2.approx.ftz.f32 	%f139, %f138;
+	mul.ftz.f32 	%f978, %f20, %f139;
+	bra.uni 	$L__BB4_22;
+
+$L__BB4_16:
+	setp.lt.s32 	%p20, %r36, 252;
+	@%p20 bra 	$L__BB4_18;
+	bra.uni 	$L__BB4_17;
+
+$L__BB4_18:
+	shr.u32 	%r112, %r35, 31;
+	add.s32 	%r113, %r35, %r112;
+	shr.s32 	%r114, %r113, 1;
+	sub.s32 	%r115, %r35, %r114;
+	cvt.rn.f32.s32 	%f133, %r114;
+	ex2.approx.ftz.f32 	%f134, %f133;
+	mul.ftz.f32 	%f135, %f20, %f134;
+	cvt.rn.f32.s32 	%f136, %r115;
+	ex2.approx.ftz.f32 	%f137, %f136;
+	mul.ftz.f32 	%f978, %f135, %f137;
+	bra.uni 	$L__BB4_22;
+
+$L__BB4_17:
+	shr.s32 	%r107, %r35, 31;
+	shr.u32 	%r108, %r107, 30;
+	add.s32 	%r109, %r35, %r108;
+	shr.s32 	%r110, %r109, 2;
+	cvt.rn.f32.s32 	%f126, %r110;
+	ex2.approx.ftz.f32 	%f127, %f126;
+	mad.lo.s32 	%r111, %r110, -3, %r35;
+	mul.ftz.f32 	%f128, %f20, %f127;
+	mul.ftz.f32 	%f129, %f127, %f128;
+	mul.ftz.f32 	%f130, %f127, %f129;
+	cvt.rn.f32.s32 	%f131, %r111;
+	ex2.approx.ftz.f32 	%f132, %f131;
+	mul.ftz.f32 	%f978, %f132, %f130;
+
+$L__BB4_22:
+	neg.ftz.f32 	%f141, %f978;
+	setp.lt.s16 	%p22, %rs1, 0;
+	selp.f32 	%f142, %f141, %f978, %p22;
+	mul.wide.s32 	%rd15, %r32, 4;
+	add.s64 	%rd16, %rd4, %rd15;
+	ld.global.nc.f32 	%f143, [%rd16];
+	mul.ftz.f32 	%f144, %f142, %f143;
+	st.shared.f32 	[%r33], %f144;
+
+$L__BB4_23:
+	add.s32 	%r157, %r157, %r5;
+	setp.lt.s32 	%p23, %r157, 256;
+	@%p23 bra 	$L__BB4_10;
+
+$L__BB4_24:
+	setp.ge.s32 	%p24, %r6, %r71;
+	bar.sync 	0;
+	@%p24 bra 	$L__BB4_57;
+
+	setp.ge.s32 	%p25, %r2, %r70;
+	@%p25 bra 	$L__BB4_27;
+
+	ld.shared.f32 	%f145, [_ZZ20marlin_gemm_fp8_bf16E10smem_input];
+	ld.shared.f32 	%f146, [%r7];
+	fma.rn.ftz.f32 	%f147, %f145, %f146, 0f00000000;
+	ld.shared.f32 	%f148, [%r7+64];
+	ld.shared.f32 	%f149, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+4];
+	fma.rn.ftz.f32 	%f150, %f149, %f148, %f147;
+	ld.shared.f32 	%f151, [%r7+128];
+	ld.shared.f32 	%f152, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+8];
+	fma.rn.ftz.f32 	%f153, %f152, %f151, %f150;
+	ld.shared.f32 	%f154, [%r7+192];
+	ld.shared.f32 	%f155, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+12];
+	fma.rn.ftz.f32 	%f156, %f155, %f154, %f153;
+	ld.shared.f32 	%f157, [%r7+256];
+	ld.shared.f32 	%f158, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+16];
+	fma.rn.ftz.f32 	%f159, %f158, %f157, %f156;
+	ld.shared.f32 	%f160, [%r7+320];
+	ld.shared.f32 	%f161, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+20];
+	fma.rn.ftz.f32 	%f162, %f161, %f160, %f159;
+	ld.shared.f32 	%f163, [%r7+384];
+	ld.shared.f32 	%f164, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+24];
+	fma.rn.ftz.f32 	%f165, %f164, %f163, %f162;
+	ld.shared.f32 	%f166, [%r7+448];
+	ld.shared.f32 	%f167, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+28];
+	fma.rn.ftz.f32 	%f168, %f167, %f166, %f165;
+	ld.shared.f32 	%f169, [%r7+512];
+	ld.shared.f32 	%f170, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+32];
+	fma.rn.ftz.f32 	%f171, %f170, %f169, %f168;
+	ld.shared.f32 	%f172, [%r7+576];
+	ld.shared.f32 	%f173, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+36];
+	fma.rn.ftz.f32 	%f174, %f173, %f172, %f171;
+	ld.shared.f32 	%f175, [%r7+640];
+	ld.shared.f32 	%f176, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+40];
+	fma.rn.ftz.f32 	%f177, %f176, %f175, %f174;
+	ld.shared.f32 	%f178, [%r7+704];
+	ld.shared.f32 	%f179, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+44];
+	fma.rn.ftz.f32 	%f180, %f179, %f178, %f177;
+	ld.shared.f32 	%f181, [%r7+768];
+	ld.shared.f32 	%f182, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+48];
+	fma.rn.ftz.f32 	%f183, %f182, %f181, %f180;
+	ld.shared.f32 	%f184, [%r7+832];
+	ld.shared.f32 	%f185, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+52];
+	fma.rn.ftz.f32 	%f186, %f185, %f184, %f183;
+	ld.shared.f32 	%f187, [%r7+896];
+	ld.shared.f32 	%f188, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+56];
+	fma.rn.ftz.f32 	%f189, %f188, %f187, %f186;
+	ld.shared.f32 	%f190, [%r7+960];
+	ld.shared.f32 	%f191, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+60];
+	fma.rn.ftz.f32 	%f192, %f191, %f190, %f189;
+	add.ftz.f32 	%f1009, %f192, %f1009;
+
+$L__BB4_27:
+	setp.ge.s32 	%p26, %r8, %r70;
+	@%p26 bra 	$L__BB4_29;
+
+	ld.shared.f32 	%f193, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+64];
+	ld.shared.f32 	%f194, [%r7];
+	fma.rn.ftz.f32 	%f195, %f193, %f194, 0f00000000;
+	ld.shared.f32 	%f196, [%r7+64];
+	ld.shared.f32 	%f197, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+68];
+	fma.rn.ftz.f32 	%f198, %f197, %f196, %f195;
+	ld.shared.f32 	%f199, [%r7+128];
+	ld.shared.f32 	%f200, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+72];
+	fma.rn.ftz.f32 	%f201, %f200, %f199, %f198;
+	ld.shared.f32 	%f202, [%r7+192];
+	ld.shared.f32 	%f203, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+76];
+	fma.rn.ftz.f32 	%f204, %f203, %f202, %f201;
+	ld.shared.f32 	%f205, [%r7+256];
+	ld.shared.f32 	%f206, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+80];
+	fma.rn.ftz.f32 	%f207, %f206, %f205, %f204;
+	ld.shared.f32 	%f208, [%r7+320];
+	ld.shared.f32 	%f209, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+84];
+	fma.rn.ftz.f32 	%f210, %f209, %f208, %f207;
+	ld.shared.f32 	%f211, [%r7+384];
+	ld.shared.f32 	%f212, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+88];
+	fma.rn.ftz.f32 	%f213, %f212, %f211, %f210;
+	ld.shared.f32 	%f214, [%r7+448];
+	ld.shared.f32 	%f215, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+92];
+	fma.rn.ftz.f32 	%f216, %f215, %f214, %f213;
+	ld.shared.f32 	%f217, [%r7+512];
+	ld.shared.f32 	%f218, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+96];
+	fma.rn.ftz.f32 	%f219, %f218, %f217, %f216;
+	ld.shared.f32 	%f220, [%r7+576];
+	ld.shared.f32 	%f221, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+100];
+	fma.rn.ftz.f32 	%f222, %f221, %f220, %f219;
+	ld.shared.f32 	%f223, [%r7+640];
+	ld.shared.f32 	%f224, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+104];
+	fma.rn.ftz.f32 	%f225, %f224, %f223, %f222;
+	ld.shared.f32 	%f226, [%r7+704];
+	ld.shared.f32 	%f227, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+108];
+	fma.rn.ftz.f32 	%f228, %f227, %f226, %f225;
+	ld.shared.f32 	%f229, [%r7+768];
+	ld.shared.f32 	%f230, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+112];
+	fma.rn.ftz.f32 	%f231, %f230, %f229, %f228;
+	ld.shared.f32 	%f232, [%r7+832];
+	ld.shared.f32 	%f233, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+116];
+	fma.rn.ftz.f32 	%f234, %f233, %f232, %f231;
+	ld.shared.f32 	%f235, [%r7+896];
+	ld.shared.f32 	%f236, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+120];
+	fma.rn.ftz.f32 	%f237, %f236, %f235, %f234;
+	ld.shared.f32 	%f238, [%r7+960];
+	ld.shared.f32 	%f239, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+124];
+	fma.rn.ftz.f32 	%f240, %f239, %f238, %f237;
+	add.ftz.f32 	%f1008, %f240, %f1008;
+
+$L__BB4_29:
+	setp.ge.s32 	%p27, %r9, %r70;
+	@%p27 bra 	$L__BB4_31;
+
+	ld.shared.f32 	%f241, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+128];
+	ld.shared.f32 	%f242, [%r7];
+	fma.rn.ftz.f32 	%f243, %f241, %f242, 0f00000000;
+	ld.shared.f32 	%f244, [%r7+64];
+	ld.shared.f32 	%f245, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+132];
+	fma.rn.ftz.f32 	%f246, %f245, %f244, %f243;
+	ld.shared.f32 	%f247, [%r7+128];
+	ld.shared.f32 	%f248, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+136];
+	fma.rn.ftz.f32 	%f249, %f248, %f247, %f246;
+	ld.shared.f32 	%f250, [%r7+192];
+	ld.shared.f32 	%f251, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+140];
+	fma.rn.ftz.f32 	%f252, %f251, %f250, %f249;
+	ld.shared.f32 	%f253, [%r7+256];
+	ld.shared.f32 	%f254, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+144];
+	fma.rn.ftz.f32 	%f255, %f254, %f253, %f252;
+	ld.shared.f32 	%f256, [%r7+320];
+	ld.shared.f32 	%f257, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+148];
+	fma.rn.ftz.f32 	%f258, %f257, %f256, %f255;
+	ld.shared.f32 	%f259, [%r7+384];
+	ld.shared.f32 	%f260, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+152];
+	fma.rn.ftz.f32 	%f261, %f260, %f259, %f258;
+	ld.shared.f32 	%f262, [%r7+448];
+	ld.shared.f32 	%f263, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+156];
+	fma.rn.ftz.f32 	%f264, %f263, %f262, %f261;
+	ld.shared.f32 	%f265, [%r7+512];
+	ld.shared.f32 	%f266, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+160];
+	fma.rn.ftz.f32 	%f267, %f266, %f265, %f264;
+	ld.shared.f32 	%f268, [%r7+576];
+	ld.shared.f32 	%f269, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+164];
+	fma.rn.ftz.f32 	%f270, %f269, %f268, %f267;
+	ld.shared.f32 	%f271, [%r7+640];
+	ld.shared.f32 	%f272, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+168];
+	fma.rn.ftz.f32 	%f273, %f272, %f271, %f270;
+	ld.shared.f32 	%f274, [%r7+704];
+	ld.shared.f32 	%f275, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+172];
+	fma.rn.ftz.f32 	%f276, %f275, %f274, %f273;
+	ld.shared.f32 	%f277, [%r7+768];
+	ld.shared.f32 	%f278, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+176];
+	fma.rn.ftz.f32 	%f279, %f278, %f277, %f276;
+	ld.shared.f32 	%f280, [%r7+832];
+	ld.shared.f32 	%f281, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+180];
+	fma.rn.ftz.f32 	%f282, %f281, %f280, %f279;
+	ld.shared.f32 	%f283, [%r7+896];
+	ld.shared.f32 	%f284, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+184];
+	fma.rn.ftz.f32 	%f285, %f284, %f283, %f282;
+	ld.shared.f32 	%f286, [%r7+960];
+	ld.shared.f32 	%f287, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+188];
+	fma.rn.ftz.f32 	%f288, %f287, %f286, %f285;
+	add.ftz.f32 	%f1007, %f288, %f1007;
+
+$L__BB4_31:
+	setp.ge.s32 	%p28, %r10, %r70;
+	@%p28 bra 	$L__BB4_33;
+
+	ld.shared.f32 	%f289, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+192];
+	ld.shared.f32 	%f290, [%r7];
+	fma.rn.ftz.f32 	%f291, %f289, %f290, 0f00000000;
+	ld.shared.f32 	%f292, [%r7+64];
+	ld.shared.f32 	%f293, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+196];
+	fma.rn.ftz.f32 	%f294, %f293, %f292, %f291;
+	ld.shared.f32 	%f295, [%r7+128];
+	ld.shared.f32 	%f296, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+200];
+	fma.rn.ftz.f32 	%f297, %f296, %f295, %f294;
+	ld.shared.f32 	%f298, [%r7+192];
+	ld.shared.f32 	%f299, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+204];
+	fma.rn.ftz.f32 	%f300, %f299, %f298, %f297;
+	ld.shared.f32 	%f301, [%r7+256];
+	ld.shared.f32 	%f302, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+208];
+	fma.rn.ftz.f32 	%f303, %f302, %f301, %f300;
+	ld.shared.f32 	%f304, [%r7+320];
+	ld.shared.f32 	%f305, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+212];
+	fma.rn.ftz.f32 	%f306, %f305, %f304, %f303;
+	ld.shared.f32 	%f307, [%r7+384];
+	ld.shared.f32 	%f308, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+216];
+	fma.rn.ftz.f32 	%f309, %f308, %f307, %f306;
+	ld.shared.f32 	%f310, [%r7+448];
+	ld.shared.f32 	%f311, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+220];
+	fma.rn.ftz.f32 	%f312, %f311, %f310, %f309;
+	ld.shared.f32 	%f313, [%r7+512];
+	ld.shared.f32 	%f314, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+224];
+	fma.rn.ftz.f32 	%f315, %f314, %f313, %f312;
+	ld.shared.f32 	%f316, [%r7+576];
+	ld.shared.f32 	%f317, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+228];
+	fma.rn.ftz.f32 	%f318, %f317, %f316, %f315;
+	ld.shared.f32 	%f319, [%r7+640];
+	ld.shared.f32 	%f320, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+232];
+	fma.rn.ftz.f32 	%f321, %f320, %f319, %f318;
+	ld.shared.f32 	%f322, [%r7+704];
+	ld.shared.f32 	%f323, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+236];
+	fma.rn.ftz.f32 	%f324, %f323, %f322, %f321;
+	ld.shared.f32 	%f325, [%r7+768];
+	ld.shared.f32 	%f326, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+240];
+	fma.rn.ftz.f32 	%f327, %f326, %f325, %f324;
+	ld.shared.f32 	%f328, [%r7+832];
+	ld.shared.f32 	%f329, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+244];
+	fma.rn.ftz.f32 	%f330, %f329, %f328, %f327;
+	ld.shared.f32 	%f331, [%r7+896];
+	ld.shared.f32 	%f332, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+248];
+	fma.rn.ftz.f32 	%f333, %f332, %f331, %f330;
+	ld.shared.f32 	%f334, [%r7+960];
+	ld.shared.f32 	%f335, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+252];
+	fma.rn.ftz.f32 	%f336, %f335, %f334, %f333;
+	add.ftz.f32 	%f1006, %f336, %f1006;
+
+$L__BB4_33:
+	setp.ge.s32 	%p29, %r11, %r70;
+	@%p29 bra 	$L__BB4_35;
+
+	ld.shared.f32 	%f337, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+256];
+	ld.shared.f32 	%f338, [%r7];
+	fma.rn.ftz.f32 	%f339, %f337, %f338, 0f00000000;
+	ld.shared.f32 	%f340, [%r7+64];
+	ld.shared.f32 	%f341, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+260];
+	fma.rn.ftz.f32 	%f342, %f341, %f340, %f339;
+	ld.shared.f32 	%f343, [%r7+128];
+	ld.shared.f32 	%f344, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+264];
+	fma.rn.ftz.f32 	%f345, %f344, %f343, %f342;
+	ld.shared.f32 	%f346, [%r7+192];
+	ld.shared.f32 	%f347, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+268];
+	fma.rn.ftz.f32 	%f348, %f347, %f346, %f345;
+	ld.shared.f32 	%f349, [%r7+256];
+	ld.shared.f32 	%f350, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+272];
+	fma.rn.ftz.f32 	%f351, %f350, %f349, %f348;
+	ld.shared.f32 	%f352, [%r7+320];
+	ld.shared.f32 	%f353, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+276];
+	fma.rn.ftz.f32 	%f354, %f353, %f352, %f351;
+	ld.shared.f32 	%f355, [%r7+384];
+	ld.shared.f32 	%f356, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+280];
+	fma.rn.ftz.f32 	%f357, %f356, %f355, %f354;
+	ld.shared.f32 	%f358, [%r7+448];
+	ld.shared.f32 	%f359, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+284];
+	fma.rn.ftz.f32 	%f360, %f359, %f358, %f357;
+	ld.shared.f32 	%f361, [%r7+512];
+	ld.shared.f32 	%f362, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+288];
+	fma.rn.ftz.f32 	%f363, %f362, %f361, %f360;
+	ld.shared.f32 	%f364, [%r7+576];
+	ld.shared.f32 	%f365, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+292];
+	fma.rn.ftz.f32 	%f366, %f365, %f364, %f363;
+	ld.shared.f32 	%f367, [%r7+640];
+	ld.shared.f32 	%f368, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+296];
+	fma.rn.ftz.f32 	%f369, %f368, %f367, %f366;
+	ld.shared.f32 	%f370, [%r7+704];
+	ld.shared.f32 	%f371, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+300];
+	fma.rn.ftz.f32 	%f372, %f371, %f370, %f369;
+	ld.shared.f32 	%f373, [%r7+768];
+	ld.shared.f32 	%f374, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+304];
+	fma.rn.ftz.f32 	%f375, %f374, %f373, %f372;
+	ld.shared.f32 	%f376, [%r7+832];
+	ld.shared.f32 	%f377, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+308];
+	fma.rn.ftz.f32 	%f378, %f377, %f376, %f375;
+	ld.shared.f32 	%f379, [%r7+896];
+	ld.shared.f32 	%f380, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+312];
+	fma.rn.ftz.f32 	%f381, %f380, %f379, %f378;
+	ld.shared.f32 	%f382, [%r7+960];
+	ld.shared.f32 	%f383, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+316];
+	fma.rn.ftz.f32 	%f384, %f383, %f382, %f381;
+	add.ftz.f32 	%f1005, %f384, %f1005;
+
+$L__BB4_35:
+	setp.ge.s32 	%p30, %r12, %r70;
+	@%p30 bra 	$L__BB4_37;
+
+	ld.shared.f32 	%f385, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+320];
+	ld.shared.f32 	%f386, [%r7];
+	fma.rn.ftz.f32 	%f387, %f385, %f386, 0f00000000;
+	ld.shared.f32 	%f388, [%r7+64];
+	ld.shared.f32 	%f389, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+324];
+	fma.rn.ftz.f32 	%f390, %f389, %f388, %f387;
+	ld.shared.f32 	%f391, [%r7+128];
+	ld.shared.f32 	%f392, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+328];
+	fma.rn.ftz.f32 	%f393, %f392, %f391, %f390;
+	ld.shared.f32 	%f394, [%r7+192];
+	ld.shared.f32 	%f395, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+332];
+	fma.rn.ftz.f32 	%f396, %f395, %f394, %f393;
+	ld.shared.f32 	%f397, [%r7+256];
+	ld.shared.f32 	%f398, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+336];
+	fma.rn.ftz.f32 	%f399, %f398, %f397, %f396;
+	ld.shared.f32 	%f400, [%r7+320];
+	ld.shared.f32 	%f401, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+340];
+	fma.rn.ftz.f32 	%f402, %f401, %f400, %f399;
+	ld.shared.f32 	%f403, [%r7+384];
+	ld.shared.f32 	%f404, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+344];
+	fma.rn.ftz.f32 	%f405, %f404, %f403, %f402;
+	ld.shared.f32 	%f406, [%r7+448];
+	ld.shared.f32 	%f407, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+348];
+	fma.rn.ftz.f32 	%f408, %f407, %f406, %f405;
+	ld.shared.f32 	%f409, [%r7+512];
+	ld.shared.f32 	%f410, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+352];
+	fma.rn.ftz.f32 	%f411, %f410, %f409, %f408;
+	ld.shared.f32 	%f412, [%r7+576];
+	ld.shared.f32 	%f413, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+356];
+	fma.rn.ftz.f32 	%f414, %f413, %f412, %f411;
+	ld.shared.f32 	%f415, [%r7+640];
+	ld.shared.f32 	%f416, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+360];
+	fma.rn.ftz.f32 	%f417, %f416, %f415, %f414;
+	ld.shared.f32 	%f418, [%r7+704];
+	ld.shared.f32 	%f419, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+364];
+	fma.rn.ftz.f32 	%f420, %f419, %f418, %f417;
+	ld.shared.f32 	%f421, [%r7+768];
+	ld.shared.f32 	%f422, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+368];
+	fma.rn.ftz.f32 	%f423, %f422, %f421, %f420;
+	ld.shared.f32 	%f424, [%r7+832];
+	ld.shared.f32 	%f425, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+372];
+	fma.rn.ftz.f32 	%f426, %f425, %f424, %f423;
+	ld.shared.f32 	%f427, [%r7+896];
+	ld.shared.f32 	%f428, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+376];
+	fma.rn.ftz.f32 	%f429, %f428, %f427, %f426;
+	ld.shared.f32 	%f430, [%r7+960];
+	ld.shared.f32 	%f431, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+380];
+	fma.rn.ftz.f32 	%f432, %f431, %f430, %f429;
+	add.ftz.f32 	%f1004, %f432, %f1004;
+
+$L__BB4_37:
+	setp.ge.s32 	%p31, %r13, %r70;
+	@%p31 bra 	$L__BB4_39;
+
+	ld.shared.f32 	%f433, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+384];
+	ld.shared.f32 	%f434, [%r7];
+	fma.rn.ftz.f32 	%f435, %f433, %f434, 0f00000000;
+	ld.shared.f32 	%f436, [%r7+64];
+	ld.shared.f32 	%f437, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+388];
+	fma.rn.ftz.f32 	%f438, %f437, %f436, %f435;
+	ld.shared.f32 	%f439, [%r7+128];
+	ld.shared.f32 	%f440, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+392];
+	fma.rn.ftz.f32 	%f441, %f440, %f439, %f438;
+	ld.shared.f32 	%f442, [%r7+192];
+	ld.shared.f32 	%f443, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+396];
+	fma.rn.ftz.f32 	%f444, %f443, %f442, %f441;
+	ld.shared.f32 	%f445, [%r7+256];
+	ld.shared.f32 	%f446, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+400];
+	fma.rn.ftz.f32 	%f447, %f446, %f445, %f444;
+	ld.shared.f32 	%f448, [%r7+320];
+	ld.shared.f32 	%f449, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+404];
+	fma.rn.ftz.f32 	%f450, %f449, %f448, %f447;
+	ld.shared.f32 	%f451, [%r7+384];
+	ld.shared.f32 	%f452, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+408];
+	fma.rn.ftz.f32 	%f453, %f452, %f451, %f450;
+	ld.shared.f32 	%f454, [%r7+448];
+	ld.shared.f32 	%f455, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+412];
+	fma.rn.ftz.f32 	%f456, %f455, %f454, %f453;
+	ld.shared.f32 	%f457, [%r7+512];
+	ld.shared.f32 	%f458, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+416];
+	fma.rn.ftz.f32 	%f459, %f458, %f457, %f456;
+	ld.shared.f32 	%f460, [%r7+576];
+	ld.shared.f32 	%f461, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+420];
+	fma.rn.ftz.f32 	%f462, %f461, %f460, %f459;
+	ld.shared.f32 	%f463, [%r7+640];
+	ld.shared.f32 	%f464, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+424];
+	fma.rn.ftz.f32 	%f465, %f464, %f463, %f462;
+	ld.shared.f32 	%f466, [%r7+704];
+	ld.shared.f32 	%f467, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+428];
+	fma.rn.ftz.f32 	%f468, %f467, %f466, %f465;
+	ld.shared.f32 	%f469, [%r7+768];
+	ld.shared.f32 	%f470, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+432];
+	fma.rn.ftz.f32 	%f471, %f470, %f469, %f468;
+	ld.shared.f32 	%f472, [%r7+832];
+	ld.shared.f32 	%f473, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+436];
+	fma.rn.ftz.f32 	%f474, %f473, %f472, %f471;
+	ld.shared.f32 	%f475, [%r7+896];
+	ld.shared.f32 	%f476, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+440];
+	fma.rn.ftz.f32 	%f477, %f476, %f475, %f474;
+	ld.shared.f32 	%f478, [%r7+960];
+	ld.shared.f32 	%f479, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+444];
+	fma.rn.ftz.f32 	%f480, %f479, %f478, %f477;
+	add.ftz.f32 	%f1003, %f480, %f1003;
+
+$L__BB4_39:
+	setp.ge.s32 	%p32, %r14, %r70;
+	@%p32 bra 	$L__BB4_41;
+
+	ld.shared.f32 	%f481, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+448];
+	ld.shared.f32 	%f482, [%r7];
+	fma.rn.ftz.f32 	%f483, %f481, %f482, 0f00000000;
+	ld.shared.f32 	%f484, [%r7+64];
+	ld.shared.f32 	%f485, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+452];
+	fma.rn.ftz.f32 	%f486, %f485, %f484, %f483;
+	ld.shared.f32 	%f487, [%r7+128];
+	ld.shared.f32 	%f488, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+456];
+	fma.rn.ftz.f32 	%f489, %f488, %f487, %f486;
+	ld.shared.f32 	%f490, [%r7+192];
+	ld.shared.f32 	%f491, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+460];
+	fma.rn.ftz.f32 	%f492, %f491, %f490, %f489;
+	ld.shared.f32 	%f493, [%r7+256];
+	ld.shared.f32 	%f494, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+464];
+	fma.rn.ftz.f32 	%f495, %f494, %f493, %f492;
+	ld.shared.f32 	%f496, [%r7+320];
+	ld.shared.f32 	%f497, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+468];
+	fma.rn.ftz.f32 	%f498, %f497, %f496, %f495;
+	ld.shared.f32 	%f499, [%r7+384];
+	ld.shared.f32 	%f500, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+472];
+	fma.rn.ftz.f32 	%f501, %f500, %f499, %f498;
+	ld.shared.f32 	%f502, [%r7+448];
+	ld.shared.f32 	%f503, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+476];
+	fma.rn.ftz.f32 	%f504, %f503, %f502, %f501;
+	ld.shared.f32 	%f505, [%r7+512];
+	ld.shared.f32 	%f506, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+480];
+	fma.rn.ftz.f32 	%f507, %f506, %f505, %f504;
+	ld.shared.f32 	%f508, [%r7+576];
+	ld.shared.f32 	%f509, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+484];
+	fma.rn.ftz.f32 	%f510, %f509, %f508, %f507;
+	ld.shared.f32 	%f511, [%r7+640];
+	ld.shared.f32 	%f512, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+488];
+	fma.rn.ftz.f32 	%f513, %f512, %f511, %f510;
+	ld.shared.f32 	%f514, [%r7+704];
+	ld.shared.f32 	%f515, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+492];
+	fma.rn.ftz.f32 	%f516, %f515, %f514, %f513;
+	ld.shared.f32 	%f517, [%r7+768];
+	ld.shared.f32 	%f518, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+496];
+	fma.rn.ftz.f32 	%f519, %f518, %f517, %f516;
+	ld.shared.f32 	%f520, [%r7+832];
+	ld.shared.f32 	%f521, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+500];
+	fma.rn.ftz.f32 	%f522, %f521, %f520, %f519;
+	ld.shared.f32 	%f523, [%r7+896];
+	ld.shared.f32 	%f524, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+504];
+	fma.rn.ftz.f32 	%f525, %f524, %f523, %f522;
+	ld.shared.f32 	%f526, [%r7+960];
+	ld.shared.f32 	%f527, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+508];
+	fma.rn.ftz.f32 	%f528, %f527, %f526, %f525;
+	add.ftz.f32 	%f1002, %f528, %f1002;
+
+$L__BB4_41:
+	setp.ge.s32 	%p33, %r15, %r70;
+	@%p33 bra 	$L__BB4_43;
+
+	ld.shared.f32 	%f529, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+512];
+	ld.shared.f32 	%f530, [%r7];
+	fma.rn.ftz.f32 	%f531, %f529, %f530, 0f00000000;
+	ld.shared.f32 	%f532, [%r7+64];
+	ld.shared.f32 	%f533, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+516];
+	fma.rn.ftz.f32 	%f534, %f533, %f532, %f531;
+	ld.shared.f32 	%f535, [%r7+128];
+	ld.shared.f32 	%f536, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+520];
+	fma.rn.ftz.f32 	%f537, %f536, %f535, %f534;
+	ld.shared.f32 	%f538, [%r7+192];
+	ld.shared.f32 	%f539, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+524];
+	fma.rn.ftz.f32 	%f540, %f539, %f538, %f537;
+	ld.shared.f32 	%f541, [%r7+256];
+	ld.shared.f32 	%f542, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+528];
+	fma.rn.ftz.f32 	%f543, %f542, %f541, %f540;
+	ld.shared.f32 	%f544, [%r7+320];
+	ld.shared.f32 	%f545, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+532];
+	fma.rn.ftz.f32 	%f546, %f545, %f544, %f543;
+	ld.shared.f32 	%f547, [%r7+384];
+	ld.shared.f32 	%f548, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+536];
+	fma.rn.ftz.f32 	%f549, %f548, %f547, %f546;
+	ld.shared.f32 	%f550, [%r7+448];
+	ld.shared.f32 	%f551, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+540];
+	fma.rn.ftz.f32 	%f552, %f551, %f550, %f549;
+	ld.shared.f32 	%f553, [%r7+512];
+	ld.shared.f32 	%f554, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+544];
+	fma.rn.ftz.f32 	%f555, %f554, %f553, %f552;
+	ld.shared.f32 	%f556, [%r7+576];
+	ld.shared.f32 	%f557, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+548];
+	fma.rn.ftz.f32 	%f558, %f557, %f556, %f555;
+	ld.shared.f32 	%f559, [%r7+640];
+	ld.shared.f32 	%f560, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+552];
+	fma.rn.ftz.f32 	%f561, %f560, %f559, %f558;
+	ld.shared.f32 	%f562, [%r7+704];
+	ld.shared.f32 	%f563, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+556];
+	fma.rn.ftz.f32 	%f564, %f563, %f562, %f561;
+	ld.shared.f32 	%f565, [%r7+768];
+	ld.shared.f32 	%f566, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+560];
+	fma.rn.ftz.f32 	%f567, %f566, %f565, %f564;
+	ld.shared.f32 	%f568, [%r7+832];
+	ld.shared.f32 	%f569, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+564];
+	fma.rn.ftz.f32 	%f570, %f569, %f568, %f567;
+	ld.shared.f32 	%f571, [%r7+896];
+	ld.shared.f32 	%f572, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+568];
+	fma.rn.ftz.f32 	%f573, %f572, %f571, %f570;
+	ld.shared.f32 	%f574, [%r7+960];
+	ld.shared.f32 	%f575, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+572];
+	fma.rn.ftz.f32 	%f576, %f575, %f574, %f573;
+	add.ftz.f32 	%f1001, %f576, %f1001;
+
+$L__BB4_43:
+	setp.ge.s32 	%p34, %r16, %r70;
+	@%p34 bra 	$L__BB4_45;
+
+	ld.shared.f32 	%f577, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+576];
+	ld.shared.f32 	%f578, [%r7];
+	fma.rn.ftz.f32 	%f579, %f577, %f578, 0f00000000;
+	ld.shared.f32 	%f580, [%r7+64];
+	ld.shared.f32 	%f581, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+580];
+	fma.rn.ftz.f32 	%f582, %f581, %f580, %f579;
+	ld.shared.f32 	%f583, [%r7+128];
+	ld.shared.f32 	%f584, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+584];
+	fma.rn.ftz.f32 	%f585, %f584, %f583, %f582;
+	ld.shared.f32 	%f586, [%r7+192];
+	ld.shared.f32 	%f587, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+588];
+	fma.rn.ftz.f32 	%f588, %f587, %f586, %f585;
+	ld.shared.f32 	%f589, [%r7+256];
+	ld.shared.f32 	%f590, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+592];
+	fma.rn.ftz.f32 	%f591, %f590, %f589, %f588;
+	ld.shared.f32 	%f592, [%r7+320];
+	ld.shared.f32 	%f593, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+596];
+	fma.rn.ftz.f32 	%f594, %f593, %f592, %f591;
+	ld.shared.f32 	%f595, [%r7+384];
+	ld.shared.f32 	%f596, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+600];
+	fma.rn.ftz.f32 	%f597, %f596, %f595, %f594;
+	ld.shared.f32 	%f598, [%r7+448];
+	ld.shared.f32 	%f599, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+604];
+	fma.rn.ftz.f32 	%f600, %f599, %f598, %f597;
+	ld.shared.f32 	%f601, [%r7+512];
+	ld.shared.f32 	%f602, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+608];
+	fma.rn.ftz.f32 	%f603, %f602, %f601, %f600;
+	ld.shared.f32 	%f604, [%r7+576];
+	ld.shared.f32 	%f605, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+612];
+	fma.rn.ftz.f32 	%f606, %f605, %f604, %f603;
+	ld.shared.f32 	%f607, [%r7+640];
+	ld.shared.f32 	%f608, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+616];
+	fma.rn.ftz.f32 	%f609, %f608, %f607, %f606;
+	ld.shared.f32 	%f610, [%r7+704];
+	ld.shared.f32 	%f611, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+620];
+	fma.rn.ftz.f32 	%f612, %f611, %f610, %f609;
+	ld.shared.f32 	%f613, [%r7+768];
+	ld.shared.f32 	%f614, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+624];
+	fma.rn.ftz.f32 	%f615, %f614, %f613, %f612;
+	ld.shared.f32 	%f616, [%r7+832];
+	ld.shared.f32 	%f617, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+628];
+	fma.rn.ftz.f32 	%f618, %f617, %f616, %f615;
+	ld.shared.f32 	%f619, [%r7+896];
+	ld.shared.f32 	%f620, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+632];
+	fma.rn.ftz.f32 	%f621, %f620, %f619, %f618;
+	ld.shared.f32 	%f622, [%r7+960];
+	ld.shared.f32 	%f623, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+636];
+	fma.rn.ftz.f32 	%f624, %f623, %f622, %f621;
+	add.ftz.f32 	%f1000, %f624, %f1000;
+
+$L__BB4_45:
+	setp.ge.s32 	%p35, %r17, %r70;
+	@%p35 bra 	$L__BB4_47;
+
+	ld.shared.f32 	%f625, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+640];
+	ld.shared.f32 	%f626, [%r7];
+	fma.rn.ftz.f32 	%f627, %f625, %f626, 0f00000000;
+	ld.shared.f32 	%f628, [%r7+64];
+	ld.shared.f32 	%f629, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+644];
+	fma.rn.ftz.f32 	%f630, %f629, %f628, %f627;
+	ld.shared.f32 	%f631, [%r7+128];
+	ld.shared.f32 	%f632, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+648];
+	fma.rn.ftz.f32 	%f633, %f632, %f631, %f630;
+	ld.shared.f32 	%f634, [%r7+192];
+	ld.shared.f32 	%f635, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+652];
+	fma.rn.ftz.f32 	%f636, %f635, %f634, %f633;
+	ld.shared.f32 	%f637, [%r7+256];
+	ld.shared.f32 	%f638, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+656];
+	fma.rn.ftz.f32 	%f639, %f638, %f637, %f636;
+	ld.shared.f32 	%f640, [%r7+320];
+	ld.shared.f32 	%f641, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+660];
+	fma.rn.ftz.f32 	%f642, %f641, %f640, %f639;
+	ld.shared.f32 	%f643, [%r7+384];
+	ld.shared.f32 	%f644, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+664];
+	fma.rn.ftz.f32 	%f645, %f644, %f643, %f642;
+	ld.shared.f32 	%f646, [%r7+448];
+	ld.shared.f32 	%f647, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+668];
+	fma.rn.ftz.f32 	%f648, %f647, %f646, %f645;
+	ld.shared.f32 	%f649, [%r7+512];
+	ld.shared.f32 	%f650, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+672];
+	fma.rn.ftz.f32 	%f651, %f650, %f649, %f648;
+	ld.shared.f32 	%f652, [%r7+576];
+	ld.shared.f32 	%f653, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+676];
+	fma.rn.ftz.f32 	%f654, %f653, %f652, %f651;
+	ld.shared.f32 	%f655, [%r7+640];
+	ld.shared.f32 	%f656, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+680];
+	fma.rn.ftz.f32 	%f657, %f656, %f655, %f654;
+	ld.shared.f32 	%f658, [%r7+704];
+	ld.shared.f32 	%f659, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+684];
+	fma.rn.ftz.f32 	%f660, %f659, %f658, %f657;
+	ld.shared.f32 	%f661, [%r7+768];
+	ld.shared.f32 	%f662, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+688];
+	fma.rn.ftz.f32 	%f663, %f662, %f661, %f660;
+	ld.shared.f32 	%f664, [%r7+832];
+	ld.shared.f32 	%f665, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+692];
+	fma.rn.ftz.f32 	%f666, %f665, %f664, %f663;
+	ld.shared.f32 	%f667, [%r7+896];
+	ld.shared.f32 	%f668, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+696];
+	fma.rn.ftz.f32 	%f669, %f668, %f667, %f666;
+	ld.shared.f32 	%f670, [%r7+960];
+	ld.shared.f32 	%f671, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+700];
+	fma.rn.ftz.f32 	%f672, %f671, %f670, %f669;
+	add.ftz.f32 	%f999, %f672, %f999;
+
+$L__BB4_47:
+	setp.ge.s32 	%p36, %r18, %r70;
+	@%p36 bra 	$L__BB4_49;
+
+	ld.shared.f32 	%f673, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+704];
+	ld.shared.f32 	%f674, [%r7];
+	fma.rn.ftz.f32 	%f675, %f673, %f674, 0f00000000;
+	ld.shared.f32 	%f676, [%r7+64];
+	ld.shared.f32 	%f677, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+708];
+	fma.rn.ftz.f32 	%f678, %f677, %f676, %f675;
+	ld.shared.f32 	%f679, [%r7+128];
+	ld.shared.f32 	%f680, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+712];
+	fma.rn.ftz.f32 	%f681, %f680, %f679, %f678;
+	ld.shared.f32 	%f682, [%r7+192];
+	ld.shared.f32 	%f683, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+716];
+	fma.rn.ftz.f32 	%f684, %f683, %f682, %f681;
+	ld.shared.f32 	%f685, [%r7+256];
+	ld.shared.f32 	%f686, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+720];
+	fma.rn.ftz.f32 	%f687, %f686, %f685, %f684;
+	ld.shared.f32 	%f688, [%r7+320];
+	ld.shared.f32 	%f689, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+724];
+	fma.rn.ftz.f32 	%f690, %f689, %f688, %f687;
+	ld.shared.f32 	%f691, [%r7+384];
+	ld.shared.f32 	%f692, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+728];
+	fma.rn.ftz.f32 	%f693, %f692, %f691, %f690;
+	ld.shared.f32 	%f694, [%r7+448];
+	ld.shared.f32 	%f695, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+732];
+	fma.rn.ftz.f32 	%f696, %f695, %f694, %f693;
+	ld.shared.f32 	%f697, [%r7+512];
+	ld.shared.f32 	%f698, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+736];
+	fma.rn.ftz.f32 	%f699, %f698, %f697, %f696;
+	ld.shared.f32 	%f700, [%r7+576];
+	ld.shared.f32 	%f701, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+740];
+	fma.rn.ftz.f32 	%f702, %f701, %f700, %f699;
+	ld.shared.f32 	%f703, [%r7+640];
+	ld.shared.f32 	%f704, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+744];
+	fma.rn.ftz.f32 	%f705, %f704, %f703, %f702;
+	ld.shared.f32 	%f706, [%r7+704];
+	ld.shared.f32 	%f707, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+748];
+	fma.rn.ftz.f32 	%f708, %f707, %f706, %f705;
+	ld.shared.f32 	%f709, [%r7+768];
+	ld.shared.f32 	%f710, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+752];
+	fma.rn.ftz.f32 	%f711, %f710, %f709, %f708;
+	ld.shared.f32 	%f712, [%r7+832];
+	ld.shared.f32 	%f713, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+756];
+	fma.rn.ftz.f32 	%f714, %f713, %f712, %f711;
+	ld.shared.f32 	%f715, [%r7+896];
+	ld.shared.f32 	%f716, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+760];
+	fma.rn.ftz.f32 	%f717, %f716, %f715, %f714;
+	ld.shared.f32 	%f718, [%r7+960];
+	ld.shared.f32 	%f719, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+764];
+	fma.rn.ftz.f32 	%f720, %f719, %f718, %f717;
+	add.ftz.f32 	%f998, %f720, %f998;
+
+$L__BB4_49:
+	setp.ge.s32 	%p37, %r19, %r70;
+	@%p37 bra 	$L__BB4_51;
+
+	ld.shared.f32 	%f721, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+768];
+	ld.shared.f32 	%f722, [%r7];
+	fma.rn.ftz.f32 	%f723, %f721, %f722, 0f00000000;
+	ld.shared.f32 	%f724, [%r7+64];
+	ld.shared.f32 	%f725, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+772];
+	fma.rn.ftz.f32 	%f726, %f725, %f724, %f723;
+	ld.shared.f32 	%f727, [%r7+128];
+	ld.shared.f32 	%f728, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+776];
+	fma.rn.ftz.f32 	%f729, %f728, %f727, %f726;
+	ld.shared.f32 	%f730, [%r7+192];
+	ld.shared.f32 	%f731, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+780];
+	fma.rn.ftz.f32 	%f732, %f731, %f730, %f729;
+	ld.shared.f32 	%f733, [%r7+256];
+	ld.shared.f32 	%f734, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+784];
+	fma.rn.ftz.f32 	%f735, %f734, %f733, %f732;
+	ld.shared.f32 	%f736, [%r7+320];
+	ld.shared.f32 	%f737, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+788];
+	fma.rn.ftz.f32 	%f738, %f737, %f736, %f735;
+	ld.shared.f32 	%f739, [%r7+384];
+	ld.shared.f32 	%f740, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+792];
+	fma.rn.ftz.f32 	%f741, %f740, %f739, %f738;
+	ld.shared.f32 	%f742, [%r7+448];
+	ld.shared.f32 	%f743, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+796];
+	fma.rn.ftz.f32 	%f744, %f743, %f742, %f741;
+	ld.shared.f32 	%f745, [%r7+512];
+	ld.shared.f32 	%f746, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+800];
+	fma.rn.ftz.f32 	%f747, %f746, %f745, %f744;
+	ld.shared.f32 	%f748, [%r7+576];
+	ld.shared.f32 	%f749, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+804];
+	fma.rn.ftz.f32 	%f750, %f749, %f748, %f747;
+	ld.shared.f32 	%f751, [%r7+640];
+	ld.shared.f32 	%f752, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+808];
+	fma.rn.ftz.f32 	%f753, %f752, %f751, %f750;
+	ld.shared.f32 	%f754, [%r7+704];
+	ld.shared.f32 	%f755, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+812];
+	fma.rn.ftz.f32 	%f756, %f755, %f754, %f753;
+	ld.shared.f32 	%f757, [%r7+768];
+	ld.shared.f32 	%f758, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+816];
+	fma.rn.ftz.f32 	%f759, %f758, %f757, %f756;
+	ld.shared.f32 	%f760, [%r7+832];
+	ld.shared.f32 	%f761, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+820];
+	fma.rn.ftz.f32 	%f762, %f761, %f760, %f759;
+	ld.shared.f32 	%f763, [%r7+896];
+	ld.shared.f32 	%f764, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+824];
+	fma.rn.ftz.f32 	%f765, %f764, %f763, %f762;
+	ld.shared.f32 	%f766, [%r7+960];
+	ld.shared.f32 	%f767, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+828];
+	fma.rn.ftz.f32 	%f768, %f767, %f766, %f765;
+	add.ftz.f32 	%f997, %f768, %f997;
+
+$L__BB4_51:
+	setp.ge.s32 	%p38, %r20, %r70;
+	@%p38 bra 	$L__BB4_53;
+
+	ld.shared.f32 	%f769, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+832];
+	ld.shared.f32 	%f770, [%r7];
+	fma.rn.ftz.f32 	%f771, %f769, %f770, 0f00000000;
+	ld.shared.f32 	%f772, [%r7+64];
+	ld.shared.f32 	%f773, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+836];
+	fma.rn.ftz.f32 	%f774, %f773, %f772, %f771;
+	ld.shared.f32 	%f775, [%r7+128];
+	ld.shared.f32 	%f776, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+840];
+	fma.rn.ftz.f32 	%f777, %f776, %f775, %f774;
+	ld.shared.f32 	%f778, [%r7+192];
+	ld.shared.f32 	%f779, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+844];
+	fma.rn.ftz.f32 	%f780, %f779, %f778, %f777;
+	ld.shared.f32 	%f781, [%r7+256];
+	ld.shared.f32 	%f782, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+848];
+	fma.rn.ftz.f32 	%f783, %f782, %f781, %f780;
+	ld.shared.f32 	%f784, [%r7+320];
+	ld.shared.f32 	%f785, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+852];
+	fma.rn.ftz.f32 	%f786, %f785, %f784, %f783;
+	ld.shared.f32 	%f787, [%r7+384];
+	ld.shared.f32 	%f788, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+856];
+	fma.rn.ftz.f32 	%f789, %f788, %f787, %f786;
+	ld.shared.f32 	%f790, [%r7+448];
+	ld.shared.f32 	%f791, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+860];
+	fma.rn.ftz.f32 	%f792, %f791, %f790, %f789;
+	ld.shared.f32 	%f793, [%r7+512];
+	ld.shared.f32 	%f794, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+864];
+	fma.rn.ftz.f32 	%f795, %f794, %f793, %f792;
+	ld.shared.f32 	%f796, [%r7+576];
+	ld.shared.f32 	%f797, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+868];
+	fma.rn.ftz.f32 	%f798, %f797, %f796, %f795;
+	ld.shared.f32 	%f799, [%r7+640];
+	ld.shared.f32 	%f800, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+872];
+	fma.rn.ftz.f32 	%f801, %f800, %f799, %f798;
+	ld.shared.f32 	%f802, [%r7+704];
+	ld.shared.f32 	%f803, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+876];
+	fma.rn.ftz.f32 	%f804, %f803, %f802, %f801;
+	ld.shared.f32 	%f805, [%r7+768];
+	ld.shared.f32 	%f806, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+880];
+	fma.rn.ftz.f32 	%f807, %f806, %f805, %f804;
+	ld.shared.f32 	%f808, [%r7+832];
+	ld.shared.f32 	%f809, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+884];
+	fma.rn.ftz.f32 	%f810, %f809, %f808, %f807;
+	ld.shared.f32 	%f811, [%r7+896];
+	ld.shared.f32 	%f812, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+888];
+	fma.rn.ftz.f32 	%f813, %f812, %f811, %f810;
+	ld.shared.f32 	%f814, [%r7+960];
+	ld.shared.f32 	%f815, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+892];
+	fma.rn.ftz.f32 	%f816, %f815, %f814, %f813;
+	add.ftz.f32 	%f996, %f816, %f996;
+
+$L__BB4_53:
+	setp.ge.s32 	%p39, %r21, %r70;
+	@%p39 bra 	$L__BB4_55;
+
+	ld.shared.f32 	%f817, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+896];
+	ld.shared.f32 	%f818, [%r7];
+	fma.rn.ftz.f32 	%f819, %f817, %f818, 0f00000000;
+	ld.shared.f32 	%f820, [%r7+64];
+	ld.shared.f32 	%f821, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+900];
+	fma.rn.ftz.f32 	%f822, %f821, %f820, %f819;
+	ld.shared.f32 	%f823, [%r7+128];
+	ld.shared.f32 	%f824, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+904];
+	fma.rn.ftz.f32 	%f825, %f824, %f823, %f822;
+	ld.shared.f32 	%f826, [%r7+192];
+	ld.shared.f32 	%f827, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+908];
+	fma.rn.ftz.f32 	%f828, %f827, %f826, %f825;
+	ld.shared.f32 	%f829, [%r7+256];
+	ld.shared.f32 	%f830, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+912];
+	fma.rn.ftz.f32 	%f831, %f830, %f829, %f828;
+	ld.shared.f32 	%f832, [%r7+320];
+	ld.shared.f32 	%f833, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+916];
+	fma.rn.ftz.f32 	%f834, %f833, %f832, %f831;
+	ld.shared.f32 	%f835, [%r7+384];
+	ld.shared.f32 	%f836, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+920];
+	fma.rn.ftz.f32 	%f837, %f836, %f835, %f834;
+	ld.shared.f32 	%f838, [%r7+448];
+	ld.shared.f32 	%f839, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+924];
+	fma.rn.ftz.f32 	%f840, %f839, %f838, %f837;
+	ld.shared.f32 	%f841, [%r7+512];
+	ld.shared.f32 	%f842, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+928];
+	fma.rn.ftz.f32 	%f843, %f842, %f841, %f840;
+	ld.shared.f32 	%f844, [%r7+576];
+	ld.shared.f32 	%f845, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+932];
+	fma.rn.ftz.f32 	%f846, %f845, %f844, %f843;
+	ld.shared.f32 	%f847, [%r7+640];
+	ld.shared.f32 	%f848, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+936];
+	fma.rn.ftz.f32 	%f849, %f848, %f847, %f846;
+	ld.shared.f32 	%f850, [%r7+704];
+	ld.shared.f32 	%f851, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+940];
+	fma.rn.ftz.f32 	%f852, %f851, %f850, %f849;
+	ld.shared.f32 	%f853, [%r7+768];
+	ld.shared.f32 	%f854, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+944];
+	fma.rn.ftz.f32 	%f855, %f854, %f853, %f852;
+	ld.shared.f32 	%f856, [%r7+832];
+	ld.shared.f32 	%f857, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+948];
+	fma.rn.ftz.f32 	%f858, %f857, %f856, %f855;
+	ld.shared.f32 	%f859, [%r7+896];
+	ld.shared.f32 	%f860, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+952];
+	fma.rn.ftz.f32 	%f861, %f860, %f859, %f858;
+	ld.shared.f32 	%f862, [%r7+960];
+	ld.shared.f32 	%f863, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+956];
+	fma.rn.ftz.f32 	%f864, %f863, %f862, %f861;
+	add.ftz.f32 	%f995, %f864, %f995;
+
+$L__BB4_55:
+	setp.ge.s32 	%p40, %r22, %r70;
+	@%p40 bra 	$L__BB4_57;
+
+	ld.shared.f32 	%f865, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+960];
+	ld.shared.f32 	%f866, [%r7];
+	fma.rn.ftz.f32 	%f867, %f865, %f866, 0f00000000;
+	ld.shared.f32 	%f868, [%r7+64];
+	ld.shared.f32 	%f869, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+964];
+	fma.rn.ftz.f32 	%f870, %f869, %f868, %f867;
+	ld.shared.f32 	%f871, [%r7+128];
+	ld.shared.f32 	%f872, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+968];
+	fma.rn.ftz.f32 	%f873, %f872, %f871, %f870;
+	ld.shared.f32 	%f874, [%r7+192];
+	ld.shared.f32 	%f875, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+972];
+	fma.rn.ftz.f32 	%f876, %f875, %f874, %f873;
+	ld.shared.f32 	%f877, [%r7+256];
+	ld.shared.f32 	%f878, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+976];
+	fma.rn.ftz.f32 	%f879, %f878, %f877, %f876;
+	ld.shared.f32 	%f880, [%r7+320];
+	ld.shared.f32 	%f881, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+980];
+	fma.rn.ftz.f32 	%f882, %f881, %f880, %f879;
+	ld.shared.f32 	%f883, [%r7+384];
+	ld.shared.f32 	%f884, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+984];
+	fma.rn.ftz.f32 	%f885, %f884, %f883, %f882;
+	ld.shared.f32 	%f886, [%r7+448];
+	ld.shared.f32 	%f887, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+988];
+	fma.rn.ftz.f32 	%f888, %f887, %f886, %f885;
+	ld.shared.f32 	%f889, [%r7+512];
+	ld.shared.f32 	%f890, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+992];
+	fma.rn.ftz.f32 	%f891, %f890, %f889, %f888;
+	ld.shared.f32 	%f892, [%r7+576];
+	ld.shared.f32 	%f893, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+996];
+	fma.rn.ftz.f32 	%f894, %f893, %f892, %f891;
+	ld.shared.f32 	%f895, [%r7+640];
+	ld.shared.f32 	%f896, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+1000];
+	fma.rn.ftz.f32 	%f897, %f896, %f895, %f894;
+	ld.shared.f32 	%f898, [%r7+704];
+	ld.shared.f32 	%f899, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+1004];
+	fma.rn.ftz.f32 	%f900, %f899, %f898, %f897;
+	ld.shared.f32 	%f901, [%r7+768];
+	ld.shared.f32 	%f902, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+1008];
+	fma.rn.ftz.f32 	%f903, %f902, %f901, %f900;
+	ld.shared.f32 	%f904, [%r7+832];
+	ld.shared.f32 	%f905, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+1012];
+	fma.rn.ftz.f32 	%f906, %f905, %f904, %f903;
+	ld.shared.f32 	%f907, [%r7+896];
+	ld.shared.f32 	%f908, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+1016];
+	fma.rn.ftz.f32 	%f909, %f908, %f907, %f906;
+	ld.shared.f32 	%f910, [%r7+960];
+	ld.shared.f32 	%f911, [_ZZ20marlin_gemm_fp8_bf16E10smem_input+1020];
+	fma.rn.ftz.f32 	%f912, %f911, %f910, %f909;
+	add.ftz.f32 	%f994, %f912, %f994;
+
+$L__BB4_57:
+	bar.sync 	0;
+	add.s32 	%r155, %r155, 16;
+	setp.lt.s32 	%p41, %r155, %r72;
+	@%p41 bra 	$L__BB4_3;
+	bra.uni 	$L__BB4_58;
+
+$L__BB4_1:
+	mov.f32 	%f994, 0f00000000;
+	mov.f32 	%f995, %f994;
+	mov.f32 	%f996, %f994;
+	mov.f32 	%f997, %f994;
+	mov.f32 	%f998, %f994;
+	mov.f32 	%f999, %f994;
+	mov.f32 	%f1000, %f994;
+	mov.f32 	%f1001, %f994;
+	mov.f32 	%f1002, %f994;
+	mov.f32 	%f1003, %f994;
+	mov.f32 	%f1004, %f994;
+	mov.f32 	%f1005, %f994;
+	mov.f32 	%f1006, %f994;
+	mov.f32 	%f1007, %f994;
+	mov.f32 	%f1008, %f994;
+	mov.f32 	%f1009, %f994;
+
+$L__BB4_58:
+	mov.u32 	%r154, %tid.x;
+	shr.s32 	%r153, %r154, 31;
+	shr.u32 	%r152, %r153, 28;
+	add.s32 	%r151, %r154, %r152;
+	and.b32  	%r150, %r151, -16;
+	sub.s32 	%r149, %r154, %r150;
+	add.s32 	%r39, %r1, %r149;
+	setp.ge.s32 	%p42, %r39, %r71;
+	@%p42 bra 	$L__BB4_124;
+
+	ld.param.u64 	%rd83, [marlin_gemm_fp8_bf16_param_8];
+	ld.param.u32 	%r148, [marlin_gemm_fp8_bf16_param_7];
+	setp.ne.s32 	%p43, %r148, 0;
+	setp.ne.s64 	%p44, %rd83, 0;
+	and.pred  	%p45, %p43, %p44;
+	@%p45 bra 	$L__BB4_92;
+	bra.uni 	$L__BB4_60;
+
+$L__BB4_92:
+	ld.param.u64 	%rd84, [marlin_gemm_fp8_bf16_param_8];
+	cvta.to.global.u64 	%rd49, %rd84;
+	mul.wide.s32 	%rd50, %r39, 2;
+	add.s64 	%rd5, %rd49, %rd50;
+	setp.ge.s32 	%p62, %r2, %r70;
+	@%p62 bra 	$L__BB4_94;
+
+	ld.global.nc.u16 	%rs23, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f929, {0,%rs23};}
+
+	// end inline asm
+	add.ftz.f32 	%f930, %f1009, %f929;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs24, %f930;}
+
+	// end inline asm
+	mad.lo.s32 	%r132, %r2, %r71, %r39;
+	mul.wide.s32 	%rd51, %r132, 2;
+	add.s64 	%rd52, %rd1, %rd51;
+	st.global.u16 	[%rd52], %rs24;
+
+$L__BB4_94:
+	add.s32 	%r55, %r2, 1;
+	setp.ge.s32 	%p63, %r55, %r70;
+	@%p63 bra 	$L__BB4_96;
+
+	ld.global.nc.u16 	%rs25, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f931, {0,%rs25};}
+
+	// end inline asm
+	add.ftz.f32 	%f932, %f1008, %f931;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs26, %f932;}
+
+	// end inline asm
+	mad.lo.s32 	%r133, %r55, %r71, %r39;
+	mul.wide.s32 	%rd53, %r133, 2;
+	add.s64 	%rd54, %rd1, %rd53;
+	st.global.u16 	[%rd54], %rs26;
+
+$L__BB4_96:
+	add.s32 	%r56, %r2, 2;
+	setp.ge.s32 	%p64, %r56, %r70;
+	@%p64 bra 	$L__BB4_98;
+
+	ld.global.nc.u16 	%rs27, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f933, {0,%rs27};}
+
+	// end inline asm
+	add.ftz.f32 	%f934, %f1007, %f933;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs28, %f934;}
+
+	// end inline asm
+	mad.lo.s32 	%r134, %r56, %r71, %r39;
+	mul.wide.s32 	%rd55, %r134, 2;
+	add.s64 	%rd56, %rd1, %rd55;
+	st.global.u16 	[%rd56], %rs28;
+
+$L__BB4_98:
+	add.s32 	%r57, %r2, 3;
+	setp.ge.s32 	%p65, %r57, %r70;
+	@%p65 bra 	$L__BB4_100;
+
+	ld.global.nc.u16 	%rs29, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f935, {0,%rs29};}
+
+	// end inline asm
+	add.ftz.f32 	%f936, %f1006, %f935;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs30, %f936;}
+
+	// end inline asm
+	mad.lo.s32 	%r135, %r57, %r71, %r39;
+	mul.wide.s32 	%rd57, %r135, 2;
+	add.s64 	%rd58, %rd1, %rd57;
+	st.global.u16 	[%rd58], %rs30;
+
+$L__BB4_100:
+	add.s32 	%r58, %r2, 4;
+	setp.ge.s32 	%p66, %r58, %r70;
+	@%p66 bra 	$L__BB4_102;
+
+	ld.global.nc.u16 	%rs31, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f937, {0,%rs31};}
+
+	// end inline asm
+	add.ftz.f32 	%f938, %f1005, %f937;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs32, %f938;}
+
+	// end inline asm
+	mad.lo.s32 	%r136, %r58, %r71, %r39;
+	mul.wide.s32 	%rd59, %r136, 2;
+	add.s64 	%rd60, %rd1, %rd59;
+	st.global.u16 	[%rd60], %rs32;
+
+$L__BB4_102:
+	add.s32 	%r59, %r2, 5;
+	setp.ge.s32 	%p67, %r59, %r70;
+	@%p67 bra 	$L__BB4_104;
+
+	ld.global.nc.u16 	%rs33, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f939, {0,%rs33};}
+
+	// end inline asm
+	add.ftz.f32 	%f940, %f1004, %f939;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs34, %f940;}
+
+	// end inline asm
+	mad.lo.s32 	%r137, %r59, %r71, %r39;
+	mul.wide.s32 	%rd61, %r137, 2;
+	add.s64 	%rd62, %rd1, %rd61;
+	st.global.u16 	[%rd62], %rs34;
+
+$L__BB4_104:
+	add.s32 	%r60, %r2, 6;
+	setp.ge.s32 	%p68, %r60, %r70;
+	@%p68 bra 	$L__BB4_106;
+
+	ld.global.nc.u16 	%rs35, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f941, {0,%rs35};}
+
+	// end inline asm
+	add.ftz.f32 	%f942, %f1003, %f941;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs36, %f942;}
+
+	// end inline asm
+	mad.lo.s32 	%r138, %r60, %r71, %r39;
+	mul.wide.s32 	%rd63, %r138, 2;
+	add.s64 	%rd64, %rd1, %rd63;
+	st.global.u16 	[%rd64], %rs36;
+
+$L__BB4_106:
+	add.s32 	%r61, %r2, 7;
+	setp.ge.s32 	%p69, %r61, %r70;
+	@%p69 bra 	$L__BB4_108;
+
+	ld.global.nc.u16 	%rs37, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f943, {0,%rs37};}
+
+	// end inline asm
+	add.ftz.f32 	%f944, %f1002, %f943;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs38, %f944;}
+
+	// end inline asm
+	mad.lo.s32 	%r139, %r61, %r71, %r39;
+	mul.wide.s32 	%rd65, %r139, 2;
+	add.s64 	%rd66, %rd1, %rd65;
+	st.global.u16 	[%rd66], %rs38;
+
+$L__BB4_108:
+	add.s32 	%r62, %r2, 8;
+	setp.ge.s32 	%p70, %r62, %r70;
+	@%p70 bra 	$L__BB4_110;
+
+	ld.global.nc.u16 	%rs39, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f945, {0,%rs39};}
+
+	// end inline asm
+	add.ftz.f32 	%f946, %f1001, %f945;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs40, %f946;}
+
+	// end inline asm
+	mad.lo.s32 	%r140, %r62, %r71, %r39;
+	mul.wide.s32 	%rd67, %r140, 2;
+	add.s64 	%rd68, %rd1, %rd67;
+	st.global.u16 	[%rd68], %rs40;
+
+$L__BB4_110:
+	add.s32 	%r63, %r2, 9;
+	setp.ge.s32 	%p71, %r63, %r70;
+	@%p71 bra 	$L__BB4_112;
+
+	ld.global.nc.u16 	%rs41, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f947, {0,%rs41};}
+
+	// end inline asm
+	add.ftz.f32 	%f948, %f1000, %f947;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs42, %f948;}
+
+	// end inline asm
+	mad.lo.s32 	%r141, %r63, %r71, %r39;
+	mul.wide.s32 	%rd69, %r141, 2;
+	add.s64 	%rd70, %rd1, %rd69;
+	st.global.u16 	[%rd70], %rs42;
+
+$L__BB4_112:
+	add.s32 	%r64, %r2, 10;
+	setp.ge.s32 	%p72, %r64, %r70;
+	@%p72 bra 	$L__BB4_114;
+
+	ld.global.nc.u16 	%rs43, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f949, {0,%rs43};}
+
+	// end inline asm
+	add.ftz.f32 	%f950, %f999, %f949;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs44, %f950;}
+
+	// end inline asm
+	mad.lo.s32 	%r142, %r64, %r71, %r39;
+	mul.wide.s32 	%rd71, %r142, 2;
+	add.s64 	%rd72, %rd1, %rd71;
+	st.global.u16 	[%rd72], %rs44;
+
+$L__BB4_114:
+	add.s32 	%r65, %r2, 11;
+	setp.ge.s32 	%p73, %r65, %r70;
+	@%p73 bra 	$L__BB4_116;
+
+	ld.global.nc.u16 	%rs45, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f951, {0,%rs45};}
+
+	// end inline asm
+	add.ftz.f32 	%f952, %f998, %f951;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs46, %f952;}
+
+	// end inline asm
+	mad.lo.s32 	%r143, %r65, %r71, %r39;
+	mul.wide.s32 	%rd73, %r143, 2;
+	add.s64 	%rd74, %rd1, %rd73;
+	st.global.u16 	[%rd74], %rs46;
+
+$L__BB4_116:
+	add.s32 	%r66, %r2, 12;
+	setp.ge.s32 	%p74, %r66, %r70;
+	@%p74 bra 	$L__BB4_118;
+
+	ld.global.nc.u16 	%rs47, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f953, {0,%rs47};}
+
+	// end inline asm
+	add.ftz.f32 	%f954, %f997, %f953;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs48, %f954;}
+
+	// end inline asm
+	mad.lo.s32 	%r144, %r66, %r71, %r39;
+	mul.wide.s32 	%rd75, %r144, 2;
+	add.s64 	%rd76, %rd1, %rd75;
+	st.global.u16 	[%rd76], %rs48;
+
+$L__BB4_118:
+	add.s32 	%r67, %r2, 13;
+	setp.ge.s32 	%p75, %r67, %r70;
+	@%p75 bra 	$L__BB4_120;
+
+	ld.global.nc.u16 	%rs49, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f955, {0,%rs49};}
+
+	// end inline asm
+	add.ftz.f32 	%f956, %f996, %f955;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs50, %f956;}
+
+	// end inline asm
+	mad.lo.s32 	%r145, %r67, %r71, %r39;
+	mul.wide.s32 	%rd77, %r145, 2;
+	add.s64 	%rd78, %rd1, %rd77;
+	st.global.u16 	[%rd78], %rs50;
+
+$L__BB4_120:
+	add.s32 	%r68, %r2, 14;
+	setp.ge.s32 	%p76, %r68, %r70;
+	@%p76 bra 	$L__BB4_122;
+
+	ld.global.nc.u16 	%rs51, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f957, {0,%rs51};}
+
+	// end inline asm
+	add.ftz.f32 	%f958, %f995, %f957;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs52, %f958;}
+
+	// end inline asm
+	mad.lo.s32 	%r146, %r68, %r71, %r39;
+	mul.wide.s32 	%rd79, %r146, 2;
+	add.s64 	%rd80, %rd1, %rd79;
+	st.global.u16 	[%rd80], %rs52;
+
+$L__BB4_122:
+	add.s32 	%r69, %r2, 15;
+	setp.ge.s32 	%p77, %r69, %r70;
+	@%p77 bra 	$L__BB4_124;
+
+	ld.global.nc.u16 	%rs53, [%rd5];
+	// begin inline asm
+	{ mov.b32 %f959, {0,%rs53};}
+
+	// end inline asm
+	add.ftz.f32 	%f960, %f994, %f959;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs54, %f960;}
+
+	// end inline asm
+	mad.lo.s32 	%r147, %r69, %r71, %r39;
+	mul.wide.s32 	%rd81, %r147, 2;
+	add.s64 	%rd82, %rd1, %rd81;
+	st.global.u16 	[%rd82], %rs54;
+	bra.uni 	$L__BB4_124;
+
+$L__BB4_60:
+	setp.ge.s32 	%p46, %r2, %r70;
+	@%p46 bra 	$L__BB4_62;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs7, %f1009;}
+
+	// end inline asm
+	mad.lo.s32 	%r116, %r2, %r71, %r39;
+	mul.wide.s32 	%rd17, %r116, 2;
+	add.s64 	%rd18, %rd1, %rd17;
+	st.global.u16 	[%rd18], %rs7;
+
+$L__BB4_62:
+	add.s32 	%r40, %r2, 1;
+	setp.ge.s32 	%p47, %r40, %r70;
+	@%p47 bra 	$L__BB4_64;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs8, %f1008;}
+
+	// end inline asm
+	mad.lo.s32 	%r117, %r40, %r71, %r39;
+	mul.wide.s32 	%rd19, %r117, 2;
+	add.s64 	%rd20, %rd1, %rd19;
+	st.global.u16 	[%rd20], %rs8;
+
+$L__BB4_64:
+	add.s32 	%r41, %r2, 2;
+	setp.ge.s32 	%p48, %r41, %r70;
+	@%p48 bra 	$L__BB4_66;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs9, %f1007;}
+
+	// end inline asm
+	mad.lo.s32 	%r118, %r41, %r71, %r39;
+	mul.wide.s32 	%rd21, %r118, 2;
+	add.s64 	%rd22, %rd1, %rd21;
+	st.global.u16 	[%rd22], %rs9;
+
+$L__BB4_66:
+	add.s32 	%r42, %r2, 3;
+	setp.ge.s32 	%p49, %r42, %r70;
+	@%p49 bra 	$L__BB4_68;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs10, %f1006;}
+
+	// end inline asm
+	mad.lo.s32 	%r119, %r42, %r71, %r39;
+	mul.wide.s32 	%rd23, %r119, 2;
+	add.s64 	%rd24, %rd1, %rd23;
+	st.global.u16 	[%rd24], %rs10;
+
+$L__BB4_68:
+	add.s32 	%r43, %r2, 4;
+	setp.ge.s32 	%p50, %r43, %r70;
+	@%p50 bra 	$L__BB4_70;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs11, %f1005;}
+
+	// end inline asm
+	mad.lo.s32 	%r120, %r43, %r71, %r39;
+	mul.wide.s32 	%rd25, %r120, 2;
+	add.s64 	%rd26, %rd1, %rd25;
+	st.global.u16 	[%rd26], %rs11;
+
+$L__BB4_70:
+	add.s32 	%r44, %r2, 5;
+	setp.ge.s32 	%p51, %r44, %r70;
+	@%p51 bra 	$L__BB4_72;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs12, %f1004;}
+
+	// end inline asm
+	mad.lo.s32 	%r121, %r44, %r71, %r39;
+	mul.wide.s32 	%rd27, %r121, 2;
+	add.s64 	%rd28, %rd1, %rd27;
+	st.global.u16 	[%rd28], %rs12;
+
+$L__BB4_72:
+	add.s32 	%r45, %r2, 6;
+	setp.ge.s32 	%p52, %r45, %r70;
+	@%p52 bra 	$L__BB4_74;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs13, %f1003;}
+
+	// end inline asm
+	mad.lo.s32 	%r122, %r45, %r71, %r39;
+	mul.wide.s32 	%rd29, %r122, 2;
+	add.s64 	%rd30, %rd1, %rd29;
+	st.global.u16 	[%rd30], %rs13;
+
+$L__BB4_74:
+	add.s32 	%r46, %r2, 7;
+	setp.ge.s32 	%p53, %r46, %r70;
+	@%p53 bra 	$L__BB4_76;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs14, %f1002;}
+
+	// end inline asm
+	mad.lo.s32 	%r123, %r46, %r71, %r39;
+	mul.wide.s32 	%rd31, %r123, 2;
+	add.s64 	%rd32, %rd1, %rd31;
+	st.global.u16 	[%rd32], %rs14;
+
+$L__BB4_76:
+	add.s32 	%r47, %r2, 8;
+	setp.ge.s32 	%p54, %r47, %r70;
+	@%p54 bra 	$L__BB4_78;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs15, %f1001;}
+
+	// end inline asm
+	mad.lo.s32 	%r124, %r47, %r71, %r39;
+	mul.wide.s32 	%rd33, %r124, 2;
+	add.s64 	%rd34, %rd1, %rd33;
+	st.global.u16 	[%rd34], %rs15;
+
+$L__BB4_78:
+	add.s32 	%r48, %r2, 9;
+	setp.ge.s32 	%p55, %r48, %r70;
+	@%p55 bra 	$L__BB4_80;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs16, %f1000;}
+
+	// end inline asm
+	mad.lo.s32 	%r125, %r48, %r71, %r39;
+	mul.wide.s32 	%rd35, %r125, 2;
+	add.s64 	%rd36, %rd1, %rd35;
+	st.global.u16 	[%rd36], %rs16;
+
+$L__BB4_80:
+	add.s32 	%r49, %r2, 10;
+	setp.ge.s32 	%p56, %r49, %r70;
+	@%p56 bra 	$L__BB4_82;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs17, %f999;}
+
+	// end inline asm
+	mad.lo.s32 	%r126, %r49, %r71, %r39;
+	mul.wide.s32 	%rd37, %r126, 2;
+	add.s64 	%rd38, %rd1, %rd37;
+	st.global.u16 	[%rd38], %rs17;
+
+$L__BB4_82:
+	add.s32 	%r50, %r2, 11;
+	setp.ge.s32 	%p57, %r50, %r70;
+	@%p57 bra 	$L__BB4_84;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs18, %f998;}
+
+	// end inline asm
+	mad.lo.s32 	%r127, %r50, %r71, %r39;
+	mul.wide.s32 	%rd39, %r127, 2;
+	add.s64 	%rd40, %rd1, %rd39;
+	st.global.u16 	[%rd40], %rs18;
+
+$L__BB4_84:
+	add.s32 	%r51, %r2, 12;
+	setp.ge.s32 	%p58, %r51, %r70;
+	@%p58 bra 	$L__BB4_86;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs19, %f997;}
+
+	// end inline asm
+	mad.lo.s32 	%r128, %r51, %r71, %r39;
+	mul.wide.s32 	%rd41, %r128, 2;
+	add.s64 	%rd42, %rd1, %rd41;
+	st.global.u16 	[%rd42], %rs19;
+
+$L__BB4_86:
+	add.s32 	%r52, %r2, 13;
+	setp.ge.s32 	%p59, %r52, %r70;
+	@%p59 bra 	$L__BB4_88;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs20, %f996;}
+
+	// end inline asm
+	mad.lo.s32 	%r129, %r52, %r71, %r39;
+	mul.wide.s32 	%rd43, %r129, 2;
+	add.s64 	%rd44, %rd1, %rd43;
+	st.global.u16 	[%rd44], %rs20;
+
+$L__BB4_88:
+	add.s32 	%r53, %r2, 14;
+	setp.ge.s32 	%p60, %r53, %r70;
+	@%p60 bra 	$L__BB4_90;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs21, %f995;}
+
+	// end inline asm
+	mad.lo.s32 	%r130, %r53, %r71, %r39;
+	mul.wide.s32 	%rd45, %r130, 2;
+	add.s64 	%rd46, %rd1, %rd45;
+	st.global.u16 	[%rd46], %rs21;
+
+$L__BB4_90:
+	add.s32 	%r54, %r2, 15;
+	setp.ge.s32 	%p61, %r54, %r70;
+	@%p61 bra 	$L__BB4_124;
+
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs22, %f994;}
+
+	// end inline asm
+	mad.lo.s32 	%r131, %r54, %r71, %r39;
+	mul.wide.s32 	%rd47, %r131, 2;
+	add.s64 	%rd48, %rd1, %rd47;
+	st.global.u16 	[%rd48], %rs22;
+
+$L__BB4_124:
 	ret;
 
 }

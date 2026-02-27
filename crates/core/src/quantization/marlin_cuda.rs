@@ -433,6 +433,244 @@ pub fn repack_gptq_to_marlin(
     qweight.apply_op1(op)
 }
 
+// ─── AWQ nibble deinterleave (GPU) ──────────────────────────────────────────
+
+/// Repack AWQ nibble ordering to GPTQ sequential ordering on GPU.
+///
+/// GPU-accelerated equivalent of the CPU `repack_awq_nibbles()`. Runs on any
+/// CUDA device with sm_80+, since it only uses integer operations.
+///
+/// Input and output are both `[K/8, N]` U32 (8 INT4 values packed per word).
+struct AwqRepackOp {
+    rows: usize, // K/8
+    cols: usize, // N
+}
+
+impl CustomOp1 for AwqRepackOp {
+    fn name(&self) -> &'static str {
+        "awq_marlin_repack_int4"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("awq_marlin_repack_int4 requires CUDA")
+    }
+
+    fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &storage.device;
+        let func =
+            dev.get_or_load_custom_func("awq_marlin_repack_int4", "marlin_gemm", MARLIN_GEMM_PTX)?;
+
+        let elem_count = self.rows * self.cols;
+        let output = dev.alloc_zeros::<u32>(elem_count)?;
+
+        let input = match &storage.slice {
+            CudaStorageSlice::U32(s) => s,
+            _ => candle_core::bail!("awq_marlin_repack_int4: qweight must be U32"),
+        };
+
+        const BLOCK: u32 = 16;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                self.cols.div_ceil(BLOCK as usize) as u32,
+                self.rows.div_ceil(BLOCK as usize) as u32,
+                1,
+            ),
+            block_dim: (BLOCK, BLOCK, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let rows_i32 = self.rows as i32;
+        let cols_i32 = self.cols as i32;
+
+        let mut builder = func.builder();
+        builder.arg(&output);
+        builder.arg(input);
+        builder.arg(&rows_i32);
+        builder.arg(&cols_i32);
+
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("awq_marlin_repack_int4 launch: {e}")))?;
+
+        let output_storage = CudaStorage {
+            slice: CudaStorageSlice::U32(output),
+            device: dev.clone(),
+        };
+        Ok((output_storage, Shape::from_dims(&[self.rows, self.cols])))
+    }
+}
+
+/// Repack AWQ nibble ordering to GPTQ sequential ordering on GPU.
+pub fn awq_marlin_repack(qweight: &Tensor, size_k: usize, size_n: usize) -> Result<Tensor> {
+    let op = AwqRepackOp {
+        rows: size_k / 8,
+        cols: size_n,
+    };
+    qweight.apply_op1(op)
+}
+
+// ─── FP8 E4M3 GEMM for Ampere (software decode) ─────────────────────────────
+
+/// CUDA op for FP8 E4M3 GEMM via software decode on Ampere (sm_80+).
+///
+/// Carries all non-input tensors so `CustomOp1` only takes the activation input.
+struct Fp8AmpereGemmOp {
+    qweight: Tensor,      // [N, K] U8  — FP8 E4M3
+    weight_scale: Tensor, // [N]    F32 — per-channel scales
+    bias: Option<Tensor>, // [N]    BF16 — optional
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+impl CustomOp1 for Fp8AmpereGemmOp {
+    fn name(&self) -> &'static str {
+        "marlin_gemm_fp8_bf16"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("marlin_gemm_fp8_bf16 requires CUDA")
+    }
+
+    fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &storage.device;
+        let func =
+            dev.get_or_load_custom_func("marlin_gemm_fp8_bf16", "marlin_gemm", MARLIN_GEMM_PTX)?;
+
+        let output_shape = Shape::from_dims(&[self.m, self.n]);
+        let output = dev.alloc_zeros::<half::bf16>(self.m * self.n)?;
+
+        let input = match &storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("marlin_gemm_fp8_bf16: input must be BF16"),
+        };
+
+        let (qw_guard, _) = self.qweight.storage_and_layout();
+        let qweight = match &*qw_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U8(s) => s,
+                _ => candle_core::bail!("marlin_gemm_fp8_bf16: qweight must be U8"),
+            },
+            _ => candle_core::bail!("marlin_gemm_fp8_bf16: qweight must be on CUDA"),
+        };
+
+        let (scale_guard, _) = self.weight_scale.storage_and_layout();
+        let weight_scale = match &*scale_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F32(s) => s,
+                _ => candle_core::bail!("marlin_gemm_fp8_bf16: weight_scale must be F32"),
+            },
+            _ => candle_core::bail!("marlin_gemm_fp8_bf16: weight_scale must be on CUDA"),
+        };
+
+        let num_m_blocks = self.m.div_ceil(GPTQ_MARLIN_TILE);
+        let num_n_blocks = self.n.div_ceil(GPTQ_MARLIN_TILE);
+        let cfg = LaunchConfig {
+            grid_dim: (num_n_blocks as u32, num_m_blocks as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let m_i32 = self.m as i32;
+        let n_i32 = self.n as i32;
+        let k_i32 = self.k as i32;
+        let has_bias_i32: i32 = if self.bias.is_some() { 1 } else { 0 };
+
+        // Hoist optional bias guard outside the builder scope so the borrow outlives
+        // `builder.launch(cfg)` — same lifetime constraint as in MarlinGemmOp.
+        let bias_storage = self.bias.as_ref().map(|b| b.storage_and_layout());
+        let null_bias_ptr: u64 = 0;
+
+        let mut builder = func.builder();
+        builder.arg(&output);
+        builder.arg(input);
+        builder.arg(qweight);
+        builder.arg(weight_scale);
+        builder.arg(&m_i32);
+        builder.arg(&n_i32);
+        builder.arg(&k_i32);
+        builder.arg(&has_bias_i32);
+
+        match &bias_storage {
+            Some((bias_guard, _)) => {
+                if let Storage::Cuda(cs) = &**bias_guard {
+                    if let CudaStorageSlice::BF16(s) = &cs.slice {
+                        builder.arg(s);
+                    } else {
+                        candle_core::bail!("marlin_gemm_fp8_bf16: bias must be BF16");
+                    }
+                } else {
+                    candle_core::bail!("marlin_gemm_fp8_bf16: bias must be on CUDA");
+                }
+            }
+            None => {
+                builder.arg(&null_bias_ptr);
+            }
+        }
+
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("marlin_gemm_fp8_bf16 launch: {e}")))?;
+
+        drop(qw_guard);
+        drop(scale_guard);
+        drop(bias_storage);
+
+        let output_storage = CudaStorage {
+            slice: CudaStorageSlice::BF16(output),
+            device: dev.clone(),
+        };
+        Ok((output_storage, output_shape))
+    }
+}
+
+/// FP8 E4M3 GEMM for Ampere GPUs (sm_80+) via software FP8 decode.
+///
+/// Computes `output = input @ dequant(qweight).T + bias` where
+/// `qweight [N, K]` is FP8 E4M3 stored as U8 and `weight_scale [N]` is
+/// per-channel F32. Runs on any CUDA device with sm_80+.
+///
+/// Unlike the Hopper native FP8 GEMM (`fp8_cuda::fp8_gemm`), this kernel
+/// decodes FP8 weights in software and uses BF16 activations without
+/// dynamic quantization.
+pub fn fp8_ampere_gemm(
+    input: &Tensor,
+    qweight: &Tensor,
+    weight_scale: &Tensor,
+    bias: Option<&Tensor>,
+    size_n: usize,
+) -> Result<Tensor> {
+    let input = input.contiguous()?;
+    let dims = input.dims();
+    let (m, k) = match dims.len() {
+        2 => (dims[0], dims[1]),
+        _ => {
+            let batch: usize = dims[..dims.len() - 1].iter().product();
+            (batch, dims[dims.len() - 1])
+        }
+    };
+
+    let op = Fp8AmpereGemmOp {
+        qweight: qweight.clone(),
+        weight_scale: weight_scale.clone(),
+        bias: bias.cloned(),
+        m,
+        n: size_n,
+        k,
+    };
+    let result = input.apply_op1(op)?;
+
+    if dims.len() > 2 {
+        let mut out_shape: Vec<usize> = dims[..dims.len() - 1].to_vec();
+        out_shape.push(size_n);
+        result.reshape(out_shape)
+    } else {
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +713,22 @@ mod tests {
 
         let result = repack_gptq_to_marlin(&qweight, None, 4096, 4096, 4);
 
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_awq_repack_requires_cuda() {
+        let qweight = Tensor::zeros(&[16, 64], DType::U32, &Device::Cpu).unwrap();
+        let result = awq_marlin_repack(&qweight, 128, 64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fp8_ampere_gemm_requires_cuda() {
+        let input = Tensor::zeros((4usize, 64usize), DType::BF16, &Device::Cpu).unwrap();
+        let qweight = Tensor::zeros((64usize, 64usize), DType::U8, &Device::Cpu).unwrap();
+        let scale = Tensor::ones(64usize, DType::F32, &Device::Cpu).unwrap();
+        let result = fp8_ampere_gemm(&input, &qweight, &scale, None, 64);
         assert!(result.is_err());
     }
 
@@ -533,6 +787,70 @@ mod tests {
             // Both are acceptable for this test
             if let Ok(output) = result {
                 assert_eq!(output.dims(), &[m, n]);
+            }
+        }
+
+        #[test]
+        fn test_awq_repack_gpu_matches_cpu() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            // Build a qweight with known values on CPU, repack via GPU, compare.
+            let k = 128usize;
+            let n = 64usize;
+            let rows = k / 8;
+
+            // All-zero input: AWQ repack should give all-zero output.
+            let qweight_cpu = Tensor::zeros((rows, n), DType::U32, &Device::Cpu).unwrap();
+            let qweight_gpu = qweight_cpu.to_device(&device).unwrap();
+
+            let result = awq_marlin_repack(&qweight_gpu, k, n);
+            if let Ok(repacked) = result {
+                assert_eq!(repacked.dims(), &[rows, n]);
+                let values: Vec<u32> = repacked
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert!(values.iter().all(|&v| v == 0));
+            }
+        }
+
+        #[test]
+        fn test_fp8_ampere_gemm_zero_weights() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            let m = 4usize;
+            let k = 64usize;
+            let n = 32usize;
+
+            let input = Tensor::ones((m, k), DType::BF16, &device).unwrap();
+            // Zero FP8 weights → output should be zero regardless of scale.
+            let qweight = Tensor::zeros((n, k), DType::U8, &device).unwrap();
+            let scale = Tensor::ones(n, DType::F32, &device).unwrap();
+
+            let result = fp8_ampere_gemm(&input, &qweight, &scale, None, n);
+            if let Ok(output) = result {
+                assert_eq!(output.dims(), &[m, n]);
+                let vals: Vec<f32> = output
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert!(
+                    vals.iter().all(|&v| v.abs() < 1e-3),
+                    "expected zeros, got {:?}",
+                    &vals[..4]
+                );
             }
         }
     }

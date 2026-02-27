@@ -22,6 +22,9 @@ use std::collections::HashMap;
 
 use candle_core::{DType, Device, Result, Tensor};
 
+#[cfg(feature = "marlin")]
+use super::marlin_cuda;
+
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
 use super::marlin::{MarlinConfig, MarlinLinear};
 
@@ -132,7 +135,18 @@ pub(crate) fn repack_awq_nibbles(qweight: &Tensor) -> Result<Tensor> {
     let shape = qweight.shape().clone();
     let device = qweight.device().clone();
 
-    // Bring to CPU u32 for bit manipulation.
+    // GPU fast path: parallel per-word transform via CUDA kernel.
+    // Any sm_80+ device is supported (the kernel uses only integer ops).
+    #[cfg(feature = "marlin")]
+    if device.is_cuda() {
+        let dims = shape.dims();
+        if dims.len() == 2 {
+            // qweight shape [K/8, N]: reconstruct size_k and size_n
+            return marlin_cuda::awq_marlin_repack(qweight, dims[0] * 8, dims[1]);
+        }
+    }
+
+    // CPU fallback: bring to host, transform word-by-word, return to original device.
     let flat = qweight
         .to_dtype(DType::U32)?
         .to_device(&Device::Cpu)?

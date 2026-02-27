@@ -36,8 +36,8 @@ CPU fallback paths work. These add GPU-accelerated paths.
 
 | Item | Current State | Gap | Effort |
 |------|--------------|-----|--------|
-| 3.1 | AWQ-Marlin CPU path works (7 tests) | No `awq_marlin_repack_int4` PTX kernel for GPU repack | 10–20h |
-| 3.2 | FBGEMM-FP8 Ada works, Ampere falls to CPU | Wire `MarlinScalarType::Float8E4m3fn` for Ampere | 5–10h |
+| 3.1 ✅ | AWQ-Marlin CPU path works (7 tests) | `awq_marlin_repack_int4` PTX kernel added; `repack_awq_nibbles()` dispatches GPU when `marlin` feature + CUDA device | `TBD` |
+| 3.2 ✅ | FBGEMM-FP8 Ada works, Ampere falls to CPU | `marlin_gemm_fp8_bf16` PTX kernel added (software FP8 decode); build-time `cuda_ampere_fp8`/`cuda_hopper_fp8` cfg flags select path | `TBD` |
 | 3.3 | MXFP4 CPU emulation works (19 tests) | No GPU dispatch for MoE FP4 compute | 10–15h |
 
 ---

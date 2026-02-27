@@ -21,8 +21,11 @@ use candle_core::{DType, Device, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
 
-#[cfg(feature = "cuda-kernels")]
+#[cfg(all(feature = "cuda-kernels", cuda_hopper_fp8))]
 use super::fp8_cuda;
+
+#[cfg(all(feature = "marlin", cuda_ampere_fp8))]
+use super::marlin_cuda;
 
 // ─── FbgemmFp8Config ─────────────────────────────────────────────────────────
 
@@ -196,22 +199,54 @@ impl FbgemmFp8Linear {
         w_f32.broadcast_mul(&s_f32)?.to_dtype(target_dtype)
     }
 
-    /// FP8 CUDA forward via `fp8_gemm` (Hopper, cap ≥ 89).
-    #[cfg(feature = "cuda-kernels")]
+    /// FP8 CUDA forward via `fp8_gemm` (Hopper, sm_89+, native hardware FP8).
+    #[cfg(all(feature = "cuda-kernels", cuda_hopper_fp8))]
     fn forward_fp8_cuda(&self, x: &Tensor) -> Result<Tensor> {
         let scale = self.weight_scale.as_ref().ok_or_else(|| {
             candle_core::Error::Msg("FbgemmFp8Linear: weight_scale required".to_string())
         })?;
         fp8_cuda::fp8_gemm(x, &self.weight, scale, self.bias.as_ref())
     }
+
+    /// FP8 CUDA forward via software decode (Ampere, sm_80–88).
+    ///
+    /// Decodes FP8 E4M3 weights in software during the GEMM, bypassing the
+    /// Hopper hardware FP8 path which is unavailable on sm_80.
+    #[cfg(all(feature = "marlin", cuda_ampere_fp8))]
+    fn forward_fp8_ampere(&self, x: &Tensor) -> Result<Tensor> {
+        let scale = self.weight_scale.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("FbgemmFp8Linear: weight_scale required".to_string())
+        })?;
+        // Ensure scale is [N] F32 (flatten [N, 1] if needed)
+        let scale_1d = if scale.dims().len() == 2 {
+            scale.flatten_all()?
+        } else {
+            scale.clone()
+        };
+        let scale_f32 = scale_1d.to_dtype(candle_core::DType::F32)?;
+        let x_bf16 = x.to_dtype(candle_core::DType::BF16)?;
+        marlin_cuda::fp8_ampere_gemm(
+            &x_bf16,
+            &self.weight,
+            &scale_f32,
+            self.bias.as_ref(),
+            self.out_features,
+        )
+    }
 }
 
 impl QuantizedLinear for FbgemmFp8Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Hopper: use FP8 GEMM kernel with dynamic per-token activation quant.
-        #[cfg(feature = "cuda-kernels")]
+        // Hopper (sm_89+): native hardware FP8 GEMM with dynamic per-token activation quant.
+        #[cfg(all(feature = "cuda-kernels", cuda_hopper_fp8))]
         if self.is_fp8_weights && self.weight_scale.is_some() && x.device().is_cuda() {
             return self.forward_fp8_cuda(x);
+        }
+
+        // Ampere (sm_80-88): FP8 weight GEMM via software decode kernel.
+        #[cfg(all(feature = "marlin", cuda_ampere_fp8))]
+        if self.is_fp8_weights && self.weight_scale.is_some() && x.device().is_cuda() {
+            return self.forward_fp8_ampere(x);
         }
 
         let out_dtype = x.dtype();

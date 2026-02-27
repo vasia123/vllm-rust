@@ -415,3 +415,163 @@ extern "C" __global__ void marlin_gemm_int4_zp_bf16(
         }
     }
 }
+
+// ─── AWQ nibble deinterleave (GPU) ──────────────────────────────────────────
+//
+// Parallel per-word transform: AWQ interleaved nibble order → GPTQ sequential.
+// Each thread handles one U32 word, so the kernel is trivially parallel.
+//
+// AWQ: nibble positions [0..7] = [v0, v2, v4, v6, v1, v3, v5, v7]
+// GPTQ: nibble positions [0..7] = [v0, v1, v2, v3, v4, v5, v6, v7]
+// Permutation: output nibble i ← input nibble undo_pack[i]
+//              undo_pack = {0, 4, 1, 5, 2, 6, 3, 7}
+//
+// Matches CPU `awq_to_gptq_u32()` in `awq_marlin.rs`.
+
+extern "C" __global__ void awq_marlin_repack_int4(
+    unsigned int* __restrict__ output,       // [rows, cols] — GPTQ nibble order
+    const unsigned int* __restrict__ input,  // [rows, cols] — AWQ nibble order
+    int rows,   // K / 8 (8 INT4 values packed per U32)
+    int cols    // N
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= rows || col >= cols) return;
+
+    unsigned int w = input[row * cols + col];
+
+    // Extract nibbles from AWQ interleaved ordering:
+    //   positions 0..3 carry even values  [v0, v2, v4, v6]
+    //   positions 4..7 carry odd values   [v1, v3, v5, v7]
+    unsigned int n0 = (w)       & 0xFU;  // v0
+    unsigned int n1 = (w >>  4) & 0xFU;  // v2
+    unsigned int n2 = (w >>  8) & 0xFU;  // v4
+    unsigned int n3 = (w >> 12) & 0xFU;  // v6
+    unsigned int n4 = (w >> 16) & 0xFU;  // v1
+    unsigned int n5 = (w >> 20) & 0xFU;  // v3
+    unsigned int n6 = (w >> 24) & 0xFU;  // v5
+    unsigned int n7 = (w >> 28) & 0xFU;  // v7
+
+    // Pack into GPTQ sequential ordering: [v0, v1, v2, v3, v4, v5, v6, v7]
+    output[row * cols + col] =
+        n0 | (n4 << 4) | (n1 << 8) | (n5 << 12) |
+        (n2 << 16) | (n6 << 20) | (n3 << 24) | (n7 << 28);
+}
+
+// ─── FP8 E4M3 GEMM for Ampere (software decode) ─────────────────────────────
+//
+// Performs output = input @ dequant(weight).T + bias
+// where weight is FP8 E4M3 stored as U8 [N, K] with per-channel F32 scales.
+//
+// FP8 E4M3fn bit layout: [s(7) | e3(6) e2(5) e1(4) e0(3) | m2(2) m1(1) m0(0)]
+//   Exponent bias: 7
+//   exp == 0:  subnormal — value = (-1)^s * 2^(-6) * (mantissa / 8)
+//   exp in [1..14]: normal — value = (-1)^s * 2^(exp-7) * (1 + mantissa / 8)
+//   exp == 15: NaN (E4M3fn has no infinity representation)
+//
+// Software FP8 decode makes this compatible with Ampere (sm_80) which has no
+// hardware FP8 support.
+
+__device__ __forceinline__ float fp8_e4m3_to_float(unsigned char fp8) {
+    unsigned int sign     = (unsigned int)(fp8 >> 7) & 1U;
+    unsigned int exponent = (unsigned int)(fp8 >> 3) & 0xFU;
+    unsigned int mantissa = (unsigned int)(fp8)       & 0x7U;
+    float val;
+    if (exponent == 15U) {
+        // E4M3fn: exponent=15 is always NaN (no infinity in this variant)
+        val = __int_as_float(0x7FC00000U);
+    } else if (exponent == 0U) {
+        // Subnormal: (-1)^s * 2^(-6) * (mantissa / 8)
+        // 2^(-6) / 8 = 1/512
+        val = (float)mantissa * (1.0f / 512.0f);
+    } else {
+        // Normal: (-1)^s * 2^(exp - 7) * (1 + mantissa / 8)
+        val = ldexpf(1.0f + (float)mantissa * (1.0f / 8.0f), (int)exponent - 7);
+    }
+    return sign ? -val : val;
+}
+
+extern "C" __global__ void marlin_gemm_fp8_bf16(
+    __nv_bfloat16* __restrict__ output,         // [M, N]
+    const __nv_bfloat16* __restrict__ input,    // [M, K] activations (BF16)
+    const unsigned char* __restrict__ qweight,  // [N, K] FP8 E4M3 as U8
+    const float* __restrict__ weight_scale,     // [N]    per-channel F32 scales
+    int M, int N, int K,
+    int has_bias,
+    const __nv_bfloat16* __restrict__ bias      // [N]    optional bias
+) {
+    int tile_n = blockIdx.x * TILE_N;
+    int tile_m = blockIdx.y * TILE_M;
+    int tid = threadIdx.x;
+
+    __shared__ float smem_input[TILE_M][TILE_K];
+    __shared__ float smem_weight[TILE_K][TILE_N];
+
+    float acc[TILE_M];
+    int local_n = tid % TILE_N;
+
+    for (int m = 0; m < TILE_M; m++) {
+        acc[m] = 0.0f;
+    }
+
+    for (int k_start = 0; k_start < K; k_start += TILE_K) {
+        // Load input tile [TILE_M, TILE_K]
+        for (int idx = tid; idx < TILE_M * TILE_K; idx += blockDim.x) {
+            int m = idx / TILE_K;
+            int k = idx % TILE_K;
+            int global_m = tile_m + m;
+            int global_k = k_start + k;
+            if (global_m < M && global_k < K) {
+                smem_input[m][k] = bf16_to_float(input[global_m * K + global_k]);
+            } else {
+                smem_input[m][k] = 0.0f;
+            }
+        }
+
+        // Decode and dequantize FP8 weight tile [TILE_K, TILE_N]
+        // Weight layout [N, K]: element [global_n, global_k] at global_n*K + global_k
+        for (int idx = tid; idx < TILE_K * TILE_N; idx += blockDim.x) {
+            int k = idx / TILE_N;
+            int n = idx % TILE_N;
+            int global_k = k_start + k;
+            int global_n = tile_n + n;
+            if (global_k < K && global_n < N) {
+                float w = fp8_e4m3_to_float(qweight[global_n * K + global_k]);
+                smem_weight[k][n] = w * weight_scale[global_n];
+            } else {
+                smem_weight[k][n] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        if (local_n < TILE_N && (tile_n + local_n) < N) {
+            for (int m = 0; m < TILE_M; m++) {
+                if (tile_m + m < M) {
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int k = 0; k < TILE_K; k++) {
+                        sum += smem_input[m][k] * smem_weight[k][local_n];
+                    }
+                    acc[m] += sum;
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (local_n < TILE_N && (tile_n + local_n) < N) {
+        for (int m = 0; m < TILE_M; m++) {
+            int global_m = tile_m + m;
+            int global_n = tile_n + local_n;
+            if (global_m < M && global_n < N) {
+                float val = acc[m];
+                if (has_bias && bias != NULL) {
+                    val += bf16_to_float(bias[global_n]);
+                }
+                output[global_m * N + global_n] = float_to_bf16(val);
+            }
+        }
+    }
+}
