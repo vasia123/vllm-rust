@@ -38,7 +38,7 @@ CPU fallback paths work. These add GPU-accelerated paths.
 |------|--------------|-----|--------|
 | 3.1 ✅ | AWQ-Marlin CPU path works (7 tests) | `awq_marlin_repack_int4` PTX kernel added; `repack_awq_nibbles()` dispatches GPU when `marlin` feature + CUDA device | `de75568` |
 | 3.2 ✅ | FBGEMM-FP8 Ada works, Ampere falls to CPU | `marlin_gemm_fp8_bf16` PTX kernel added (software FP8 decode); build-time `cuda_ampere_fp8`/`cuda_hopper_fp8` cfg flags select path | `de75568` |
-| 3.3 ✅ | MXFP4 CPU emulation works (19 tests) | `mxfp4_gemm_bf16` PTX kernel added (FP4 LUT + E8M0 dequant); `MxFp4Linear::forward()` dispatches GPU when `cuda-kernels` feature + CUDA device | pending |
+| 3.3 ✅ | MXFP4 CPU emulation works (19 tests) | `mxfp4_gemm_bf16` PTX kernel added (FP4 LUT + E8M0 dequant); `MxFp4Linear::forward()` dispatches GPU when `cuda-kernels` feature + CUDA device | `d984362` |
 
 ---
 
@@ -48,7 +48,7 @@ Requires multi-GPU testing.
 
 | Item | What Exists | Gap | Effort |
 |------|------------|-----|--------|
-| 4.1 | PP signals + worker loop + 27 tests | Stage construction (layer slicing by rank), NCCL multi-process launch | 30–50h |
+| 4.1 ✅ | PP signals + worker loop + 27 tests | `LlamaForCausalLM::new_with_pp()` + `impl PipelineForward`; `from_config_with_pp()` for Llama/Mistral family; `distributed_launcher.rs` spawns N-1 worker processes; `run_pipeline_worker()` on worker ranks; `PipelineStagedModel` wraps NCCL comm at coordinator | `f755064` |
 | 4.2 | EPLB state tracking + rebalance detect | `rearrange_expert_weights_inplace` via NCCL all-to-all | 15–25h |
 
 ---
