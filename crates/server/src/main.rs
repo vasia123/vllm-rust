@@ -1042,7 +1042,9 @@ struct ServerLaunchConfig {
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
-    logging::init_with_level(&cfg.log_level);
+    // Capture before cfg is destructured below.
+    let otlp_endpoint = cfg.otlp_traces_endpoint.clone();
+    logging::init_with_otlp(&cfg.log_level, otlp_endpoint.as_deref())?;
     prometheus::init_metrics();
 
     let ServerLaunchConfig {
@@ -1106,8 +1108,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         ngram_prompt_lookup_min,
         disable_log_stats,
         max_logprobs,
-        otlp_traces_endpoint,
-        log_level: _, // already consumed above via cfg.log_level
+        otlp_traces_endpoint: _, // already consumed above via otlp_endpoint clone
+        log_level: _,            // already consumed above via cfg.log_level
         limit_mm_per_prompt,
         disable_mm_preprocessor_cache,
         guided_decoding_backend,
