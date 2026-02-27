@@ -9,14 +9,16 @@
 //!   y_t      = h_t · C_t  +  D_h · x_t
 //! ```
 //!
-//! This module provides two equivalent implementations:
+//! This module provides two CPU implementations and one GPU-accelerated path:
 //!
 //! * [`ssd_sequential`] — simple sequential loop; always correct, used as
 //!   reference and for short sequences.
 //! * [`ssd_chunk_scan`] — chunked scan that groups time-steps into blocks,
 //!   enabling matrix-level parallelism within each chunk.  On CPU both produce
-//!   the same numerics; the chunked structure maps cleanly to future CUDA
-//!   kernel integration.
+//!   the same numerics; the chunked structure maps cleanly to CUDA kernel work.
+//! * [`ssd_forward`] — dispatch function: uses the GPU kernel via
+//!   [`super::ssd_cuda::ssd_scan`] on CUDA devices (when the `cuda-kernels`
+//!   feature is enabled), otherwise falls back to [`ssd_sequential`].
 //!
 //! ## Tensor layout
 //!
@@ -255,6 +257,41 @@ pub fn ssd_chunk_scan(
 
     let output = Tensor::cat(&chunk_outputs, 1)?; // [B, L, H, P]
     Ok((output, h))
+}
+
+// ─── GPU-accelerated dispatch ─────────────────────────────────────────────────
+
+/// Dispatch Mamba2 SSD scan to the best available implementation.
+///
+/// On CUDA devices with the `cuda-kernels` feature enabled, calls the
+/// `ssd_scan_f32` GPU kernel which parallelises across `(B, H, P)` dimensions
+/// while keeping the sequential `L` recurrence inside the kernel.
+///
+/// Falls back to [`ssd_sequential`] when:
+/// * the device is CPU, or
+/// * `cuda-kernels` is not enabled, or
+/// * `head_dim > 1024` (CUDA block-size limit), or
+/// * `d_state > 256` (kernel register-array bound).
+#[allow(clippy::too_many_arguments)]
+pub fn ssd_forward(
+    x: &Tensor,
+    dt: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    d: &Tensor,
+    state: &Tensor,
+    heads_per_group: usize,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda-kernels")]
+    if x.device().is_cuda() {
+        match super::ssd_cuda::ssd_scan(x, dt, a, b, c, d, state, heads_per_group) {
+            Ok(result) => return Ok(result),
+            // Constraint violations (head_dim or d_state too large) fall through.
+            Err(_) => {}
+        }
+    }
+    ssd_sequential(x, dt, a, b, c, d, state, heads_per_group)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

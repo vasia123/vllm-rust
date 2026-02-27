@@ -126,6 +126,12 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/custom_allreduce.ptx",
         min_sm: 80,
     },
+    // Mamba2 SSD sequential scan — F32 arithmetic, works on sm_75+
+    KernelDef {
+        source: "kernels/ssd_scan.cu",
+        output: "kernels/ssd_scan.ptx",
+        min_sm: 75,
+    },
 ];
 
 fn parse_sm_version(arch: &str) -> u32 {
