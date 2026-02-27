@@ -1,26 +1,32 @@
-//! Multi-process launcher for pipeline parallelism.
+//! Multi-process launchers for pipeline and tensor parallelism.
+//!
+//! ## Pipeline Parallelism
 //!
 //! When `--pipeline-parallel-size N` is requested, rank 0 spawns N-1 worker
 //! processes (ranks 1..N-1) that run the pipeline worker loop instead of the
-//! HTTP server. Each worker is a re-execution of the same binary with the same
-//! CLI arguments, distinguished by the standard distributed environment variables.
+//! HTTP server.
+//!
+//! ## Tensor Parallelism
+//!
+//! When `--tensor-parallel-size N` is requested, rank 0 spawns N-1 worker
+//! processes (ranks 1..N-1) that run `tensor_worker_loop`. TP workers are
+//! distinguished from PP workers by the `VLLM_TP_WORKER=1` environment variable.
 //!
 //! # Environment Variables (standard distributed training convention)
 //!
-//! | Variable      | Set by launcher | Consumed by |
-//! |---------------|----------------|-------------|
-//! | `RANK`        | 1..N-1         | `DistributedConfig::from_env()` |
-//! | `WORLD_SIZE`  | N              | `DistributedConfig::from_env()` |
-//! | `LOCAL_RANK`  | 1..N-1         | `DistributedConfig::from_env()` |
-//! | `MASTER_ADDR` | 127.0.0.1      | NCCL bootstrap TCP |
-//! | `MASTER_PORT` | 29500          | NCCL bootstrap TCP |
-//!
-//! Workers detect their role via `is_worker_process()` which returns `true` when
-//! `RANK > 0`.
+//! | Variable        | Set by launcher | Consumed by |
+//! |-----------------|----------------|-------------|
+//! | `RANK`          | 1..N-1         | `DistributedConfig::from_env()` |
+//! | `WORLD_SIZE`    | N              | `DistributedConfig::from_env()` |
+//! | `LOCAL_RANK`    | 1..N-1         | `DistributedConfig::from_env()` |
+//! | `MASTER_ADDR`   | 127.0.0.1      | NCCL bootstrap TCP |
+//! | `MASTER_PORT`   | dynamic        | NCCL bootstrap TCP |
+//! | `VLLM_TP_WORKER`| 1 (TP only)    | `is_tp_worker_process()` |
 
 use std::process::{Child, Command};
 
-/// Return `true` when this process is a pipeline worker (RANK > 0).
+/// Return `true` when this process is a **pipeline** worker (RANK > 0 and
+/// `VLLM_TP_WORKER` not set).
 ///
 /// Called at the top of `run_server` to branch into the worker code path
 /// instead of the full HTTP server path.
@@ -28,11 +34,31 @@ use std::process::{Child, Command};
 // non-cuda builds where the call site is compiled out.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub fn is_worker_process() -> bool {
-    std::env::var("RANK")
+    let is_worker = std::env::var("RANK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .map(|r| r > 0)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let is_tp = std::env::var("VLLM_TP_WORKER")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    is_worker && !is_tp
+}
+
+/// Return `true` when this process is a **tensor-parallel** worker
+/// (RANK > 0 and `VLLM_TP_WORKER=1`).
+// Only called from #[cfg(feature = "cuda")] code.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub fn is_tp_worker_process() -> bool {
+    let is_worker = std::env::var("RANK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|r| r > 0)
+        .unwrap_or(false);
+    let is_tp = std::env::var("VLLM_TP_WORKER")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    is_worker && is_tp
 }
 
 /// Spawn `world_size - 1` worker processes (ranks 1..world_size).
@@ -79,6 +105,52 @@ pub fn spawn_pipeline_workers(world_size: usize, master_port: u16) -> anyhow::Re
     }
 
     tracing::info!(count = world_size - 1, "all pipeline workers spawned");
+    Ok(workers)
+}
+
+/// Spawn `world_size - 1` tensor-parallel worker processes (ranks 1..world_size).
+///
+/// Mirrors [`spawn_pipeline_workers`] but sets `VLLM_TP_WORKER=1` so workers
+/// route to `run_tensor_worker` instead of `run_pipeline_worker`.
+///
+/// # Arguments
+/// * `world_size`   — total number of TP ranks (= tp_size)
+/// * `master_port`  — TCP port used by NCCL for unique-ID broadcast
+pub fn spawn_tensor_workers(world_size: usize, master_port: u16) -> anyhow::Result<Vec<Child>> {
+    assert!(world_size > 1, "no workers to spawn for world_size=1");
+
+    let current_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to determine current executable: {e}"))?;
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    let mut workers = Vec::with_capacity(world_size - 1);
+    for rank in 1..world_size {
+        tracing::info!(
+            rank,
+            world_size,
+            master_port,
+            "spawning tensor-parallel worker"
+        );
+
+        let child = Command::new(&current_exe)
+            .args(&args)
+            .env("RANK", rank.to_string())
+            .env("WORLD_SIZE", world_size.to_string())
+            .env("LOCAL_RANK", rank.to_string())
+            .env("MASTER_ADDR", "127.0.0.1")
+            .env("MASTER_PORT", master_port.to_string())
+            .env("VLLM_TP_WORKER", "1")
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn TP worker rank {rank}: {e}"))?;
+
+        workers.push(child);
+    }
+
+    tracing::info!(
+        count = world_size - 1,
+        "all tensor-parallel workers spawned"
+    );
     Ok(workers)
 }
 

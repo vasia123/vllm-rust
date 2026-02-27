@@ -792,6 +792,13 @@ async fn main() -> anyhow::Result<()> {
                 pipeline_parallel_size
             };
 
+            // Tensor Parallelism
+            let tensor_parallel_size = if tensor_parallel_size == 1 {
+                file_config.tensor_parallel_size.unwrap_or(1)
+            } else {
+                tensor_parallel_size
+            };
+
             // Generation Defaults
             let guided_decoding_backend = if guided_decoding_backend == "outlines" {
                 file_config
@@ -809,14 +816,6 @@ async fn main() -> anyhow::Result<()> {
                 enable_auto_tool_choice || file_config.enable_auto_tool_choice.unwrap_or(false);
             let return_tokens_as_token_ids = return_tokens_as_token_ids
                 || file_config.return_tokens_as_token_ids.unwrap_or(false);
-
-            // Validate tensor_parallel_size
-            if tensor_parallel_size != 1 {
-                anyhow::bail!(
-                    "--tensor-parallel-size {} is not yet supported (only 1 is currently implemented)",
-                    tensor_parallel_size
-                );
-            }
 
             // Parse scheduling policy
             let sched_policy = match scheduling_policy.as_str() {
@@ -936,6 +935,7 @@ async fn main() -> anyhow::Result<()> {
                 enable_auto_tool_choice,
                 return_tokens_as_token_ids,
                 pipeline_parallel_size,
+                tensor_parallel_size,
             })
             .await
         }
@@ -1044,11 +1044,16 @@ struct ServerLaunchConfig {
     return_tokens_as_token_ids: bool,
     // Parallelism
     pipeline_parallel_size: usize,
+    tensor_parallel_size: usize,
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
-    // Pipeline worker detection: if RANK > 0, this process is a worker spawned by
-    // rank 0 for pipeline parallelism. Run the worker loop instead of the HTTP server.
+    // Worker detection: distinguish TP workers (VLLM_TP_WORKER=1) from PP workers
+    // (RANK > 0 without that flag) before running the HTTP server path.
+    #[cfg(feature = "cuda")]
+    if distributed_launcher::is_tp_worker_process() {
+        return run_tensor_worker(cfg).await;
+    }
     #[cfg(feature = "cuda")]
     if distributed_launcher::is_worker_process() {
         return run_pipeline_worker(cfg).await;
@@ -1129,6 +1134,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         enable_auto_tool_choice,
         return_tokens_as_token_ids,
         pipeline_parallel_size,
+        tensor_parallel_size,
     } = cfg;
 
     if seed != 0 {
@@ -1248,6 +1254,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         );
     }
 
+    // Mutual exclusion: TP and PP cannot be combined.
+    if tensor_parallel_size > 1 && pipeline_parallel_size > 1 {
+        anyhow::bail!(
+            "--tensor-parallel-size > 1 and --pipeline-parallel-size > 1 cannot be used together"
+        );
+    }
+
     // Pipeline parallelism: when pp > 1, spawn worker processes (ranks 1..pp_size)
     // before model loading so that all ranks can begin NCCL initialization concurrently.
     // Spec decode and LoRA are not supported with pipeline parallelism.
@@ -1268,6 +1281,26 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         );
         pp_workers =
             distributed_launcher::spawn_pipeline_workers(pipeline_parallel_size, PP_NCCL_PORT)?;
+    }
+
+    // Tensor parallelism: when tp > 1, spawn worker processes (ranks 1..tp_size).
+    // Workers receive broadcast inputs and participate in all-reduce inside each layer.
+    // Spec decode and LoRA are not supported with tensor parallelism.
+    const TP_NCCL_PORT: u16 = 29501;
+    let mut tp_workers = Vec::new();
+    if tensor_parallel_size > 1 {
+        if draft_model_id.is_some() || num_speculative_tokens > 0 {
+            anyhow::bail!("--tensor-parallel-size > 1 is not compatible with speculative decoding");
+        }
+        if !lora_adapters.is_empty() {
+            anyhow::bail!("--tensor-parallel-size > 1 is not compatible with --lora-modules");
+        }
+        eprintln!(
+            "Tensor parallelism: spawning {} worker processes...",
+            tensor_parallel_size - 1
+        );
+        tp_workers =
+            distributed_launcher::spawn_tensor_workers(tensor_parallel_size, TP_NCCL_PORT)?;
     }
 
     eprintln!("Loading model: {model_id}");
@@ -1388,6 +1421,45 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             let staged =
                 PipelineStagedModel::new(pp_model, stage.clone(), comm, files.config.vocab_size);
             Box::new(staged)
+        }
+    } else if tensor_parallel_size > 1 {
+        // Tensor parallelism coordinator: load rank-0 weight shards, then wrap
+        // in TpStagedModel which broadcasts inputs to workers before each forward.
+        // Workers participate via all-reduce inside each TP-aware layer.
+        // Requires the `cuda` feature for NCCL communication.
+        #[cfg(not(feature = "cuda"))]
+        {
+            anyhow::bail!("--tensor-parallel-size > 1 requires the 'cuda' feature");
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use vllm_core::distributed::LocalProcessGroup;
+            use vllm_core::engine::TpStagedModel;
+            use vllm_core::models::TpContext;
+
+            // NCCL init: rank 0 generates the unique ID and broadcasts to workers.
+            let dist_cfg = DistributedConfig {
+                rank: 0,
+                world_size: tensor_parallel_size,
+                local_rank: 0,
+                master_addr: "127.0.0.1".to_string(),
+                master_port: TP_NCCL_PORT,
+            };
+            let pg = NcclProcessGroup::new(&dist_cfg)
+                .map_err(|e| anyhow::anyhow!("NCCL init failed (TP): {e}"))?;
+            let nccl_comm = pg.communicator().clone();
+            let local_pg = LocalProcessGroup::with_rank(0, tensor_parallel_size);
+            let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg);
+            let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
+
+            let tp_ctx = TpContext::new(comm.clone());
+            let local_pg_for_sharding = LocalProcessGroup::with_rank(0, tensor_parallel_size);
+            let tp_model =
+                models::from_config_with_tp(&files.config, vb, &local_pg_for_sharding, tp_ctx)
+                    .map_err(|e| anyhow::anyhow!("TP model construction failed: {e}"))?;
+
+            Box::new(TpStagedModel::new(tp_model, comm, tensor_parallel_size))
         }
     } else if !parsed_lora_specs.is_empty() {
         // Create LoRA-enabled model and register adapters
@@ -1883,8 +1955,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Wait for pipeline worker processes to exit (no-op when pp_workers is empty).
+    // Wait for pipeline/tensor-parallel worker processes to exit.
     distributed_launcher::wait_for_workers(pp_workers);
+    distributed_launcher::wait_for_workers(tp_workers);
 
     tracing::info!("Shutdown complete");
     Ok(())
@@ -2023,6 +2096,89 @@ async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("pipeline_worker_loop panicked: {e}"))?;
 
     eprintln!("[rank {rank}/{world_size}] Pipeline worker exiting");
+    Ok(())
+}
+
+/// Entry point for tensor-parallel worker processes (RANK 1..N-1, VLLM_TP_WORKER=1).
+///
+/// Workers load rank-`N` weight shards via `from_config_with_tp`, initialize NCCL,
+/// then call `tensor_worker_loop` which blocks until the coordinator broadcasts
+/// `TP_SIGNAL_SHUTDOWN` (or the NCCL communicator errors on coordinator exit).
+#[cfg(feature = "cuda")]
+async fn run_tensor_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
+    use vllm_core::distributed::{DeviceCommunicator, LocalProcessGroup};
+    use vllm_core::engine::tensor_worker_loop;
+    use vllm_core::models::TpContext;
+
+    logging::init_with_otlp(&cfg.log_level, cfg.otlp_traces_endpoint.as_deref())?;
+
+    let dist_cfg = DistributedConfig::from_env();
+    let rank = dist_cfg.rank;
+    let world_size = dist_cfg.world_size;
+
+    tracing::info!(rank, world_size, "TP worker starting");
+    eprintln!("[tp rank {rank}/{world_size}] Tensor-parallel worker starting");
+
+    let cache_dir = cfg.download_dir.as_deref().map(std::path::Path::new);
+    let parsed_load_format: loader::LoadFormat = cfg.load_format.parse()?;
+    let files = loader::fetch_model_with_options(
+        &cfg.model_id,
+        &cfg.revision,
+        cfg.hf_token.as_deref(),
+        cache_dir,
+        parsed_load_format,
+        cfg.max_parallel_loading_workers,
+    )?;
+
+    let device = Device::new_cuda(dist_cfg.local_rank)?;
+    let vb = if parsed_load_format == loader::LoadFormat::Dummy {
+        loader::load_dummy_weights(cfg.dtype, &device)
+    } else {
+        loader::load_weights(&files.weights, cfg.dtype, &device)?
+    };
+
+    // NCCL init: connect to rank 0's bootstrap server (same port as coordinator).
+    let pg = NcclProcessGroup::new(&dist_cfg)
+        .map_err(|e| anyhow::anyhow!("NCCL init failed on TP rank {rank}: {e}"))?;
+    let nccl_comm = pg.communicator().clone();
+    let local_pg_for_comm = LocalProcessGroup::with_rank(rank, world_size);
+    let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg_for_comm);
+    let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
+
+    // Build TP-aware model for this rank's weight shards.
+    let local_pg_for_sharding = LocalProcessGroup::with_rank(rank, world_size);
+    let tp_ctx = TpContext::new(comm.clone());
+    let tp_model =
+        models::from_config_with_tp(&files.config, vb, &local_pg_for_sharding, tp_ctx)
+            .map_err(|e| anyhow::anyhow!("TP model construction failed on rank {rank}: {e}"))?;
+
+    // KV cache: full model layers (all TP ranks cache the same sequences).
+    let cache_config = CacheConfig {
+        block_size: cfg.block_size,
+        num_blocks: cfg.num_blocks,
+        num_layers: files.config.num_hidden_layers,
+        num_kv_heads: files.config.num_key_value_heads,
+        head_dim: files.config.head_dim,
+        dtype: cfg.dtype,
+        device: device.clone(),
+        kv_cache_dtype: match cfg.kv_cache_dtype.as_str() {
+            "fp8" | "fp8_e4m3" | "fp8_e5m2" => KVCacheDtype::Fp8E4m3,
+            _ => KVCacheDtype::Auto,
+        },
+        cpu_offload: None,
+    };
+    let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+
+    eprintln!("[tp rank {rank}/{world_size}] Entering tensor-parallel worker loop");
+    // Run the blocking worker loop on a dedicated thread so the tokio runtime
+    // is not blocked. The loop exits when the coordinator broadcasts TP_SIGNAL_SHUTDOWN.
+    tokio::task::spawn_blocking(move || {
+        tensor_worker_loop(tp_model, comm, kv_cache_mgr);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("tensor_worker_loop panicked: {e}"))?;
+
+    eprintln!("[tp rank {rank}/{world_size}] Tensor-parallel worker exiting");
     Ok(())
 }
 

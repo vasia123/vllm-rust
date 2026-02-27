@@ -31,6 +31,7 @@ pub mod spec_decode;
 mod speculative;
 mod standard;
 mod strategy;
+pub mod tensor_parallel;
 mod types;
 pub mod warmup;
 
@@ -55,6 +56,10 @@ pub use spec_decode::{
     DraftModelDraftProposer, DraftModelProposer, DraftProposer, EagleConfig, EagleProposer,
     MedusaHead, MedusaProposer, NGramConfig, NGramProposer, SpeculationTree, SpeculativeProposer,
     SuffixArrayConfig, SuffixArrayProposer,
+};
+pub use tensor_parallel::{
+    tensor_worker_loop, TpStagedModel, TP_SIGNAL_EXECUTE, TP_SIGNAL_EXECUTE_DECODE,
+    TP_SIGNAL_SHUTDOWN,
 };
 pub use types::{
     AcceptanceMethod, EngineConfig, EngineError, EngineStats, GenerationParams, GenerationRequest,

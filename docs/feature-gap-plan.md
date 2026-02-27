@@ -5,22 +5,22 @@ All completed phases removed — see git history for done items.
 
 ---
 
-## Phase 1: Tensor Parallelism (~3–6 weeks)
+## Phase 1: Tensor Parallelism — DONE
 
-TP layer code exists and is TP-aware (attention, linear, MLP weights are already shardable).
-Missing: the multi-process runtime. PP is fully working and is the reference pattern to follow.
+TP runtime implemented. All three items complete:
 
-| Item | What's Missing | Fix | Effort |
-|------|---------------|-----|--------|
-| 1.1 | TP > 1 process spawning | Mirror `spawn_pipeline_workers()` for TP: spawn N−1 worker processes each owning one GPU; NCCL all-reduce after every layer | 30–60h |
-| 1.2 | TP worker loop | Analogous to `run_pipeline_worker()`: worker receives activations, runs its weight shard, participates in all-reduce | 20–40h |
-| 1.3 | TP-aware weight loading | `from_config_with_tp(rank, tp_size)` for major architectures; shard Q/K/V/O by column, gate/up by column, down by row | 20–40h |
+| Item | Status |
+|------|--------|
+| 1.1 | ✅ `spawn_tensor_workers()` + `is_tp_worker_process()` in `distributed_launcher.rs` |
+| 1.2 | ✅ `tensor_worker_loop` + `TpStagedModel` in `crates/core/src/engine/tensor_parallel.rs` |
+| 1.3 | ✅ `from_config_with_tp` was already fully implemented for 50+ architectures |
 
-**Key files:**
-- `crates/server/src/main.rs:814` — bail to remove once wired
-- `crates/server/src/distributed_launcher.rs` — PP launcher to mirror
-- `crates/core/src/models/llama.rs` — `new_with_pp()` pattern to generalize to `new_with_tp()`
-- `crates/core/src/layers/` — attention/linear/tp_layers already TP-aware
+Coordinator wraps the model in `TpStagedModel`, which broadcasts inputs to workers before each
+forward. Workers run `tensor_worker_loop`, participating in NCCL all-reduce inside each TP-aware
+layer and discarding their output. The bail at `main.rs:814` has been removed; `--tensor-parallel-size N`
+is now wired end-to-end.
+
+**Integration testing requires multi-GPU hardware** (not available in CI).
 
 ---
 
@@ -54,7 +54,7 @@ Lightning Attention backend (§5.1, commit `1fa3229`) is complete. Remaining gap
 ## Dependency Graph
 
 ```
-Phase 1 (TP > 1)     — independent; needs multi-GPU hardware for integration tests
+Phase 1 (TP > 1)     — DONE
 Phase 2 (MiniMax-VL) — independent; Lightning Attention already unblocks it
 Phase 3 (deferred)   — no dependencies; implement opportunistically
 ```
@@ -63,7 +63,7 @@ Phase 3 (deferred)   — no dependencies; implement opportunistically
 
 | Phase | Area | Effort |
 |-------|------|--------|
-| 1 | Tensor Parallelism runtime | 3–6 weeks |
+| 1 | Tensor Parallelism runtime | ✅ DONE |
 | 2 | MiniMax-VL-01 vision wiring | 2–4 weeks |
 | 3 | Low priority / deferred | indefinite |
-| **Total** | | **~5–10 weeks** |
+| **Total** | | **~2–4 weeks** |
