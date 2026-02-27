@@ -59,7 +59,7 @@ Requires multi-GPU testing.
 |------|--------------|-------|--------|
 | 5.1 ✅ | Linear / Lightning Attention | CPU linear recurrence + per-request state (`Mutex<HashMap<u64, Tensor>>`); prefill `forward_prefill()` + decode `forward_decode_batch()` in `minimax_text01.rs`; slope_rate ALiBi formula with layer scaling; 3 tests | `1fa3229` |
 | 5.2 ✅ | Mamba SSD GPU | `ssd_scan_f32` PTX kernel (sm_75+); Grid (B×H,1,1) × Block (P,1,1); shared b/c load per timestep; `ssd_forward()` dispatch; 3 CUDA tests + 6 CPU tests | `20ea1b9` |
-| 5.3 | DeepGEMM (grouped GEMM for MoE) | flashinfer-rs or new crate: variable-M grouped GEMM; vllm-rust: wire in `moe/` | 20–40h |
+| 5.3 ✅ | DeepGEMM (grouped GEMM for MoE) | DeepGEMM-lite: GPU-resident two-pass alignment (`moe_u32_to_i32_kernel` + `moe_align_block_size_kernel` + `moe_sort_tokens_kernel`); eliminates D2H+CPU+H2D bottleneck; only 4 bytes (scalar) cross PCIe; `launch_gemm_kernels()` extracted from `FusedMoECudaOp::cuda_fwd()` | TBD |
 
 ---
 
@@ -70,7 +70,7 @@ Requires multi-GPU testing.
 | FlashAttn-DiffKV | Research models only |
 | MLA CUTLASS/Sparse variants | Optimization of existing working MLA backend |
 | `POST /v1/images/generations` | Diffusion pipeline — out of scope |
-| MiniMax-VL-01 | Blocked on §5.1 Lightning Attention |
+| MiniMax-VL-01 | Vision multimodal pipeline; §5.1 Lightning Attention is done; needs VLM image encoder wiring |
 | Audio sinc interpolation | `rubato` crate — optional quality improvement over linear resampling |
 
 ---
@@ -85,7 +85,7 @@ Phase 4.1 (PP stage construction) — needs NCCL multi-process infra
 Phase 4.2 (EPLB rearrange) — needs NCCL all-to-all
 Phase 5.1 (Lightning Attention) — blocks MiniMax-VL-01
 Phase 5.2 (Mamba SSD GPU) — blocks efficient Mamba/Jamba inference
-Phase 5.3 (DeepGEMM) — blocks MoE GPU optimization
+Phase 5.3 (DeepGEMM-lite) — ✅ DONE; full variable-M FP8 GEMM remains low-priority
 ```
 
 ## Effort Summary

@@ -259,6 +259,21 @@ extern "C" __global__ void moe_sum_kernel(
     }
 }
 
+// Convert packed uint32 expert IDs (from candle U32 tensor) to int32 in-place.
+// All valid expert IDs fit in int32 (num_experts <= 2^31), so the bit pattern
+// is identical — this is a purely logical reinterpretation performed element-wise
+// so that the alignment kernels can consume a canonical int32 pointer.
+extern "C" __global__ void moe_u32_to_i32_kernel(
+    const uint32_t* __restrict__ src,
+    int32_t* __restrict__ dst,
+    const int32_t numel
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numel) {
+        dst[i] = (int32_t)src[i];
+    }
+}
+
 // BFloat16 version of sum kernel
 extern "C" __global__ void moe_sum_bf16_kernel(
     __nv_bfloat16* __restrict__ output,

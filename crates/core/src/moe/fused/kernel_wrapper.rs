@@ -129,6 +129,142 @@ fn i64_to_i32_vec(values: &[i64]) -> Result<Vec<i32>> {
 }
 
 // ============================================================================
+// GPU Token Alignment (DeepGEMM-lite: zero-copy alignment stays on device)
+// ============================================================================
+
+/// Align tokens by expert assignment using CUDA kernels, keeping all large
+/// buffers on the device.
+///
+/// Replaces the D2H → CPU compute → H2D pipeline in the CUDA forward pass.
+/// Only a single scalar (total padded token count) is transferred D2H to
+/// determine the GEMM grid shape; everything else stays on GPU.
+///
+/// # Two-pass algorithm
+/// 1. `moe_align_block_size_kernel` (grid 2×1×1): Block 0 counts tokens per
+///    expert, computes padded prefix sums, and fills `expert_ids`; Block 1
+///    initialises `sorted_token_ids` with the padding sentinel (`numel`).
+/// 2. `moe_sort_tokens_kernel` (grid 1×G×1): Scatters each `topk_ids[i]`
+///    into its sorted position using atomic increments on the prefix-sum
+///    buffer from pass 1.
+///
+/// # Returns
+/// `(sorted_token_ids, expert_ids, total_tokens_pp_dev, num_tokens_post_padded, num_valid_tokens)`
+#[cfg(feature = "cuda-kernels")]
+fn moe_align_block_size_gpu(
+    topk_ids_i32: &candle_core::cuda::cudarc::driver::CudaSlice<i32>,
+    num_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+    block_size: usize,
+    dev: &candle_core::cuda::CudaDevice,
+) -> candle_core::Result<(
+    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // sorted_token_ids
+    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // expert_ids
+    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // total_tokens_post_padded (scalar)
+    usize,                                             // num_tokens_post_padded
+    usize,                                             // num_valid_tokens
+)> {
+    use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    let numel = num_tokens * top_k;
+    // Upper bound: every expert could get all tokens (rounded up to block boundary)
+    let max_tokens_padded = (numel + num_experts * block_size - 1) / (num_experts * block_size)
+        * num_experts
+        * block_size
+        + num_experts * block_size;
+    let max_blocks = (max_tokens_padded + block_size - 1) / block_size;
+
+    // Allocate GPU buffers — these never cross the PCIe bus (except the scalar).
+    let sorted_token_ids = dev
+        .alloc_zeros::<i32>(max_tokens_padded)
+        .map_err(|e| candle_core::Error::Msg(format!("alloc sorted_token_ids: {e}")))?;
+    let expert_ids = dev
+        .alloc_zeros::<i32>(max_blocks)
+        .map_err(|e| candle_core::Error::Msg(format!("alloc expert_ids: {e}")))?;
+    let total_tokens_pp = dev
+        .alloc_zeros::<i32>(1)
+        .map_err(|e| candle_core::Error::Msg(format!("alloc total_tokens_pp: {e}")))?;
+    // Cumsum buffer: [num_experts + 1] — written by pass 1, consumed atomically by pass 2.
+    let cumsum = dev
+        .alloc_zeros::<i32>(num_experts + 1)
+        .map_err(|e| candle_core::Error::Msg(format!("alloc cumsum: {e}")))?;
+
+    // Pass 1: count, cumsum, expert_ids, sentinel-fill of sorted_token_ids.
+    {
+        let func = dev.get_or_load_custom_func(
+            "moe_align_block_size_kernel",
+            "fused_moe_align",
+            MOE_ALIGN_PTX,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (2, 1, 1),
+            block_dim: (1024, 1, 1),
+            // Shared memory: expert_counts[num_experts]
+            shared_mem_bytes: (num_experts * std::mem::size_of::<i32>()) as u32,
+        };
+        let num_experts_i32 = num_experts as i32;
+        let block_size_i32 = block_size as i32;
+        let numel_i32 = numel as i32;
+        let max_padded_i32 = max_tokens_padded as i32;
+        let mut b = func.builder();
+        b.arg(topk_ids_i32);
+        b.arg(&sorted_token_ids);
+        b.arg(&expert_ids);
+        b.arg(&total_tokens_pp);
+        b.arg(&num_experts_i32);
+        b.arg(&block_size_i32);
+        b.arg(&numel_i32);
+        b.arg(&max_padded_i32);
+        b.arg(&cumsum);
+        // SAFETY: All buffers are freshly allocated with correct sizes.
+        unsafe { b.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("moe_align_block_size_kernel: {e}")))?;
+    }
+
+    // Pass 2: scatter tokens into their sorted positions.
+    {
+        let func = dev.get_or_load_custom_func(
+            "moe_sort_tokens_kernel",
+            "fused_moe_align",
+            MOE_ALIGN_PTX,
+        )?;
+        let blocks_y = ((numel + 255) / 256) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, blocks_y.max(1), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let num_experts_i32 = num_experts as i32;
+        let numel_i32 = numel as i32;
+        let max_padded_i32 = max_tokens_padded as i32;
+        let mut b = func.builder();
+        b.arg(topk_ids_i32);
+        b.arg(&sorted_token_ids);
+        b.arg(&cumsum);
+        b.arg(&num_experts_i32);
+        b.arg(&numel_i32);
+        b.arg(&max_padded_i32);
+        // SAFETY: cumsum was written by pass 1; sorted_token_ids was initialised.
+        unsafe { b.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("moe_sort_tokens_kernel: {e}")))?;
+    }
+
+    // D2H: only the scalar total — 4 bytes across PCIe.
+    let total_pp_host: Vec<i32> = dev
+        .dtoh_sync_copy(&total_tokens_pp)
+        .map_err(|e| candle_core::Error::Msg(format!("dtoh total_tokens_pp: {e}")))?;
+    let num_tokens_post_padded = total_pp_host[0].max(0) as usize;
+
+    Ok((
+        sorted_token_ids,
+        expert_ids,
+        total_tokens_pp,
+        num_tokens_post_padded,
+        numel, // num_valid_tokens = all expert assignments (top_k per token)
+    ))
+}
+
+// ============================================================================
 // CUDA Fused MoE Custom Op
 // ============================================================================
 
@@ -144,63 +280,29 @@ struct FusedMoECudaOp {
 }
 
 #[cfg(feature = "cuda-kernels")]
-impl candle_core::CustomOp1 for FusedMoECudaOp {
-    fn name(&self) -> &'static str {
-        "fused_moe_cuda"
-    }
-
-    fn cpu_fwd(
+impl FusedMoECudaOp {
+    /// Launch gate+up+SiLU and down-reduce kernels using pre-computed GPU alignment
+    /// buffers.  All large operands stay on device; the only host-side knowledge
+    /// needed is `num_tokens_post_padded` (a scalar read back by the caller) and
+    /// `num_valid_tokens` (derived from `num_tokens * top_k` on the host).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gemm_kernels(
         &self,
-        _storage: &candle_core::CpuStorage,
-        _layout: &candle_core::Layout,
-    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
-        candle_core::bail!("FusedMoECudaOp: CPU path should not be reached via CustomOp")
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn cuda_fwd(
-        &self,
-        hs_storage: &candle_core::CudaStorage,
-        hs_layout: &candle_core::Layout,
-    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        dev: &candle_core::cuda::CudaDevice,
+        hs_slice: &candle_core::cuda::cudarc::driver::CudaSlice<half::bf16>,
+        num_tokens: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        sorted_ids_dev: &candle_core::cuda::cudarc::driver::CudaSlice<i32>,
+        expert_ids_dev: &candle_core::cuda::cudarc::driver::CudaSlice<i32>,
+        num_tokens_pp_dev: &candle_core::cuda::cudarc::driver::CudaSlice<i32>,
+        num_tokens_post_padded: usize,
+        num_valid_tokens: usize,
+    ) -> candle_core::Result<(candle_core::CudaStorage, candle_core::Shape)> {
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use candle_core::cuda::CudaStorageSlice;
         use candle_core::Storage;
-        let dev = &hs_storage.device;
-        if hs_layout.start_offset() != 0 {
-            candle_core::bail!("fused_moe_cuda: hidden_states must be contiguous from offset 0");
-        }
-        let hs_slice = match &hs_storage.slice {
-            CudaStorageSlice::BF16(s) => s,
-            _ => candle_core::bail!("fused_moe_cuda: hidden_states must be BF16"),
-        };
-        let hs_dims = hs_layout.dims();
-        let num_tokens = hs_dims[0];
-        let hidden_size = hs_dims[1];
-        let intermediate_size = self.w2_weights.dim(2)?;
-        let expert_indices_cpu = self.expert_indices.to_device(&Device::Cpu)?;
-        let alignment = moe_align_block_size_cpu(
-            &expert_indices_cpu,
-            self.num_experts,
-            self.config.block_size_m,
-        )?;
-        let num_tokens_post_padded = alignment.num_tokens_post_padded;
-        let num_valid_tokens = alignment.num_valid_tokens;
-        // Upload i32 alignment data via raw cudarc (candle lacks I32 tensors)
-        let sorted_ids_cpu: Vec<i64> = alignment.sorted_token_ids.to_vec1()?;
-        let sorted_ids_i32 = i64_to_i32_vec(&sorted_ids_cpu)?;
-        let expert_ids_cpu: Vec<i64> = alignment.expert_ids.to_vec1()?;
-        let expert_ids_i32 = i64_to_i32_vec(&expert_ids_cpu)?;
-        let num_tokens_pp_i32: Vec<i32> = vec![num_tokens_post_padded as i32];
-        let sorted_ids_dev = dev
-            .htod_copy(sorted_ids_i32)
-            .map_err(|e| candle_core::Error::Msg(format!("htod_copy sorted_ids: {e}")))?;
-        let expert_ids_dev = dev
-            .htod_copy(expert_ids_i32)
-            .map_err(|e| candle_core::Error::Msg(format!("htod_copy expert_ids: {e}")))?;
-        let num_tokens_pp_dev = dev.htod_copy(num_tokens_pp_i32).map_err(|e| {
-            candle_core::Error::Msg(format!("htod_copy num_tokens_post_padded: {e}"))
-        })?;
+
         let (w13_guard, w13_layout) = self.w13_weights.storage_and_layout();
         let w13_slice = match &*w13_guard {
             Storage::Cuda(cs) => {
@@ -242,6 +344,7 @@ impl candle_core::CustomOp1 for FusedMoECudaOp {
             }
             _ => candle_core::bail!("fused_moe_cuda: routing_weights must be on CUDA"),
         };
+
         let hidden_elem_count = num_tokens_post_padded * intermediate_size;
         let hidden_intermediate = dev
             .alloc_zeros::<half::bf16>(hidden_elem_count)
@@ -270,9 +373,9 @@ impl candle_core::CustomOp1 for FusedMoECudaOp {
             builder.arg(hs_slice);
             builder.arg(w13_slice);
             builder.arg(&hidden_intermediate);
-            builder.arg(&sorted_ids_dev);
-            builder.arg(&expert_ids_dev);
-            builder.arg(&num_tokens_pp_dev);
+            builder.arg(sorted_ids_dev);
+            builder.arg(expert_ids_dev);
+            builder.arg(num_tokens_pp_dev);
             builder.arg(&hidden_size_i32);
             builder.arg(&intermediate_size_i32);
             builder.arg(&num_valid_tokens_i32);
@@ -311,9 +414,9 @@ impl candle_core::CustomOp1 for FusedMoECudaOp {
             builder.arg(w2_slice);
             builder.arg(&output_slice);
             builder.arg(rw_slice);
-            builder.arg(&sorted_ids_dev);
-            builder.arg(&expert_ids_dev);
-            builder.arg(&num_tokens_pp_dev);
+            builder.arg(sorted_ids_dev);
+            builder.arg(expert_ids_dev);
+            builder.arg(num_tokens_pp_dev);
             builder.arg(&hidden_size_i32);
             builder.arg(&intermediate_size_i32);
             builder.arg(&num_valid_tokens_i32);
@@ -335,6 +438,151 @@ impl candle_core::CustomOp1 for FusedMoECudaOp {
         };
         let output_shape = candle_core::Shape::from_dims(&[num_tokens, hidden_size]);
         Ok((output_storage, output_shape))
+    }
+}
+
+#[cfg(feature = "cuda-kernels")]
+impl candle_core::CustomOp1 for FusedMoECudaOp {
+    fn name(&self) -> &'static str {
+        "fused_moe_cuda"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        candle_core::bail!("FusedMoECudaOp: CPU path should not be reached via CustomOp")
+    }
+
+    fn cuda_fwd(
+        &self,
+        hs_storage: &candle_core::CudaStorage,
+        hs_layout: &candle_core::Layout,
+    ) -> Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda::CudaStorageSlice;
+        use candle_core::Storage;
+        let dev = &hs_storage.device;
+        if hs_layout.start_offset() != 0 {
+            candle_core::bail!("fused_moe_cuda: hidden_states must be contiguous from offset 0");
+        }
+        let hs_slice = match &hs_storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("fused_moe_cuda: hidden_states must be BF16"),
+        };
+        let hs_dims = hs_layout.dims();
+        let num_tokens = hs_dims[0];
+        let hidden_size = hs_dims[1];
+        let intermediate_size = self.w2_weights.dim(2)?;
+
+        // GPU-side alignment: convert expert_indices (U32 candle tensor) to i32
+        // on the device, then run the two-pass alignment kernels entirely on GPU.
+        // This eliminates the D2H + CPU compute + H2D pipeline that was the
+        // bottleneck for large batches (sorted_ids can be 10–100 MB).
+        let (ei_guard, ei_layout) = self.expert_indices.storage_and_layout();
+        let ei_u32_slice = match &*ei_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => {
+                    // Unexpected dtype: fall back to CPU alignment.
+                    drop(ei_guard);
+                    let ei_cpu = self.expert_indices.to_device(&Device::Cpu)?;
+                    let alignment = moe_align_block_size_cpu(
+                        &ei_cpu,
+                        self.num_experts,
+                        self.config.block_size_m,
+                    )?;
+                    let npp = alignment.num_tokens_post_padded;
+                    let nvt = alignment.num_valid_tokens;
+                    let s_i32 = i64_to_i32_vec(&alignment.sorted_token_ids.to_vec1::<i64>()?)?;
+                    let e_i32 = i64_to_i32_vec(&alignment.expert_ids.to_vec1::<i64>()?)?;
+                    let sorted_ids_dev = dev.htod_copy(s_i32).map_err(|e| {
+                        candle_core::Error::Msg(format!("htod_copy sorted_ids: {e}"))
+                    })?;
+                    let expert_ids_dev = dev.htod_copy(e_i32).map_err(|e| {
+                        candle_core::Error::Msg(format!("htod_copy expert_ids: {e}"))
+                    })?;
+                    let npp_dev = dev
+                        .htod_copy(vec![npp as i32])
+                        .map_err(|e| candle_core::Error::Msg(format!("htod_copy npp: {e}")))?;
+                    return self.launch_gemm_kernels(
+                        dev,
+                        hs_slice,
+                        num_tokens,
+                        hidden_size,
+                        intermediate_size,
+                        &sorted_ids_dev,
+                        &expert_ids_dev,
+                        &npp_dev,
+                        npp,
+                        nvt,
+                    );
+                }
+            },
+            _ => {
+                candle_core::bail!("fused_moe_cuda: expert_indices must be on CUDA")
+            }
+        };
+        if ei_layout.start_offset() != 0 {
+            candle_core::bail!("fused_moe_cuda: expert_indices must be contiguous from offset 0");
+        }
+
+        // Convert U32 → I32 on GPU (values are expert IDs ≤ num_experts < 2^31).
+        let numel = num_tokens * self.top_k;
+        let topk_ids_i32 = dev
+            .alloc_zeros::<i32>(numel)
+            .map_err(|e| candle_core::Error::Msg(format!("alloc topk_ids_i32: {e}")))?;
+        {
+            let func = dev.get_or_load_custom_func(
+                "moe_u32_to_i32_kernel",
+                "fused_moe_align",
+                MOE_ALIGN_PTX,
+            )?;
+            let blocks = ((numel + 255) / 256) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks.max(1), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let numel_i32 = numel as i32;
+            let mut b = func.builder();
+            b.arg(ei_u32_slice);
+            b.arg(&topk_ids_i32);
+            b.arg(&numel_i32);
+            // SAFETY: ei_u32_slice and topk_ids_i32 are valid device allocations.
+            unsafe { b.launch(cfg) }
+                .map_err(|e| candle_core::Error::Msg(format!("moe_u32_to_i32: {e}")))?;
+        }
+        drop(ei_guard);
+
+        let (
+            sorted_ids_dev,
+            expert_ids_dev,
+            num_tokens_pp_dev,
+            num_tokens_post_padded,
+            num_valid_tokens,
+        ) = moe_align_block_size_gpu(
+            &topk_ids_i32,
+            num_tokens,
+            self.top_k,
+            self.num_experts,
+            self.config.block_size_m,
+            dev,
+        )?;
+
+        self.launch_gemm_kernels(
+            dev,
+            hs_slice,
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            &sorted_ids_dev,
+            &expert_ids_dev,
+            &num_tokens_pp_dev,
+            num_tokens_post_padded,
+            num_valid_tokens,
+        )
     }
 }
 
