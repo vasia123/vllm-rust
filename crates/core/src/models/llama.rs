@@ -3,8 +3,8 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
-use crate::distributed::{LocalProcessGroup, ProcessGroup};
-use crate::engine::DecodeSequenceMetadata;
+use crate::distributed::{LocalProcessGroup, PipelineStageConfig, ProcessGroup};
+use crate::engine::{DecodeSequenceMetadata, PipelineForward};
 use crate::kv_cache::{config::CacheConfig, quantization::KVCacheDtype};
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, RotaryEmbedding};
@@ -380,6 +380,7 @@ pub struct LlamaForCausalLM {
     // Stored for temporary cache creation in forward_hidden_states.
     num_kv_heads: usize,
     head_dim: usize,
+    hidden_size: usize,
 }
 
 impl LlamaForCausalLM {
@@ -401,49 +402,81 @@ impl LlamaForCausalLM {
         pg: &dyn ProcessGroup,
         tp_ctx: TpContext,
     ) -> Result<Self> {
+        Self::new_with_tp_pp(cfg, vb, pg, tp_ctx, None)
+    }
+
+    /// Create a pipeline-parallel stage that loads only the assigned layers.
+    ///
+    /// Each stage loads layers `[stage.first_layer, stage.first_layer + stage.num_layers)`.
+    /// The embedding and LM head are loaded on all stages (they are small relative to
+    /// transformer layers) but only exercised by the first and last stages respectively.
+    ///
+    /// # Arguments
+    /// * `cfg`   — model configuration (num_hidden_layers describes the full model)
+    /// * `vb`    — VarBuilder pointing at checkpoint root (all layer weights accessible)
+    /// * `stage` — pipeline stage configuration (which layers to load and whether to call
+    ///   embed/lm_head)
+    pub fn new_with_pp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        stage: &PipelineStageConfig,
+    ) -> Result<Self> {
+        Self::new_with_tp_pp(
+            cfg,
+            vb,
+            &LocalProcessGroup::new(),
+            TpContext::single_gpu(),
+            Some(stage),
+        )
+    }
+
+    fn new_with_tp_pp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+        stage: Option<&PipelineStageConfig>,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
         let world_size = pg.world_size();
 
         let embed_tokens =
             TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        // Load only the layers assigned to this stage (or all layers if no stage config).
+        let layer_range: std::ops::Range<usize> = stage
+            .map(|s| s.layer_range())
+            .unwrap_or(0..cfg.num_hidden_layers);
+
+        let mut layers = Vec::with_capacity(layer_range.len());
         let vb_l = vb_m.pp("layers");
-        for i in 0..cfg.num_hidden_layers {
+        for i in layer_range {
             layers.push(LlamaDecoderLayer::new_with_tp(cfg, vb_l.pp(i), pg)?);
         }
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
-        // LM head: output projection to vocabulary
-        //
-        // For single GPU with tied embeddings: reuse embedding weights directly
-        // For TP: use column-parallel linear that loads from embed_tokens (tied) or lm_head (separate)
         let lm_head = if cfg.tie_word_embeddings && world_size == 1 {
-            // Single GPU with tied embeddings: reuse embedding weights
             let emb_weights = embed_tokens
                 .embeddings()
                 .expect("single GPU should have accessible embeddings")
                 .clone();
             TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
         } else if cfg.tie_word_embeddings {
-            // TP with tied embeddings: load from embed_tokens path
-            // The weights are the same as embedding, just used as a linear projection
             TpLinear::column_parallel(
                 cfg.hidden_size,
                 cfg.vocab_size,
                 false,
-                true,                    // gather output to get full vocab logits
-                vb_m.pp("embed_tokens"), // Use embed_tokens weights for tied case
+                true,
+                vb_m.pp("embed_tokens"),
                 pg,
             )?
         } else {
-            // Separate lm_head (no tied embeddings)
             TpLinear::column_parallel(
                 cfg.hidden_size,
                 cfg.vocab_size,
                 false,
-                true, // gather output to get full vocab logits
+                true,
                 vb.pp("lm_head"),
                 pg,
             )?
@@ -459,6 +492,7 @@ impl LlamaForCausalLM {
             dtype: vb.dtype(),
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
+            hidden_size: cfg.hidden_size,
         })
     }
 
@@ -681,6 +715,83 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
 
     fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+// ─── PipelineForward ─────────────────────────────────────────────────────────
+
+impl PipelineForward for LlamaForCausalLM {
+    fn embed(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
+        self.embed_tokens.forward(input_ids, &self.tp_ctx)
+    }
+
+    fn forward_layers(
+        &self,
+        hidden_states: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+        let mut xs = hidden_states.clone();
+        // Use local (0-based) layer indices so they align with the KV cache manager,
+        // which is sized for this stage's num_layers (not the full model layer count).
+        for (local_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                local_idx,
+                block_table,
+                slot_mapping,
+                &self.tp_ctx,
+            )?;
+        }
+        Ok(xs)
+    }
+
+    fn forward_layers_decode_batch(
+        &self,
+        hidden_states: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> candle_core::Result<Tensor> {
+        let mut xs = hidden_states.clone();
+        for (local_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward_decode_batch(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                local_idx,
+                &self.tp_ctx,
+            )?;
+        }
+        Ok(xs)
+    }
+
+    fn lm_head(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
+        let xs = self.norm.forward(hidden_states)?;
+        self.lm_head.forward(&xs, &self.tp_ctx)
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
     }
 }
 

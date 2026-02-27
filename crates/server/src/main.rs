@@ -1,10 +1,15 @@
+mod distributed_launcher;
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::{DType, Device};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "cuda")]
+use vllm_core::distributed::{DistributedConfig, NcclDeviceCommunicator, NcclProcessGroup};
 use vllm_core::{
+    distributed::PipelineStageConfig,
     engine::{
         spec_decode::MLPSpeculatorDraftProposer, start_engine, start_engine_with_draft,
         start_engine_with_proposer, AcceptanceMethod, CudaGraphConfig, EngineConfig,
@@ -1042,6 +1047,13 @@ struct ServerLaunchConfig {
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
+    // Pipeline worker detection: if RANK > 0, this process is a worker spawned by
+    // rank 0 for pipeline parallelism. Run the worker loop instead of the HTTP server.
+    #[cfg(feature = "cuda")]
+    if distributed_launcher::is_worker_process() {
+        return run_pipeline_worker(cfg).await;
+    }
+
     // Capture before cfg is destructured below.
     let otlp_endpoint = cfg.otlp_traces_endpoint.clone();
     logging::init_with_otlp(&cfg.log_level, otlp_endpoint.as_deref())?;
@@ -1236,14 +1248,26 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         );
     }
 
-    // Pipeline parallelism validation.
-    // TODO: wire pipeline_parallel_size to PipelineStagedModel stage construction.
-    // Until stage-slicing is wired, reject pp > 1 gracefully.
+    // Pipeline parallelism: when pp > 1, spawn worker processes (ranks 1..pp_size)
+    // before model loading so that all ranks can begin NCCL initialization concurrently.
+    // Spec decode and LoRA are not supported with pipeline parallelism.
+    const PP_NCCL_PORT: u16 = 29500;
+    let mut pp_workers = Vec::new();
     if pipeline_parallel_size > 1 {
-        anyhow::bail!(
-            "--pipeline-parallel-size {} is not yet supported (only 1 is currently implemented)",
-            pipeline_parallel_size
+        if draft_model_id.is_some() || num_speculative_tokens > 0 {
+            anyhow::bail!(
+                "--pipeline-parallel-size > 1 is not compatible with speculative decoding"
+            );
+        }
+        if !lora_adapters.is_empty() {
+            anyhow::bail!("--pipeline-parallel-size > 1 is not compatible with --lora-modules");
+        }
+        eprintln!(
+            "Pipeline parallelism: spawning {} worker processes...",
+            pipeline_parallel_size - 1
         );
+        pp_workers =
+            distributed_launcher::spawn_pipeline_workers(pipeline_parallel_size, PP_NCCL_PORT)?;
     }
 
     eprintln!("Loading model: {model_id}");
@@ -1321,7 +1345,51 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         },
     );
 
-    let model: Box<dyn vllm_core::engine::ModelForward> = if !parsed_lora_specs.is_empty() {
+    // ─── PP stage config (computed once; None when pipeline_parallel_size == 1) ──
+    let pp_stage = if pipeline_parallel_size > 1 {
+        Some(PipelineStageConfig::new(
+            0,
+            pipeline_parallel_size,
+            files.config.num_hidden_layers,
+        ))
+    } else {
+        None
+    };
+
+    let model: Box<dyn vllm_core::engine::ModelForward> = if let Some(ref stage) = pp_stage {
+        // Pipeline parallelism coordinator: load only stage 0 layers, then wrap in
+        // PipelineStagedModel which handles all P2P communication transparently.
+        // Requires the `cuda` feature for NCCL communication.
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = stage; // consumed below; only reachable under #[cfg(feature = "cuda")]
+            anyhow::bail!("--pipeline-parallel-size > 1 requires the 'cuda' feature");
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            let pp_model = models::from_config_with_pp(&files.config, vb, stage)?;
+
+            // NCCL init: rank 0 generates the unique ID and broadcasts to workers.
+            let dist_cfg = DistributedConfig {
+                rank: 0,
+                world_size: pipeline_parallel_size,
+                local_rank: 0,
+                master_addr: "127.0.0.1".to_string(),
+                master_port: PP_NCCL_PORT,
+            };
+            let pg = NcclProcessGroup::new(&dist_cfg)
+                .map_err(|e| anyhow::anyhow!("NCCL init failed: {e}"))?;
+            let nccl_comm = pg.communicator().clone();
+            let local_pg = LocalProcessGroup::with_rank(0, pipeline_parallel_size);
+            let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg);
+            let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
+
+            let staged =
+                PipelineStagedModel::new(pp_model, stage.clone(), comm, files.config.vocab_size);
+            Box::new(staged)
+        }
+    } else if !parsed_lora_specs.is_empty() {
         // Create LoRA-enabled model and register adapters
         let mut lora_model = models::from_config_with_lora(&files.config, vb)?;
 
@@ -1493,10 +1561,16 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         }
     };
 
+    // When using pipeline parallelism, each stage only needs KV cache for its own layers.
+    let kv_cache_num_layers = pp_stage
+        .as_ref()
+        .map(|s| s.num_layers)
+        .unwrap_or(files.config.num_hidden_layers);
+
     let cache_config = CacheConfig {
         block_size,
         num_blocks,
-        num_layers: files.config.num_hidden_layers,
+        num_layers: kv_cache_num_layers,
         num_kv_heads: files.config.num_key_value_heads,
         head_dim: files.config.head_dim,
         dtype,
@@ -1505,8 +1579,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         cpu_offload: cpu_offload_config,
     };
     eprintln!(
-        "Allocating KV cache ({} blocks)...",
-        cache_config.num_blocks
+        "Allocating KV cache ({} blocks, {} layers)...",
+        cache_config.num_blocks, cache_config.num_layers
     );
     let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
 
@@ -1809,6 +1883,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Wait for pipeline worker processes to exit (no-op when pp_workers is empty).
+    distributed_launcher::wait_for_workers(pp_workers);
+
     tracing::info!("Shutdown complete");
     Ok(())
 }
@@ -1862,6 +1939,91 @@ fn estimate_kv_cache_budget(
         let _ = (utilization, config, dtype);
         anyhow::bail!("--gpu-memory-utilization requires the 'cuda' feature")
     }
+}
+
+/// Entry point for pipeline-parallel worker processes (RANK 1..N-1).
+///
+/// Workers load only their assigned model layers, initialize NCCL for
+/// communication with the coordinator (rank 0) and other stages, then
+/// call `pipeline_worker_loop` which blocks until the coordinator sends
+/// `SIGNAL_SHUTDOWN`.
+#[cfg(feature = "cuda")]
+async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
+    logging::init_with_otlp(&cfg.log_level, cfg.otlp_traces_endpoint.as_deref())?;
+
+    let dist_cfg = DistributedConfig::from_env();
+    let rank = dist_cfg.rank;
+    let world_size = dist_cfg.world_size;
+
+    tracing::info!(rank, world_size, "Pipeline worker starting");
+    eprintln!("[rank {rank}/{world_size}] Pipeline worker starting");
+
+    // Load model files (same model ID/revision as coordinator).
+    let cache_dir = cfg.download_dir.as_deref().map(std::path::Path::new);
+    let parsed_load_format: loader::LoadFormat = cfg.load_format.parse()?;
+    let files = loader::fetch_model_with_options(
+        &cfg.model_id,
+        &cfg.revision,
+        cfg.hf_token.as_deref(),
+        cache_dir,
+        parsed_load_format,
+        cfg.max_parallel_loading_workers,
+    )?;
+
+    let device = Device::new_cuda(dist_cfg.local_rank)?;
+    let vb = if parsed_load_format == loader::LoadFormat::Dummy {
+        loader::load_dummy_weights(cfg.dtype, &device)
+    } else {
+        loader::load_weights(&files.weights, cfg.dtype, &device)?
+    };
+
+    // Compute stage config for this worker rank.
+    let stage = PipelineStageConfig::new(rank, world_size, files.config.num_hidden_layers);
+    tracing::info!(
+        rank,
+        first_layer = stage.first_layer,
+        num_layers = stage.num_layers,
+        "Loading stage layers"
+    );
+
+    let pp_model = models::from_config_with_pp(&files.config, vb, &stage)?;
+
+    // NCCL init: connect to rank 0's bootstrap server.
+    let pg = NcclProcessGroup::new(&dist_cfg)
+        .map_err(|e| anyhow::anyhow!("NCCL init failed on rank {rank}: {e}"))?;
+    let nccl_comm = pg.communicator().clone();
+    let local_pg = LocalProcessGroup::with_rank(rank, world_size);
+    let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg);
+    let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
+
+    // Build KV cache sized to this stage's layer count.
+    let cache_config = CacheConfig {
+        block_size: cfg.block_size,
+        num_blocks: cfg.num_blocks,
+        num_layers: stage.num_layers,
+        num_kv_heads: files.config.num_key_value_heads,
+        head_dim: files.config.head_dim,
+        dtype: cfg.dtype,
+        device: device.clone(),
+        kv_cache_dtype: match cfg.kv_cache_dtype.as_str() {
+            "fp8" | "fp8_e4m3" | "fp8_e5m2" => KVCacheDtype::Fp8E4m3,
+            _ => KVCacheDtype::Auto,
+        },
+        cpu_offload: None,
+    };
+    let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+
+    eprintln!("[rank {rank}/{world_size}] Entering pipeline worker loop");
+    // Run the blocking worker loop on a dedicated thread so the tokio runtime
+    // is not blocked. The loop exits when the coordinator sends SIGNAL_SHUTDOWN.
+    tokio::task::spawn_blocking(move || {
+        pipeline_worker_loop(pp_model, stage, comm, kv_cache_mgr);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("pipeline_worker_loop panicked: {e}"))?;
+
+    eprintln!("[rank {rank}/{world_size}] Pipeline worker exiting");
+    Ok(())
 }
 
 async fn run_generate(

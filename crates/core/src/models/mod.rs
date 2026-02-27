@@ -503,8 +503,8 @@ use candle_nn::VarBuilder;
 use thiserror::Error;
 
 use crate::config::ModelConfig;
-use crate::distributed::{LocalProcessGroup, ProcessGroup};
-use crate::engine::ModelForward;
+use crate::distributed::{LocalProcessGroup, PipelineStageConfig, ProcessGroup};
+use crate::engine::{ModelForward, PipelineForward};
 use crate::kv_cache::{CacheConfig, CacheError, KVCacheDtype, KVCacheManager, MLACacheConfig};
 use crate::lora::LoraModel;
 use crate::quantization::{
@@ -963,6 +963,48 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
             "MllamaForConditionalGeneration was removed in vLLM v0.10.2; use Llama4ForConditionalGeneration instead".into(),
         )),
         other => Err(ModelError::UnsupportedArchitecture(other.into())),
+    }
+}
+
+/// Construct a pipeline-parallel model stage from config.architectures[0].
+///
+/// Only architectures in the Llama family are supported for pipeline parallelism.
+/// The returned model implements [`PipelineForward`] and covers only the layers
+/// assigned by `stage`: global layers `[stage.first_layer, stage.first_layer +
+/// stage.num_layers)` are loaded from `vb`; other layers are not loaded.
+///
+/// # Errors
+/// Returns [`ModelError::UnsupportedArchitecture`] for architectures that have
+/// not yet been ported to the `PipelineForward` interface.
+pub fn from_config_with_pp(
+    cfg: &ModelConfig,
+    vb: candle_nn::VarBuilder,
+    stage: &PipelineStageConfig,
+) -> Result<Box<dyn PipelineForward>, ModelError> {
+    let arch = get_arch(cfg)?;
+    match arch {
+        // Llama-family architectures all share LlamaForCausalLM internals.
+        "LlamaForCausalLM"
+        | "LlamaModel"
+        | "LLaMAForCausalLM"
+        | "AquilaModel"
+        | "AquilaForCausalLM"
+        | "CwmForCausalLM"
+        | "InternLMForCausalLM"
+        | "InternLM3ForCausalLM"
+        | "IQuestCoderForCausalLM"
+        | "XverseForCausalLM"
+        | "SolarForCausalLM"
+        | "Fairseq2LlamaForCausalLM"
+        | "OrionForCausalLM"
+        | "OlmoForCausalLM"
+        | "SmolLM3ForCausalLM"
+        | "MistralForCausalLM" => Ok(Box::new(llama::LlamaForCausalLM::new_with_pp(
+            cfg, vb, stage,
+        )?)),
+        other => Err(ModelError::UnsupportedArchitecture(format!(
+            "{other} does not support pipeline parallelism yet; use --pipeline-parallel-size 1"
+        ))),
     }
 }
 

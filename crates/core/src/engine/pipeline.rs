@@ -124,6 +124,52 @@ pub trait PipelineForward: Send + 'static {
     fn hidden_size(&self) -> usize;
 }
 
+/// Blanket implementation so `Box<dyn PipelineForward>` can be passed wherever
+/// `M: PipelineForward` is required (e.g. `pipeline_worker_loop`).
+impl PipelineForward for Box<dyn PipelineForward> {
+    fn embed(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
+        (**self).embed(input_ids)
+    }
+
+    fn forward_layers(
+        &self,
+        hidden_states: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut crate::kv_cache::KVCacheManager,
+        block_table: &crate::kv_cache::BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_layers(
+            hidden_states,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn forward_layers_decode_batch(
+        &self,
+        hidden_states: &Tensor,
+        sequences: &[super::model_forward::DecodeSequenceMetadata],
+        kv_cache_mgr: &mut crate::kv_cache::KVCacheManager,
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_layers_decode_batch(hidden_states, sequences, kv_cache_mgr)
+    }
+
+    fn lm_head(&self, hidden_states: &Tensor) -> candle_core::Result<Tensor> {
+        (**self).lm_head(hidden_states)
+    }
+
+    fn device(&self) -> &Device {
+        (**self).device()
+    }
+
+    fn hidden_size(&self) -> usize {
+        (**self).hidden_size()
+    }
+}
+
 // ─── PipelineStagedModel ─────────────────────────────────────────────────
 
 /// Model wrapper that transparently handles pipeline communication.
