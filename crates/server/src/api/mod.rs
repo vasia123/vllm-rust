@@ -17,7 +17,7 @@ pub mod tokenize;
 pub mod types;
 pub mod validation;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -37,6 +37,100 @@ use responses_types::ResponsesResponse;
 
 /// Default maximum request body size: 32 MiB.
 const DEFAULT_MAX_BODY_SIZE: usize = 32 * 1024 * 1024;
+
+// ─── LoRA adapter registry with LRU eviction ─────────────────────────────
+
+/// LRU-evicting registry for CPU-resident LoRA adapters.
+///
+/// Tracks adapters by name with O(1) lookup via an inner `HashMap`. Eviction
+/// order is insertion order: the adapter that was loaded least recently sits
+/// at the front of the deque and is the first to be evicted when the registry
+/// is at capacity. This matches vLLM's `LRUCacheWorkerLoRAManager` semantics.
+///
+/// When `max_cpu_loras` is `None` the registry is unbounded.
+#[derive(Clone)]
+pub struct LoraAdapterRegistry {
+    adapters: HashMap<String, LoraRequest>,
+    /// Adapter names in load order: oldest at the front, newest at the back.
+    order: VecDeque<String>,
+    /// Maximum number of resident adapters. `None` = unlimited.
+    max_cpu_loras: Option<usize>,
+}
+
+impl LoraAdapterRegistry {
+    pub fn new(max_cpu_loras: Option<usize>) -> Self {
+        Self {
+            adapters: HashMap::new(),
+            order: VecDeque::new(),
+            max_cpu_loras,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.adapters.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.adapters.contains_key(name)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&LoraRequest> {
+        self.adapters.get(name)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &LoraRequest> {
+        self.adapters.values()
+    }
+
+    /// Insert an adapter, evicting the oldest if at capacity.
+    ///
+    /// Replacing an existing adapter (inplace reload) moves it to the most-recently-
+    /// used position and never triggers eviction.
+    ///
+    /// Returns the name of the evicted adapter, if any.
+    pub fn insert(&mut self, name: String, request: LoraRequest) -> Option<String> {
+        let is_replacement = self.adapters.contains_key(&name);
+
+        // For replacements, remove from the order queue so it re-enters at the back.
+        if is_replacement {
+            self.order.retain(|n| n != &name);
+        }
+
+        // Evict the oldest when adding a genuinely new adapter at capacity.
+        let evicted = if !is_replacement {
+            if let Some(max) = self.max_cpu_loras {
+                if self.adapters.len() >= max {
+                    self.order.pop_front().inspect(|evict_name| {
+                        self.adapters.remove(evict_name);
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.adapters.insert(name.clone(), request);
+        self.order.push_back(name);
+        evicted
+    }
+
+    /// Remove an adapter by name. Returns the removed request or `None`.
+    pub fn remove(&mut self, name: &str) -> Option<LoraRequest> {
+        let removed = self.adapters.remove(name);
+        if removed.is_some() {
+            self.order.retain(|n| n != name);
+        }
+        removed
+    }
+}
 
 pub use admin::restart::{
     AtomicEngineHandle, EngineBuilder, EngineController, ProductionEngineBuilder,
@@ -59,8 +153,8 @@ pub struct AppState {
     accepting: Arc<AtomicBool>,
     /// Count of in-flight GPU requests (for /load endpoint).
     server_load: Arc<AtomicUsize>,
-    /// Registry of dynamically loaded LoRA adapters (name → request).
-    lora_adapters: Arc<RwLock<HashMap<String, LoraRequest>>>,
+    /// Registry of dynamically loaded LoRA adapters with LRU eviction.
+    lora_adapters: Arc<RwLock<LoraAdapterRegistry>>,
     /// Monotonically increasing ID counter for LoRA adapters.
     next_lora_id: Arc<AtomicUsize>,
     /// In-memory store for completed Responses API objects (response_id → response).
@@ -110,6 +204,7 @@ impl AppState {
         mm_limits: HashMap<String, usize>,
         stream_interval: usize,
         enable_lora: bool,
+        max_cpu_loras: Option<usize>,
     ) -> Self {
         Self {
             engine,
@@ -122,7 +217,7 @@ impl AppState {
             reasoning_parser,
             accepting,
             server_load: Arc::new(AtomicUsize::new(0)),
-            lora_adapters: Arc::new(RwLock::new(HashMap::new())),
+            lora_adapters: Arc::new(RwLock::new(LoraAdapterRegistry::new(max_cpu_loras))),
             next_lora_id: Arc::new(AtomicUsize::new(1)),
             response_store: Arc::new(RwLock::new(HashMap::new())),
             batch_store: batch::new_batch_store(),
@@ -518,7 +613,15 @@ async fn load_lora_adapter(
 
     let lora_id = state.next_lora_id.fetch_add(1, Ordering::Relaxed) as u32;
     let lora_request = LoraRequest::new(req.lora_name.clone(), lora_id, req.lora_path);
-    adapters.insert(req.lora_name.clone(), lora_request);
+    let evicted = adapters.insert(req.lora_name.clone(), lora_request);
+
+    if let Some(ref evicted_name) = evicted {
+        tracing::info!(
+            evicted = %evicted_name,
+            loaded = %req.lora_name,
+            "LRU eviction: max_cpu_loras reached, evicted least-recently-loaded adapter"
+        );
+    }
 
     Ok(format!(
         "Success: LoRA adapter '{}' added successfully.",
@@ -988,6 +1091,7 @@ mod tests {
             HashMap::new(),
             1,
             true,
+            None, // max_cpu_loras: unlimited in tests
         )
     }
 
@@ -2736,6 +2840,122 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("--enable-lora"));
+    }
+
+    // ─── LoraAdapterRegistry unit tests ─────────────────────────────────────
+
+    #[test]
+    fn lora_registry_insert_evicts_oldest_when_at_capacity() {
+        let mut registry = LoraAdapterRegistry::new(Some(2));
+
+        registry.insert("a".into(), LoraRequest::new("a", 1, "/a"));
+        registry.insert("b".into(), LoraRequest::new("b", 2, "/b"));
+
+        // At capacity (2); inserting "c" must evict "a" (oldest).
+        let evicted = registry.insert("c".into(), LoraRequest::new("c", 3, "/c"));
+        assert_eq!(evicted.as_deref(), Some("a"));
+        assert!(!registry.contains_key("a"));
+        assert!(registry.contains_key("b"));
+        assert!(registry.contains_key("c"));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn lora_registry_replacement_does_not_evict() {
+        let mut registry = LoraAdapterRegistry::new(Some(2));
+
+        registry.insert("a".into(), LoraRequest::new("a", 1, "/a"));
+        registry.insert("b".into(), LoraRequest::new("b", 2, "/b"));
+
+        // Replacing "a" (inplace) should not trigger eviction.
+        let evicted = registry.insert("a".into(), LoraRequest::new("a", 3, "/a2"));
+        assert_eq!(evicted, None);
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.get("a").unwrap().path, "/a2");
+    }
+
+    #[test]
+    fn lora_registry_replacement_moves_to_most_recent() {
+        let mut registry = LoraAdapterRegistry::new(Some(2));
+
+        registry.insert("a".into(), LoraRequest::new("a", 1, "/a"));
+        registry.insert("b".into(), LoraRequest::new("b", 2, "/b"));
+
+        // Reload "a" — it should become most-recently-used.
+        // The next eviction should target "b" (now the oldest).
+        registry.insert("a".into(), LoraRequest::new("a", 3, "/a2"));
+        let evicted = registry.insert("c".into(), LoraRequest::new("c", 4, "/c"));
+        assert_eq!(evicted.as_deref(), Some("b"), "b should be evicted, not a");
+    }
+
+    #[test]
+    fn lora_registry_unlimited_never_evicts() {
+        let mut registry = LoraAdapterRegistry::new(None);
+        for i in 0..100u32 {
+            let evicted =
+                registry.insert(format!("a{i}"), LoraRequest::new(format!("a{i}"), i, "/p"));
+            assert_eq!(evicted, None);
+        }
+        assert_eq!(registry.len(), 100);
+    }
+
+    #[test]
+    fn lora_registry_remove_updates_order() {
+        let mut registry = LoraAdapterRegistry::new(Some(2));
+        registry.insert("a".into(), LoraRequest::new("a", 1, "/a"));
+        registry.insert("b".into(), LoraRequest::new("b", 2, "/b"));
+
+        registry.remove("a");
+        // One slot freed; inserting "c" should not evict.
+        let evicted = registry.insert("c".into(), LoraRequest::new("c", 3, "/c"));
+        assert_eq!(evicted, None);
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_lora_adapter_evicts_via_api() {
+        // Create state with max_cpu_loras = 1 via a small capacity registry.
+        let mut state = test_app_state();
+        *state.lora_adapters.write().await = LoraAdapterRegistry::new(Some(1));
+
+        let router = create_router(state);
+
+        // Load first adapter.
+        let body = serde_json::json!({"lora_name": "first", "lora_path": "/first"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/load_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Load second adapter — should evict "first".
+        let body = serde_json::json!({"lora_name": "second", "lora_path": "/second"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/load_lora_adapter")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Only "second" should be listed.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/lora_adapters")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let adapters = json["lora_adapters"].as_array().unwrap();
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0]["lora_name"], "second");
     }
 
     #[tokio::test]

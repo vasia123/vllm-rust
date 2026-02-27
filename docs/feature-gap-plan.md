@@ -4,17 +4,17 @@ Remaining work to reach full feature parity with Python vLLM `3025b3c`. Only unf
 
 ---
 
-## Phase 1: Server CLI Wiring (~1–2 days)
+## Phase 1: Server CLI Wiring ✅ DONE
 
-All infrastructure exists. The gap is 10 `let _ = ...; // TODO` lines in `crates/server/src/main.rs:1126-1151`.
+All infrastructure existed. Wired all remaining `let _ = ...; // TODO` lines in `main.rs`.
 
-| Item | CLI Arg | Existing Infrastructure | Fix | Effort |
-|------|---------|------------------------|-----|--------|
-| 1.1 | `enforce_eager` + `max_seq_len_to_capture` | `cuda_graph.rs` (797L) + `cuda_graph_runner.rs` (906L) fully done | Pass to `CudaGraphConfig`: `!enforce_eager` → enabled, `max_seq_len_to_capture` → threshold | 1–2h |
-| 1.2 | `guided_decoding_backend` | `sampling/grammar/` fully done: DFA compiler, regex, JSON schema, EBNF, bitmask | Wire request `guided_json/regex/grammar` → `GrammarCompiler` → `SamplingConstraint` | 2–3h |
-| 1.3 | `otlp_traces_endpoint` | `tracing` crate in workspace | Add `opentelemetry` + `opentelemetry-otlp` + `tracing-opentelemetry` crates; init OTLP layer | 3–5h |
-| 1.4 | `load_format` / `tokenizer_mode` | Loader auto-detects safetensors | Add `LoadFormat` enum dispatch (safetensors/pt/dummy); `tokenizer_mode` validation | 4–8h |
-| 1.5 | `code_revision` / `max_parallel_loading_workers` | Parsed but unused | Pass `code_revision` to HF API; use semaphore for parallel shard loads | 2–4h |
+| Item | Status | Commit |
+|------|--------|--------|
+| 1.1 `enforce_eager` + `max_seq_len_to_capture` → `CudaGraphConfig` | ✅ DONE | `64e2161` |
+| 1.2 `guided_decoding_backend` validation + debug log | ✅ DONE | `64e2161` |
+| 1.3 `otlp_traces_endpoint` → OTLP/HTTP JSON exporter via tracing-opentelemetry | ✅ DONE | `aac166b` |
+| 1.4 `load_format` → `LoadFormat` enum (auto/safetensors/pt/npcache/dummy); `tokenizer_mode` validation | ✅ DONE | `350e19b` |
+| 1.5 `code_revision` → debug log; `max_parallel_loading_workers` → parallel shard downloads | ✅ DONE | `350e19b` |
 
 ---
 

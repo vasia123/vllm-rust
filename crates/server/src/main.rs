@@ -1675,6 +1675,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         mm_limits,
         stream_interval,
         enable_lora,
+        max_cpu_loras,
     );
 
     let start_time = SystemTime::now()
