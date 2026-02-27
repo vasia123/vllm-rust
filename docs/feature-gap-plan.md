@@ -49,7 +49,7 @@ Requires multi-GPU testing.
 | Item | What Exists | Gap | Effort |
 |------|------------|-----|--------|
 | 4.1 ✅ | PP signals + worker loop + 27 tests | `LlamaForCausalLM::new_with_pp()` + `impl PipelineForward`; `from_config_with_pp()` for Llama/Mistral family; `distributed_launcher.rs` spawns N-1 worker processes; `run_pipeline_worker()` on worker ranks; `PipelineStagedModel` wraps NCCL comm at coordinator | `f755064` |
-| 4.2 | EPLB state tracking + rebalance detect | `rearrange_expert_weights_inplace` via NCCL all-to-all | 15–25h |
+| 4.2 ✅ | EPLB state tracking + rebalance detect | `rearrange_expert_weights_inplace` in `moe/eplb_execute.rs`; routing tables computed from global placement arrays; `all_to_all_v` exchanges weights; `SimulatedCommunicator` enables 8 multi-threaded unit tests | `7c51e55` |
 
 ---
 
