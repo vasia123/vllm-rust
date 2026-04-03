@@ -69,6 +69,8 @@ pub mod gemma3_quantized;
 pub mod gemma3_vlm;
 pub mod gemma3n;
 pub mod gemma3n_vlm;
+pub mod gemma4;
+pub mod gemma4_vlm;
 pub mod gemma_lora;
 pub mod gemma_quantized;
 pub mod glm;
@@ -320,6 +322,8 @@ pub use gemma3_quantized::QuantizedGemma3ForCausalLM;
 pub use gemma3_vlm::Gemma3ForConditionalGeneration;
 pub use gemma3n::Gemma3nForCausalLM;
 pub use gemma3n_vlm::Gemma3nForConditionalGeneration;
+pub use gemma4::Gemma4ForCausalLM;
+pub use gemma4_vlm::Gemma4ForConditionalGeneration;
 pub use gemma_lora::GemmaWithLora;
 pub use gemma_quantized::QuantizedGemmaForCausalLM;
 pub use glm::GlmForCausalLM;
@@ -716,6 +720,9 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         "Gemma3nForConditionalGeneration" => {
             Ok(Box::new(Gemma3nForConditionalGeneration::new(cfg, vb)?))
         }
+        "Gemma4ForConditionalGeneration" => {
+            Ok(Box::new(Gemma4ForConditionalGeneration::new(cfg, vb)?))
+        }
         "Molmo2ForConditionalGeneration" => {
             Ok(Box::new(Molmo2ForConditionalGeneration::new(cfg, vb)?))
         }
@@ -841,6 +848,7 @@ pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelFor
         }
         "FlexOlmoForCausalLM" => Ok(Box::new(FlexOlmoForCausalLM::new(cfg, vb)?)),
         "Gemma3nForCausalLM" => Ok(Box::new(Gemma3nForCausalLM::new(cfg, vb)?)),
+        "Gemma4ForCausalLM" | "Gemma4TextModel" => Ok(Box::new(Gemma4ForCausalLM::new(cfg, vb)?)),
         "GPTBigCodeForCausalLM" => Ok(Box::new(GPTBigCodeForCausalLM::new(cfg, vb)?)),
         "GPTJForCausalLM" => Ok(Box::new(GPTJForCausalLM::new(cfg, vb)?)),
         "GptOssForCausalLM" => Ok(Box::new(GptOssForCausalLM::new(cfg, vb)?)),
@@ -1695,6 +1703,9 @@ pub fn from_config_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "Gemma3nForCausalLM" => Ok(Box::new(Gemma3nForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?)),
+        "Gemma4ForCausalLM" | "Gemma4TextModel" => Ok(Box::new(Gemma4ForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?)),
         "GPTBigCodeForCausalLM" => Ok(Box::new(GPTBigCodeForCausalLM::new_with_tp(
