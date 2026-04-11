@@ -546,6 +546,154 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires HF download (~600 MB BnB 4-bit weights); run with --ignored"]
+    fn real_bnb_nf4_tinyllama_prefill_decode() {
+        // End-to-end integration test for the BitsAndBytes NF4 4-bit
+        // production path. Mirrors the AWQ test but exercises a very
+        // different backend: NF4 packed u8 weights with double-quant
+        // (absmax is itself quantized to u8, recovered via
+        // nested_absmax / nested_quant_map). Validates:
+        //
+        // - `fetch_model` resolves a real BnB HuggingFace repo,
+        // - `detect_from_json` recognises `quant_method="bitsandbytes"`,
+        // - `create_weight_loader_with_params` routes to
+        //   `BitsAndBytesWeightLoader`,
+        // - the loader parses the HF-native tensor layout (`weight` as
+        //   `[packed_len, 1]` U8, `weight.absmax` as U8, plus the
+        //   `nested_absmax` / `nested_quant_map` / `quant_map` double-
+        //   quant metadata),
+        // - `QuantizedLlamaForCausalLM::new` assembles the full model,
+        // - a CPU forward pass through `dequantize_nf4` produces
+        //   non-NaN logits with a reasonable argmax (proving the
+        //   double-quant unpacking is correct, not just zeros).
+        //
+        // Model: `unsloth/tinyllama-bnb-4bit` — 1.1B Llama,
+        // bnb_4bit_quant_type=nf4, bnb_4bit_use_double_quant=true,
+        // bnb_4bit_compute_dtype=bfloat16. ~600 MB on disk, comfortable
+        // for CPU inference. We run on CPU so the test works even
+        // without a GPU (the focus is the loader/dequant path).
+        //
+        // Run:
+        //   cargo test -p vllm-core --lib \
+        //       loader::tests::real_bnb_nf4_tinyllama_prefill_decode \
+        //       -- --ignored --nocapture
+        use crate::engine::ModelForward;
+        use crate::kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager};
+        use crate::models::from_config_with_quant;
+        use crate::quantization::QuantizationMethod;
+        use candle_core::Tensor;
+
+        let model_id = "unsloth/tinyllama-bnb-4bit";
+        let files = fetch_model_with_auth(model_id, "main", None, None)
+            .expect("fetch BnB NF4 checkpoint from HuggingFace");
+
+        eprintln!(
+            "fetched: arch={:?} quant={} layers={} hidden={} vocab={}",
+            files.config.architectures,
+            quantization_info(&files),
+            files.config.num_hidden_layers,
+            files.config.hidden_size,
+            files.config.vocab_size,
+        );
+        assert_eq!(
+            files.quantization.method,
+            QuantizationMethod::BitsAndBytes,
+            "checkpoint must be detected as BitsAndBytes"
+        );
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let vb = load_weights(&files.weights, dtype, &device).expect("mmap BnB weights");
+
+        // Route through the production dispatch (same path the server
+        // uses): `from_config_with_quant` calls
+        // `create_weight_loader_with_params` → `BitsAndBytesWeightLoader`
+        // and constructs `QuantizedLlamaForCausalLM`.
+        let model = from_config_with_quant(&files.config, vb, &files.quantization)
+            .expect("construct QuantizedLlamaForCausalLM via BnB loader");
+
+        let cfg = &files.config;
+        let cache_cfg = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            dtype,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).expect("kv cache manager");
+        let mut block_table = BlockTable::new(cache_cfg.block_size);
+
+        let prompt_ids: Vec<u32> = vec![1, 15043, 29892, 920, 526, 366];
+        let seq_len = prompt_ids.len();
+        let input_ids = Tensor::from_vec(prompt_ids, (1, seq_len), &device).expect("input_ids");
+
+        kv_cache
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate prefill");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
+            .expect("BnB prefill forward");
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+
+        let last: Vec<f32> = logits
+            .narrow(1, seq_len - 1, 1)
+            .and_then(|t| t.squeeze(1))
+            .and_then(|t| t.squeeze(0))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.to_vec1())
+            .expect("last-token logits");
+
+        let nan = last.iter().filter(|v| v.is_nan()).count();
+        let inf = last.iter().filter(|v| v.is_infinite()).count();
+        assert_eq!(nan, 0, "BnB NF4 forward must not produce NaN");
+        assert_eq!(inf, 0, "BnB NF4 forward must not produce Inf");
+
+        let (argmax, max_val) = last.iter().copied().enumerate().fold(
+            (0usize, f32::NEG_INFINITY),
+            |(bi, bv), (i, v)| if v > bv { (i, v) } else { (bi, bv) },
+        );
+        let mean: f32 = last.iter().sum::<f32>() / last.len() as f32;
+        let gap = max_val - mean;
+        eprintln!(
+            "bnb last-token logits: argmax={argmax} max={max_val:.4} mean={mean:.4} gap={gap:.4}"
+        );
+        assert!((argmax as usize) < cfg.vocab_size);
+        assert!(
+            gap > 1e-3,
+            "BnB NF4 logits must show real spread (gap={gap}); flat distribution would \
+             indicate the double-quant absmax recovery is wrong"
+        );
+
+        // Follow-up decode step with a non-zero seqlen_offset — exercises
+        // the same BnB dequant path on a fresh single-token input.
+        block_table.advance(seq_len);
+        kv_cache
+            .allocate_for_request(&mut block_table, 1)
+            .expect("allocate decode");
+        let decode_slot = block_table.slot_mapping(seq_len, 1);
+        let next_token =
+            Tensor::from_vec(vec![argmax as u32], (1, 1), &device).expect("decode token");
+        let decode_logits = model
+            .forward(
+                &next_token,
+                seq_len,
+                &mut kv_cache,
+                &block_table,
+                &decode_slot,
+            )
+            .expect("BnB decode forward");
+        assert_eq!(decode_logits.dims(), &[1, 1, cfg.vocab_size]);
+
+        eprintln!("OK: BnB NF4 double-quant prefill+decode produced real logits (argmax={argmax})");
+    }
+
+    #[test]
     #[ignore = "requires HF download (~750 MB AWQ weights); run with --ignored"]
     fn real_awq_tinyllama_prefill_decode() {
         // End-to-end integration test for the AWQ production path.

@@ -572,15 +572,49 @@ impl QuantizedWeightLoader for BitsAndBytesWeightLoader {
 
         match self.config.quant_type {
             BnbQuantType::NF4 => {
-                // NF4: packed uint8, shape [n*k/2] (flattened)
+                // NF4: packed uint8. HF BnB checkpoints store the
+                // packed tensor as 2D `[packed_len, 1]` with dtype U8;
+                // fall back to flat `[packed_len]` for in-memory /
+                // unit-test construction paths.
                 let packed_len = total_elements.div_ceil(2);
-                if let Ok(w) = vb.get(packed_len, "weight") {
-                    weights.insert("weight".to_string(), w);
-                }
-                // Per-block absmax scales
+                let weight_tensor = vb_get_as(&vb, (packed_len, 1), "weight", DType::U8)
+                    .or_else(|_| vb_get_as(&vb, packed_len, "weight", DType::U8));
+                let weight = weight_tensor.map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "BnB NF4 weight load failed for {prefix} (expected U8 shape \
+                         [{packed_len}, 1] or [{packed_len}]): {e}"
+                    ))
+                })?;
+                weights.insert("weight".to_string(), weight);
+
+                // Per-block absmax. Double-quant checkpoints store
+                // absmax as U8 (itself quantized) plus nested metadata;
+                // single-quant stores it as F32 directly. Try U8 first
+                // (the HF-native layout), fall back to F32 for legacy.
                 let num_blocks = total_elements.div_ceil(self.config.block_size);
-                if let Ok(a) = vb.get(num_blocks, "weight.absmax") {
-                    weights.insert("absmax".to_string(), a);
+                let absmax_tensor = vb_get_as(&vb, num_blocks, "weight.absmax", DType::U8)
+                    .or_else(|_| vb_get_as(&vb, num_blocks, "weight.absmax", DType::F32));
+                let absmax = absmax_tensor.map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "BnB NF4 absmax load failed for {prefix} \
+                         (expected shape [{num_blocks}]): {e}"
+                    ))
+                })?;
+                weights.insert("absmax".to_string(), absmax);
+
+                // Optional double-quant metadata — only present in
+                // `bnb_4bit_use_double_quant=True` checkpoints.
+                let nested_block_size = 256usize;
+                let num_outer_blocks = num_blocks.div_ceil(nested_block_size);
+                if let Ok(n) = vb_get_as(&vb, num_outer_blocks, "weight.nested_absmax", DType::F32)
+                {
+                    weights.insert("nested_absmax".to_string(), n);
+                }
+                if let Ok(m) = vb_get_as(&vb, 256, "weight.nested_quant_map", DType::F32) {
+                    weights.insert("nested_quant_map".to_string(), m);
+                }
+                if let Ok(m) = vb_get_as(&vb, 16, "weight.quant_map", DType::F32) {
+                    weights.insert("quant_map".to_string(), m);
                 }
             }
             BnbQuantType::INT8 => {

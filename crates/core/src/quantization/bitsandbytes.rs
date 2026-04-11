@@ -111,15 +111,21 @@ impl BitsAndBytesConfig {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // HF BnB configs list excluded modules under
+        // `llm_int8_skip_modules` (the original INT8 name) or under
+        // `bnb_4bit_skip_modules` for newer checkpoints. Absent both,
+        // unsloth / HuggingFace still leave `lm_head` unquantized by
+        // default — matches `transformers` behaviour.
         let ignored_layers = raw_config
             .get("llm_int8_skip_modules")
+            .or_else(|| raw_config.get("bnb_4bit_skip_modules"))
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| vec!["lm_head".to_string()]);
 
         Self {
             quant_type,
@@ -212,14 +218,33 @@ pub struct BitsAndBytesLinear {
     /// NF4: packed u8 tensor (2 values per byte), shape [out_features * in_features / 2]
     /// INT8: i8 weights stored as U8, shape [out_features, in_features]
     quantized_weight: Tensor,
-    /// Per-block absmax scales for dequantization
+    /// Per-block absmax scales for dequantization. In single-quant NF4
+    /// this is F32 directly. In double-quant NF4 this is U8 (itself
+    /// quantized) and must be looked up against `nested_quant_map` and
+    /// multiplied by `nested_absmax` before being applied to weights.
     absmax: Tensor,
+    /// Double-quant: outer-block scale applied to the dequantized
+    /// absmax values. `None` when the checkpoint ships single-quant
+    /// NF4 (e.g. the pre-load default from `BitsAndBytesLinear::new`).
+    nested_absmax: Option<Tensor>,
+    /// Double-quant: 256-entry F32 lookup table mapping each U8 absmax
+    /// code to a normalised float before the nested-block multiply.
+    nested_quant_map: Option<Tensor>,
+    /// Optional 16-entry F32 lookup table for the NF4 value codebook.
+    /// Kept so we can honour the checkpoint's table instead of the
+    /// hardcoded `NF4_LOOKUP` when present — vLLM and bitsandbytes
+    /// both ship the same canonical values so the fallback path is
+    /// numerically equivalent.
+    quant_map: Option<Tensor>,
     /// Optional bias
     bias: Option<Tensor>,
     in_features: usize,
     out_features: usize,
     quant_type: BnbQuantType,
     block_size: usize,
+    /// Number of absmax entries per nested block when double-quant is
+    /// enabled. Standard `bitsandbytes` value is 256.
+    nested_block_size: usize,
     device: Device,
 }
 
@@ -265,23 +290,42 @@ impl BitsAndBytesLinear {
         Ok(Self {
             quantized_weight,
             absmax,
+            nested_absmax: None,
+            nested_quant_map: None,
+            quant_map: None,
             bias,
             in_features,
             out_features,
             quant_type,
             block_size,
+            nested_block_size: 256,
             device: device.clone(),
         })
     }
 
     /// Dequantize NF4 packed weights to f32.
     ///
-    /// Each byte holds two 4-bit indices: low nibble first, high nibble second.
-    /// Each index maps to a value in the NF4_LOOKUP table, then scaled by the
-    /// per-block absmax factor.
+    /// Single-quant path: `absmax` is a `[num_blocks]` F32 tensor that
+    /// directly scales each NF4 block. This is the layout the unit
+    /// tests build against via [`BitsAndBytesLinear::new`] + zero
+    /// weights.
+    ///
+    /// Double-quant path: `absmax` is a `[num_blocks]` U8 tensor whose
+    /// values index into `nested_quant_map` (F32 [256]); the result is
+    /// then multiplied by `nested_absmax` (F32 [num_outer_blocks]) to
+    /// recover the real per-block absmax. This matches the
+    /// `bitsandbytes` on-disk layout used by HuggingFace checkpoints
+    /// with `bnb_4bit_use_double_quant=True` (unsloth / standard NF4).
+    ///
+    /// Both paths use the NF4 16-entry value LUT — either from the
+    /// checkpoint's `quant_map` tensor when available (ensures exact
+    /// reproducibility against the saved weights) or the hardcoded
+    /// `NF4_LOOKUP` fallback.
     fn dequantize_nf4(&self) -> Result<Tensor> {
+        let absmax_f32 = self.materialize_absmax()?;
+        let nf4_lut = self.nf4_value_lut()?;
+
         let packed_data: Vec<u8> = self.quantized_weight.flatten_all()?.to_vec1()?;
-        let absmax_data: Vec<f32> = self.absmax.flatten_all()?.to_vec1()?;
 
         let total_elements = self.out_features * self.in_features;
         let mut output = vec![0.0f32; total_elements];
@@ -295,26 +339,86 @@ impl BitsAndBytesLinear {
 
             if elem_low < total_elements {
                 let block_idx = elem_low / self.block_size;
-                let scale = if block_idx < absmax_data.len() {
-                    absmax_data[block_idx]
-                } else {
-                    1.0
-                };
-                output[elem_low] = NF4_LOOKUP[low_idx] * scale;
+                let scale = absmax_f32.get(block_idx).copied().unwrap_or(1.0);
+                output[elem_low] = nf4_lut[low_idx] * scale;
             }
 
             if elem_high < total_elements {
                 let block_idx = elem_high / self.block_size;
-                let scale = if block_idx < absmax_data.len() {
-                    absmax_data[block_idx]
-                } else {
-                    1.0
-                };
-                output[elem_high] = NF4_LOOKUP[high_idx] * scale;
+                let scale = absmax_f32.get(block_idx).copied().unwrap_or(1.0);
+                output[elem_high] = nf4_lut[high_idx] * scale;
             }
         }
 
         Tensor::from_vec(output, (self.out_features, self.in_features), &self.device)
+    }
+
+    /// Collapse the stored absmax into a dense F32 vector indexed by
+    /// block number. Handles both the simple single-quant case (absmax
+    /// is already F32) and the double-quant layout where absmax is a
+    /// U8 codebook index that needs `nested_quant_map` + `nested_absmax`
+    /// to recover real F32 scales.
+    fn materialize_absmax(&self) -> Result<Vec<f32>> {
+        // Single-quant fast path: absmax stored as F32 directly.
+        if self.absmax.dtype() == DType::F32 {
+            return self.absmax.flatten_all()?.to_vec1();
+        }
+
+        // Double-quant path requires U8 absmax + nested metadata.
+        if self.absmax.dtype() != DType::U8 {
+            candle_core::bail!(
+                "BnB NF4 absmax must be F32 or U8 (got {:?})",
+                self.absmax.dtype()
+            );
+        }
+        let nested_absmax = self.nested_absmax.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "BnB NF4 double-quant requires nested_absmax tensor".to_string(),
+            )
+        })?;
+        let nested_quant_map = self.nested_quant_map.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "BnB NF4 double-quant requires nested_quant_map tensor".to_string(),
+            )
+        })?;
+
+        let codes: Vec<u8> = self.absmax.flatten_all()?.to_vec1()?;
+        let lut: Vec<f32> = nested_quant_map.flatten_all()?.to_vec1()?;
+        let outer: Vec<f32> = nested_absmax.flatten_all()?.to_vec1()?;
+        if lut.len() != 256 {
+            candle_core::bail!(
+                "BnB nested_quant_map must have 256 entries (got {})",
+                lut.len()
+            );
+        }
+
+        let nested_block = self.nested_block_size.max(1);
+        let mut absmax = Vec::with_capacity(codes.len());
+        for (b, &code) in codes.iter().enumerate() {
+            let outer_idx = b / nested_block;
+            let outer_scale = outer.get(outer_idx).copied().unwrap_or(1.0);
+            absmax.push(lut[code as usize] * outer_scale);
+        }
+        Ok(absmax)
+    }
+
+    /// Return the 16-entry NF4 value lookup table, preferring the
+    /// checkpoint's own `quant_map` when present. The bitsandbytes
+    /// library always saves the same canonical 16 NF4 values so the
+    /// hardcoded `NF4_LOOKUP` fallback is numerically equivalent for
+    /// standard checkpoints.
+    fn nf4_value_lut(&self) -> Result<[f32; 16]> {
+        if let Some(qm) = self.quant_map.as_ref() {
+            let vec: Vec<f32> = qm.flatten_all()?.to_vec1()?;
+            if vec.len() != 16 {
+                candle_core::bail!("BnB NF4 quant_map must have 16 entries (got {})", vec.len());
+            }
+            let mut lut = [0.0f32; 16];
+            lut.copy_from_slice(&vec);
+            Ok(lut)
+        } else {
+            Ok(NF4_LOOKUP)
+        }
     }
 
     /// Dequantize INT8 weights to f32.
@@ -444,10 +548,26 @@ impl QuantizedLinear for BitsAndBytesLinear {
 
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         if let Some(w) = weights.get("weight") {
-            self.quantized_weight = w.clone();
+            // HF BnB checkpoints store the packed NF4 tensor as a 2D
+            // `[packed_len, 1]` buffer; flatten so the element-by-element
+            // dequant loop in `dequantize_nf4` stays 1-D.
+            self.quantized_weight = if w.dims().len() == 2 && w.dim(1).unwrap_or(1) == 1 {
+                w.squeeze(1)?
+            } else {
+                w.clone()
+            };
         }
         if let Some(a) = weights.get("absmax") {
             self.absmax = a.clone();
+        }
+        if let Some(n) = weights.get("nested_absmax") {
+            self.nested_absmax = Some(n.clone());
+        }
+        if let Some(m) = weights.get("nested_quant_map") {
+            self.nested_quant_map = Some(m.clone());
+        }
+        if let Some(m) = weights.get("quant_map") {
+            self.quant_map = Some(m.clone());
         }
         // INT8 uses SCB (Scale Column-wise/Block-wise) naming
         if let Some(s) = weights.get("SCB") {
