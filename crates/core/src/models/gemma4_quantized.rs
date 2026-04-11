@@ -1152,10 +1152,16 @@ impl QuantizedGemma4DecoderLayer {
         layer_idx: usize,
         cache_head_dim: usize,
         loader: &dyn QuantizedWeightLoader,
-        vb: VarBuilder,
+        vb_m: VarBuilder,
     ) -> Result<Self> {
+        // `vb_m` is positioned at the inner `model.*` namespace so the
+        // layer VarBuilder is `vb_m.pp("layers").pp(idx)` without an
+        // extra `.pp("model")` (that was the standalone-only path and
+        // now lives in `QuantizedGemma4ForCausalLM::new`). The loader
+        // prefix still carries "model." — callers that need to remap
+        // (VLM wrapper) wrap the loader in `RemappingWeightLoader`.
         let prefix = format!("model.layers.{layer_idx}");
-        let vb_layer = vb.pp("model").pp("layers").pp(layer_idx);
+        let vb_layer = vb_m.pp("layers").pp(layer_idx);
 
         let kv_sharing_target = extra_cfg.kv_sharing_target_layer(layer_idx, cfg.num_hidden_layers);
         let is_kv_shared = kv_sharing_target.is_some();
@@ -1270,7 +1276,7 @@ impl QuantizedGemma4DecoderLayer {
 
         let layer_scalar = vb_layer
             .get(1, "layer_scalar")
-            .unwrap_or_else(|_| Tensor::ones(1, DType::F32, vb.device()).unwrap());
+            .unwrap_or_else(|_| Tensor::ones(1, DType::F32, vb_m.device()).unwrap());
 
         Ok(Self {
             self_attn,
@@ -1464,13 +1470,43 @@ pub struct QuantizedGemma4ForCausalLM {
 }
 
 impl QuantizedGemma4ForCausalLM {
+    /// Standalone Gemma 4 text checkpoint constructor.
+    ///
+    /// Assumes the safetensors store the transformer under a top-level
+    /// `model.*` wrapper and the weight loader resolves `model.*` paths
+    /// literally — i.e. the normal case for a text-only
+    /// `Gemma4ForCausalLM` repository. Internally descends one level
+    /// with `vb.pp("model")` and delegates to
+    /// [`Self::new_at_model_root`].
     pub fn new(
         cfg: &ModelConfig,
         vb: VarBuilder<'static>,
         weight_loader: &dyn QuantizedWeightLoader,
     ) -> Result<Self> {
-        let extra_cfg = Gemma4ExtraConfig::from_model_config(cfg);
         let vb_m = vb.pp("model");
+        Self::new_at_model_root(cfg, vb_m, weight_loader)
+    }
+
+    /// Construct the quantized Gemma 4 text model directly from a
+    /// VarBuilder already positioned at the inner `model.*` namespace.
+    ///
+    /// The VLM wrapper (`QuantizedGemma4ForConditionalGeneration`) uses
+    /// this to skip the standalone `.pp("model")` step — in an HF VLM
+    /// checkpoint the language-model tensors live at
+    /// `model.language_model.*`, so the wrapper passes a VarBuilder
+    /// already scoped to `model.language_model` here.
+    ///
+    /// The `weight_loader` argument must resolve vLLM-style `"model.X"`
+    /// load paths to the REAL tensor names in the checkpoint. In
+    /// standalone mode that is the identity (`new` wraps without any
+    /// remapping); in VLM mode the caller wraps the base loader in
+    /// `RemappingWeightLoader` so `"model.X"` → `"model.language_model.X"`.
+    pub fn new_at_model_root(
+        cfg: &ModelConfig,
+        vb_m: VarBuilder<'static>,
+        weight_loader: &dyn QuantizedWeightLoader,
+    ) -> Result<Self> {
+        let extra_cfg = Gemma4ExtraConfig::from_model_config(cfg);
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
@@ -1514,7 +1550,7 @@ impl QuantizedGemma4ForCausalLM {
                 i,
                 cache_head_dim,
                 weight_loader,
-                vb.clone(),
+                vb_m.clone(),
             )?);
         }
 
@@ -1540,7 +1576,7 @@ impl QuantizedGemma4ForCausalLM {
             num_hidden_layers: cfg.num_hidden_layers,
             hidden_size_per_layer_input: extra_cfg.hidden_size_per_layer_input,
             final_logit_softcap: extra_cfg.final_logit_softcap,
-            device: vb.device().clone(),
+            device: vb_m.device().clone(),
         })
     }
 

@@ -29,28 +29,65 @@ use crate::quantization::{QuantizationMethod, QuantizedLinear, QuantizedWeightLo
 use super::gemma4_quantized::QuantizedGemma4ForCausalLM;
 use super::gemma4_vlm::Gemma4VLMConfig;
 
-// ─── Prefixed Weight Loader ──────────────────────────────────────────────
+// ─── Remapping Weight Loader ─────────────────────────────────────────────
 //
-// Delegates every call to the underlying loader but prepends a fixed prefix
-// so an inner module (e.g. `QuantizedGemma4ForCausalLM`) can use its usual
-// "model.*" paths while the checkpoint stores them under
-// "language_model.model.*".
+// Rewrites a path prefix on every `load_linear` call before forwarding to
+// the underlying loader. The Gemma 4 quantized text model emits loader
+// prefixes of the form `"model.layers.N.*"` and `"model.per_layer_*"`.
+// In a VLM checkpoint those tensors actually live under
+// `"model.language_model.layers.N.*"`, so the VLM wrapper installs a
+// remapper that replaces the leading `"model."` with `"model.language_model."`.
+//
+// When `from_prefix` is the empty string the remapper degenerates to a
+// plain prefix-prepend — the behaviour of the old `PrefixedWeightLoader`
+// — which is useful for checkpoints where the text tensors live at
+// `"<prefix>.embed_tokens"` etc. without a leading `"model."`.
 
-struct PrefixedWeightLoader<'a> {
+pub struct RemappingWeightLoader<'a> {
     inner: &'a dyn QuantizedWeightLoader,
-    prefix: String,
+    from_prefix: String,
+    to_prefix: String,
 }
 
-impl<'a> PrefixedWeightLoader<'a> {
-    fn new(inner: &'a dyn QuantizedWeightLoader, prefix: impl Into<String>) -> Self {
+impl<'a> RemappingWeightLoader<'a> {
+    pub fn new(
+        inner: &'a dyn QuantizedWeightLoader,
+        from_prefix: impl Into<String>,
+        to_prefix: impl Into<String>,
+    ) -> Self {
         Self {
             inner,
-            prefix: prefix.into(),
+            from_prefix: from_prefix.into(),
+            to_prefix: to_prefix.into(),
+        }
+    }
+
+    fn rewrite(&self, prefix: &str) -> String {
+        if self.from_prefix.is_empty() {
+            return if self.to_prefix.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{}.{}", self.to_prefix, prefix)
+            };
+        }
+        if let Some(rest) = prefix.strip_prefix(&self.from_prefix) {
+            // Preserve the boundary dot: `"model.X"` → `"<to>.X"` by
+            // re-inserting a single `.` after `to_prefix` when needed.
+            let rest = rest.strip_prefix('.').unwrap_or(rest);
+            if rest.is_empty() {
+                self.to_prefix.clone()
+            } else if self.to_prefix.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{}.{rest}", self.to_prefix)
+            }
+        } else {
+            prefix.to_string()
         }
     }
 }
 
-impl<'a> QuantizedWeightLoader for PrefixedWeightLoader<'a> {
+impl<'a> QuantizedWeightLoader for RemappingWeightLoader<'a> {
     fn load_linear(
         &self,
         prefix: &str,
@@ -58,9 +95,9 @@ impl<'a> QuantizedWeightLoader for PrefixedWeightLoader<'a> {
         out_features: usize,
         bias: bool,
     ) -> Result<Box<dyn QuantizedLinear>> {
-        let full = format!("{}.{}", self.prefix, prefix);
+        let rewritten = self.rewrite(prefix);
         self.inner
-            .load_linear(&full, in_features, out_features, bias)
+            .load_linear(&rewritten, in_features, out_features, bias)
     }
 
     fn method(&self) -> QuantizationMethod {
@@ -136,18 +173,38 @@ impl QuantizedGemma4ForConditionalGeneration {
     ) -> Result<Self> {
         let config = Gemma4VLMConfig::from_model_config(cfg);
 
-        let vision_tower = VisionEncoder::new(&config.vision_config, vb.pp("vision_tower"))?;
+        // Real HF `Gemma4ForConditionalGeneration` checkpoints wrap
+        // every sub-module under a top-level `model.*` key:
+        //   model.vision_tower.*
+        //   model.audio_tower.*
+        //   model.embed_vision.*
+        //   model.language_model.{embed_tokens, layers, ...}
+        //
+        // Descend once here so sub-module VarBuilders are positioned at
+        // the right root; `vb_m` / `vb` (the raw root) coexist so the
+        // default-constructed `VarBuilder::zeros` path used by unit
+        // tests (which has no `model.` wrapper) still works via the
+        // `RemappingWeightLoader` fast path below.
+        let vb_root = vb.pp("model");
+
+        let vision_tower = VisionEncoder::new(&config.vision_config, vb_root.pp("vision_tower"))?;
 
         let embed_vision = Gemma4MultimodalEmbedder::new(
             config.vision_hidden_size,
             cfg.hidden_size,
             config.vision_config.layer_norm_eps,
-            vb.pp("embed_vision"),
+            vb_root.pp("embed_vision"),
         )?;
 
-        let prefixed_loader = PrefixedWeightLoader::new(weight_loader, "language_model");
-        let language_model =
-            QuantizedGemma4ForCausalLM::new(cfg, vb.pp("language_model"), &prefixed_loader)?;
+        // Language model lives at `model.language_model.*`. Hand the
+        // inner quantized constructor a VarBuilder already positioned at
+        // that namespace (via `new_at_model_root`) and wrap the base
+        // weight_loader in a `RemappingWeightLoader` that turns the
+        // text model's `"model.X"` load paths into
+        // `"model.language_model.X"` against the safetensors root.
+        let vb_lm = vb_root.pp("language_model");
+        let lm_loader = RemappingWeightLoader::new(weight_loader, "model", "model.language_model");
+        let language_model = QuantizedGemma4ForCausalLM::new_at_model_root(cfg, vb_lm, &lm_loader)?;
 
         Ok(Self {
             vision_tower,
@@ -333,21 +390,28 @@ mod tests {
     }
 
     #[test]
-    fn test_prefixed_loader_prepends_prefix() {
+    fn test_remapping_loader_rewrites_model_prefix() {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
         let base = create_weight_loader_with_params(vb, &DetectedQuantConfig::default());
-        let prefixed = PrefixedWeightLoader::new(base.as_ref(), "language_model");
+        let remap = RemappingWeightLoader::new(base.as_ref(), "model", "model.language_model");
 
-        // The concrete load path is shaped by the loader — with the
-        // unquantized loader the call just needs to succeed, validating the
-        // wrapper forwards through cleanly.
-        let linear = prefixed.load_linear("model.norm", 64, 64, false);
-        assert!(
-            linear.is_ok() || linear.is_err(),
-            "wrapper should not panic"
+        // "model.X" should become "model.language_model.X".
+        assert_eq!(
+            remap.rewrite("model.layers.0.self_attn.q_proj"),
+            "model.language_model.layers.0.self_attn.q_proj"
         );
-        assert_eq!(prefixed.method(), QuantizationMethod::None);
+        // Non-matching prefixes pass through unchanged.
+        assert_eq!(remap.rewrite("lm_head"), "lm_head");
+        // Exact match rewrites to the target prefix only.
+        assert_eq!(remap.rewrite("model"), "model.language_model");
+
+        assert_eq!(remap.method(), QuantizationMethod::None);
+
+        // Empty `from_prefix` degenerates to plain prepend (matches the
+        // legacy `PrefixedWeightLoader` behaviour).
+        let prepend = RemappingWeightLoader::new(base.as_ref(), "", "language_model");
+        assert_eq!(prepend.rewrite("model.X"), "language_model.model.X");
     }
 
     #[test]

@@ -546,6 +546,303 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires HF download (~8 GB Gemma 4 BnB safetensors); run with --ignored"]
+    fn real_bnb_nf4_gemma4_e2b_forward() {
+        // Integration test: load the real `unsloth/gemma-4-E2B-it-unsloth-bnb-4bit`
+        // checkpoint (a Gemma 4 VLM shipped as BitsAndBytes NF4
+        // double-quant with a complex `llm_int8_skip_modules` list that
+        // mixes per-layer excluded linears, PLE gates, the vision /
+        // audio towers, `lm_head`, etc.) and run a short forward through
+        // the language model.
+        //
+        // Exercises:
+        // - `BitsAndBytesConfig::from_detected` with a checkpoint-native
+        //   skip list containing specific layer patterns (e.g.
+        //   `model.language_model.layers.12.self_attn`, `model.language_model.layers.6.mlp`),
+        // - `RemappingWeightLoader` mapping `"model.X"` → `"model.language_model.X"`,
+        // - `QuantizedGemma4ForCausalLM::new_at_model_root` bypassing
+        //   the standalone `vb.pp("model")` step,
+        // - `BitsAndBytesWeightLoader::load_linear` dispatching between
+        //   the NF4 double-quant path and the BF16 fp16 fallback based
+        //   on `is_layer_skipped`,
+        // - KV sharing: layers 15..35 skip k/v projection load entirely
+        //   (the shared layers would be missing `k_proj`/`v_proj` in
+        //   the checkpoint anyway).
+        //
+        // Memory discipline: we override `hidden_size_per_layer_input=0`
+        // to skip PLE (`embed_tokens_per_layer` alone is ~9 GB at F32
+        // and would blow the laptop budget), and construct via
+        // `new_at_model_root` directly to avoid loading the vision /
+        // audio towers. That still leaves the main `embed_tokens`
+        // table, the BF16 fallback layers, and the BnB NF4 quantized
+        // layers fully exercised on CPU.
+        //
+        // Run:
+        //   cargo test -p vllm-core --lib \
+        //       loader::tests::real_bnb_nf4_gemma4_e2b_forward \
+        //       -- --ignored --nocapture
+        use crate::kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager};
+        use crate::models::{gemma4_vlm_quantized, QuantizedGemma4ForCausalLM};
+        use crate::quantization::{
+            create_weight_loader_with_params, BitsAndBytesConfig, BitsAndBytesWeightLoader,
+            QuantizationMethod,
+        };
+        use candle_core::Tensor;
+
+        let model_id = "unsloth/gemma-4-E2B-it-unsloth-bnb-4bit";
+        let files = fetch_model_with_auth(model_id, "main", None, None)
+            .expect("fetch Gemma 4 BnB checkpoint");
+
+        eprintln!(
+            "fetched: arch={:?} quant={} layers={} hidden={} vocab={}",
+            files.config.architectures,
+            quantization_info(&files),
+            files.config.num_hidden_layers,
+            files.config.hidden_size,
+            files.config.vocab_size,
+        );
+        assert_eq!(
+            files.quantization.method,
+            QuantizationMethod::BitsAndBytes,
+            "checkpoint must be detected as BitsAndBytes"
+        );
+
+        let mut cfg = files.config.clone();
+        cfg.architectures = vec!["Gemma4ForCausalLM".to_string()];
+        // Skip PLE to keep the working set under 9 GB on a laptop —
+        // `embed_tokens_per_layer` is `[262144, ple_dim * 35]` BF16 and
+        // blows the budget on its own.
+        cfg.extra.insert(
+            "hidden_size_per_layer_input".to_string(),
+            serde_json::json!(0),
+        );
+
+        let device = Device::Cpu;
+        // Gemma 4 BnB 4-bit compute dtype is bfloat16 but Candle CPU
+        // matmul doesn't support BF16 yet; load at F32 for the BnB
+        // fallback path (weights stay U8 on disk and only the fp16
+        // excluded tensors inflate, which is fine without PLE).
+        let dtype = DType::F32;
+        let vb =
+            load_weights(&files.weights, dtype, &device).expect("mmap BnB Gemma 4 safetensors");
+
+        // Build the quantized loader directly so we can wrap it in a
+        // `RemappingWeightLoader`. We can't use the standard
+        // `from_config_with_quant` dispatch because it would route
+        // through `new()` which assumes a standalone checkpoint layout.
+        let bnb_cfg = BitsAndBytesConfig::from_detected(&files.quantization.raw_config);
+        let base_loader = BitsAndBytesWeightLoader::new(vb.clone(), bnb_cfg);
+
+        // Construct the text model directly against `model.language_model.*`.
+        // The `new_at_model_root` ctor skips the standalone
+        // `vb.pp("model")` step, and the `RemappingWeightLoader` (a
+        // `pub(crate)` helper reused from `gemma4_vlm_quantized`)
+        // translates the inner model's `"model.X"` load paths into the
+        // real checkpoint's `"model.language_model.X"`.
+        let vb_lm = vb.pp("model").pp("language_model");
+        let remap = gemma4_vlm_quantized::RemappingWeightLoader::new(
+            &base_loader,
+            "model",
+            "model.language_model",
+        );
+        let model = QuantizedGemma4ForCausalLM::new_at_model_root(&cfg, vb_lm, &remap)
+            .expect("build QuantizedGemma4ForCausalLM from BnB checkpoint");
+
+        // Sanity: also exercise the default dispatch path works for a
+        // vanilla quant config → unquantized loader factory so the test
+        // catches broken routing that normally only surfaces in the
+        // server path. This is a quick smoke check and throws away the
+        // result.
+        let _ = create_weight_loader_with_params(vb, &DetectedQuantConfig::default());
+
+        // KV cache geometry: `cache_head_dim = max(head_dim, global_head_dim)`.
+        let cache_head_dim = cfg
+            .extra
+            .get("global_head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(cfg.head_dim)
+            .max(cfg.head_dim);
+        let cache_cfg = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cache_head_dim,
+            dtype,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).expect("kv cache manager");
+        let mut block_table = BlockTable::new(cache_cfg.block_size);
+
+        let prompt_ids: Vec<u32> = vec![2, 105, 108, 109, 112];
+        let seq_len = prompt_ids.len();
+        let input_ids = Tensor::from_vec(prompt_ids, (1, seq_len), &device).expect("input_ids");
+        kv_cache
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate prefill");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
+            .expect("BnB Gemma 4 prefill forward");
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+
+        let last: Vec<f32> = logits
+            .narrow(1, seq_len - 1, 1)
+            .and_then(|t| t.squeeze(1))
+            .and_then(|t| t.squeeze(0))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.to_vec1())
+            .expect("last-token logits");
+        assert_eq!(last.iter().filter(|v| v.is_nan()).count(), 0);
+        assert_eq!(last.iter().filter(|v| v.is_infinite()).count(), 0);
+
+        let (argmax, max_val) = last.iter().copied().enumerate().fold(
+            (0usize, f32::NEG_INFINITY),
+            |(bi, bv), (i, v)| if v > bv { (i, v) } else { (bi, bv) },
+        );
+        let mean: f32 = last.iter().sum::<f32>() / last.len() as f32;
+        let gap = max_val - mean;
+        eprintln!(
+            "gemma4 bnb last-token logits: argmax={argmax} max={max_val:.4} mean={mean:.4} gap={gap:.4}"
+        );
+        assert!(
+            gap > 1e-3,
+            "Gemma 4 BnB logits must have spread (gap={gap})"
+        );
+
+        eprintln!(
+            "OK: Gemma 4 E2B BnB NF4 forward exercised all {} layers (mixed NF4 + BF16 fallback)",
+            cfg.num_hidden_layers
+        );
+    }
+
+    #[test]
+    #[ignore = "requires HF download + CUDA GPU; run with --features cuda --ignored"]
+    fn real_bnb_nf4_tinyllama_prefill_decode_cuda() {
+        // CUDA-flavoured variant of the existing BnB TinyLlama test.
+        // Proves that the BitsAndBytes NF4 double-quant dequant path
+        // produces correct output when the linear weights live on the
+        // GPU: the CPU dequant helper bounces the packed U8 through
+        // host memory and uploads the dense F16 back to the original
+        // device before matmul, so the GPU path is functionally
+        // correct even without a fused CUDA kernel.
+        //
+        // Skipped when no CUDA device is visible (e.g. on a CPU-only
+        // dev loop). Requires the `cuda` crate feature so candle-core
+        // builds with the CUDA backend.
+        //
+        // Run:
+        //   cargo test -p vllm-core --lib --features cuda \
+        //       loader::tests::real_bnb_nf4_tinyllama_prefill_decode_cuda \
+        //       -- --ignored --nocapture
+        use crate::engine::ModelForward;
+        use crate::kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager};
+        use crate::models::from_config_with_quant;
+        use crate::quantization::QuantizationMethod;
+        use candle_core::Tensor;
+
+        let device = match Device::cuda_if_available(0) {
+            Ok(d) if d.is_cuda() => d,
+            Ok(_) => {
+                eprintln!("SKIP: no CUDA device available");
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP: CUDA init failed: {e}");
+                return;
+            }
+        };
+
+        let model_id = "unsloth/tinyllama-bnb-4bit";
+        let files =
+            fetch_model_with_auth(model_id, "main", None, None).expect("fetch BnB NF4 checkpoint");
+        assert_eq!(files.quantization.method, QuantizationMethod::BitsAndBytes);
+
+        // F32 weights + F32 activations — candle's CUDA matmul backend
+        // supports F32 without any extra feature flags, and BnB
+        // backends dequantize to F32 internally anyway.
+        let dtype = DType::F32;
+        let vb = load_weights(&files.weights, dtype, &device).expect("mmap BnB weights to CUDA");
+        let model = from_config_with_quant(&files.config, vb, &files.quantization)
+            .expect("construct QuantizedLlamaForCausalLM via BnB loader on CUDA");
+
+        let cfg = &files.config;
+        let cache_cfg = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            dtype,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv_cache = KVCacheManager::new(&cache_cfg).expect("kv cache manager");
+        let mut block_table = BlockTable::new(cache_cfg.block_size);
+
+        let prompt_ids: Vec<u32> = vec![1, 15043, 29892, 920, 526, 366];
+        let seq_len = prompt_ids.len();
+        let input_ids = Tensor::from_vec(prompt_ids, (1, seq_len), &device).expect("input_ids");
+        kv_cache
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate prefill");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
+            .expect("CUDA BnB prefill forward");
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+
+        let last: Vec<f32> = logits
+            .narrow(1, seq_len - 1, 1)
+            .and_then(|t| t.squeeze(1))
+            .and_then(|t| t.squeeze(0))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .and_then(|t| t.to_vec1())
+            .expect("last logits");
+        assert_eq!(last.iter().filter(|v| v.is_nan()).count(), 0);
+        assert_eq!(last.iter().filter(|v| v.is_infinite()).count(), 0);
+
+        let (argmax, max_val) = last.iter().copied().enumerate().fold(
+            (0usize, f32::NEG_INFINITY),
+            |(bi, bv), (i, v)| if v > bv { (i, v) } else { (bi, bv) },
+        );
+        let mean: f32 = last.iter().sum::<f32>() / last.len() as f32;
+        let gap = max_val - mean;
+        eprintln!(
+            "bnb cuda last-token logits: argmax={argmax} max={max_val:.4} mean={mean:.4} gap={gap:.4} device={:?}",
+            device,
+        );
+        assert!(
+            gap > 1e-3,
+            "CUDA BnB logits must show real spread (gap={gap})"
+        );
+
+        if let Ok(out) = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            eprintln!(
+                "nvidia-smi after CUDA BnB forward: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+
+        eprintln!(
+            "OK: CUDA BnB NF4 forward produced real logits on {:?}",
+            device
+        );
+    }
+
+    #[test]
     #[ignore = "requires HF download (~600 MB BnB 4-bit weights); run with --ignored"]
     fn real_bnb_nf4_tinyllama_prefill_decode() {
         // End-to-end integration test for the BitsAndBytes NF4 4-bit
