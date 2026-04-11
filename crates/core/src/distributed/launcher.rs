@@ -179,6 +179,11 @@ impl NcclProcessGroup {
     pub fn communicator(&self) -> &NcclCommunicator {
         &self.communicator
     }
+
+    /// Consume the process group and return the owned NCCL communicator.
+    pub fn into_communicator(self) -> NcclCommunicator {
+        self.communicator
+    }
 }
 
 impl ProcessGroup for NcclProcessGroup {

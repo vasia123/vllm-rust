@@ -9,7 +9,7 @@ use super::quantization::KVCacheDtype;
 /// Requires an active CUDA context (call after `Device::new_cuda()`).
 #[cfg(feature = "cuda")]
 pub fn gpu_memory_info() -> anyhow::Result<(usize, usize)> {
-    cudarc::driver::result::mem_get_info()
+    candle_core::cuda::cudarc::driver::result::mem_get_info()
         .map_err(|e| anyhow::anyhow!("Failed to query GPU memory: {e}"))
 }
 

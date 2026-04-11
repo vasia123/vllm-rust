@@ -990,6 +990,40 @@ pub fn create_full_router_with_all_options(
     }
 }
 
+/// Create a minimal router for idle mode (no model loaded).
+///
+/// Only serves the admin panel, GPU info, model search/download, and estimation
+/// endpoints. All `/v1/*` inference endpoints return 503 Service Unavailable.
+pub fn create_idle_router(
+    cors: CorsLayer,
+    max_body_size: usize,
+    enable_request_logging: bool,
+) -> Router {
+    let router = Router::new()
+        .route("/health", get(idle_health))
+        .route("/version", get(version))
+        .route("/ping", get(ping).post(ping))
+        .nest("/admin", admin::create_idle_admin_router())
+        .layer(DefaultBodyLimit::max(max_body_size))
+        .layer(cors);
+
+    if enable_request_logging {
+        router.layer(axum::middleware::from_fn(middleware::http_logging))
+    } else {
+        router
+    }
+}
+
+async fn idle_health() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "idle",
+            "message": "No model loaded. Use the admin panel to select and launch a model."
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

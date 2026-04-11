@@ -112,6 +112,11 @@ impl CacheEngine {
         self.layout
     }
 
+    /// Get the block size (number of tokens per block).
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     /// Quantize write data based on kv_cache_dtype setting.
     ///
     /// Input and output are in [new_tokens, kv_heads, head_dim] layout.

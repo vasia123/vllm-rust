@@ -44,9 +44,10 @@ struct Cli {
 enum Command {
     /// Start the OpenAI-compatible HTTP server
     Serve {
-        /// Model ID (HuggingFace Hub format)
-        #[arg(long, default_value = "Qwen/Qwen3-0.6B")]
-        model: String,
+        /// Model ID (HuggingFace Hub format). If omitted, starts in idle mode
+        /// with only the admin panel available for model selection.
+        #[arg(long)]
+        model: Option<String>,
 
         /// Draft model ID for speculative decoding
         #[arg(long)]
@@ -497,11 +498,7 @@ async fn main() -> anyhow::Result<()> {
             return_tokens_as_token_ids,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
-            let model = if model == "Qwen/Qwen3-0.6B" {
-                file_config.model.unwrap_or(model)
-            } else {
-                model
-            };
+            let model = model.or(file_config.model);
             let draft_model = draft_model.or(file_config.draft_model);
             let num_speculative_tokens = if num_speculative_tokens == 3 {
                 file_config
@@ -568,7 +565,8 @@ async fn main() -> anyhow::Result<()> {
             // Resolve served model name: CLI > config file > model identifier
             let served_model_name = served_model_name
                 .or(file_config.served_model_name)
-                .unwrap_or_else(|| model.clone());
+                .or_else(|| model.clone())
+                .unwrap_or_default();
 
             // TLS: CLI > config file
             let ssl_certfile = ssl_certfile.or(file_config.ssl_certfile);
@@ -966,7 +964,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct ServerLaunchConfig {
-    model_id: String,
+    model_id: Option<String>,
     draft_model_id: Option<String>,
     num_speculative_tokens: usize,
     host: String,
@@ -1136,6 +1134,28 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         pipeline_parallel_size,
         tensor_parallel_size,
     } = cfg;
+
+    // ── Idle mode: no model specified ─────────────────────────────────────
+    // Start a minimal server with only the admin panel for model selection.
+    if model_id.is_none() {
+        eprintln!("No model specified. Starting in idle mode.");
+        eprintln!("Open http://{host}:{port}/admin/models to select a model.");
+
+        let cors_layer = api::build_cors_layer(&cors_config);
+        let max_body_size = max_body_size_mb * 1024 * 1024;
+        let app = api::create_idle_router(cors_layer, max_body_size, !disable_log_requests);
+
+        let addr = format!("{host}:{port}");
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        tracing::info!("Idle mode: serving on http://{addr}/admin/");
+        eprintln!("Admin panel: http://{addr}/admin/");
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        return Ok(());
+    }
+    let model_id = model_id.unwrap();
 
     if seed != 0 {
         eprintln!("Using random seed: {seed}");
@@ -1401,6 +1421,9 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
         #[cfg(feature = "cuda")]
         {
+            use vllm_core::distributed::{DeviceCommunicator, LocalProcessGroup};
+            use vllm_core::engine::PipelineStagedModel;
+
             let pp_model = models::from_config_with_pp(&files.config, vb, stage)?;
 
             // NCCL init: rank 0 generates the unique ID and broadcasts to workers.
@@ -1413,7 +1436,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             };
             let pg = NcclProcessGroup::new(&dist_cfg)
                 .map_err(|e| anyhow::anyhow!("NCCL init failed: {e}"))?;
-            let nccl_comm = pg.communicator().clone();
+            let nccl_comm = pg.into_communicator();
             let local_pg = LocalProcessGroup::with_rank(0, pipeline_parallel_size);
             let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg);
             let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
@@ -1434,7 +1457,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
         #[cfg(feature = "cuda")]
         {
-            use vllm_core::distributed::LocalProcessGroup;
+            use vllm_core::distributed::{DeviceCommunicator, LocalProcessGroup};
             use vllm_core::engine::TpStagedModel;
             use vllm_core::models::TpContext;
 
@@ -1448,7 +1471,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             };
             let pg = NcclProcessGroup::new(&dist_cfg)
                 .map_err(|e| anyhow::anyhow!("NCCL init failed (TP): {e}"))?;
-            let nccl_comm = pg.communicator().clone();
+            let nccl_comm = pg.into_communicator();
             let local_pg = LocalProcessGroup::with_rank(0, tensor_parallel_size);
             let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg);
             let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
@@ -2022,6 +2045,9 @@ fn estimate_kv_cache_budget(
 /// `SIGNAL_SHUTDOWN`.
 #[cfg(feature = "cuda")]
 async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
+    use vllm_core::distributed::{DeviceCommunicator, LocalProcessGroup};
+    use vllm_core::engine::pipeline_worker_loop;
+
     logging::init_with_otlp(&cfg.log_level, cfg.otlp_traces_endpoint.as_deref())?;
 
     let dist_cfg = DistributedConfig::from_env();
@@ -2064,7 +2090,7 @@ async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // NCCL init: connect to rank 0's bootstrap server.
     let pg = NcclProcessGroup::new(&dist_cfg)
         .map_err(|e| anyhow::anyhow!("NCCL init failed on rank {rank}: {e}"))?;
-    let nccl_comm = pg.communicator().clone();
+    let nccl_comm = pg.into_communicator();
     let local_pg = LocalProcessGroup::with_rank(rank, world_size);
     let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg);
     let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);
@@ -2140,7 +2166,7 @@ async fn run_tensor_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // NCCL init: connect to rank 0's bootstrap server (same port as coordinator).
     let pg = NcclProcessGroup::new(&dist_cfg)
         .map_err(|e| anyhow::anyhow!("NCCL init failed on TP rank {rank}: {e}"))?;
-    let nccl_comm = pg.communicator().clone();
+    let nccl_comm = pg.into_communicator();
     let local_pg_for_comm = LocalProcessGroup::with_rank(rank, world_size);
     let device_comm = NcclDeviceCommunicator::new(nccl_comm, local_pg_for_comm);
     let comm: Arc<dyn DeviceCommunicator> = Arc::new(device_comm);

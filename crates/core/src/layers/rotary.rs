@@ -81,6 +81,72 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Gemma 4 proportional RoPE used by `full_attention` layers.
+    ///
+    /// This matches HuggingFace `_compute_proportional_rope_parameters` and
+    /// vLLM's `Gemma4RotaryEmbedding` in two ways that a plain
+    /// `new_partial` does not:
+    ///
+    /// 1. The inverse-frequency exponent denominator is `head_dim`, not
+    ///    `rotary_dim`. For E2B full attention with `head_dim = 512` and
+    ///    `partial_rotary_factor = 0.25`, this yields much higher
+    ///    frequencies than standard partial RoPE would.
+    /// 2. Only the first `rotary_dim` dimensions are rotated; the trailing
+    ///    `head_dim - rotary_dim` dimensions pass through untouched. The
+    ///    existing `apply_partial_rope` handles this correctly once the
+    ///    cos/sin tables are built from the proportional inv_freq.
+    ///
+    /// `rotary_dim` is derived from `head_dim * partial_rotary_factor` and
+    /// rounded down to an even number. `is_neox_style = true` is the only
+    /// variant used by Gemma 4.
+    pub fn new_gemma4_proportional(
+        head_dim: usize,
+        max_seq_len: usize,
+        rope_theta: f64,
+        partial_rotary_factor: f64,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        if partial_rotary_factor <= 0.0 || partial_rotary_factor > 1.0 {
+            return Err(candle_core::Error::Msg(format!(
+                "partial_rotary_factor must be in (0, 1], got {partial_rotary_factor}"
+            )));
+        }
+        let rotary_dim = (head_dim as f64 * partial_rotary_factor) as usize;
+        let rotary_dim = rotary_dim - (rotary_dim % 2);
+        if rotary_dim == 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "Gemma 4 proportional RoPE requires rotary_dim > 0 (head_dim={head_dim}, \
+                 partial_rotary_factor={partial_rotary_factor})"
+            )));
+        }
+
+        // Key difference from `new_partial`: exponent denominator is the
+        // full head_dim, not rotary_dim. Zero padding for non-rotated dims
+        // is handled by `apply_partial_rope` rather than inside inv_freq.
+        let inv_freq: Vec<f32> = (0..rotary_dim)
+            .step_by(2)
+            .map(|i| 1.0 / (rope_theta as f32).powf(i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq =
+            Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+
+        Ok(Self {
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            rotary_dim,
+            head_dim,
+            is_neox_style: true,
+            #[cfg(feature = "cuda-kernels")]
+            cos_sin_cache: OnceLock::new(),
+        })
+    }
+
     /// Create a su-scaled (LongRoPE) rotary embedding used by Phi-3 long-context models.
     ///
     /// Per-dimension scaling factors are applied to the inverse frequencies. The model
@@ -576,6 +642,69 @@ mod tests {
     use super::*;
 
     // Test parameters from vLLM: max_positions [11, 4096, 32768], head_dim [32, 64, 128], rope_theta [10000, 1000000]
+
+    #[test]
+    fn test_gemma4_proportional_rope_shape_and_freq() {
+        // Real Gemma 4 E2B full_attention layer: head_dim=512, factor=0.25 → rotary_dim=128.
+        let device = Device::Cpu;
+        let rope = RotaryEmbedding::new_gemma4_proportional(
+            512,
+            256,
+            1_000_000.0,
+            0.25,
+            DType::F32,
+            &device,
+        )
+        .expect("build proportional rope");
+
+        assert_eq!(rope.rotary_dim(), 128);
+        assert!(rope.is_partial());
+        // cos/sin table second dim == rotary_dim/2 == 64.
+        assert_eq!(rope.cos().dims(), &[256, 64]);
+        assert_eq!(rope.sin().dims(), &[256, 64]);
+
+        // Position 0 is always cos=1, sin=0 regardless of the inv_freq formula.
+        let cos0: Vec<f32> = rope.cos().narrow(0, 0, 1).unwrap().to_vec2().unwrap()[0].clone();
+        let sin0: Vec<f32> = rope.sin().narrow(0, 0, 1).unwrap().to_vec2().unwrap()[0].clone();
+        for &c in &cos0 {
+            assert!((c - 1.0).abs() < 1e-5);
+        }
+        for &s in &sin0 {
+            assert!(s.abs() < 1e-5);
+        }
+
+        // Verify the proportional formula: inv_freq[i] = 1 / base^(2i/head_dim).
+        // At position 1, freq_i = inv_freq[i] so cos[i]=cos(inv_freq[i]).
+        let cos1: Vec<f32> = rope.cos().narrow(0, 1, 1).unwrap().to_vec2().unwrap()[0].clone();
+        let expected_inv_freq_0 = 1.0f32; // 1 / 1e6^(0/512)
+        assert!((cos1[0] - expected_inv_freq_0.cos()).abs() < 1e-4);
+        // inv_freq[1] = 1 / 1e6^(2/512). Expected cos at pos 1 ≈ cos(that).
+        let expected_inv_freq_1 = 1.0f32 / 1_000_000f32.powf(2.0 / 512.0);
+        assert!((cos1[1] - expected_inv_freq_1.cos()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_gemma4_proportional_rope_rejects_bad_factor() {
+        let device = Device::Cpu;
+        assert!(RotaryEmbedding::new_gemma4_proportional(
+            512,
+            256,
+            1_000_000.0,
+            0.0,
+            DType::F32,
+            &device
+        )
+        .is_err());
+        assert!(RotaryEmbedding::new_gemma4_proportional(
+            512,
+            256,
+            1_000_000.0,
+            1.5,
+            DType::F32,
+            &device
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_rotary_embedding_new_shape() {

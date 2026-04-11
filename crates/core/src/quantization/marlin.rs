@@ -599,7 +599,8 @@ impl MarlinLinear {
     }
 
     /// Fallback forward using standard GPTQ dequantization.
-    fn forward_fallback(&self, _x: &Tensor) -> Result<Tensor> {
+    #[cfg_attr(not(feature = "cuda-kernels"), allow(unused_variables))]
+    fn forward_fallback(&self, x: &Tensor) -> Result<Tensor> {
         // When Marlin kernel is not available, fall back to standard GPTQ
         // This is slower but ensures correctness
         #[cfg(feature = "cuda-kernels")]

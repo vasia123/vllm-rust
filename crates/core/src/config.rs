@@ -1,5 +1,126 @@
 use serde::Deserialize;
 
+/// Normalise a raw HuggingFace `config.json` payload so that models which
+/// nest transformer hyperparameters under a sub-object (Gemma 4's
+/// `text_config`, some VLMs' `llm_config`, etc.) still deserialise into the
+/// flat `ModelConfig` shape.
+///
+/// For Gemma 4 specifically we also:
+/// - Pull `rope_parameters.{full,sliding}_attention.rope_theta` up to the
+///   flat `rope_theta` / `rope_local_base_freq` fields so the deserializer
+///   finds them.
+/// - Rename `hidden_activation` → `hidden_act` to match transformers'
+///   canonical naming.
+/// - Collapse `eos_token_id` arrays (some Gemma checkpoints list several)
+///   to a single integer.
+///
+/// The architecture list is left intact — callers can still dispatch on
+/// `Gemma4ForConditionalGeneration` when the checkpoint is a VLM.
+pub fn flatten_hf_model_config(raw: &str) -> Result<String, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(raw)?;
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(raw.to_string());
+    };
+
+    // Pull `text_config` up to the top level. We only do this when the
+    // top-level object does NOT already expose the flat transformer
+    // fields — otherwise we'd clobber deliberate overrides.
+    let has_flat_hidden = obj.contains_key("hidden_size") && obj.contains_key("num_hidden_layers");
+    if !has_flat_hidden {
+        if let Some(text_cfg) = obj.remove("text_config") {
+            if let Some(text_obj) = text_cfg.as_object() {
+                for (k, v) in text_obj {
+                    obj.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
+
+    // HF uses `hidden_activation` for Gemma family; we expect `hidden_act`.
+    if !obj.contains_key("hidden_act") {
+        if let Some(act) = obj.remove("hidden_activation") {
+            obj.insert("hidden_act".to_string(), act);
+        }
+    }
+
+    // Gemma 4 stores RoPE theta per layer type under `rope_parameters`.
+    // Surface the full-attention theta as `rope_theta` (primary) and the
+    // sliding-attention theta as `rope_local_base_freq` so the rest of
+    // the engine keeps working with flat fields.
+    if let Some(rope_params) = obj.get("rope_parameters").cloned() {
+        if !obj.contains_key("rope_theta") {
+            let full_theta = rope_params
+                .get("full_attention")
+                .and_then(|fa| fa.get("rope_theta"))
+                .and_then(|v| v.as_f64());
+            let sliding_theta = rope_params
+                .get("sliding_attention")
+                .and_then(|sa| sa.get("rope_theta"))
+                .and_then(|v| v.as_f64());
+            if let Some(t) = full_theta.or(sliding_theta) {
+                obj.insert("rope_theta".to_string(), serde_json::json!(t));
+            }
+        }
+        if !obj.contains_key("rope_local_base_freq") {
+            if let Some(t) = rope_params
+                .get("sliding_attention")
+                .and_then(|sa| sa.get("rope_theta"))
+                .and_then(|v| v.as_f64())
+            {
+                obj.insert("rope_local_base_freq".to_string(), serde_json::json!(t));
+            }
+        }
+    }
+
+    // `eos_token_id` can be an array (e.g. Gemma 4 has `[1, 106]`).
+    // `ModelConfig::eos_token_id` is a single `u32`, so take the first.
+    if let Some(eos) = obj.get("eos_token_id").cloned() {
+        if let Some(first) = eos.as_array().and_then(|a| a.first().cloned()) {
+            obj.insert("eos_token_id".to_string(), first);
+        }
+    }
+
+    // Most pre-2024 HF Llama/Mistral/etc. configs omit `head_dim` —
+    // transformers computes it as `hidden_size / num_attention_heads`.
+    // Our `ModelConfig` has `head_dim` as a required field because
+    // newer models (Gemma, some Qwen) store it explicitly, so we
+    // back-fill here when it's missing.
+    if !obj.contains_key("head_dim") {
+        let hidden_size = obj.get("hidden_size").and_then(|v| v.as_u64());
+        let num_heads = obj.get("num_attention_heads").and_then(|v| v.as_u64());
+        if let (Some(h), Some(n)) = (hidden_size, num_heads) {
+            if n > 0 {
+                obj.insert("head_dim".to_string(), serde_json::json!(h / n));
+            }
+        }
+    }
+
+    // Similar defensive defaults: `num_key_value_heads` defaults to
+    // `num_attention_heads` when missing (multi-head = GQA with groups=1).
+    if !obj.contains_key("num_key_value_heads") {
+        if let Some(n) = obj.get("num_attention_heads").cloned() {
+            obj.insert("num_key_value_heads".to_string(), n);
+        }
+    }
+
+    // `tie_word_embeddings` defaults to false if missing.
+    if !obj.contains_key("tie_word_embeddings") {
+        obj.insert("tie_word_embeddings".to_string(), serde_json::json!(false));
+    }
+
+    // `rms_norm_eps` default (transformers uses 1e-6).
+    if !obj.contains_key("rms_norm_eps") {
+        obj.insert("rms_norm_eps".to_string(), serde_json::json!(1e-6));
+    }
+
+    // `rope_theta` default (transformers uses 10000.0 if not specified).
+    if !obj.contains_key("rope_theta") {
+        obj.insert("rope_theta".to_string(), serde_json::json!(10_000.0));
+    }
+
+    serde_json::to_string(&value)
+}
+
 /// Handles sliding_window configs that are either null, an int, or a list of
 /// ints (Mistral-style per-layer windows). Lists are collapsed to a single
 /// value after validating all non-null entries are identical.
@@ -455,5 +576,89 @@ mod tests {
         }"#;
         let config: ModelConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.sliding_window, None);
+    }
+
+    // ─── flatten_hf_model_config tests ──────────────────────────────
+
+    #[test]
+    fn flatten_gemma4_text_config_pulls_fields_up() {
+        // Realistic slice of `google/gemma-4-E2B-it/config.json`.
+        let raw = r#"{
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "tie_word_embeddings": true,
+            "eos_token_id": [1, 106],
+            "text_config": {
+                "hidden_size": 1536,
+                "num_hidden_layers": 35,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "intermediate_size": 6144,
+                "vocab_size": 262144,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": true,
+                "sliding_window": 512,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "bos_token_id": 2,
+                "eos_token_id": 1,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default"
+                    }
+                }
+            }
+        }"#;
+
+        let flattened = flatten_hf_model_config(raw).expect("flatten");
+        let cfg: ModelConfig =
+            serde_json::from_str(&flattened).expect("deserialise flattened config");
+
+        assert_eq!(cfg.hidden_size, 1536);
+        assert_eq!(cfg.num_hidden_layers, 35);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.hidden_act, "gelu_pytorch_tanh");
+        // Full-attention theta lands on the top-level `rope_theta`.
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+        // Sliding theta surfaces as `rope_local_base_freq` in `extra`.
+        assert_eq!(
+            cfg.extra
+                .get("rope_local_base_freq")
+                .and_then(|v| v.as_f64()),
+            Some(10_000.0)
+        );
+        // `rope_parameters` is kept so Gemma4ExtraConfig can read
+        // partial_rotary_factor / rope_type per layer type.
+        assert!(cfg.extra.get("rope_parameters").is_some());
+        // `eos_token_id` at top level is an array `[1, 106]`; the
+        // collapser picks the first element. (`text_config.eos_token_id`
+        // is 1, so both paths agree here.)
+        assert_eq!(cfg.eos_token_id, 1);
+        // Architecture is preserved so the VLM dispatch still fires.
+        assert_eq!(cfg.architectures, vec!["Gemma4ForConditionalGeneration"]);
+    }
+
+    #[test]
+    fn flatten_preserves_flat_config() {
+        // A flat config (no `text_config`) should round-trip to the same
+        // logical shape.
+        let raw = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "num_hidden_layers": 2, "intermediate_size": 128, "vocab_size": 100,
+            "max_position_embeddings": 256, "head_dim": 16, "hidden_act": "silu",
+            "rms_norm_eps": 1e-6, "rope_theta": 10000, "tie_word_embeddings": false,
+            "bos_token_id": 1, "eos_token_id": 2
+        }"#;
+        let flattened = flatten_hf_model_config(raw).expect("flatten");
+        let cfg: ModelConfig = serde_json::from_str(&flattened).expect("deserialise");
+        assert_eq!(cfg.hidden_size, 64);
+        assert_eq!(cfg.rope_theta, 10_000.0);
     }
 }

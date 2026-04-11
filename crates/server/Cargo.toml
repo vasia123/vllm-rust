@@ -27,6 +27,8 @@ mime_guess = "2"
 toml = "0.8"
 dirs = "5"
 base64.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2"
 async-stream = "0.3"
 async-trait = "0.1"
 prometheus = "0.13"

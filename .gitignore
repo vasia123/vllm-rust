@@ -3,3 +3,4 @@ reference/
 frontend/node_modules/
 frontend/dist/*
 !frontend/dist/.gitkeep
+.claude/scheduled_tasks.lock

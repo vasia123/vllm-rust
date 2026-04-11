@@ -251,7 +251,7 @@ fn moe_align_block_size_gpu(
 
     // D2H: only the scalar total — 4 bytes across PCIe.
     let total_pp_host: Vec<i32> = dev
-        .dtoh_sync_copy(&total_tokens_pp)
+        .memcpy_dtov(&total_tokens_pp)
         .map_err(|e| candle_core::Error::Msg(format!("dtoh total_tokens_pp: {e}")))?;
     let num_tokens_post_padded = total_pp_host[0].max(0) as usize;
 
@@ -497,15 +497,16 @@ impl candle_core::CustomOp1 for FusedMoECudaOp {
                     let nvt = alignment.num_valid_tokens;
                     let s_i32 = i64_to_i32_vec(&alignment.sorted_token_ids.to_vec1::<i64>()?)?;
                     let e_i32 = i64_to_i32_vec(&alignment.expert_ids.to_vec1::<i64>()?)?;
-                    let sorted_ids_dev = dev.htod_copy(s_i32).map_err(|e| {
-                        candle_core::Error::Msg(format!("htod_copy sorted_ids: {e}"))
+                    let sorted_ids_dev = dev.memcpy_stod(&s_i32).map_err(|e| {
+                        candle_core::Error::Msg(format!("memcpy_stod sorted_ids: {e}"))
                     })?;
-                    let expert_ids_dev = dev.htod_copy(e_i32).map_err(|e| {
-                        candle_core::Error::Msg(format!("htod_copy expert_ids: {e}"))
+                    let expert_ids_dev = dev.memcpy_stod(&e_i32).map_err(|e| {
+                        candle_core::Error::Msg(format!("memcpy_stod expert_ids: {e}"))
                     })?;
+                    let npp_vec = vec![npp as i32];
                     let npp_dev = dev
-                        .htod_copy(vec![npp as i32])
-                        .map_err(|e| candle_core::Error::Msg(format!("htod_copy npp: {e}")))?;
+                        .memcpy_stod(&npp_vec)
+                        .map_err(|e| candle_core::Error::Msg(format!("memcpy_stod npp: {e}")))?;
                     return self.launch_gemm_kernels(
                         dev,
                         hs_slice,

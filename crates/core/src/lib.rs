@@ -11,6 +11,7 @@ pub mod lora;
 pub mod models;
 pub mod moe;
 pub mod multimodal;
+pub mod perf_estimate;
 pub mod prompt_adapter;
 pub mod quantization;
 pub mod reasoning;

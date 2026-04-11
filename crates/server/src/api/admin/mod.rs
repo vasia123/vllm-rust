@@ -1,5 +1,6 @@
 //! Admin API for monitoring and management.
 
+pub mod estimate;
 pub mod metrics;
 pub mod prometheus;
 pub mod restart;
@@ -95,6 +96,25 @@ impl AdminState {
     }
 }
 
+/// Create idle-mode admin router (no engine required).
+///
+/// Only serves GPU info, model search/download, estimation, and static files.
+/// Health/metrics/restart endpoints are not available without an engine.
+pub fn create_idle_admin_router() -> Router {
+    Router::new()
+        .route("/gpu/info", get(estimate::gpu_info))
+        .route("/models/estimate", post(estimate::estimate_performance))
+        .route("/models/search", get(estimate::search_models))
+        .route("/models/download", post(estimate::start_download))
+        .route(
+            "/models/download/progress",
+            get(estimate::download_progress),
+        )
+        .with_state(estimate::EstimateState::new())
+        .route("/", get(static_files::index_handler))
+        .route("/{*path}", get(static_files::static_handler))
+}
+
 /// Create admin router with all admin endpoints.
 pub fn create_admin_router(state: AdminState) -> Router {
     let restart_state = state.restart_state();
@@ -113,6 +133,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/cache/reset", post(reset_cache))
         .route("/cache/stats", get(cache_stats))
         .with_state(state)
+        .route("/gpu/info", get(estimate::gpu_info))
+        .route("/models/estimate", post(estimate::estimate_performance))
+        .route("/models/search", get(estimate::search_models))
+        .route("/models/download", post(estimate::start_download))
+        .route(
+            "/models/download/progress",
+            get(estimate::download_progress),
+        )
+        .with_state(estimate::EstimateState::new())
         .route("/restart", post(restart_handler))
         .route("/restart/status", get(restart_status_stream))
         .with_state(restart_state)

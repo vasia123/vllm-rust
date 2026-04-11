@@ -3,6 +3,21 @@ use candle_core::{
     Shape, Storage, Tensor,
 };
 
+/// Clone a CudaStorageSlice by pattern-matching each variant.
+/// CudaStorageSlice does not derive Clone, but inner CudaSlice<T> does.
+#[cfg(feature = "cuda")]
+fn clone_cuda_storage_slice(slice: &CudaStorageSlice) -> CudaStorageSlice {
+    match slice {
+        CudaStorageSlice::U8(s) => CudaStorageSlice::U8(s.clone()),
+        CudaStorageSlice::U32(s) => CudaStorageSlice::U32(s.clone()),
+        CudaStorageSlice::I64(s) => CudaStorageSlice::I64(s.clone()),
+        CudaStorageSlice::BF16(s) => CudaStorageSlice::BF16(s.clone()),
+        CudaStorageSlice::F16(s) => CudaStorageSlice::F16(s.clone()),
+        CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.clone()),
+        CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.clone()),
+    }
+}
+
 const PTX: &str = include_str!("../kernels/paged_attention.ptx");
 
 #[cfg(feature = "cuda-fused-activations")]
@@ -1299,7 +1314,7 @@ impl CustomOp1 for RmsNormOp {
         input_storage: &CudaStorage,
         input_layout: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use cudarc::driver::LaunchConfig;
+        use candle_core::cuda::cudarc::driver::LaunchConfig;
         use half::{bf16, f16};
 
         let dev = &input_storage.device;
@@ -1316,7 +1331,7 @@ impl CustomOp1 for RmsNormOp {
         if num_tokens == 0 {
             return Ok((
                 CudaStorage {
-                    slice: input_storage.slice.clone(),
+                    slice: clone_cuda_storage_slice(&input_storage.slice),
                     device: dev.clone(),
                 },
                 input_shape.clone(),
@@ -1501,7 +1516,7 @@ impl CustomOp1 for RopeOp {
         input_storage: &CudaStorage,
         input_layout: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use cudarc::driver::LaunchConfig;
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use half::bf16;
 
         let dev = &input_storage.device;
@@ -1511,7 +1526,7 @@ impl CustomOp1 for RopeOp {
         if num_tokens == 0 {
             return Ok((
                 CudaStorage {
-                    slice: input_storage.slice.clone(),
+                    slice: clone_cuda_storage_slice(&input_storage.slice),
                     device: dev.clone(),
                 },
                 shape.clone(),
@@ -1557,8 +1572,7 @@ impl CustomOp1 for RopeOp {
                     .iter()
                     .map(|&v| v as i32)
                     .collect();
-                let pos_i32 = dev.alloc_zeros::<i32>(pos_vec.len())?;
-                dev.htod_copy_into(pos_vec, &pos_i32)?;
+                let pos_i32 = dev.memcpy_stod(&pos_vec)?;
                 pos_i32
             }
             CudaStorageSlice::U32(s) => {
@@ -1569,8 +1583,7 @@ impl CustomOp1 for RopeOp {
                     .iter()
                     .map(|&v| v as i32)
                     .collect();
-                let pos_i32 = dev.alloc_zeros::<i32>(pos_vec.len())?;
-                dev.htod_copy_into(pos_vec, &pos_i32)?;
+                let pos_i32 = dev.memcpy_stod(&pos_vec)?;
                 pos_i32
             }
             _ => candle_core::bail!(
@@ -1593,8 +1606,8 @@ impl CustomOp1 for RopeOp {
         match &input_storage.slice {
             CudaStorageSlice::BF16(input_slice) => {
                 // Copy input to output buffer (kernel modifies in-place)
-                let output_slice = dev.alloc_zeros::<bf16>(total_elems)?;
-                dev.dtod_copy(input_slice, &output_slice)?;
+                let mut output_slice = dev.alloc_zeros::<bf16>(total_elems)?;
+                dev.memcpy_dtod(input_slice, &mut output_slice)?;
 
                 let func = dev.get_or_load_custom_func(kernel_name, "rope", ROPE_PTX)?;
 
@@ -1622,10 +1635,7 @@ impl CustomOp1 for RopeOp {
                     shape.clone(),
                 ))
             }
-            _ => candle_core::bail!(
-                "rope_fused: only bf16 supported, got {:?}",
-                input_storage.slice.dtype()
-            ),
+            _ => candle_core::bail!("rope_fused: only bf16 supported"),
         }
     }
 }
@@ -1800,7 +1810,7 @@ impl CustomOp1 for GeluAndMulOp {
         input_storage: &CudaStorage,
         input_layout: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use cudarc::driver::LaunchConfig;
+        use candle_core::cuda::cudarc::driver::LaunchConfig;
         use half::{bf16, f16};
 
         let dev = &input_storage.device;
@@ -1816,7 +1826,7 @@ impl CustomOp1 for GeluAndMulOp {
             *out_dims.last_mut().unwrap() = d;
             return Ok((
                 CudaStorage {
-                    slice: input_storage.slice.clone(),
+                    slice: clone_cuda_storage_slice(&input_storage.slice),
                     device: dev.clone(),
                 },
                 Shape::from_dims(&out_dims),
@@ -2031,8 +2041,8 @@ pub fn reshape_and_cache_cuda(
                 shared_mem_bytes: 0,
             };
 
-            match &key_guard {
-                Storage::Cuda(key_cs) => match (&key_cs.slice, &value_guard) {
+            match &*key_guard {
+                Storage::Cuda(key_cs) => match (&key_cs.slice, &*value_guard) {
                     (CudaStorageSlice::BF16(k_slice), Storage::Cuda(v_cs)) => {
                         let v_slice = match &v_cs.slice {
                             CudaStorageSlice::BF16(s) => s,
@@ -2138,8 +2148,8 @@ pub fn reshape_and_cache_cuda(
                 shared_mem_bytes: 0,
             };
 
-            match &key_guard {
-                Storage::Cuda(key_cs) => match (&key_cs.slice, &value_guard) {
+            match &*key_guard {
+                Storage::Cuda(key_cs) => match (&key_cs.slice, &*value_guard) {
                     (CudaStorageSlice::BF16(k_slice), Storage::Cuda(v_cs)) => {
                         let v_slice = match &v_cs.slice {
                             CudaStorageSlice::BF16(s) => s,

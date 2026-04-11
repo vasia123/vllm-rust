@@ -1,51 +1,43 @@
-//! Gemma 4 model architecture with MoE and PLE.
+//! Quantized Gemma 4 model implementation.
 //!
-//! Gemma 4 combines dense MLP + Mixture of Experts (parallel), Per-Layer
-//! Embeddings (PLE), QKV norms, and sliding/global attention patterns.
+//! Mirrors `crates/core/src/models/gemma4.rs` but routes all linear layers
+//! through the `QuantizedWeightLoader` abstraction so checkpoints quantized
+//! with AWQ, BitsAndBytes, GPTQ, FP8, GGUF, etc. load without going through
+//! the full-precision path.
 //!
-//! Key differences from Gemma3/Gemma3n:
-//! - MoE: parallel dense MLP + MoE experts per layer (optional)
-//! - Custom router: UnweightedRmsNorm + root_size + learned scale + gate
-//! - QKV norms: Q/K with learned weight (offset +1), V without weight
-//! - Scaling = 1.0 (norms handle magnitude, unlike query_pre_attn_scalar)
-//! - k_eq_v: laptop variant where V = K for full-attention layers
-//! - layer_scalar: per-layer learned scalar multiplier
-//! - PLE: simpler than Gemma3n (no AltUp, no Laurel)
+//! Gemma 4 specifics preserved in the quantized path:
+//! - `Gemma4RmsNorm` with `(1 + weight)` offset scaling
+//! - `UnweightedRmsNorm` for V and router normalisation
+//! - PLE pipeline (per-layer embeddings + projection + per-layer norm)
+//! - MoE block running in parallel with dense MLP (custom Gemma 4 router:
+//!   softmax-all → top-k → renormalize → fold `per_expert_scale`)
+//! - QKV norms with per-head application
+//! - `k_eq_v` laptop variant where V reuses K weights on full-attention layers
+//! - Sliding / global attention alternation with separate RoPE base for local
+//! - Final logit soft capping
+//! - Per-layer `layer_scalar` multiplier
 //!
-//! Architecture:
-//! ```text
-//! Embedding (* sqrt(hidden_size)) + PLE Pipeline -> [Gemma4Layer x N] -> RMSNorm -> LM Head
+//! Single-GPU MVP: no tensor-parallel variant. The TP path lives in the full
+//! precision `gemma4.rs` and is not yet wired for quantized weights.
 //!
-//! Gemma4Layer:
-//!   InputLayerNorm -> Attention(Q/K/V norms) -> PostAttnNorm -> Residual
-//!   PreFFNorm -> GeGLU MLP ─────────┐
-//!   [Optional] Router(residual) ─┐  │ PostFFNorm1
-//!               PreFFNorm2 ──> MoE ─┘ PostFFNorm2
-//!                              Sum -> PostFFNorm -> Residual
-//!   PerLayerGating -> PerLayerProjection -> PostPerLayerNorm -> Residual
-//!   * layer_scalar
-//! ```
-//!
-//! Reference: `reference/vllm/vllm/model_executor/models/gemma4.py`
+//! Reference: `crates/core/src/models/gemma4.rs` (full precision) and
+//! `crates/core/src/models/gemma3_quantized.rs` (closest quantized pattern).
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::VarBuilder;
+use candle_nn::{embedding, Embedding, VarBuilder};
 
 use crate::config::ModelConfig;
-use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::attention::repeat_kv;
 use crate::layers::RotaryEmbedding;
-
-use super::tp_layers::{TpContext, TpEmbedding, TpGeGluMlp, TpLinear};
+use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 
 // ─── Gemma4 RMSNorm ────────────────────────────────────────────────────────
 //
-// Unlike Gemma 2/3 which use `(1 + weight) * x`, Gemma 4 uses plain
-// `weight * x` — the reference Python `gemma4.py` imports `RMSNorm`, not
-// `GemmaRMSNorm`. Keeping the +1 offset here would silently produce wrong
-// norms on every layer.
+// Plain `weight * x` — Gemma 4 Python uses `RMSNorm`, not the Gemma 2/3
+// `GemmaRMSNorm` with `(1 + weight)` offset. Using the offset here would
+// silently break every normalization in the model.
 
 struct Gemma4RmsNorm {
     weight: Tensor,
@@ -71,7 +63,7 @@ impl Module for Gemma4RmsNorm {
     }
 }
 
-// ─── RMSNorm without learned weight (for v_norm and router norm) ──────────
+// ─── RMSNorm without learned weight (V and router) ────────────────────────
 
 struct UnweightedRmsNorm {
     eps: f64,
@@ -93,7 +85,7 @@ impl Module for UnweightedRmsNorm {
     }
 }
 
-// ─── Soft Capping ───────────────────────────────────────────────────────────
+// ─── Soft capping helper ───────────────────────────────────────────────────
 
 fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
     if cap <= 0.0 {
@@ -103,7 +95,7 @@ fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
     scaled.tanh()? * cap
 }
 
-// ─── Sliding Window Mask ────────────────────────────────────────────────────
+// ─── Sliding window causal mask ────────────────────────────────────────────
 
 fn sliding_window_mask(
     q_len: usize,
@@ -127,45 +119,36 @@ fn sliding_window_mask(
     Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
 }
 
-// ─── Config Extraction ─────────────────────────────────────────────────────
+// ─── Extra config extraction (duplicated from gemma4.rs for independence) ─
 
 struct Gemma4ExtraConfig {
     attn_logit_softcap: Option<f64>,
     final_logit_softcap: Option<f64>,
     sliding_window_pattern: usize,
-    /// RoPE base (`rope_theta`) used by sliding-attention layers. Sourced
-    /// from `rope_parameters.sliding_attention.rope_theta` when present,
-    /// with a fallback to the legacy flat `rope_local_base_freq` and
-    /// finally `cfg.rope_theta`.
+    /// RoPE base for sliding-attention layers (from
+    /// `rope_parameters.sliding_attention.rope_theta`, legacy fallback
+    /// `rope_local_base_freq`, then `cfg.rope_theta`).
     rope_theta_local: f64,
-    /// RoPE base for full-attention layers
-    /// (`rope_parameters.full_attention.rope_theta`, fallback
-    /// `cfg.rope_theta`). For Gemma 4 E2B this is 1e6 vs 10000 for sliding.
+    /// RoPE base for full-attention layers (from
+    /// `rope_parameters.full_attention.rope_theta`). For Gemma 4 E2B this
+    /// is 1e6 vs 10000 for sliding.
     rope_theta_full: f64,
-    /// `partial_rotary_factor` applied to full-attention layers
-    /// (default 1.0). For Gemma 4 E2B this is 0.25 — only the first
-    /// 25% of `global_head_dim` participate in rotation.
+    /// Partial rotary factor for full-attention layers (default 1.0).
+    /// Gemma 4 E2B uses 0.25.
     partial_rotary_factor_full: f64,
-    /// `rope_type` for full-attention layers. Gemma 4 uses `"proportional"`
-    /// which tweaks the `inv_freq` computation to use `head_dim` (not
-    /// `rotary_dim`) as the exponent denominator.
+    /// `rope_type` for full attention — `"proportional"` selects Gemma 4's
+    /// head_dim-denominator variant.
     rope_type_full: String,
     layer_types: Vec<String>,
-    // MoE
     enable_moe_block: bool,
     num_experts: usize,
     top_k_experts: usize,
     moe_intermediate_size: usize,
-    // PLE
     hidden_size_per_layer_input: usize,
     vocab_size_per_layer_input: usize,
-    // k_eq_v
     attention_k_eq_v: bool,
-    // KV sharing
     num_kv_shared_layers: usize,
-    // Double-wide MLP
     use_double_wide_mlp: bool,
-    // Global head dim (may differ from default head_dim for full-attention layers)
     global_head_dim: Option<usize>,
 }
 
@@ -188,10 +171,6 @@ impl Gemma4ExtraConfig {
             .map(|v| v as usize)
             .unwrap_or(2);
 
-        // Gemma 4 stores RoPE parameters under
-        // `rope_parameters.{full,sliding}_attention`. We read those first
-        // and fall back to the legacy flat fields for back-compat with
-        // test configs.
         let rope_params = cfg.extra.get("rope_parameters");
         let rope_full = rope_params.and_then(|rp| rp.get("full_attention"));
         let rope_sliding = rope_params.and_then(|rp| rp.get("sliding_attention"));
@@ -338,10 +317,10 @@ impl Gemma4ExtraConfig {
     }
 
     /// Construct the per-layer rotary embedding. Sliding layers use
-    /// standard `RotaryEmbedding::new` with `rope_theta_local`. Full
-    /// layers dispatch on `rope_type_full`: `"proportional"` → Gemma 4's
-    /// proportional variant, anything else → standard (partial if
-    /// `partial_rotary_factor_full < 1.0`).
+    /// standard `RotaryEmbedding::new` with `rope_theta_local`; full
+    /// layers dispatch on `rope_type_full` — `"proportional"` selects
+    /// Gemma 4's proportional variant, anything else falls back to
+    /// standard partial (or full) rotation.
     fn build_rotary_for_layer(
         &self,
         layer_idx: usize,
@@ -387,10 +366,9 @@ impl Gemma4ExtraConfig {
         }
     }
 
-    /// Target layer index for KV cache sharing. Returns `Some(target)` for
-    /// layers in the last `num_kv_shared_layers`, pointing at the most
-    /// recent non-shared layer of the same attention type. `None` means
-    /// the layer owns its KV cache.
+    /// Target layer index for KV cache sharing — see the matching helper
+    /// in `gemma4.rs` for the algorithm. Returns `Some(target)` for
+    /// layers in the last `num_kv_shared_layers`, `None` otherwise.
     fn kv_sharing_target_layer(&self, layer_idx: usize, num_hidden_layers: usize) -> Option<usize> {
         if self.num_kv_shared_layers == 0 || num_hidden_layers == 0 {
             return None;
@@ -399,8 +377,6 @@ impl Gemma4ExtraConfig {
         if layer_idx < first_shared {
             return None;
         }
-        // Walk back through the non-shared layers for the latest layer
-        // of the same attention type.
         let current_type = self.layer_types.get(layer_idx).cloned().unwrap_or_else(|| {
             if self.is_sliding_layer(layer_idx) {
                 "sliding_attention".to_string()
@@ -449,8 +425,9 @@ impl Gemma4ExtraConfig {
         if self.num_kv_shared_layers == 0 {
             return false;
         }
-        // saturating_sub: a reduced-layer smoke test may keep a production
-        // `num_kv_shared_layers` that exceeds the shrunk model depth.
+        // saturating_sub: `num_kv_shared_layers` may exceed the model depth
+        // when an integration test or smoke run reduces `num_hidden_layers`
+        // while keeping the rest of a real production config intact.
         let first_shared = num_hidden_layers.saturating_sub(self.num_kv_shared_layers);
         layer_idx >= first_shared
     }
@@ -468,36 +445,41 @@ impl Gemma4ExtraConfig {
         }
     }
 
-    /// Largest per-layer `head_dim` used by any attention layer in the
-    /// model. All layers share the same KV cache geometry, so the cache
-    /// is allocated at this width and per-layer reads/writes slice back
-    /// to their true `head_dim`.
+    /// Largest per-layer `head_dim` across all layers. Used to allocate a
+    /// uniform KV cache width — per-layer reads/writes pad and slice
+    /// back to their true `head_dim`.
     fn max_cache_head_dim(&self, default_head_dim: usize) -> usize {
         default_head_dim.max(self.global_head_dim.unwrap_or(default_head_dim))
     }
 }
 
-// ─── Gemma4 Router ──────────────────────────────────────────────────────────
+// ─── Quantized Gemma 4 Router ─────────────────────────────────────────────
 //
-// Custom router: UnweightedRmsNorm → root_size scaling → learned scale → gate
+// UnweightedRmsNorm → root_size scaling → learned scale → gate linear.
+// The `scale` tensor and the gate linear are loaded separately: the scale
+// is a small FP vector kept in the checkpoint dtype, the gate is routed
+// through the quantized weight loader like every other linear projection.
 
-struct Gemma4Router {
+struct QuantizedGemma4Router {
     norm: UnweightedRmsNorm,
     scale: Tensor,
-    gate: candle_nn::Linear,
+    gate: Box<dyn QuantizedLinear>,
     root_size: f64,
 }
 
-impl Gemma4Router {
+impl QuantizedGemma4Router {
     fn new(
         hidden_size: usize,
         num_experts: usize,
         rms_norm_eps: f64,
+        loader: &dyn QuantizedWeightLoader,
         vb: VarBuilder,
+        prefix: &str,
     ) -> Result<Self> {
         let norm = UnweightedRmsNorm::new(rms_norm_eps);
         let scale = vb.get(hidden_size, "scale")?;
-        let gate = candle_nn::linear_no_bias(hidden_size, num_experts, vb.pp("proj"))?;
+        let gate =
+            loader.load_linear(&format!("{prefix}.proj"), hidden_size, num_experts, false)?;
         let root_size = (hidden_size as f64).powf(-0.5);
 
         Ok(Self {
@@ -516,46 +498,41 @@ impl Gemma4Router {
     }
 }
 
-// ─── MoE Expert ─────────────────────────────────────────────────────────────
+// ─── Quantized MoE Expert ─────────────────────────────────────────────────
 //
-// Fused gate_up_proj with GELU activation (not SiLU).
+// gate_proj + up_proj + down_proj, GELU-Erf activation (not SiLU — critical
+// for Gemma 4 vs Llama/Mistral family).
 
-struct Gemma4MoEExpert {
-    gate_proj: TpLinear,
-    up_proj: TpLinear,
-    down_proj: TpLinear,
+struct QuantizedGemma4MoEExpert {
+    gate_proj: Box<dyn QuantizedLinear>,
+    up_proj: Box<dyn QuantizedLinear>,
+    down_proj: Box<dyn QuantizedLinear>,
 }
 
-impl Gemma4MoEExpert {
+impl QuantizedGemma4MoEExpert {
     fn new(
         hidden_size: usize,
         intermediate_size: usize,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
+        loader: &dyn QuantizedWeightLoader,
+        prefix: &str,
     ) -> Result<Self> {
-        let gate_proj = TpLinear::column_parallel(
+        let gate_proj = loader.load_linear(
+            &format!("{prefix}.gate_proj"),
             hidden_size,
             intermediate_size,
             false,
-            false,
-            vb.pp("gate_proj"),
-            pg,
         )?;
-        let up_proj = TpLinear::column_parallel(
+        let up_proj = loader.load_linear(
+            &format!("{prefix}.up_proj"),
             hidden_size,
             intermediate_size,
             false,
-            false,
-            vb.pp("up_proj"),
-            pg,
         )?;
-        let down_proj = TpLinear::row_parallel(
+        let down_proj = loader.load_linear(
+            &format!("{prefix}.down_proj"),
             intermediate_size,
             hidden_size,
             false,
-            true,
-            vb.pp("down_proj"),
-            pg,
         )?;
 
         Ok(Self {
@@ -565,50 +542,56 @@ impl Gemma4MoEExpert {
         })
     }
 
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs, tp_ctx)?;
-        let up = self.up_proj.forward(xs, tp_ctx)?;
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(xs)?;
+        let up = self.up_proj.forward(xs)?;
         let hidden = gate.gelu_erf()?.mul(&up)?;
-        self.down_proj.forward(&hidden, tp_ctx)
+        self.down_proj.forward(&hidden)
     }
 }
 
-// ─── MoE Block ──────────────────────────────────────────────────────────────
-//
-// Custom Gemma4 routing: softmax-all → top-k → renormalize → fold per_expert_scale
+// ─── Quantized MoE block ──────────────────────────────────────────────────
 
-struct Gemma4MoE {
-    router: Gemma4Router,
+struct QuantizedGemma4MoE {
+    router: QuantizedGemma4Router,
     per_expert_scale: Tensor,
-    experts: Vec<Gemma4MoEExpert>,
+    experts: Vec<QuantizedGemma4MoEExpert>,
     num_experts: usize,
     top_k: usize,
 }
 
-impl Gemma4MoE {
+impl QuantizedGemma4MoE {
     fn new(
         cfg: &ModelConfig,
         extra_cfg: &Gemma4ExtraConfig,
         rms_norm_eps: f64,
+        loader: &dyn QuantizedWeightLoader,
         vb: VarBuilder,
-        pg: &dyn ProcessGroup,
+        prefix: &str,
     ) -> Result<Self> {
         let num_experts = extra_cfg.num_experts;
         let top_k = extra_cfg.top_k_experts;
         let hidden_size = cfg.hidden_size;
         let moe_intermediate_size = extra_cfg.moe_intermediate_size;
 
-        let router = Gemma4Router::new(hidden_size, num_experts, rms_norm_eps, vb.pp("router"))?;
+        let router = QuantizedGemma4Router::new(
+            hidden_size,
+            num_experts,
+            rms_norm_eps,
+            loader,
+            vb.pp("router"),
+            &format!("{prefix}.router"),
+        )?;
+
         let per_expert_scale = vb.get(num_experts, "per_expert_scale")?;
 
         let mut experts = Vec::with_capacity(num_experts);
-        let vb_experts = vb.pp("experts");
         for i in 0..num_experts {
-            experts.push(Gemma4MoEExpert::new(
+            experts.push(QuantizedGemma4MoEExpert::new(
                 hidden_size,
                 moe_intermediate_size,
-                vb_experts.pp(i),
-                pg,
+                loader,
+                &format!("{prefix}.experts.{i}"),
             )?);
         }
 
@@ -621,18 +604,17 @@ impl Gemma4MoE {
         })
     }
 
-    fn forward(&self, xs: &Tensor, router_input: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, router_input: &Tensor) -> Result<Tensor> {
         let orig_shape = xs.dims().to_vec();
         let hidden_dim = *orig_shape.last().unwrap();
         let xs_2d = xs.reshape(((), hidden_dim))?;
         let num_tokens = xs_2d.dim(0)?;
 
-        // Router logits from the residual stream
         let router_input_2d = router_input.reshape(((), hidden_dim))?;
         let router_logits = self.router.forward(&router_input_2d)?;
 
-        // Gemma4 routing: topk on raw logits, softmax on all, then renormalize
         let per_expert_scale_f32 = self.per_expert_scale.to_dtype(DType::F32)?;
+        let expert_scales: Vec<f32> = per_expert_scale_f32.to_vec1()?;
 
         let mut final_output = Tensor::zeros((num_tokens, hidden_dim), xs.dtype(), xs.device())?;
 
@@ -643,18 +625,18 @@ impl Gemma4MoE {
                 .flatten_all()?
                 .to_dtype(DType::F32)?;
 
-            // Top-k selection on raw logits
+            // Gemma 4 routing: top-k indices come from raw logits,
+            // dispatch weights come from softmax over *all* experts,
+            // then renormalised across the chosen top-k.
             let logits_vec: Vec<f32> = token_logits.to_vec1()?;
             let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let topk_indices: Vec<usize> = indexed.iter().take(self.top_k).map(|x| x.0).collect();
 
-            // Softmax over ALL experts
             let probs =
                 candle_nn::ops::softmax_last_dim(&token_logits.unsqueeze(0)?)?.squeeze(0)?;
             let probs_vec: Vec<f32> = probs.to_vec1()?;
 
-            // Build indicator and compute dispatch weights
             let mut gate_weights = vec![0.0f32; self.num_experts];
             for &idx in &topk_indices {
                 gate_weights[idx] = probs_vec[idx];
@@ -666,16 +648,13 @@ impl Gemma4MoE {
                 1.0
             };
 
-            // Fold per_expert_scale
-            let expert_scales: Vec<f32> = per_expert_scale_f32.to_vec1()?;
-
             let mut token_output = Tensor::zeros((1, hidden_dim), xs.dtype(), xs.device())?;
 
             for &expert_idx in &topk_indices {
                 if expert_idx < self.num_experts {
                     let weight =
                         (gate_weights[expert_idx] / renorm_factor) * expert_scales[expert_idx];
-                    let expert_out = self.experts[expert_idx].forward(&token_input, tp_ctx)?;
+                    let expert_out = self.experts[expert_idx].forward(&token_input)?;
                     let weighted = expert_out.affine(weight as f64, 0.0)?;
                     token_output = (token_output + weighted)?;
                 }
@@ -689,14 +668,11 @@ impl Gemma4MoE {
     }
 }
 
-// ─── Attention ──────────────────────────────────────────────────────────────
+// ─── Quantized Attention ──────────────────────────────────────────────────
 
-/// Pad a 4D `[b, heads, seq, dim]` tensor on its last dimension from `from`
-/// to `to` with zeros. Used to widen K/V from a layer-specific head_dim
-/// (256 for sliding layers, 512 for full in E2B) to the shared cache
-/// head_dim. Zero-padded dimensions contribute identically to attention
-/// as long as both sides (K and Q view from cache) are sliced back
-/// symmetrically.
+/// Pad the last dimension of `[b, heads, seq, dim]` from `from` to `to`
+/// with zeros. Used to widen K/V from the per-layer `head_dim` up to the
+/// shared `cache_head_dim` before writing to the paged KV cache.
 fn pad_last_dim(x: &Tensor, from: usize, to: usize) -> Result<Tensor> {
     if from == to {
         return Ok(x.clone());
@@ -716,116 +692,85 @@ fn pad_last_dim(x: &Tensor, from: usize, to: usize) -> Result<Tensor> {
     Tensor::cat(&[x, &zeros], 3)
 }
 
-struct Gemma4Attention {
-    q_proj: TpLinear,
-    /// KV-shared layers (layers in the last `num_kv_shared_layers`) have
-    /// no `k_proj` / `v_proj` weights in the checkpoint. For those layers
-    /// these fields are `None` and the forward pass reads K/V straight
-    /// from the target layer's cache engine.
-    k_proj: Option<TpLinear>,
-    v_proj: Option<TpLinear>,
-    o_proj: TpLinear,
+struct QuantizedGemma4Attention {
+    q_proj: Box<dyn QuantizedLinear>,
+    /// KV-shared layers (last `num_kv_shared_layers` in the stack) carry
+    /// no `k_proj` / `v_proj` weights — those slots are `None` and the
+    /// forward pass reads K/V straight from the target layer's cache.
+    k_proj: Option<Box<dyn QuantizedLinear>>,
+    v_proj: Option<Box<dyn QuantizedLinear>>,
+    o_proj: Box<dyn QuantizedLinear>,
     q_norm: Gemma4RmsNorm,
     k_norm: Option<Gemma4RmsNorm>,
     v_norm: Option<UnweightedRmsNorm>,
     rotary_emb: RotaryEmbedding,
     num_heads: usize,
     num_kv_heads: usize,
-    /// Layer-specific head dimension (256 for sliding, 512 for full in E2B).
+    /// Layer-specific head_dim (256 for sliding, 512 for full in E2B).
     head_dim: usize,
-    /// Padded head dimension stored in the shared KV cache. Equal to
-    /// `max(head_dim, global_head_dim)` across all layers.
+    /// Shared KV cache head_dim = max across all layers in the model.
     cache_head_dim: usize,
     attn_logit_softcap: Option<f64>,
     sliding_window: Option<usize>,
-    /// `true` when this layer reuses another layer's KV cache — no K/V
-    /// projection, no K/V norm, no K/V RoPE, no cache write.
     is_kv_shared: bool,
 }
 
-impl Gemma4Attention {
+impl QuantizedGemma4Attention {
     #[allow(clippy::too_many_arguments)]
-    fn new_with_tp(
+    fn new(
         cfg: &ModelConfig,
         extra_cfg: &Gemma4ExtraConfig,
         layer_idx: usize,
         cache_head_dim: usize,
         is_kv_shared: bool,
+        loader: &dyn QuantizedWeightLoader,
         vb: VarBuilder,
-        pg: &dyn ProcessGroup,
+        prefix: &str,
     ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = extra_cfg.head_dim_for_layer(layer_idx, cfg.head_dim);
-        let world_size = pg.world_size();
 
-        if world_size > 1 {
-            if !num_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-            if !num_kv_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-        }
-
-        let q_proj = TpLinear::column_parallel(
+        let q_proj = loader.load_linear(
+            &format!("{prefix}.q_proj"),
             cfg.hidden_size,
             num_heads * head_dim,
             false,
-            false,
-            vb.pp("q_proj"),
-            pg,
         )?;
 
-        // KV-shared layers carry no k_proj/v_proj/k_norm/v_norm. The
-        // reference Python `Gemma4Attention` simply doesn't create those
-        // modules and the weight loader never sees the corresponding
-        // checkpoint keys.
         let (k_proj, v_proj, k_norm, v_norm) = if is_kv_shared {
             (None, None, None, None)
         } else {
-            let k_proj = TpLinear::column_parallel(
+            let k_proj = loader.load_linear(
+                &format!("{prefix}.k_proj"),
                 cfg.hidden_size,
                 num_kv_heads * head_dim,
                 false,
-                false,
-                vb.pp("k_proj"),
-                pg,
             )?;
 
             let use_k_eq_v =
                 extra_cfg.attention_k_eq_v && extra_cfg.is_full_attention_layer(layer_idx);
             let v_proj = if use_k_eq_v {
-                match TpLinear::column_parallel(
+                match loader.load_linear(
+                    &format!("{prefix}.v_proj"),
                     cfg.hidden_size,
                     num_kv_heads * head_dim,
                     false,
-                    false,
-                    vb.pp("v_proj"),
-                    pg,
                 ) {
                     Ok(v) => v,
-                    Err(_) => TpLinear::column_parallel(
+                    Err(_) => loader.load_linear(
+                        &format!("{prefix}.k_proj"),
                         cfg.hidden_size,
                         num_kv_heads * head_dim,
                         false,
-                        false,
-                        vb.pp("k_proj"),
-                        pg,
                     )?,
                 }
             } else {
-                TpLinear::column_parallel(
+                loader.load_linear(
+                    &format!("{prefix}.v_proj"),
                     cfg.hidden_size,
                     num_kv_heads * head_dim,
                     false,
-                    false,
-                    vb.pp("v_proj"),
-                    pg,
                 )?
             };
 
@@ -835,17 +780,12 @@ impl Gemma4Attention {
             (Some(k_proj), Some(v_proj), Some(k_norm), Some(v_norm))
         };
 
-        let o_proj = TpLinear::row_parallel(
+        let o_proj = loader.load_linear(
+            &format!("{prefix}.o_proj"),
             num_heads * head_dim,
             cfg.hidden_size,
             false,
-            true,
-            vb.pp("o_proj"),
-            pg,
         )?;
-
-        let num_heads_per_gpu = num_heads / world_size;
-        let num_kv_heads_per_gpu = num_kv_heads / world_size;
 
         let q_norm = Gemma4RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
 
@@ -853,8 +793,8 @@ impl Gemma4Attention {
             layer_idx,
             head_dim,
             cfg.max_position_embeddings,
-            vb.dtype(),
-            vb.device(),
+            loader.dtype(),
+            loader.device(),
         )?;
 
         let sliding_window = if extra_cfg.is_sliding_layer(layer_idx) {
@@ -872,8 +812,8 @@ impl Gemma4Attention {
             k_norm,
             v_norm,
             rotary_emb,
-            num_heads: num_heads_per_gpu,
-            num_kv_heads: num_kv_heads_per_gpu,
+            num_heads,
+            num_kv_heads,
             head_dim,
             cache_head_dim,
             attn_logit_softcap: extra_cfg.attn_logit_softcap,
@@ -900,45 +840,39 @@ impl Gemma4Attention {
     fn forward(
         &self,
         xs: &Tensor,
-        _attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
-        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
-        let device = xs.device();
-        let dtype = xs.dtype();
 
-        let q = self.q_proj.forward(xs, tp_ctx)?;
+        let q = self.q_proj.forward(xs)?;
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
         let q = Self::apply_per_head_norm(&q, &self.q_norm)?;
 
         if self.is_kv_shared {
-            // Shared layers rotate only Q. K/V are read straight from the
-            // target layer's cache (at `cache_head_dim`), no new write.
+            // Shared layer: rotate Q only, read K/V from the target layer's
+            // cache (already populated by an earlier layer of the same type).
             let (q, _) = self.rotary_emb.apply(&q, &q, seqlen_offset)?;
-
             let num_tokens = seqlen_offset + q_len;
             let (k_full, v_full) = cache_engine
                 .read(block_table.block_ids(), num_tokens)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset, tp_ctx)
+            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset)
         } else {
-            // Non-shared: full K/V computation + cache write.
             let k = self
                 .k_proj
                 .as_ref()
                 .expect("non-shared layer must have k_proj")
-                .forward(xs, tp_ctx)?;
+                .forward(xs)?;
             let v = self
                 .v_proj
                 .as_ref()
                 .expect("non-shared layer must have v_proj")
-                .forward(xs, tp_ctx)?;
+                .forward(xs)?;
 
             let k = k
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
@@ -958,10 +892,8 @@ impl Gemma4Attention {
 
             let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
-            // Pad K/V from layer head_dim to the shared cache head_dim.
             let k_padded = pad_last_dim(&k, self.head_dim, self.cache_head_dim)?;
             let v_padded = pad_last_dim(&v, self.head_dim, self.cache_head_dim)?;
-
             let k_for_cache = k_padded.squeeze(0)?.contiguous()?;
             let v_for_cache = v_padded.squeeze(0)?.contiguous()?;
             cache_engine
@@ -972,16 +904,10 @@ impl Gemma4Attention {
             let (k_full, v_full) = cache_engine
                 .read(block_table.block_ids(), num_tokens)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-
-            let _ = (device, dtype);
-            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset, tp_ctx)
+            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset)
         }
     }
 
-    /// Shared tail: slice padded K/V back to `head_dim`, broadcast KV
-    /// groups, apply optional soft cap + mask, softmax, compute the
-    /// weighted sum and project out.
-    #[allow(clippy::too_many_arguments)]
     fn finalize_attention(
         &self,
         q: &Tensor,
@@ -990,13 +916,10 @@ impl Gemma4Attention {
         q_len: usize,
         b_sz: usize,
         seqlen_offset: usize,
-        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let device = q.device();
         let dtype = q.dtype();
 
-        // K/V are stored at cache_head_dim; trim back to this layer's
-        // actual head_dim so the matmul shapes line up with Q.
         let k_full = if k_full.dim(3)? != self.head_dim {
             k_full.narrow(3, 0, self.head_dim)?
         } else {
@@ -1013,7 +936,6 @@ impl Gemma4Attention {
         let k_full = repeat_kv(k_full, num_kv_groups)?;
         let v_full = repeat_kv(v_full, num_kv_groups)?;
 
-        // Gemma 4 uses scaling=1.0 — the Q/K norms control magnitude.
         let mut attn_weights = q.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
 
         if let Some(cap) = self.attn_logit_softcap {
@@ -1034,8 +956,7 @@ impl Gemma4Attention {
             attn_output
                 .transpose(1, 2)?
                 .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-
-        self.o_proj.forward(&attn_output, tp_ctx)
+        self.o_proj.forward(&attn_output)
     }
 
     fn forward_decode_batch(
@@ -1043,20 +964,17 @@ impl Gemma4Attention {
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
-        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
         let device = xs.device();
         let dtype = xs.dtype();
 
-        let q = self.q_proj.forward(xs, tp_ctx)?;
+        let q = self.q_proj.forward(xs)?;
         let q = q
             .reshape((batch_size, 1, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
         let q = Self::apply_per_head_norm(&q, &self.q_norm)?;
 
-        // Non-shared layers compute + cache K/V up front; shared layers
-        // skip this entirely and read directly from the target engine.
         let (k, v) = if self.is_kv_shared {
             (None, None)
         } else {
@@ -1064,12 +982,12 @@ impl Gemma4Attention {
                 .k_proj
                 .as_ref()
                 .expect("non-shared layer must have k_proj")
-                .forward(xs, tp_ctx)?;
+                .forward(xs)?;
             let v = self
                 .v_proj
                 .as_ref()
                 .expect("non-shared layer must have v_proj")
-                .forward(xs, tp_ctx)?;
+                .forward(xs)?;
             let k = k
                 .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
                 .transpose(1, 2)?;
@@ -1093,20 +1011,21 @@ impl Gemma4Attention {
         for (i, seq) in sequences.iter().enumerate() {
             let q_i = q.narrow(0, i, 1)?;
 
-            let (q_i, _k_rotated) = if self.is_kv_shared {
-                self.rotary_emb.apply(&q_i, &q_i, seq.seqlen_offset)?
+            let q_i = if self.is_kv_shared {
+                let (q_rot, _) = self.rotary_emb.apply(&q_i, &q_i, seq.seqlen_offset)?;
+                q_rot
             } else {
                 let k_i = k.as_ref().unwrap().narrow(0, i, 1)?;
                 let v_i = v.as_ref().unwrap().narrow(0, i, 1)?;
-                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-                let k_padded = pad_last_dim(&k_i, self.head_dim, self.cache_head_dim)?;
+                let (q_rot, k_rot) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
+                let k_padded = pad_last_dim(&k_rot, self.head_dim, self.cache_head_dim)?;
                 let v_padded = pad_last_dim(&v_i, self.head_dim, self.cache_head_dim)?;
                 let k_for_cache = k_padded.squeeze(0)?.contiguous()?;
                 let v_for_cache = v_padded.squeeze(0)?.contiguous()?;
                 cache_engine
                     .write(&k_for_cache, &v_for_cache, &seq.slot_mapping)
                     .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-                (q_i, k_i)
+                q_rot
             };
 
             let kv_len = seq.seqlen_offset + 1;
@@ -1114,7 +1033,6 @@ impl Gemma4Attention {
                 .read(&seq.block_ids, kv_len)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
 
-            // Slice padded cache back to this layer's real head_dim.
             let k_full = if k_full.dim(3)? != self.head_dim {
                 k_full.narrow(3, 0, self.head_dim)?
             } else {
@@ -1151,59 +1069,106 @@ impl Gemma4Attention {
         }
 
         let attn_output = Tensor::cat(&outputs, 0)?;
-        self.o_proj.forward(&attn_output, tp_ctx)
+        self.o_proj.forward(&attn_output)
     }
 }
 
-// ─── Decoder Layer ──────────────────────────────────────────────────────────
+// ─── Quantized GeGLU MLP ──────────────────────────────────────────────────
 
-struct Gemma4DecoderLayer {
-    self_attn: Gemma4Attention,
-    mlp: TpGeGluMlp,
-    // MoE (optional — parallel with MLP)
-    moe: Option<Gemma4MoE>,
-    // Norms
+struct QuantizedGemma4Mlp {
+    gate_proj: Box<dyn QuantizedLinear>,
+    up_proj: Box<dyn QuantizedLinear>,
+    down_proj: Box<dyn QuantizedLinear>,
+}
+
+impl QuantizedGemma4Mlp {
+    fn new(
+        hidden_size: usize,
+        intermediate_size: usize,
+        loader: &dyn QuantizedWeightLoader,
+        prefix: &str,
+    ) -> Result<Self> {
+        let gate_proj = loader.load_linear(
+            &format!("{prefix}.gate_proj"),
+            hidden_size,
+            intermediate_size,
+            false,
+        )?;
+        let up_proj = loader.load_linear(
+            &format!("{prefix}.up_proj"),
+            hidden_size,
+            intermediate_size,
+            false,
+        )?;
+        let down_proj = loader.load_linear(
+            &format!("{prefix}.down_proj"),
+            intermediate_size,
+            hidden_size,
+            false,
+        )?;
+
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(xs)?;
+        let up = self.up_proj.forward(xs)?;
+        let hidden = gate.gelu_erf()?.mul(&up)?;
+        self.down_proj.forward(&hidden)
+    }
+}
+
+// ─── Quantized Decoder Layer ──────────────────────────────────────────────
+
+struct QuantizedGemma4DecoderLayer {
+    self_attn: QuantizedGemma4Attention,
+    mlp: QuantizedGemma4Mlp,
+    moe: Option<QuantizedGemma4MoE>,
     input_layernorm: Gemma4RmsNorm,
     post_attention_layernorm: Gemma4RmsNorm,
     pre_feedforward_layernorm: Gemma4RmsNorm,
     post_feedforward_layernorm: Gemma4RmsNorm,
-    // Extra MoE norms (only when MoE enabled)
     post_feedforward_layernorm_1: Option<Gemma4RmsNorm>,
     post_feedforward_layernorm_2: Option<Gemma4RmsNorm>,
     pre_feedforward_layernorm_2: Option<Gemma4RmsNorm>,
-    // PLE components (optional — when hidden_size_per_layer_input > 0)
-    per_layer_input_gate: Option<candle_nn::Linear>,
-    per_layer_projection: Option<candle_nn::Linear>,
+    per_layer_input_gate: Option<Box<dyn QuantizedLinear>>,
+    per_layer_projection: Option<Box<dyn QuantizedLinear>>,
     post_per_layer_input_norm: Option<Gemma4RmsNorm>,
-    // Layer scalar (per-layer multiplier)
     layer_scalar: Tensor,
-    /// `Some(target_layer_idx)` for KV-shared layers — the attention
-    /// forward reads K/V from the target layer's cache engine instead of
-    /// owning its own.
+    /// Target layer idx for KV cache sharing, or `None` when this layer
+    /// owns its own slot.
     kv_sharing_target: Option<usize>,
 }
 
-impl Gemma4DecoderLayer {
+impl QuantizedGemma4DecoderLayer {
     #[allow(clippy::too_many_arguments)]
-    fn new_with_tp(
+    fn new(
         cfg: &ModelConfig,
         extra_cfg: &Gemma4ExtraConfig,
         layer_idx: usize,
         cache_head_dim: usize,
+        loader: &dyn QuantizedWeightLoader,
         vb: VarBuilder,
-        pg: &dyn ProcessGroup,
     ) -> Result<Self> {
+        let prefix = format!("model.layers.{layer_idx}");
+        let vb_layer = vb.pp("model").pp("layers").pp(layer_idx);
+
         let kv_sharing_target = extra_cfg.kv_sharing_target_layer(layer_idx, cfg.num_hidden_layers);
         let is_kv_shared = kv_sharing_target.is_some();
 
-        let self_attn = Gemma4Attention::new_with_tp(
+        let self_attn = QuantizedGemma4Attention::new(
             cfg,
             extra_cfg,
             layer_idx,
             cache_head_dim,
             is_kv_shared,
-            vb.pp("self_attn"),
-            pg,
+            loader,
+            vb_layer.pp("self_attn"),
+            &format!("{prefix}.self_attn"),
         )?;
 
         let intermediate_size = extra_cfg.layer_intermediate_size(
@@ -1211,40 +1176,47 @@ impl Gemma4DecoderLayer {
             cfg.intermediate_size,
             cfg.num_hidden_layers,
         );
-        let mlp = TpGeGluMlp::new(cfg.hidden_size, intermediate_size, vb.pp("mlp"), pg)?;
+        let mlp = QuantizedGemma4Mlp::new(
+            cfg.hidden_size,
+            intermediate_size,
+            loader,
+            &format!("{prefix}.mlp"),
+        )?;
 
-        // MoE block (optional)
         let moe = if extra_cfg.enable_moe_block && extra_cfg.num_experts > 0 {
-            Some(Gemma4MoE::new(
+            Some(QuantizedGemma4MoE::new(
                 cfg,
                 extra_cfg,
                 cfg.rms_norm_eps,
-                vb.pp("moe"),
-                pg,
+                loader,
+                vb_layer.pp("moe"),
+                &format!("{prefix}.moe"),
             )?)
         } else {
             None
         };
 
-        let input_layernorm =
-            Gemma4RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let input_layernorm = Gemma4RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb_layer.pp("input_layernorm"),
+        )?;
         let post_attention_layernorm = Gemma4RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
+            vb_layer.pp("post_attention_layernorm"),
         )?;
         let pre_feedforward_layernorm = Gemma4RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            vb.pp("pre_feedforward_layernorm"),
+            vb_layer.pp("pre_feedforward_layernorm"),
         )?;
         let post_feedforward_layernorm = Gemma4RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            vb.pp("post_feedforward_layernorm"),
+            vb_layer.pp("post_feedforward_layernorm"),
         )?;
 
-        // Extra norms for MoE layers
         let (
             post_feedforward_layernorm_1,
             post_feedforward_layernorm_2,
@@ -1254,49 +1226,49 @@ impl Gemma4DecoderLayer {
                 Some(Gemma4RmsNorm::new(
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
-                    vb.pp("post_feedforward_layernorm_1"),
+                    vb_layer.pp("post_feedforward_layernorm_1"),
                 )?),
                 Some(Gemma4RmsNorm::new(
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
-                    vb.pp("post_feedforward_layernorm_2"),
+                    vb_layer.pp("post_feedforward_layernorm_2"),
                 )?),
                 Some(Gemma4RmsNorm::new(
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
-                    vb.pp("pre_feedforward_layernorm_2"),
+                    vb_layer.pp("pre_feedforward_layernorm_2"),
                 )?),
             )
         } else {
             (None, None, None)
         };
 
-        // PLE components
         let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) =
             if extra_cfg.hidden_size_per_layer_input > 0 {
                 (
-                    Some(candle_nn::linear_no_bias(
+                    Some(loader.load_linear(
+                        &format!("{prefix}.per_layer_input_gate"),
                         cfg.hidden_size,
                         extra_cfg.hidden_size_per_layer_input,
-                        vb.pp("per_layer_input_gate"),
+                        false,
                     )?),
-                    Some(candle_nn::linear_no_bias(
+                    Some(loader.load_linear(
+                        &format!("{prefix}.per_layer_projection"),
                         extra_cfg.hidden_size_per_layer_input,
                         cfg.hidden_size,
-                        vb.pp("per_layer_projection"),
+                        false,
                     )?),
                     Some(Gemma4RmsNorm::new(
                         cfg.hidden_size,
                         cfg.rms_norm_eps,
-                        vb.pp("post_per_layer_input_norm"),
+                        vb_layer.pp("post_per_layer_input_norm"),
                     )?),
                 )
             } else {
                 (None, None, None)
             };
 
-        // Layer scalar (buffer, not a trained weight — defaults to 1.0)
-        let layer_scalar = vb
+        let layer_scalar = vb_layer
             .get(1, "layer_scalar")
             .unwrap_or_else(|_| Tensor::ones(1, DType::F32, vb.device()).unwrap());
 
@@ -1341,26 +1313,17 @@ impl Gemma4DecoderLayer {
         }
     }
 
-    fn forward_ffn(
-        &self,
-        residual: &Tensor,
-        hidden_states_mlp: Tensor,
-        tp_ctx: &TpContext,
-    ) -> Result<Tensor> {
+    fn forward_ffn(&self, residual: &Tensor, hidden_states_mlp: Tensor) -> Result<Tensor> {
         if let (Some(moe), Some(pf_norm1), Some(pf_norm2), Some(pre_ff2)) = (
             &self.moe,
             &self.post_feedforward_layernorm_1,
             &self.post_feedforward_layernorm_2,
             &self.pre_feedforward_layernorm_2,
         ) {
-            // MoE enabled: MLP and MoE run in parallel
             let h1 = pf_norm1.forward(&hidden_states_mlp)?;
-
-            // MoE sees the residual (pre-MLP state)
             let h2 = pre_ff2.forward(residual)?;
-            let h2 = moe.forward(&h2, residual, tp_ctx)?;
+            let h2 = moe.forward(&h2, residual)?;
             let h2 = pf_norm2.forward(&h2)?;
-
             Ok((h1 + h2)?)
         } else {
             Ok(hidden_states_mlp)
@@ -1372,48 +1335,36 @@ impl Gemma4DecoderLayer {
         &self,
         xs: &Tensor,
         per_layer_input: Option<&Tensor>,
-        _attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
-        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
         let hidden_states = self.input_layernorm.forward(xs)?;
 
-        // KV-shared layers read from the target layer's cache engine
-        // instead of their own slot. The target was already populated
-        // earlier in the forward pass because layers execute in order.
         let cache_layer_idx = self.kv_sharing_target.unwrap_or(layer_idx);
         let hidden_states = self.self_attn.forward(
             &hidden_states,
-            None,
             seqlen_offset,
             kv_cache_mgr.engine_mut(cache_layer_idx),
             block_table,
             slot_mapping,
-            tp_ctx,
         )?;
 
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
         let hidden_states = (hidden_states + residual)?;
         let residual = &hidden_states;
 
-        // Dense MLP
         let hidden_states_norm = self.pre_feedforward_layernorm.forward(&hidden_states)?;
-        let hidden_states_mlp = self.mlp.forward(&hidden_states_norm, tp_ctx)?;
+        let hidden_states_mlp = self.mlp.forward(&hidden_states_norm)?;
 
-        // FFN: MLP only or MLP + MoE
-        let hidden_states = self.forward_ffn(residual, hidden_states_mlp, tp_ctx)?;
+        let hidden_states = self.forward_ffn(residual, hidden_states_mlp)?;
         let hidden_states = self.post_feedforward_layernorm.forward(&hidden_states)?;
         let hidden_states = (hidden_states + residual)?;
 
-        // PLE gating
         let hidden_states = self.apply_ple(&hidden_states, per_layer_input)?;
-
-        // Layer scalar
         hidden_states.broadcast_mul(&self.layer_scalar)
     }
 
@@ -1424,7 +1375,6 @@ impl Gemma4DecoderLayer {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
-        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
         let hidden_states = self.input_layernorm.forward(xs)?;
@@ -1434,112 +1384,114 @@ impl Gemma4DecoderLayer {
             &hidden_states,
             sequences,
             kv_cache_mgr.engine_mut(cache_layer_idx),
-            tp_ctx,
         )?;
 
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
         let hidden_states = (hidden_states + residual)?;
         let residual = &hidden_states;
 
-        // Dense MLP
         let hidden_states_norm = self.pre_feedforward_layernorm.forward(&hidden_states)?;
-        let hidden_states_mlp = self.mlp.forward(&hidden_states_norm, tp_ctx)?;
+        let hidden_states_mlp = self.mlp.forward(&hidden_states_norm)?;
 
-        // FFN: MLP only or MLP + MoE
-        let hidden_states = self.forward_ffn(residual, hidden_states_mlp, tp_ctx)?;
+        let hidden_states = self.forward_ffn(residual, hidden_states_mlp)?;
         let hidden_states = self.post_feedforward_layernorm.forward(&hidden_states)?;
         let hidden_states = (hidden_states + residual)?;
 
-        // PLE gating
         let hidden_states = self.apply_ple(&hidden_states, per_layer_input)?;
-
-        // Layer scalar
         hidden_states.broadcast_mul(&self.layer_scalar)
     }
 }
 
-// ─── Model ──────────────────────────────────────────────────────────────────
+// ─── Tied Embedding Head ──────────────────────────────────────────────────
+//
+// Copied from gemma3_quantized.rs — lets the lm_head implement the
+// QuantizedLinear trait so the rest of the forward path is agnostic of
+// whether the checkpoint ties word embeddings or stores a dedicated head.
 
-pub struct Gemma4ForCausalLM {
-    embed_tokens: TpEmbedding,
-    // PLE embeddings (optional — when hidden_size_per_layer_input > 0)
-    embed_tokens_per_layer: Option<TpEmbedding>,
-    per_layer_model_projection: Option<TpLinear>,
+struct TiedEmbeddingHead {
+    weight: Tensor,
+}
+
+impl QuantizedLinear for TiedEmbeddingHead {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let w = match x.dims().len() {
+            3 => self.weight.broadcast_left(x.dim(0)?)?,
+            _ => self.weight.clone(),
+        };
+        x.matmul(&w.t()?)
+    }
+
+    fn load_weights(&mut self, _weights: &std::collections::HashMap<String, Tensor>) -> Result<()> {
+        Ok(())
+    }
+
+    fn weight_dtype(&self) -> DType {
+        self.weight.dtype()
+    }
+
+    fn in_features(&self) -> usize {
+        self.weight.dims()[1]
+    }
+
+    fn out_features(&self) -> usize {
+        self.weight.dims()[0]
+    }
+
+    fn has_bias(&self) -> bool {
+        false
+    }
+}
+
+// ─── Quantized Model ──────────────────────────────────────────────────────
+
+/// Quantized Gemma 4 text model.
+///
+/// Supports AWQ, BitsAndBytes, GPTQ, FP8, GGUF, and the pass-through
+/// unquantized loader via the `QuantizedWeightLoader` trait.
+pub struct QuantizedGemma4ForCausalLM {
+    embed_tokens: Embedding,
+    embed_tokens_per_layer: Option<Embedding>,
+    per_layer_model_projection: Option<Box<dyn QuantizedLinear>>,
     per_layer_projection_norm: Option<Gemma4RmsNorm>,
-    layers: Vec<Gemma4DecoderLayer>,
+    layers: Vec<QuantizedGemma4DecoderLayer>,
     norm: Gemma4RmsNorm,
-    lm_head: TpLinear,
+    lm_head: Box<dyn QuantizedLinear>,
     hidden_size: usize,
     num_hidden_layers: usize,
     hidden_size_per_layer_input: usize,
     final_logit_softcap: Option<f64>,
-    tp_ctx: TpContext,
     device: Device,
-    dtype: DType,
 }
 
-impl Gemma4ForCausalLM {
-    pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        Self::new_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
-    }
-
-    pub fn new_with_tp(
+impl QuantizedGemma4ForCausalLM {
+    pub fn new(
         cfg: &ModelConfig,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-        tp_ctx: TpContext,
-    ) -> Result<Self> {
-        // Standalone Gemma 4 text checkpoints store the inner
-        // transformer under a `model.` wrapper, so we descend one level
-        // here. The VLM wrapper (`Gemma4ForConditionalGeneration`) calls
-        // `new_with_tp_at_root` directly with a VarBuilder that's
-        // already positioned at the language-model root and skips the
-        // extra `vb.pp("model")` step.
-        Self::new_with_tp_at_root(cfg, vb.pp("model"), Some(vb), pg, tp_ctx)
-    }
-
-    /// Construct a Gemma 4 text model where `vb_m` already points at
-    /// the inner `model.*` namespace (i.e. `vb_m.pp("embed_tokens")`
-    /// resolves to a real tensor name without an extra `model.` prefix).
-    ///
-    /// `lm_head_root` is an optional VarBuilder positioned at the same
-    /// root as the (untied) `lm_head` weight — typically the parent of
-    /// `vb_m`. When `tie_word_embeddings` is true the parameter is
-    /// ignored. The wrapper VLM passes `None` because Gemma 4 always
-    /// ties embeddings.
-    pub fn new_with_tp_at_root(
-        cfg: &ModelConfig,
-        vb_m: VarBuilder,
-        lm_head_root: Option<VarBuilder>,
-        pg: &dyn ProcessGroup,
-        tp_ctx: TpContext,
+        vb: VarBuilder<'static>,
+        weight_loader: &dyn QuantizedWeightLoader,
     ) -> Result<Self> {
         let extra_cfg = Gemma4ExtraConfig::from_model_config(cfg);
-        let vb = vb_m.clone();
-        let world_size = pg.world_size();
+        let vb_m = vb.pp("model");
 
-        let embed_tokens =
-            TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
-        // PLE components
+        // PLE components: per-layer embedding stays as a regular embedding
+        // table (embeddings are never quantized by AWQ/BnB/GGUF), only the
+        // model-level projection is routed through the quantized loader.
         let (embed_tokens_per_layer, per_layer_model_projection, per_layer_projection_norm) =
             if extra_cfg.hidden_size_per_layer_input > 0 {
                 let total_ple_dim = extra_cfg.hidden_size_per_layer_input * cfg.num_hidden_layers;
 
-                let ple_embed = TpEmbedding::new(
+                let ple_embed = embedding(
                     extra_cfg.vocab_size_per_layer_input,
                     total_ple_dim,
                     vb_m.pp("embed_tokens_per_layer"),
-                    pg,
                 )?;
 
-                let ple_proj = TpLinear::column_parallel(
+                let ple_proj = weight_loader.load_linear(
+                    "model.per_layer_model_projection",
                     cfg.hidden_size,
                     total_ple_dim,
                     false,
-                    true, // gather output for PLE
-                    vb_m.pp("per_layer_model_projection"),
-                    pg,
                 )?;
 
                 let ple_norm = Gemma4RmsNorm::new(
@@ -1555,53 +1507,25 @@ impl Gemma4ForCausalLM {
 
         let cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(Gemma4DecoderLayer::new_with_tp(
+            layers.push(QuantizedGemma4DecoderLayer::new(
                 cfg,
                 &extra_cfg,
                 i,
                 cache_head_dim,
-                vb_l.pp(i),
-                pg,
+                weight_loader,
+                vb.clone(),
             )?);
         }
 
         let norm = Gemma4RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
-        let lm_head = if cfg.tie_word_embeddings {
-            if world_size == 1 {
-                let emb_weights = embed_tokens
-                    .embeddings()
-                    .expect("single GPU should have accessible embeddings")
-                    .clone();
-                TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
-            } else {
-                TpLinear::column_parallel(
-                    cfg.hidden_size,
-                    cfg.vocab_size,
-                    false,
-                    true,
-                    vb_m.pp("embed_tokens"),
-                    pg,
-                )?
-            }
+        let lm_head: Box<dyn QuantizedLinear> = if cfg.tie_word_embeddings {
+            Box::new(TiedEmbeddingHead {
+                weight: embed_tokens.embeddings().clone(),
+            })
         } else {
-            // Untied lm_head sits OUTSIDE the inner model namespace —
-            // for the standalone Gemma 4 checkpoint that's `lm_head.weight`
-            // at the safetensors root. The caller passes the right vb
-            // via `lm_head_root`; if absent (e.g. VLM nested call) we
-            // still try `vb_m.pp("lm_head")` as a defensive fallback so
-            // the constructor doesn't crash for unusual layouts.
-            let head_vb = lm_head_root.as_ref().unwrap_or(&vb_m);
-            TpLinear::column_parallel(
-                cfg.hidden_size,
-                cfg.vocab_size,
-                false,
-                true,
-                head_vb.pp("lm_head"),
-                pg,
-            )?
+            weight_loader.load_linear("lm_head", cfg.hidden_size, cfg.vocab_size, false)?
         };
 
         Ok(Self {
@@ -1616,15 +1540,14 @@ impl Gemma4ForCausalLM {
             num_hidden_layers: cfg.num_hidden_layers,
             hidden_size_per_layer_input: extra_cfg.hidden_size_per_layer_input,
             final_logit_softcap: extra_cfg.final_logit_softcap,
-            tp_ctx,
             device: vb.device().clone(),
-            dtype: vb.dtype(),
         })
     }
 
     /// Compute PLE per-layer inputs from input_ids and hidden_states.
     ///
-    /// Returns tensor of shape [..., num_layers, hidden_size_per_layer_input] or None.
+    /// Returns tensor of shape [..., num_layers, hidden_size_per_layer_input]
+    /// or None when PLE is disabled.
     fn compute_per_layer_inputs(
         &self,
         input_ids: &Tensor,
@@ -1643,19 +1566,16 @@ impl Gemma4ForCausalLM {
         let num_layers = self.num_hidden_layers;
         let embed_scale = (ple_dim as f64).sqrt();
         let proj_scale = (self.hidden_size as f64).powf(-0.5);
-        let input_scale = (2.0_f64).powf(-0.5); // 1/sqrt(2)
+        let input_scale = (2.0_f64).powf(-0.5);
 
-        // Per-layer embeddings: [T, total_ple_dim]
-        let ple_embed = (embed_pl.forward(input_ids, &self.tp_ctx)? * embed_scale)?;
-        let shape = input_ids.dims();
-        let batch_seq: Vec<usize> = shape.to_vec();
-        let mut new_shape = batch_seq;
+        let ple_embed = (embed_pl.forward(input_ids)? * embed_scale)?;
+        let id_shape = input_ids.dims();
+        let mut new_shape: Vec<usize> = id_shape.to_vec();
         new_shape.push(num_layers);
         new_shape.push(ple_dim);
         let ple_embed = ple_embed.reshape(&new_shape[..])?;
 
-        // Projection from hidden_states: [T, total_ple_dim]
-        let ple_proj = (proj.forward(hidden_states, &self.tp_ctx)? * proj_scale)?;
+        let ple_proj = (proj.forward(hidden_states)? * proj_scale)?;
         let proj_shape = {
             let hs = hidden_states.dims();
             let mut s: Vec<usize> = hs[..hs.len() - 1].to_vec();
@@ -1665,7 +1585,6 @@ impl Gemma4ForCausalLM {
         };
         let ple_proj = ple_proj.reshape(&proj_shape[..])?;
 
-        // Normalize each per-layer slice of the projection
         let ndim = ple_proj.dims().len();
         let layer_dim = ndim - 2;
         let mut normed_slices = Vec::with_capacity(num_layers);
@@ -1676,12 +1595,10 @@ impl Gemma4ForCausalLM {
         }
         let ple_proj_normed = Tensor::cat(&normed_slices, layer_dim)?;
 
-        // Combine: (projection + embedding) * 1/sqrt(2)
         let per_layer_inputs = ((ple_proj_normed + ple_embed)? * input_scale)?;
         Ok(Some(per_layer_inputs))
     }
 
-    /// Extract per-layer input for a specific layer from the combined tensor.
     fn extract_per_layer_input(
         per_layer_inputs: &Option<Tensor>,
         layer_idx: usize,
@@ -1705,43 +1622,27 @@ impl Gemma4ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (_b_size, seq_len) = input_ids.dims2()?;
         let normalizer = (self.hidden_size as f64).sqrt();
-        let xs = (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
+        let xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
 
-        // Compute PLE per-layer inputs
         let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
-
-        let attention_mask = if seq_len <= 1 {
-            None
-        } else {
-            Some(crate::layers::causal_mask(
-                seq_len,
-                seqlen_offset,
-                self.dtype,
-                &self.device,
-            )?)
-        };
 
         let mut xs = xs;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
-
             xs = layer.forward(
                 &xs,
                 pli.as_ref(),
-                attention_mask.as_ref(),
                 seqlen_offset,
                 kv_cache_mgr,
                 layer_idx,
                 block_table,
                 slot_mapping,
-                &self.tp_ctx,
             )?;
         }
 
         let xs = self.norm.forward(&xs)?;
-        let mut logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
+        let mut logits = self.lm_head.forward(&xs)?;
 
         if let Some(cap) = self.final_logit_softcap {
             logits = soft_cap(&logits, cap)?;
@@ -1751,13 +1652,13 @@ impl Gemma4ForCausalLM {
     }
 
     /// Embed text tokens (for VLM use — embed only, no layers).
-    /// Applies Gemma4's sqrt(hidden_size) normalization.
+    /// Applies Gemma 4's sqrt(hidden_size) normalisation.
     pub(crate) fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
         let normalizer = (self.hidden_size as f64).sqrt();
-        self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer
+        self.embed_tokens.forward(input_ids)? * normalizer
     }
 
-    /// Forward with pre-computed embeddings (for VLM use — skips embedding layer).
+    /// Forward with pre-computed embeddings (for VLM use — skips embedding).
     pub(crate) fn forward_with_embeddings(
         &self,
         embeddings: &Tensor,
@@ -1766,19 +1667,8 @@ impl Gemma4ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let seq_len = embeddings.dim(1)?;
-        let attention_mask = if seq_len <= 1 {
-            None
-        } else {
-            Some(crate::layers::causal_mask(
-                seq_len,
-                seqlen_offset,
-                self.dtype,
-                &self.device,
-            )?)
-        };
-
-        // PLE: use a dummy input_ids of zeros for the per-layer embedding lookup
+        // PLE uses a dummy input_ids of zeros because the original token ids
+        // aren't available after multimodal token replacement.
         let dummy_shape: Vec<usize> = embeddings.dims()[..embeddings.dims().len() - 1].to_vec();
         let dummy_ids = Tensor::zeros(&dummy_shape[..], DType::U32, &self.device)?;
         let per_layer_inputs = self.compute_per_layer_inputs(&dummy_ids, embeddings)?;
@@ -1786,29 +1676,25 @@ impl Gemma4ForCausalLM {
         let mut xs = embeddings.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
-
             xs = layer.forward(
                 &xs,
                 pli.as_ref(),
-                attention_mask.as_ref(),
                 seqlen_offset,
                 kv_cache_mgr,
                 layer_idx,
                 block_table,
                 slot_mapping,
-                &self.tp_ctx,
             )?;
         }
 
         let xs = self.norm.forward(&xs)?;
-        let mut logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
+        let mut logits = self.lm_head.forward(&xs)?;
         if let Some(cap) = self.final_logit_softcap {
             logits = soft_cap(&logits, cap)?;
         }
         Ok(logits)
     }
 
-    /// Forward decode batch with pre-computed embeddings (for VLM use).
     pub(crate) fn forward_decode_batch_with_embeddings(
         &self,
         embeddings: &Tensor,
@@ -1822,19 +1708,17 @@ impl Gemma4ForCausalLM {
         let mut xs = embeddings.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
-
             xs = layer.forward_decode_batch(
                 &xs,
                 pli.as_ref(),
                 sequences,
                 kv_cache_mgr,
                 layer_idx,
-                &self.tp_ctx,
             )?;
         }
 
         let xs = self.norm.forward(&xs)?;
-        let mut logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
+        let mut logits = self.lm_head.forward(&xs)?;
         if let Some(cap) = self.final_logit_softcap {
             logits = soft_cap(&logits, cap)?;
         }
@@ -1844,13 +1728,9 @@ impl Gemma4ForCausalLM {
     pub fn device(&self) -> &Device {
         &self.device
     }
-
-    pub fn tp_context(&self) -> &TpContext {
-        &self.tp_ctx
-    }
 }
 
-impl crate::engine::ModelForward for Gemma4ForCausalLM {
+impl crate::engine::ModelForward for QuantizedGemma4ForCausalLM {
     fn forward(
         &self,
         input_ids: &Tensor,
@@ -1859,7 +1739,7 @@ impl crate::engine::ModelForward for Gemma4ForCausalLM {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        Gemma4ForCausalLM::forward(
+        QuantizedGemma4ForCausalLM::forward(
             self,
             input_ids,
             seqlen_offset,
@@ -1876,26 +1756,24 @@ impl crate::engine::ModelForward for Gemma4ForCausalLM {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let normalizer = (self.hidden_size as f64).sqrt();
-        let xs = (self.embed_tokens.forward(input_ids, &self.tp_ctx)? * normalizer)?;
+        let xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
 
         let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
 
         let mut xs = xs;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
-
             xs = layer.forward_decode_batch(
                 &xs,
                 pli.as_ref(),
                 sequences,
                 kv_cache_mgr,
                 layer_idx,
-                &self.tp_ctx,
             )?;
         }
 
         let xs = self.norm.forward(&xs)?;
-        let mut logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
+        let mut logits = self.lm_head.forward(&xs)?;
 
         if let Some(cap) = self.final_logit_softcap {
             logits = soft_cap(&logits, cap)?;
@@ -1913,6 +1791,7 @@ impl crate::engine::ModelForward for Gemma4ForCausalLM {
 mod tests {
     use super::*;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
+    use crate::quantization::{create_weight_loader_with_params, DetectedQuantConfig};
 
     fn test_config() -> ModelConfig {
         test_config_with_moe(false)
@@ -1974,74 +1853,57 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_config() {
-        let cfg = test_config();
-        let extra_cfg = Gemma4ExtraConfig::from_model_config(&cfg);
-
-        assert_eq!(extra_cfg.hidden_size_per_layer_input, 16);
-        assert_eq!(extra_cfg.final_logit_softcap, Some(30.0));
-        assert!(!extra_cfg.enable_moe_block);
-        assert_eq!(extra_cfg.sliding_window_pattern, 2);
-
-        assert!(extra_cfg.is_sliding_layer(0));
-        assert!(!extra_cfg.is_sliding_layer(1));
-        assert!(extra_cfg.is_sliding_layer(2));
-        assert!(!extra_cfg.is_sliding_layer(3));
-    }
-
-    #[test]
-    fn test_gemma4_config_moe() {
+    fn test_gemma4_extra_config_parsing() {
         let cfg = test_config_with_moe(true);
-        let extra_cfg = Gemma4ExtraConfig::from_model_config(&cfg);
+        let extra = Gemma4ExtraConfig::from_model_config(&cfg);
 
-        assert!(extra_cfg.enable_moe_block);
-        assert_eq!(extra_cfg.num_experts, 4);
-        assert_eq!(extra_cfg.top_k_experts, 2);
-        assert_eq!(extra_cfg.moe_intermediate_size, 32);
+        assert_eq!(extra.hidden_size_per_layer_input, 16);
+        assert_eq!(extra.final_logit_softcap, Some(30.0));
+        assert!(extra.enable_moe_block);
+        assert_eq!(extra.num_experts, 4);
+        assert_eq!(extra.top_k_experts, 2);
+        assert_eq!(extra.moe_intermediate_size, 32);
+        assert_eq!(extra.sliding_window_pattern, 2);
+
+        assert!(extra.is_sliding_layer(0));
+        assert!(!extra.is_sliding_layer(1));
+        assert!(extra.is_sliding_layer(2));
+        assert!(!extra.is_sliding_layer(3));
     }
 
     #[test]
-    fn test_gemma4_construction() {
+    fn test_quantized_gemma4_construction() {
         let cfg = test_config();
         let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let vb = VarBuilder::zeros(DType::F32, &device);
 
-        let model = Gemma4ForCausalLM::new(&cfg, vb);
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+
+        let model = QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref());
         assert!(
             model.is_ok(),
-            "Gemma4ForCausalLM should construct: {:?}",
+            "QuantizedGemma4ForCausalLM should construct with unquantized loader: {:?}",
             model.err()
         );
 
-        let model = model.unwrap();
+        let model = model.expect("construction succeeded");
         assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+        assert!(model.final_logit_softcap.is_some());
         assert!(model.embed_tokens_per_layer.is_some());
         assert!(model.per_layer_model_projection.is_some());
     }
 
     #[test]
-    fn test_gemma4_construction_with_moe() {
-        let cfg = test_config_with_moe(true);
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-
-        let model = Gemma4ForCausalLM::new(&cfg, vb);
-        assert!(
-            model.is_ok(),
-            "Gemma4ForCausalLM with MoE should construct: {:?}",
-            model.err()
-        );
-
-        let model = model.unwrap();
-        assert!(model.layers[0].moe.is_some());
-    }
-
-    #[test]
-    fn test_gemma4_forward_shape() {
+    fn test_quantized_gemma4_forward_shape() {
         let cfg = test_config();
         let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let model = Gemma4ForCausalLM::new(&cfg, vb).expect("build model");
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model =
+            QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build model");
 
         let cache_config = create_cache_config(&cfg, &device);
         let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
@@ -2074,21 +1936,66 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_single_token() {
-        let cfg = test_config();
+    fn test_quantized_gemma4_moe_forward() {
+        let cfg = test_config_with_moe(true);
         let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let model = Gemma4ForCausalLM::new(&cfg, vb).expect("build model");
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model =
+            QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build MoE model");
+
+        assert!(model.layers[0].moe.is_some());
 
         let cache_config = create_cache_config(&cfg, &device);
         let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
         let mut block_table = BlockTable::new(cache_config.block_size);
 
-        let input_ids = Tensor::zeros((1, 1), DType::U32, &device).expect("input");
+        let seq_len = 3;
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).expect("input");
         kv_cache_mgr
-            .allocate_for_request(&mut block_table, 1)
+            .allocate_for_request(&mut block_table, seq_len)
             .expect("allocate");
-        let slot_mapping = block_table.slot_mapping(0, 1);
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("MoE forward");
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn test_quantized_gemma4_ple_pipeline() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model =
+            QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build model");
+
+        // PLE must be enabled and carry through a forward pass.
+        assert_eq!(
+            model.hidden_size_per_layer_input, 16,
+            "PLE should be configured"
+        );
+
+        let cache_config = create_cache_config(&cfg, &device);
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let input_ids = Tensor::zeros((1, 4), DType::U32, &device).expect("input");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 4)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, 4);
 
         let logits = model
             .forward(
@@ -2099,21 +2006,23 @@ mod tests {
                 &slot_mapping,
             )
             .expect("forward");
-        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
     }
 
     #[test]
-    fn test_gemma4_prefill_then_decode() {
+    fn test_quantized_gemma4_prefill_then_decode() {
         let cfg = test_config();
         let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let model = Gemma4ForCausalLM::new(&cfg, vb).expect("build model");
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model =
+            QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build model");
 
         let cache_config = create_cache_config(&cfg, &device);
         let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
         let mut block_table = BlockTable::new(cache_config.block_size);
 
-        // Prefill
         let prompt = Tensor::zeros((1, 3), DType::U32, &device).expect("prompt");
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 3)
@@ -2126,7 +2035,6 @@ mod tests {
         assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
         block_table.advance(3);
 
-        // Decode
         kv_cache_mgr
             .allocate_for_request(&mut block_table, 1)
             .expect("allocate decode");
@@ -2146,23 +2054,159 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_forward_with_moe() {
-        let cfg = test_config_with_moe(true);
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let model = Gemma4ForCausalLM::new(&cfg, vb).expect("build model");
+    #[ignore = "requires HF download + CUDA GPU; set HF_TOKEN in env"]
+    fn load_gemma4_e2b_real_config_smoke_on_gpu() {
+        // End-to-end smoke test against the real `google/gemma-4-E2B-it`
+        // config, exercising every Gemma 4 specific code path:
+        //
+        // - `loader::fetch_model_config_only` → flattens nested
+        //   `text_config` / `rope_parameters` into a flat ModelConfig.
+        // - `Gemma4ExtraConfig` → parses per-layer-type RoPE parameters,
+        //   PLE dims, KV-sharing config, layer_types array, etc.
+        // - Full 35-layer model construction with the REAL attention
+        //   shape: hidden_size=1536, num_heads=8, num_kv_heads=1 (MQA),
+        //   head_dim=256 (sliding) vs 512 (full), use_double_wide_mlp,
+        //   num_kv_shared_layers=20, proportional RoPE for full
+        //   attention layers, standard RoPE for sliding layers.
+        // - KV cache padding from per-layer `head_dim` to the shared
+        //   `cache_head_dim = max(256, 512) = 512`, with read-side slice
+        //   back to the layer's real head_dim.
+        // - KV sharing: layers 15..35 reuse layers 10..14's engines.
+        // - PLE pipeline end-to-end.
+        // - Corrected Gemma4RmsNorm (no +1 offset).
+        //
+        // Memory budget: the real E2B at BF16 would weigh ~9 GB which is
+        // over a laptop 8 GB GPU. We shrink the three dimensions that do
+        // not affect Gemma 4 specific logic — `intermediate_size`,
+        // `vocab_size` and `vocab_size_per_layer_input` — to fit under
+        // ~2 GB. All 35 layers with their mixed sliding/full attention,
+        // KV sharing pattern and proportional RoPE are preserved.
+        //
+        // Run with:
+        //   HF_TOKEN=hf_... cargo test -p vllm-core --lib --features cuda \
+        //     gemma4_quantized::tests::load_gemma4_e2b_real_config_smoke_on_gpu \
+        //     -- --ignored --nocapture
+        use crate::quantization::{create_weight_loader_with_params, DetectedQuantConfig};
 
-        let cache_config = create_cache_config(&cfg, &device);
+        let device = match Device::cuda_if_available(0) {
+            Ok(d) if d.is_cuda() => d,
+            Ok(_) => {
+                eprintln!("SKIP: no CUDA device available");
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP: CUDA init failed: {e}");
+                return;
+            }
+        };
+
+        // Fetch the real HF config through the production code path so
+        // we exercise `flatten_hf_model_config` + `fetch_model_config_only`.
+        let mut cfg = crate::loader::fetch_model_config_only("google/gemma-4-E2B-it", "main")
+            .expect("fetch config.json via flattener (check HF_TOKEN + gated-repo access)");
+
+        // Override the VLM arch to the text-only CausalLM path for a
+        // focused language-model forward. The rest of the config stays
+        // exactly as HF ships it.
+        cfg.architectures = vec!["Gemma4ForCausalLM".to_string()];
+
+        // Shrink the dimensions that don't affect Gemma 4 specific math
+        // but dominate memory — keeps the test under 8 GB VRAM.
+        let original_hidden = cfg.hidden_size;
+        let original_layers = cfg.num_hidden_layers;
+        let original_head_dim = cfg.head_dim;
+        cfg.intermediate_size = 512; // from 6144
+        cfg.vocab_size = 1024; // from 262144
+        cfg.max_position_embeddings = 4096; // from 131072 — keeps RoPE precompute bounded
+        cfg.extra.insert(
+            "vocab_size_per_layer_input".to_string(),
+            serde_json::json!(512u64),
+        );
+
+        // Sanity-check that the real structural fields landed.
+        assert_eq!(original_hidden, 1536, "expected E2B hidden_size=1536");
+        assert_eq!(original_layers, 35, "expected E2B num_hidden_layers=35");
+        assert_eq!(original_head_dim, 256, "expected E2B head_dim=256");
+
+        let extra_cfg = Gemma4ExtraConfig::from_model_config(&cfg);
+        assert_eq!(extra_cfg.global_head_dim, Some(512));
+        assert_eq!(extra_cfg.num_kv_shared_layers, 20);
+        assert!(extra_cfg.use_double_wide_mlp);
+        assert_eq!(extra_cfg.partial_rotary_factor_full, 0.25);
+        assert_eq!(extra_cfg.rope_type_full, "proportional");
+        assert!((extra_cfg.rope_theta_full - 1_000_000.0).abs() < 1.0);
+        assert!((extra_cfg.rope_theta_local - 10_000.0).abs() < 1.0);
+        assert_eq!(extra_cfg.hidden_size_per_layer_input, 256);
+        // KV sharing: layer 0 is not shared, layer 34 is shared.
+        assert!(extra_cfg
+            .kv_sharing_target_layer(0, cfg.num_hidden_layers)
+            .is_none());
+        assert!(extra_cfg
+            .kv_sharing_target_layer(34, cfg.num_hidden_layers)
+            .is_some());
+
+        let num_sliding = extra_cfg
+            .layer_types
+            .iter()
+            .filter(|t| t.as_str() == "sliding_attention")
+            .count();
+        let num_full = extra_cfg
+            .layer_types
+            .iter()
+            .filter(|t| t.as_str() == "full_attention")
+            .count();
+        eprintln!(
+            "real config: hidden={} layers={} sliding={} full={} head_dim={} \
+             global_head_dim={:?} vocab={}→1024 inter_size={}→512 \
+             rope_full=proportional@1e6 partial=0.25 kv_shared_last={}",
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            num_sliding,
+            num_full,
+            cfg.head_dim,
+            extra_cfg.global_head_dim,
+            262144,
+            6144,
+            extra_cfg.num_kv_shared_layers
+        );
+
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let loader = create_weight_loader_with_params(vb.clone(), &DetectedQuantConfig::default());
+
+        let model = QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref())
+            .expect("build QuantizedGemma4ForCausalLM from real (reduced) Gemma 4 E2B config");
+
+        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+        assert!(
+            model.embed_tokens_per_layer.is_some(),
+            "PLE must be enabled"
+        );
+
+        // KV cache allocated at the shared `cache_head_dim`
+        // (max head_dim across layers = 512). Each layer's forward pads
+        // K/V to this width and slices back after the read.
+        let cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
+        assert_eq!(cache_head_dim, 512);
+
+        let cache_config = crate::kv_cache::config::CacheConfig {
+            block_size: 16,
+            num_blocks: 8,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cache_head_dim,
+            dtype: DType::BF16,
+            device: device.clone(),
+            kv_cache_dtype: crate::kv_cache::KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
         let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
         let mut block_table = BlockTable::new(cache_config.block_size);
 
-        let batch_size = 1;
-        let seq_len = 3;
-        let input_ids = Tensor::zeros((batch_size, seq_len), DType::U32, &device).expect("input");
-
+        let seq_len = 8;
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).expect("input_ids zeros");
         kv_cache_mgr
             .allocate_for_request(&mut block_table, seq_len)
-            .expect("allocate");
+            .expect("allocate prefill blocks");
         let slot_mapping = block_table.slot_mapping(0, seq_len);
 
         let logits = model
@@ -2173,48 +2217,56 @@ mod tests {
                 &block_table,
                 &slot_mapping,
             )
-            .expect("forward with MoE");
+            .expect("forward through all 35 real Gemma 4 layers");
 
-        assert_eq!(logits.dims(), &[batch_size, seq_len, cfg.vocab_size],);
-    }
-
-    #[test]
-    fn test_gemma4_device() {
-        let cfg = test_config();
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let model = Gemma4ForCausalLM::new(&cfg, vb).expect("build model");
-
-        assert!(matches!(model.device(), Device::Cpu));
-    }
-
-    #[test]
-    fn test_gemma4_router() {
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let router = Gemma4Router::new(64, 4, 1e-6, vb.pp("router")).expect("router");
-
-        let xs = Tensor::randn(0.0f32, 1.0, (2, 64), &device).expect("input");
-        let logits = router.forward(&xs).expect("forward");
-        assert_eq!(logits.dims(), &[2, 4]);
-    }
-
-    #[test]
-    fn test_gemma4_tp_construction() {
-        let cfg = test_config();
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let pg = crate::distributed::LocalProcessGroup::new();
-        let tp_ctx = TpContext::single_gpu();
-
-        let model = Gemma4ForCausalLM::new_with_tp(&cfg, vb, &pg, tp_ctx);
-        assert!(
-            model.is_ok(),
-            "Gemma4ForCausalLM should construct with TP: {:?}",
-            model.err()
+        assert_eq!(
+            logits.dims(),
+            &[1, seq_len, cfg.vocab_size],
+            "logits shape must be [batch, seq_len, vocab_size]"
         );
 
-        let model = model.unwrap();
-        assert_eq!(model.layers.len(), cfg.num_hidden_layers);
+        // A follow-up single-token decode pass exercises the decode
+        // code path (narrower sequence, KV cache read at longer kv_len).
+        block_table.advance(seq_len);
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, 1)
+            .expect("allocate decode block");
+        let decode_slot = block_table.slot_mapping(seq_len, 1);
+        let next_token = Tensor::zeros((1, 1), DType::U32, &device).expect("decode input");
+        let decode_logits = model
+            .forward(
+                &next_token,
+                seq_len,
+                &mut kv_cache_mgr,
+                &block_table,
+                &decode_slot,
+            )
+            .expect("decode forward");
+        assert_eq!(decode_logits.dims(), &[1, 1, cfg.vocab_size]);
+
+        // Surface final VRAM usage so the GPU-fit check is visible.
+        if let Ok(out) = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            eprintln!(
+                "nvidia-smi after full 35-layer forward: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+
+        eprintln!(
+            "OK: {} layers ({}s sliding / {}f full), KV sharing active for last {}, \
+             proportional RoPE on full layers, produced prefill {:?} and decode {:?}",
+            cfg.num_hidden_layers,
+            num_sliding,
+            num_full,
+            extra_cfg.num_kv_shared_layers,
+            logits.dims(),
+            decode_logits.dims(),
+        );
     }
 }

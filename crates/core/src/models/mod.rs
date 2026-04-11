@@ -70,7 +70,9 @@ pub mod gemma3_vlm;
 pub mod gemma3n;
 pub mod gemma3n_vlm;
 pub mod gemma4;
+pub mod gemma4_quantized;
 pub mod gemma4_vlm;
+pub mod gemma4_vlm_quantized;
 pub mod gemma_lora;
 pub mod gemma_quantized;
 pub mod glm;
@@ -323,7 +325,9 @@ pub use gemma3_vlm::Gemma3ForConditionalGeneration;
 pub use gemma3n::Gemma3nForCausalLM;
 pub use gemma3n_vlm::Gemma3nForConditionalGeneration;
 pub use gemma4::Gemma4ForCausalLM;
+pub use gemma4_quantized::QuantizedGemma4ForCausalLM;
 pub use gemma4_vlm::Gemma4ForConditionalGeneration;
+pub use gemma4_vlm_quantized::QuantizedGemma4ForConditionalGeneration;
 pub use gemma_lora::GemmaWithLora;
 pub use gemma_quantized::QuantizedGemmaForCausalLM;
 pub use glm::GlmForCausalLM;
@@ -1146,6 +1150,14 @@ pub fn from_config_with_quant(
             vb,
             weight_loader.as_ref(),
         )?)),
+        "Gemma4ForCausalLM" | "Gemma4TextModel" => Ok(Box::new(QuantizedGemma4ForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader.as_ref(),
+        )?)),
+        "Gemma4ForConditionalGeneration" => Ok(Box::new(
+            QuantizedGemma4ForConditionalGeneration::new(cfg, vb, weight_loader.as_ref())?,
+        )),
         "MixtralForCausalLM" => Ok(Box::new(QuantizedMixtralForCausalLM::new(
             cfg,
             vb,

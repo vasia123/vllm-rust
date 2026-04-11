@@ -7,7 +7,21 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::VarBuilder;
+use candle_nn::{Init, VarBuilder};
+
+/// Request a tensor from a VarBuilder with an explicit storage dtype,
+/// bypassing the VarBuilder's default activation dtype. Used for loading
+/// packed integer tensors (GPTQ qweight, AWQ qweight/qzeros, etc.) that
+/// must keep their raw bit pattern even when the model's activation
+/// dtype is F16/BF16/F32.
+fn vb_get_as<S: Into<candle_core::Shape>>(
+    vb: &VarBuilder<'static>,
+    shape: S,
+    name: &str,
+    dtype: DType,
+) -> Result<Tensor> {
+    vb.get_with_hints_dtype(shape, name, Init::Const(0.0), dtype)
+}
 
 use super::awq::{AwqConfig, AwqLinear};
 use super::awq_marlin::{repack_awq_nibbles, AwqMarlinConfig};
@@ -394,9 +408,28 @@ impl QuantizedWeightLoader for AwqWeightLoader {
         out_features: usize,
         bias: bool,
     ) -> Result<Box<dyn QuantizedLinear>> {
+        // Respect `modules_to_not_convert` — HF AWQ checkpoints leave
+        // certain layers (`lm_head` by default) in plain fp16/bf16
+        // instead of packing them. Fall back to the unquantized loader
+        // for those paths.
+        if self.config.is_layer_skipped(prefix) {
+            let vb = self.vb.pp(prefix);
+            let weight = vb.get((out_features, in_features), "weight")?;
+            let bias_tensor = if bias {
+                Some(vb.get(out_features, "bias")?)
+            } else {
+                None
+            };
+            return Ok(Box::new(LoadedUnquantizedLinear {
+                weight,
+                bias: bias_tensor,
+                in_features,
+                out_features,
+            }));
+        }
+
         let vb = self.vb.pp(prefix);
 
-        // Create AWQ linear layer
         let mut linear = AwqLinear::new(
             in_features,
             out_features,
@@ -406,9 +439,14 @@ impl QuantizedWeightLoader for AwqWeightLoader {
             &self.device,
         )?;
 
-        // Calculate packed dimensions for AWQ (same as GPTQ)
+        // HuggingFace AWQ gemm format (this is the ONLY native layout vLLM
+        // publishes for AWQ checkpoints): qweight is packed along the
+        // output axis, shape `[in_features, out_features / pack_factor]`,
+        // stored as I32. The old code expected the GPTQ-style
+        // `[in_features / pack_factor, out_features]` which silently
+        // mismatched and left the layer with unquantized zeros.
         let pack_factor = 32 / self.config.bits as usize;
-        let packed_in = in_features.div_ceil(pack_factor);
+        let packed_out = out_features.div_ceil(pack_factor);
         let num_groups = if self.config.group_size <= 0 {
             1
         } else {
@@ -417,23 +455,37 @@ impl QuantizedWeightLoader for AwqWeightLoader {
 
         let mut weights = HashMap::new();
 
-        // Load qweight
-        if let Ok(qweight) = vb.get((packed_in, out_features), "qweight") {
-            weights.insert("qweight".to_string(), qweight);
-        }
+        // `vb_get_as` overrides the VarBuilder's default activation
+        // dtype so qweight/qzeros arrive as U32 (the raw packed bits)
+        // instead of being numerically cast to the activation dtype.
+        // Scales stay at F16 which is the HuggingFace-native dtype.
+        let qweight =
+            vb_get_as(&vb, (in_features, packed_out), "qweight", DType::U32).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "AWQ qweight load failed for {prefix} with expected shape \
+                     [{in_features}, {packed_out}]: {e}"
+                ))
+            })?;
+        weights.insert("qweight".to_string(), qweight);
 
-        // Load scales
-        if let Ok(scales) = vb.get((num_groups, out_features), "scales") {
-            weights.insert("scales".to_string(), scales);
-        }
+        let scales =
+            vb_get_as(&vb, (num_groups, out_features), "scales", DType::F16).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "AWQ scales load failed for {prefix} with expected shape \
+                     [{num_groups}, {out_features}]: {e}"
+                ))
+            })?;
+        weights.insert("scales".to_string(), scales);
 
-        // Load qzeros - packed format
-        let packed_out = out_features.div_ceil(pack_factor);
-        if let Ok(qzeros) = vb.get((num_groups, packed_out), "qzeros") {
-            weights.insert("qzeros".to_string(), qzeros);
-        }
+        let qzeros =
+            vb_get_as(&vb, (num_groups, packed_out), "qzeros", DType::U32).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "AWQ qzeros load failed for {prefix} with expected shape \
+                     [{num_groups}, {packed_out}]: {e}"
+                ))
+            })?;
+        weights.insert("qzeros".to_string(), qzeros);
 
-        // Optional bias
         if bias {
             if let Ok(b) = vb.get(out_features, "bias") {
                 weights.insert("bias".to_string(), b);
@@ -1270,7 +1322,22 @@ pub fn create_weight_loader_from_config(
             let gptq_config = GptqConfig::from_detected(None, None, None, &HashMap::new());
             Box::new(GptqWeightLoader::new(vb, gptq_config))
         }
-        _ => Box::new(UnquantizedWeightLoader::new(vb)),
+        // Standalone Marlin — same layout as GPTQ, the Marlin kernel path
+        // in `GptqLinear` engages automatically on supported hardware.
+        QuantizationMethod::Marlin => {
+            let gptq_config = GptqConfig::from_detected(None, None, None, &HashMap::new());
+            Box::new(GptqWeightLoader::new(vb, gptq_config))
+        }
+        other => {
+            if !matches!(other, QuantizationMethod::None) {
+                tracing::warn!(
+                    method = %other,
+                    "no production weight loader for quantization method; falling back to unquantized — \
+                     weights will NOT be dequantized"
+                );
+            }
+            Box::new(UnquantizedWeightLoader::new(vb))
+        }
     }
 }
 
@@ -1351,7 +1418,51 @@ pub fn create_weight_loader_with_params(
             );
             Box::new(Fp8WeightLoader::new(vb, fp8_config))
         }
-        _ => Box::new(UnquantizedWeightLoader::new(vb)),
+        // CPU AWQ shares the packed-INT4 layout with standard AWQ.
+        QuantizationMethod::CpuWna16 => {
+            let awq_config =
+                AwqConfig::from_detected(detected.bits, detected.group_size, &detected.raw_config);
+            Box::new(AwqWeightLoader::new(vb, awq_config))
+        }
+        // INC (Intel Neural Compressor) defaults to GPTQ packing format.
+        // The `packing_format` field lives in `detected.raw_config`; we
+        // route through GPTQ which covers the common case and lets
+        // Marlin engage for INT4 weights automatically.
+        QuantizationMethod::Inc => {
+            let gptq_config = GptqConfig::from_detected(
+                detected.bits,
+                detected.group_size,
+                detected.desc_act,
+                &detected.raw_config,
+            );
+            Box::new(GptqWeightLoader::new(vb, gptq_config))
+        }
+        // Standalone Marlin checkpoints (`gptq_marlin` in config.json) use
+        // the GPTQ layout with Marlin upgrade. Route through GPTQ so the
+        // Marlin kernel path kicks in when the hardware supports it.
+        QuantizationMethod::Marlin => {
+            let gptq_config = GptqConfig::from_detected(
+                detected.bits,
+                detected.group_size,
+                detected.desc_act,
+                &detected.raw_config,
+            );
+            Box::new(GptqWeightLoader::new(vb, gptq_config))
+        }
+        other => {
+            // Anything else (Gguf / Torchao / Quark / FpQuant / ModelOptFull
+            // / SqueezeLlm / None) silently returns an unquantized loader.
+            // Log a loud warning for non-`None` fall-through so users notice
+            // their quant is being downgraded to zero-weight unquantized.
+            if !matches!(other, QuantizationMethod::None) {
+                tracing::warn!(
+                    method = %other,
+                    "no production weight loader for quantization method; falling back to unquantized — \
+                     weights will NOT be dequantized. Add an explicit dispatch arm or pick a supported method."
+                );
+            }
+            Box::new(UnquantizedWeightLoader::new(vb))
+        }
     }
 }
 
@@ -1400,6 +1511,60 @@ mod tests {
         let vb = VarBuilder::zeros(DType::F32, &device);
         let detected = DetectedQuantConfig {
             method: QuantizationMethod::Gptq,
+            bits: Some(4),
+            group_size: Some(128),
+            desc_act: Some(false),
+            activation_scheme: None,
+            raw_config: HashMap::new(),
+        };
+        let loader = create_weight_loader_with_params(vb, &detected);
+        assert_eq!(loader.method(), QuantizationMethod::Gptq);
+    }
+
+    #[test]
+    fn test_create_weight_loader_cpu_wna16_routes_to_awq() {
+        // Drift-fix regression: `create_weight_loader_with_params` used
+        // to silently fall through to unquantized on CpuWna16 even though
+        // `from_config` routed it correctly.
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::CpuWna16,
+            bits: Some(4),
+            group_size: Some(128),
+            desc_act: None,
+            activation_scheme: None,
+            raw_config: HashMap::new(),
+        };
+        let loader = create_weight_loader_with_params(vb, &detected);
+        assert_eq!(loader.method(), QuantizationMethod::Awq);
+    }
+
+    #[test]
+    fn test_create_weight_loader_inc_routes_to_gptq() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::Inc,
+            bits: Some(4),
+            group_size: Some(128),
+            desc_act: Some(false),
+            activation_scheme: None,
+            raw_config: HashMap::new(),
+        };
+        let loader = create_weight_loader_with_params(vb, &detected);
+        assert_eq!(loader.method(), QuantizationMethod::Gptq);
+    }
+
+    #[test]
+    fn test_create_weight_loader_marlin_routes_to_gptq() {
+        // Standalone Marlin (`gptq_marlin` in config.json) uses the GPTQ
+        // layout — routing through GPTQ lets the Marlin kernel engage
+        // automatically on supported hardware.
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let detected = DetectedQuantConfig {
+            method: QuantizationMethod::Marlin,
             bits: Some(4),
             group_size: Some(128),
             desc_act: Some(false),

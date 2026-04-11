@@ -18,8 +18,153 @@ use super::marlin::{
     check_marlin_supports_shape, MarlinConfig, MarlinLinear, MARLIN_SUPPORTED_GROUP_SIZES,
 };
 
-#[cfg(feature = "cuda-kernels")]
-use super::gptq_cuda;
+/// AWQ-gemm nibble interleaving within a u32 word.
+///
+/// In HuggingFace AWQ gemm checkpoints, the 8 int4 values stored in
+/// a single u32 encode the 8 adjacent **output** dimensions at the nibble
+/// positions given by this table: output `i` of the block lives at nibble
+/// `AWQ_UNDO_PACK[i]`, so
+///   output 0 ← bits 0..3,
+///   output 1 ← bits 16..19,
+///   output 2 ← bits 4..7,
+///   output 3 ← bits 20..23,
+///   output 4 ← bits 8..11,
+///   output 5 ← bits 24..27,
+///   output 6 ← bits 12..15,
+///   output 7 ← bits 28..31.
+///
+/// This matches `undo_pack = [0, 4, 1, 5, 2, 6, 3, 7]` used by vLLM's
+/// `awq_marlin_repack` kernel and by our own `repack_awq_nibbles`
+/// helper in `awq_marlin.rs`.
+const AWQ_UNDO_PACK: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+
+/// Dequantize AWQ-gemm weights into a dense `[in_features, out_features]`
+/// F16 tensor on the qweight's device.
+///
+/// Input shapes (matching HuggingFace AWQ gemm format):
+/// - `qweight`: `[in_features, out_features / 8]`, I32 or U32 (packed)
+/// - `qzeros`:  `[num_groups, out_features / 8]`, I32 or U32 (packed)
+/// - `scales`:  `[num_groups, out_features]`, F16 / F32 / BF16
+///
+/// Formula: `weight[i, o] = (int4(w) - int4(z)) * scale[group(i), o]`
+/// where `group(i) = i / group_size`.
+///
+/// The computation runs entirely on the CPU (scalar Rust) because the
+/// packing is bit-level and the tensor sizes for a single linear layer
+/// are small enough that a well-vectorised loop is fast. The result is
+/// uploaded back to the original device before returning so downstream
+/// matmuls stay where the caller put them.
+pub fn awq_dequantize_cpu(
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    group_size: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Tensor> {
+    const PACK_FACTOR: usize = 8;
+
+    if !out_features.is_multiple_of(PACK_FACTOR) {
+        candle_core::bail!(
+            "awq_dequantize_cpu: out_features ({out_features}) must be divisible by 8"
+        );
+    }
+    let packed_out = out_features / PACK_FACTOR;
+
+    // Candle does not expose an I32 DType — HF safetensors I32 tensors
+    // arrive as U32 (bit-reinterpret) because the packed AWQ nibbles are
+    // unsigned anyway. Accept U32 only.
+    if qweight.dtype() != DType::U32 {
+        candle_core::bail!(
+            "awq_dequantize_cpu: qweight must be U32, got {:?}",
+            qweight.dtype()
+        );
+    }
+    if qzeros.dtype() != DType::U32 {
+        candle_core::bail!(
+            "awq_dequantize_cpu: qzeros must be U32, got {:?}",
+            qzeros.dtype()
+        );
+    }
+
+    let expected_qw_shape = &[in_features, packed_out];
+    if qweight.dims() != expected_qw_shape {
+        candle_core::bail!(
+            "awq_dequantize_cpu: qweight shape {:?} != expected {:?}",
+            qweight.dims(),
+            expected_qw_shape
+        );
+    }
+
+    let num_groups = if group_size == 0 {
+        1
+    } else {
+        in_features.div_ceil(group_size)
+    };
+    let effective_group_size = if group_size == 0 {
+        in_features.max(1)
+    } else {
+        group_size
+    };
+
+    if qzeros.dims() != [num_groups, packed_out] {
+        candle_core::bail!(
+            "awq_dequantize_cpu: qzeros shape {:?} != expected {:?}",
+            qzeros.dims(),
+            [num_groups, packed_out]
+        );
+    }
+    if scales.dims() != [num_groups, out_features] {
+        candle_core::bail!(
+            "awq_dequantize_cpu: scales shape {:?} != expected {:?}",
+            scales.dims(),
+            [num_groups, out_features]
+        );
+    }
+
+    let original_device = qweight.device().clone();
+
+    // Pull everything to the CPU as plain Vecs. `to_dtype` on I32→U32 in
+    // Candle is a numeric cast (not a bit reinterpret), so we go via I32
+    // and then `as u32` which IS a bit-reinterpret in Rust. The packed
+    // values are effectively unsigned nibbles; negative i32 values only
+    // appear because the high nibble's top bit can be set.
+    let qw_words: Vec<u32> = qweight.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+    let qz_words: Vec<u32> = qzeros.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+
+    let scales_f32: Vec<f32> = scales
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1()?;
+
+    let mut weight = vec![0.0f32; in_features * out_features];
+
+    for in_idx in 0..in_features {
+        let group = (in_idx / effective_group_size).min(num_groups - 1);
+        let qz_row = group * packed_out;
+        let sc_row = group * out_features;
+        let qw_row = in_idx * packed_out;
+        let w_row = in_idx * out_features;
+        for out_packed in 0..packed_out {
+            let w_word = qw_words[qw_row + out_packed];
+            let z_word = qz_words[qz_row + out_packed];
+            let out_base = out_packed * PACK_FACTOR;
+            for (lane, &undo) in AWQ_UNDO_PACK.iter().enumerate() {
+                let nibble_shift = undo * 4;
+                let w_val = ((w_word >> nibble_shift) & 0xF) as i32;
+                let z_val = ((z_word >> nibble_shift) & 0xF) as i32;
+                let out_idx = out_base + lane;
+                let scale = scales_f32[sc_row + out_idx];
+                weight[w_row + out_idx] = (w_val - z_val) as f32 * scale;
+            }
+        }
+    }
+
+    Tensor::from_vec(weight, (in_features, out_features), &Device::Cpu)?
+        .to_dtype(DType::F16)?
+        .to_device(&original_device)
+}
 
 /// AWQ quantization configuration.
 #[derive(Debug, Clone)]
@@ -34,6 +179,11 @@ pub struct AwqConfig {
     pub version: AwqVersion,
     /// Whether to use Marlin kernels (2-4x faster on Ampere+)
     pub use_marlin: bool,
+    /// Explicit list of module name substrings whose layers must NOT be
+    /// quantized (loaded as plain fp16/bf16 weights instead). This mirrors
+    /// the `modules_to_not_convert` field HuggingFace AWQ configs use to
+    /// exclude `lm_head`, specific MoE blocks, etc.
+    pub modules_to_not_convert: Vec<String>,
 }
 
 /// AWQ kernel version.
@@ -55,6 +205,10 @@ impl AwqConfig {
             zero_point: true,
             version: AwqVersion::Gemm,
             use_marlin: true, // Auto-enable Marlin for 4-bit
+            // `lm_head` is excluded by default — the HF AWQ convention is
+            // to leave the vocabulary projection in fp16 unless the
+            // checkpoint specifically lists it in `modules_to_not_convert`.
+            modules_to_not_convert: vec!["lm_head".to_string()],
         }
     }
 
@@ -83,12 +237,27 @@ impl AwqConfig {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // HF AWQ uses `modules_to_not_convert` (list of strings) — every
+        // layer whose full prefix contains one of these substrings is
+        // loaded as a plain fp16 weight. Default to excluding `lm_head`
+        // when the config doesn't say otherwise (matches `autoawq`).
+        let modules_to_not_convert = raw_config
+            .get("modules_to_not_convert")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["lm_head".to_string()]);
+
         Self {
             bits,
             group_size,
             zero_point,
             version,
             use_marlin: is_marlin || bits == 4,
+            modules_to_not_convert,
         }
     }
 
@@ -167,8 +336,10 @@ impl QuantizationConfig for AwqConfig {
         }
     }
 
-    fn is_layer_skipped(&self, _layer_name: &str) -> bool {
-        false // AWQ quantizes all linear layers
+    fn is_layer_skipped(&self, layer_name: &str) -> bool {
+        self.modules_to_not_convert
+            .iter()
+            .any(|pat| layer_name.contains(pat))
     }
 
     fn create_linear(
@@ -256,9 +427,14 @@ impl AwqLinear {
             candle_core::bail!("AWQ only supports 4-bit quantization, got {bits}");
         }
 
-        // Calculate packed dimensions (same packing as GPTQ)
+        // AWQ GEMM layout: qweight is packed along the OUTPUT axis.
+        // HuggingFace stores shape `[in_features, out_features / pack_factor]`
+        // with each int32 word encoding 8 int4 values for 8 neighbouring
+        // output dims (not input dims — that's GPTQ). This is the
+        // opposite packing orientation to GPTQ so we must not reuse
+        // GPTQ's `[in_features/pack, out_features]` shape here.
         let pack_factor = 32 / bits as usize;
-        let packed_in = in_features.div_ceil(pack_factor);
+        let packed_out = out_features.div_ceil(pack_factor);
 
         let num_groups = if group_size <= 0 {
             1
@@ -266,14 +442,12 @@ impl AwqLinear {
             in_features.div_ceil(group_size as usize)
         };
 
-        // Initialize with zeros (weights loaded later)
-        let qweight = Tensor::zeros((packed_in, out_features), DType::U32, device)?;
+        // Initialize with zeros (weights loaded later). Stored as I32 to
+        // match HuggingFace safetensors dtype; the bit pattern is the
+        // same as U32 but Candle reads it without a numeric conversion.
+        let qweight = Tensor::zeros((in_features, packed_out), DType::U32, device)?;
         let scales = Tensor::zeros((num_groups, out_features), DType::F16, device)?;
-        let qzeros = Tensor::zeros(
-            (num_groups, out_features.div_ceil(pack_factor)),
-            DType::U32,
-            device,
-        )?;
+        let qzeros = Tensor::zeros((num_groups, packed_out), DType::U32, device)?;
 
         let bias = if has_bias {
             Some(Tensor::zeros(out_features, DType::F16, device)?)
@@ -294,65 +468,33 @@ impl AwqLinear {
         })
     }
 
-    /// Check if this layer can use AWQ CUDA kernels.
-    /// AWQ uses the same kernel infrastructure as GPTQ for 4-bit.
-    #[cfg(feature = "cuda-kernels")]
-    fn can_use_awq_kernel(&self) -> bool {
-        self.is_quantized && self.bits == 4 && self.qweight.device().is_cuda()
-    }
-
-    /// Perform AWQ forward pass using CUDA kernels.
-    /// AWQ uses GPTQ-compatible kernels for the actual computation.
-    #[cfg(feature = "cuda-kernels")]
-    fn forward_awq(&self, x: &Tensor) -> Result<Tensor> {
-        // Convert scales to BF16 if needed
-        let scales_bf16 = if self.scales.dtype() == DType::BF16 {
-            self.scales.clone()
-        } else {
-            self.scales.to_dtype(DType::BF16)?
-        };
-
-        // Use GPTQ GEMM kernel (AWQ uses compatible weight format)
-        gptq_cuda::gptq_gemm(
-            x,
-            &self.qweight,
-            &scales_bf16,
-            &self.qzeros,
-            self.bias.as_ref(),
-            self.group_size as i32,
-        )
-    }
-
-    /// Dequantize weights to full precision for computation.
+    /// Dequantize AWQ weights to a dense `[in_features, out_features]`
+    /// F16 tensor on the layer's device.
+    ///
+    /// Shared between CPU and GPU paths: the math is fast enough to run
+    /// entirely in scalar Rust for typical layer sizes, and the result
+    /// gets uploaded back to the original device before matmul.
+    /// A dedicated AWQ CUDA kernel can later replace this for throughput —
+    /// it is NOT the GPTQ kernel (AWQ packs along the output axis, GPTQ
+    /// packs along the input axis; they are not interchangeable).
     fn dequantize(&self) -> Result<Tensor> {
         if !self.is_quantized {
             candle_core::bail!(
                 "AWQ layer has no quantized weights loaded - call load_weights() first"
             );
         }
-
-        #[cfg(feature = "cuda-kernels")]
-        if self.qweight.device().is_cuda() {
-            let scales_bf16 = if self.scales.dtype() == DType::BF16 {
-                self.scales.clone()
-            } else {
-                self.scales.to_dtype(DType::BF16)?
-            };
-            // Use GPTQ dequantize (AWQ uses compatible format)
-            let weight = gptq_cuda::gptq_dequantize(
-                &self.qweight,
-                &scales_bf16,
-                &self.qzeros,
-                self.in_features,
-                self.out_features,
-                self.group_size as i32,
-                self.bits,
-            )?;
-            return weight.t()?.contiguous();
-        }
-
-        candle_core::bail!(
-            "AWQ dequantization requires CUDA device with cuda-kernels feature enabled"
+        let group_size = if self.group_size <= 0 {
+            self.in_features
+        } else {
+            self.group_size as usize
+        };
+        awq_dequantize_cpu(
+            &self.qweight,
+            &self.scales,
+            &self.qzeros,
+            group_size,
+            self.in_features,
+            self.out_features,
         )
     }
 
@@ -364,29 +506,52 @@ impl AwqLinear {
 
 impl QuantizedLinear for AwqLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Use AWQ CUDA kernels when available
-        #[cfg(feature = "cuda-kernels")]
-        if self.can_use_awq_kernel() {
-            let x_bf16 = if x.dtype() == DType::BF16 {
-                x.clone()
-            } else {
-                x.to_dtype(DType::BF16)?
-            };
-            return self.forward_awq(&x_bf16);
-        }
+        // Dequantized weight lives in F16 but the caller's activation
+        // dtype may be F32/BF16 — preserve the input dtype on the way
+        // out so downstream ops (norms, RoPE) don't see a mixed-dtype
+        // tensor. Candle's matmul does not auto-broadcast a 2D weight
+        // over a 3D batched input, so we flatten leading dims first.
+        let orig_dtype = x.dtype();
+        let weight_f16 = self.dequantize()?;
+        let compute_dtype = DType::F32;
+        let weight = weight_f16.to_dtype(compute_dtype)?;
+        let x_compute = x.to_dtype(compute_dtype)?;
 
-        // Fallback: dequantize and compute
-        let weight = self.dequantize()?;
-        let y = x.to_dtype(DType::F16)?.matmul(&weight.t()?)?;
-        match &self.bias {
-            Some(b) => y.broadcast_add(b),
-            None => Ok(y),
+        let dims = x_compute.dims().to_vec();
+        if dims.is_empty() {
+            candle_core::bail!("AwqLinear forward: scalar input is not supported");
         }
+        let in_features = *dims.last().unwrap();
+        if in_features != self.in_features {
+            candle_core::bail!(
+                "AwqLinear forward: last dim {in_features} != in_features {}",
+                self.in_features
+            );
+        }
+        let leading: usize = dims[..dims.len() - 1].iter().product();
+        let x2d = x_compute.reshape((leading, in_features))?;
+        let y2d = x2d.matmul(&weight)?;
+
+        let mut out_dims: Vec<usize> = dims[..dims.len() - 1].to_vec();
+        out_dims.push(self.out_features);
+        let y = y2d.reshape(out_dims)?;
+
+        let y = match &self.bias {
+            Some(b) => y.broadcast_add(&b.to_dtype(compute_dtype)?)?,
+            None => y,
+        };
+        y.to_dtype(orig_dtype)
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         if let Some(w) = weights.get("qweight") {
-            self.is_quantized = w.dtype() == DType::U32;
+            // HuggingFace stores AWQ qweight as int32; Candle reads that
+            // as U32 (bit-reinterpret, safe because the packed nibbles
+            // are semantically unsigned).
+            if w.dtype() != DType::U32 {
+                candle_core::bail!("AWQ qweight must be U32, got {:?}", w.dtype());
+            }
+            self.is_quantized = true;
             self.qweight = w.clone();
         }
         if let Some(s) = weights.get("scales") {

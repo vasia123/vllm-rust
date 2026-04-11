@@ -15,6 +15,8 @@ export default defineConfig({
       '/admin/health': 'http://localhost:8000',
       '/admin/config': 'http://localhost:8000',
       '/admin/restart': 'http://localhost:8000',
+      '/admin/gpu': 'http://localhost:8000',
+      '/admin/models': 'http://localhost:8000',
     }
   },
   build: {
