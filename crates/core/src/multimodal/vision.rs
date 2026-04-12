@@ -332,7 +332,15 @@ pub struct VisionEncoder {
 impl VisionEncoder {
     /// Create a new vision encoder.
     pub fn new(cfg: &VisionEncoderConfig, vb: VarBuilder) -> Result<Self> {
-        let patch_embedding = PatchEmbedding::new(cfg, vb.clone())?;
+        // SigLIP wraps patch + position embeddings under `embeddings.*`;
+        // CLIP keeps them flat at the encoder root.
+        let vb_emb = if cfg.encoder_type == VisionEncoderType::SigLip {
+            vb.pp("embeddings")
+        } else {
+            vb.clone()
+        };
+
+        let patch_embedding = PatchEmbedding::new(cfg, vb_emb.clone())?;
 
         // CLS token embedding (CLIP only)
         let class_embedding = if cfg.encoder_type == VisionEncoderType::Clip {
@@ -342,8 +350,11 @@ impl VisionEncoder {
         };
 
         // Position embeddings
-        let position_embedding =
-            candle_nn::embedding(cfg.seq_len(), cfg.hidden_size, vb.pp("position_embedding"))?;
+        let position_embedding = candle_nn::embedding(
+            cfg.seq_len(),
+            cfg.hidden_size,
+            vb_emb.pp("position_embedding"),
+        )?;
 
         // Transformer layers
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
