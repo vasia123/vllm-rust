@@ -2069,10 +2069,14 @@ async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     eprintln!("[rank {rank}/{world_size}] Pipeline worker starting");
 
     // Load model files (same model ID/revision as coordinator).
+    let model_id = cfg
+        .model_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--model is required for pipeline workers"))?;
     let cache_dir = cfg.download_dir.as_deref().map(std::path::Path::new);
     let parsed_load_format: loader::LoadFormat = cfg.load_format.parse()?;
     let files = loader::fetch_model_with_options(
-        &cfg.model_id,
+        model_id,
         &cfg.revision,
         cfg.hf_token.as_deref(),
         cache_dir,
@@ -2156,10 +2160,14 @@ async fn run_tensor_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     tracing::info!(rank, world_size, "TP worker starting");
     eprintln!("[tp rank {rank}/{world_size}] Tensor-parallel worker starting");
 
+    let model_id = cfg
+        .model_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--model is required for tensor-parallel workers"))?;
     let cache_dir = cfg.download_dir.as_deref().map(std::path::Path::new);
     let parsed_load_format: loader::LoadFormat = cfg.load_format.parse()?;
     let files = loader::fetch_model_with_options(
-        &cfg.model_id,
+        model_id,
         &cfg.revision,
         cfg.hf_token.as_deref(),
         cache_dir,
