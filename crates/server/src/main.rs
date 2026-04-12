@@ -1527,8 +1527,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eprintln!("Registered adapters: {:?}", lora_model.lora_adapters());
         Box::new(lora_model)
     } else {
-        // Create regular model without LoRA
-        models::from_config(&files.config, vb)?
+        // Route through the quant-aware dispatcher so BnB / AWQ / GPTQ /
+        // GGUF / Marlin checkpoints build their proper quantized model
+        // instead of trying to load packed tensors through the plain
+        // unquantized `from_config` path (which silently fails to
+        // match HF packed shapes). Falls through to `from_config` when
+        // `quantization.method == None`.
+        models::from_config_with_quant(&files.config, vb, &files.quantization)?
     };
 
     // Resolve tokenizer: CLI override > tokenizer_revision > model default.
@@ -1740,7 +1745,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 "Building draft model ({} layers)...",
                 draft_files.config.num_hidden_layers
             );
-            let draft_model = models::from_config(&draft_files.config, draft_vb)?;
+            // Quant-aware dispatch for the draft model too so paired
+            // speculative decoding with quantized drafts works.
+            let draft_model = models::from_config_with_quant(
+                &draft_files.config,
+                draft_vb,
+                &draft_files.quantization,
+            )?;
 
             let draft_cache_config = CacheConfig {
                 block_size: 16,
@@ -2229,7 +2240,10 @@ async fn run_generate(
         "Building model ({} layers)...",
         files.config.num_hidden_layers
     );
-    let model = models::from_config(&files.config, vb)?;
+    // Quant-aware dispatch: BnB / AWQ / GPTQ / GGUF build their proper
+    // quantized variant; unquantized checkpoints fall through to the
+    // plain `from_config` path automatically.
+    let model = models::from_config_with_quant(&files.config, vb, &files.quantization)?;
 
     let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
 
@@ -2305,7 +2319,13 @@ async fn run_generate(
                 "Building draft model ({} layers)...",
                 draft_files.config.num_hidden_layers
             );
-            let draft_model = models::from_config(&draft_files.config, draft_vb)?;
+            // Quant-aware dispatch for the draft model too so paired
+            // speculative decoding with quantized drafts works.
+            let draft_model = models::from_config_with_quant(
+                &draft_files.config,
+                draft_vb,
+                &draft_files.quantization,
+            )?;
 
             let draft_cache_config = CacheConfig {
                 block_size: 16,

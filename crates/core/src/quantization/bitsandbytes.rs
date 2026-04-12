@@ -494,7 +494,8 @@ impl BitsAndBytesLinear {
 
 impl QuantizedLinear for BitsAndBytesLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_f32 = if x.dtype() != DType::F32 {
+        let orig_dtype = x.dtype();
+        let x_f32 = if orig_dtype != DType::F32 {
             x.to_dtype(DType::F32)?
         } else {
             x.clone()
@@ -515,12 +516,18 @@ impl QuantizedLinear for BitsAndBytesLinear {
         if x_2d.device().is_cuda() {
             match self.forward_fused(&x_2d) {
                 Ok(output) => {
-                    if original_shape.len() > 2 {
+                    let output = if original_shape.len() > 2 {
                         let mut out_shape = original_shape[..original_shape.len() - 1].to_vec();
                         out_shape.push(self.out_features);
-                        return output.reshape(out_shape);
-                    }
-                    return Ok(output);
+                        output.reshape(out_shape)?
+                    } else {
+                        output
+                    };
+                    return if output.dtype() != orig_dtype {
+                        output.to_dtype(orig_dtype)
+                    } else {
+                        Ok(output)
+                    };
                 }
                 Err(_) => {
                     // Fused kernel failed (e.g. PTX not loaded); fall through
@@ -537,10 +544,16 @@ impl QuantizedLinear for BitsAndBytesLinear {
             None => y,
         };
 
-        if original_shape.len() > 2 {
+        let y = if original_shape.len() > 2 {
             let mut out_shape = original_shape[..original_shape.len() - 1].to_vec();
             out_shape.push(self.out_features);
-            y.reshape(out_shape)
+            y.reshape(out_shape)?
+        } else {
+            y
+        };
+
+        if y.dtype() != orig_dtype {
+            y.to_dtype(orig_dtype)
         } else {
             Ok(y)
         }

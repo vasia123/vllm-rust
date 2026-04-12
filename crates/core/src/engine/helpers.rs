@@ -566,7 +566,7 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
-) -> Vec<RequestId> {
+) -> Vec<(RequestId, String)> {
     execute_batched_decode_with_graph(
         decode_request_ids,
         model,
@@ -660,21 +660,18 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     requests: &mut HashMap<RequestId, ActiveRequest>,
     dispatcher: Option<&Arc<std::sync::RwLock<CudaGraphDispatcher>>>,
     graph_runner: Option<&Arc<CudaGraphRunner>>,
-) -> Vec<RequestId> {
-    let mut failed = Vec::new();
+) -> Vec<(RequestId, String)> {
+    let mut failed: Vec<(RequestId, String)> = Vec::new();
     let mut batch_ids: Vec<RequestId> = Vec::with_capacity(decode_request_ids.len());
 
     // Step 1: Allocate blocks for each sequence
     for &req_id in decode_request_ids {
         let Some(req) = requests.get_mut(&req_id) else {
-            failed.push(req_id);
+            failed.push((req_id, "request no longer active".to_string()));
             continue;
         };
-        if kv_cache_mgr
-            .allocate_for_request(&mut req.state.block_table, 1)
-            .is_err()
-        {
-            failed.push(req_id);
+        if let Err(e) = kv_cache_mgr.allocate_for_request(&mut req.state.block_table, 1) {
+            failed.push((req_id, format!("kv cache allocate_for_request: {e}")));
         } else {
             batch_ids.push(req_id);
         }
@@ -715,6 +712,14 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     let batch_size = batch_ids.len();
     let has_any_adapter = adapter_names.iter().any(|a| a.is_some());
 
+    // Helper: tag every request in the current batch with the same
+    // error message. Used when a whole-batch op (forward, tensor build,
+    // sampling) fails — every in-flight request in that batch bubbles
+    // up the same root cause to the caller.
+    let failed_batch = |msg: String, batch: &[RequestId]| -> Vec<(RequestId, String)> {
+        batch.iter().map(|id| (*id, msg.clone())).collect()
+    };
+
     let logits = if has_any_adapter {
         // Multi-adapter path: group sequences by adapter, forward each group separately,
         // then reassemble logits in original batch order.
@@ -727,8 +732,10 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             batch_size,
         ) {
             Ok(l) => l,
-            Err(_) => {
-                failed.extend(&batch_ids);
+            Err(e) => {
+                let msg = format!("forward_grouped_by_adapter: {e}");
+                tracing::error!(error = %e, "batched decode forward failed");
+                failed.extend(failed_batch(msg, &batch_ids));
                 return failed;
             }
         }
@@ -749,8 +756,10 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
 
         let input = match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
             Ok(t) => t,
-            Err(_) => {
-                failed.extend(&batch_ids);
+            Err(e) => {
+                let msg = format!("Tensor::from_vec(decode input): {e}");
+                tracing::error!(error = %e, "batched decode tensor build failed");
+                failed.extend(failed_batch(msg, &batch_ids));
                 return failed;
             }
         };
@@ -760,13 +769,18 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 model.forward_decode_batch(inp, &sequences, kv_cache_mgr)
             }) {
                 Ok(l) => l,
-                Err(_) => match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        failed.extend(&batch_ids);
-                        return failed;
+                Err(cuda_err) => {
+                    tracing::warn!(error = %cuda_err, "CUDA graph decode failed; falling back to eager");
+                    match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let msg = format!("forward_decode_batch (eager fallback): {e}");
+                            tracing::error!(error = %e, "eager decode fallback failed");
+                            failed.extend(failed_batch(msg, &batch_ids));
+                            return failed;
+                        }
                     }
-                },
+                }
             }
         } else {
             match model.forward_decode_batch_with_ctx(
@@ -776,8 +790,10 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 &forward_ctx,
             ) {
                 Ok(l) => l,
-                Err(_) => {
-                    failed.extend(&batch_ids);
+                Err(e) => {
+                    let msg = format!("forward_decode_batch_with_ctx: {e}");
+                    tracing::error!(error = %e, "batched decode forward failed");
+                    failed.extend(failed_batch(msg, &batch_ids));
                     return failed;
                 }
             }
@@ -789,13 +805,17 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     let last_logits = match logits.narrow(1, seq_dim - 1, 1) {
         Ok(l) => match l.squeeze(1) {
             Ok(l) => l,
-            Err(_) => {
-                failed.extend(&batch_ids);
+            Err(e) => {
+                let msg = format!("last-logits squeeze: {e}");
+                tracing::error!(error = %e, "batched decode last-logits squeeze failed");
+                failed.extend(failed_batch(msg, &batch_ids));
                 return failed;
             }
         },
-        Err(_) => {
-            failed.extend(&batch_ids);
+        Err(e) => {
+            let msg = format!("last-logits narrow: {e}");
+            tracing::error!(error = %e, "batched decode last-logits narrow failed");
+            failed.extend(failed_batch(msg, &batch_ids));
             return failed;
         }
     };
@@ -861,7 +881,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             Ok(token_ids) => {
                 for (i, &req_id) in batch_ids.iter().enumerate() {
                     let Some(req) = requests.get_mut(&req_id) else {
-                        failed.push(req_id);
+                        failed.push((req_id, "request no longer active".to_string()));
                         continue;
                     };
                     req.state.block_table.advance(1);
@@ -870,8 +890,9 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 }
                 return failed;
             }
-            Err(_) => {
+            Err(e) => {
                 // Fall through to CPU path on GPU sampling failure
+                tracing::warn!(error = %e, "GPU batched sampling failed; falling back to CPU");
             }
         }
     }
@@ -879,8 +900,10 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // CPU path: transfer logits and sample per-sequence
     let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
         Ok(v) => v.into_iter().flatten().collect(),
-        Err(_) => {
-            failed.extend(&batch_ids);
+        Err(e) => {
+            let msg = format!("last-logits to_vec2::<f32>: {e}");
+            tracing::error!(error = %e, "batched decode logits->cpu transfer failed");
+            failed.extend(failed_batch(msg, &batch_ids));
             return failed;
         }
     };
@@ -902,7 +925,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     if all_greedy && !any_need_logprobs {
         for (i, &req_id) in batch_ids.iter().enumerate() {
             let Some(req) = requests.get_mut(&req_id) else {
-                failed.push(req_id);
+                failed.push((req_id, "request no longer active".to_string()));
                 continue;
             };
             let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];
@@ -919,7 +942,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     } else {
         for (i, &req_id) in batch_ids.iter().enumerate() {
             let Some(req) = requests.get_mut(&req_id) else {
-                failed.push(req_id);
+                failed.push((req_id, "request no longer active".to_string()));
                 continue;
             };
             let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];

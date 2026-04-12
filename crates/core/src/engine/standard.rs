@@ -333,11 +333,11 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                     self.graph_runner.as_ref(),
                 );
 
-                for req_id in failed {
+                for (req_id, err_msg) in failed {
                     active_decode_ids.retain(|&id| id != req_id);
                     if let Some(id) = finish_request_with_error_deferred(
                         req_id,
-                        EngineError::Model("batched decode failed".to_string()),
+                        EngineError::Model(format!("batched decode failed: {err_msg}")),
                         &mut state.requests,
                     ) {
                         state.errored_ids.push(id);
