@@ -676,21 +676,22 @@ impl Gemma4VisionEncoder {
 
 /// Build additive mask `[B, 1, L, L]` with -inf at padded key positions.
 fn bidirectional_additive_mask(padding_positions: &Tensor, dtype: DType) -> Result<Tensor> {
-    // padding_positions: bool [B, L]; true = padded.
+    // padding_positions: bool/u8 [B, L]; true = padded.
+    // Build additive mask: 0 for valid key positions, large negative for padded.
+    //
+    // NOTE: we use `-1e9` rather than `-inf` because
+    // `0 * (-inf) == NaN` in IEEE 754, which would poison activations
+    // whenever we combined the mask via multiplication. A large finite
+    // negative value is functionally equivalent after softmax.
     let b = padding_positions.dim(0)?;
     let l = padding_positions.dim(1)?;
-    let device = padding_positions.device();
 
-    // [B, 1, 1, L] in f32, then cast to target dtype.
+    // [B, 1, 1, L]
     let pad_f = padding_positions
         .to_dtype(DType::F32)?
         .reshape((b, 1, 1, l))?;
-    let neg_inf = Tensor::full(f32::NEG_INFINITY, pad_f.shape(), device)?;
-    let zero = Tensor::zeros(pad_f.shape(), DType::F32, device)?;
-    // where(padding, -inf, 0)
-    let ones = Tensor::ones_like(&pad_f)?;
-    let mask = pad_f.broadcast_mul(&neg_inf)? + (ones - pad_f)?.broadcast_mul(&zero)?;
-    let mask = mask?;
+    // mask = pad * (-1e9)  →  0 for valid, -1e9 for padded.
+    let mask = pad_f.affine(-1e9, 0.0)?;
     mask.broadcast_as((b, 1, l, l))?.to_dtype(dtype)
 }
 
