@@ -4,6 +4,16 @@
 ARG CUDA_VERSION=12.4.1
 ARG UBUNTU_VERSION=22.04
 
+# ==================== FRONTEND STAGE ====================
+# Build the admin UI separately so the Rust stage can focus on the
+# toolchain + native deps and we avoid shipping npm into the final image.
+FROM node:20-alpine AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 # ==================== BUILDER STAGE ====================
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
@@ -37,8 +47,8 @@ RUN mkdir -p crates/core/src crates/server/src && \
     echo "pub fn dummy() {}" > crates/core/src/lib.rs && \
     echo "pub fn dummy() {}" > crates/server/src/lib.rs
 
-# Copy frontend dist (needed by RustEmbed at compile time)
-COPY frontend/dist/ frontend/dist/
+# Copy frontend dist from the Node stage (needed by RustEmbed at compile time)
+COPY --from=frontend /frontend/dist/ frontend/dist/
 
 # Build dependencies (this layer will be cached)
 RUN cargo build --release -p vllm-server 2>/dev/null || true
