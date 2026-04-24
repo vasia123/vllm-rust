@@ -26,6 +26,7 @@
 //! ```
 
 pub mod audio;
+pub mod gemma4_image;
 mod inputs;
 pub mod mel_spectrogram;
 mod preprocessor_cache;

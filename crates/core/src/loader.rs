@@ -834,6 +834,101 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "image-loading")]
+    #[test]
+    #[ignore = "requires HF download + image-loading; run with --features image-loading --ignored"]
+    fn real_gemma4_vlm_e2e_image_to_soft_tokens() {
+        // End-to-end vision preprocessing + forward on a synthetic PNG.
+        //
+        // Pipeline:
+        //   RGB gradient → PNG bytes
+        //   → `Gemma4ImageProcessor::preprocess_bytes`
+        //     (aspect-ratio resize → rescale → patchify → pad)
+        //   → stack to [1, max_patches, …]
+        //   → `Gemma4VisionTower::forward`
+        //   → `[num_soft_tokens, hidden_size]` ready for the LLM.
+        //
+        // Run:
+        //   cargo test -p vllm-core --lib --features image-loading \
+        //     loader::tests::real_gemma4_vlm_e2e_image_to_soft_tokens \
+        //     -- --ignored --nocapture
+        use crate::models::gemma4_vision::{Gemma4VisionConfig, Gemma4VisionTower};
+        use crate::multimodal::gemma4_image::{Gemma4ImageProcessor, Gemma4ImageProcessorConfig};
+
+        // Build a simple 128×96 RGB gradient PNG in-memory.
+        let (img_w, img_h) = (128u32, 96u32);
+        let mut rgb = Vec::with_capacity((img_w * img_h * 3) as usize);
+        for y in 0..img_h {
+            for x in 0..img_w {
+                rgb.push(((x * 255 / img_w) as u8).min(255));
+                rgb.push(((y * 255 / img_h) as u8).min(255));
+                rgb.push((((x + y) * 255 / (img_w + img_h)) as u8).min(255));
+            }
+        }
+        let buf = image::ImageBuffer::<image::Rgb<u8>, _>::from_raw(img_w, img_h, rgb.clone())
+            .expect("build RGB buffer");
+        let mut png_bytes: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        buf.write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode PNG");
+
+        let model_id = "unsloth/gemma-4-E2B-it-unsloth-bnb-4bit";
+        let files = fetch_model_with_auth(model_id, "main", None, None)
+            .expect("fetch Gemma 4 BnB checkpoint");
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let vb =
+            load_weights(&files.weights, dtype, &device).expect("mmap BnB Gemma 4 safetensors");
+
+        let cfg = Gemma4VisionConfig::from_model_config(&files.config);
+        let proc_cfg = Gemma4ImageProcessorConfig {
+            patch_size: cfg.patch_size,
+            // Smallest supported token budget keeps the working set tight.
+            max_soft_tokens: 70,
+            pooling_kernel_size: cfg.pooling_kernel_size,
+            rescale_factor: 1.0 / 255.0,
+        };
+        let proc = Gemma4ImageProcessor::new(proc_cfg, device.clone());
+
+        let preprocessed = proc.preprocess_bytes(&png_bytes).expect("preprocess image");
+        eprintln!(
+            "preprocessed: patches={} soft_tokens={} pixel_dim={}",
+            preprocessed.pixel_values.dim(0).unwrap(),
+            preprocessed.num_soft_tokens,
+            preprocessed.pixel_values.dim(1).unwrap(),
+        );
+
+        let (pixels, positions, token_counts) = proc.batch(&[preprocessed]).expect("stack batch");
+        assert_eq!(pixels.dim(0).unwrap(), 1);
+        assert_eq!(token_counts.len(), 1);
+
+        let vb_vt = vb.pp("model").pp("vision_tower");
+        let tower =
+            Gemma4VisionTower::new(&cfg, vb_vt).expect("Gemma4VisionTower loads all weights");
+
+        let pixels = pixels.to_dtype(DType::F32).unwrap();
+        let soft_tokens = tower.forward(&pixels, &positions).expect("forward");
+        assert_eq!(soft_tokens.dim(1).unwrap(), cfg.hidden_size);
+        assert_eq!(soft_tokens.dim(0).unwrap(), token_counts[0]);
+
+        let flat: Vec<f32> = soft_tokens
+            .to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .expect("flatten");
+        assert_eq!(flat.iter().filter(|v| v.is_nan()).count(), 0);
+        assert_eq!(flat.iter().filter(|v| v.is_infinite()).count(), 0);
+
+        eprintln!(
+            "OK: Gemma 4 E2E vision: {}×{} PNG → {} soft tokens × {} hidden",
+            img_w,
+            img_h,
+            soft_tokens.dim(0).unwrap(),
+            soft_tokens.dim(1).unwrap(),
+        );
+    }
+
     #[test]
     #[ignore = "requires HF download + CUDA GPU; run with --features cuda --ignored"]
     fn real_bnb_nf4_tinyllama_prefill_decode_cuda() {
