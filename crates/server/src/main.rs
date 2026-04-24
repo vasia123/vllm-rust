@@ -1349,7 +1349,14 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         None => loader::is_quantized(&files),
     };
 
-    eprintln!("Loading weights to GPU ({dtype_label})...");
+    let quant_label = match files.quantization.method {
+        vllm_core::quantization::QuantizationMethod::None => "unquantized".to_string(),
+        ref m => format!("{m:?}").to_lowercase(),
+    };
+    // Compute dtype below is for activations + unquantized layers; each
+    // quantized tensor is loaded in its native storage (U8 for NF4 packs,
+    // I32 for AWQ qweight, F8 for FP8, …) via the quantization loader.
+    eprintln!("Mmap'ing weights (compute dtype={dtype_label}, quantization={quant_label})...");
     let vb = if parsed_load_format == loader::LoadFormat::Dummy {
         tracing::info!("Using dummy zero-filled weights (--load-format dummy)");
         loader::load_dummy_weights(dtype, &device)
@@ -1535,6 +1542,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         // `quantization.method == None`.
         models::from_config_with_quant(&files.config, vb, &files.quantization)?
     };
+    report_gpu_mem("after model build");
 
     // Resolve tokenizer: CLI override > tokenizer_revision > model default.
     // --tokenizer-revision allows fetching tokenizer files at a different
@@ -2227,6 +2235,28 @@ async fn run_tensor_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print a one-line GPU memory snapshot `(used / total GiB)` prefixed
+/// by `tag`. Noop when the `cuda` feature is off.
+fn report_gpu_mem(tag: &str) {
+    #[cfg(feature = "cuda")]
+    {
+        match vllm_core::kv_cache::config::gpu_memory_info() {
+            Ok((free, total)) => {
+                let used = total.saturating_sub(free) as f64 / (1024.0 * 1024.0 * 1024.0);
+                let total = total as f64 / (1024.0 * 1024.0 * 1024.0);
+                eprintln!("GPU memory [{tag}]: {used:.2} / {total:.2} GiB used");
+            }
+            Err(e) => {
+                eprintln!("GPU memory [{tag}]: query failed ({e})");
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = tag;
+    }
+}
+
 async fn run_generate(
     model_id: String,
     draft_model_id: Option<String>,
@@ -2241,7 +2271,15 @@ async fn run_generate(
     let device = Device::new_cuda(0)?;
     let dtype = DType::BF16;
 
-    eprintln!("Loading weights to GPU (bf16)...");
+    // Compute dtype is BF16; per-tensor storage is picked by the
+    // quantization-aware loader (packed NF4 stays U8, AWQ qweight stays
+    // I32, FP8 stays F8E4M3, …), so unquantized layers use BF16 without
+    // forcing quantized tensors to inflate to BF16 at mmap time.
+    let quant_label = match files.quantization.method {
+        vllm_core::quantization::QuantizationMethod::None => "unquantized".to_string(),
+        ref m => format!("{m:?}").to_lowercase(),
+    };
+    eprintln!("Mmap'ing weights (compute dtype=bf16, quantization={quant_label})...");
     let vb = loader::load_weights(&files.weights, dtype, &device)?;
 
     eprintln!(
@@ -2252,6 +2290,10 @@ async fn run_generate(
     // quantized variant; unquantized checkpoints fall through to the
     // plain `from_config` path automatically.
     let model = models::from_config_with_quant(&files.config, vb, &files.quantization)?;
+    report_gpu_mem("after model build");
+
+    // Note: `report_gpu_mem` is defined below; we call it twice so the
+    // user sees VRAM right after load + after any warmup / graph capture.
 
     let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
 
