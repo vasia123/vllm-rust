@@ -47,13 +47,13 @@ use super::tp_layers::{TpContext, TpEmbedding, TpGeGluMlp, TpLinear};
 // `GemmaRMSNorm`. Keeping the +1 offset here would silently produce wrong
 // norms on every layer.
 
-struct Gemma4RmsNorm {
+pub(crate) struct Gemma4RmsNorm {
     weight: Tensor,
     eps: f64,
 }
 
 impl Gemma4RmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(size, "weight")?;
         Ok(Self { weight, eps })
     }
@@ -73,12 +73,12 @@ impl Module for Gemma4RmsNorm {
 
 // ─── RMSNorm without learned weight (for v_norm and router norm) ──────────
 
-struct UnweightedRmsNorm {
+pub(crate) struct UnweightedRmsNorm {
     eps: f64,
 }
 
 impl UnweightedRmsNorm {
-    fn new(eps: f64) -> Self {
+    pub(crate) fn new(eps: f64) -> Self {
         Self { eps }
     }
 }

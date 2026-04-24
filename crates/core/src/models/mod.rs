@@ -71,6 +71,7 @@ pub mod gemma3n;
 pub mod gemma3n_vlm;
 pub mod gemma4;
 pub mod gemma4_quantized;
+pub mod gemma4_vision;
 pub mod gemma4_vlm;
 pub mod gemma4_vlm_quantized;
 pub mod gemma_lora;

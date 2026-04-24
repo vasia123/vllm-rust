@@ -23,7 +23,9 @@ use candle_nn::VarBuilder;
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, KVCacheManager};
-use crate::multimodal::{MultimodalInputs, VisionEncoder};
+use crate::multimodal::MultimodalInputs;
+
+use super::gemma4_vision::Gemma4VisionTower;
 use crate::quantization::{QuantizationMethod, QuantizedLinear, QuantizedWeightLoader};
 
 use super::gemma4_quantized::QuantizedGemma4ForCausalLM;
@@ -156,7 +158,7 @@ impl Gemma4MultimodalEmbedder {
 // ─── Quantized VLM ────────────────────────────────────────────────────────
 
 pub struct QuantizedGemma4ForConditionalGeneration {
-    vision_tower: VisionEncoder,
+    vision_tower: Gemma4VisionTower,
     embed_vision: Gemma4MultimodalEmbedder,
     language_model: QuantizedGemma4ForCausalLM,
     #[allow(dead_code)]
@@ -187,12 +189,13 @@ impl QuantizedGemma4ForConditionalGeneration {
         // `RemappingWeightLoader` fast path below.
         let vb_root = vb.pp("model");
 
-        let vision_tower = VisionEncoder::new(&config.vision_config, vb_root.pp("vision_tower"))?;
+        let vision_tower =
+            Gemma4VisionTower::new(&config.vision_config, vb_root.pp("vision_tower"))?;
 
         let embed_vision = Gemma4MultimodalEmbedder::new(
             config.vision_hidden_size,
             cfg.hidden_size,
-            config.vision_config.layer_norm_eps,
+            config.vision_config.rms_norm_eps,
             vb_root.pp("embed_vision"),
         )?;
 
@@ -216,8 +219,18 @@ impl QuantizedGemma4ForConditionalGeneration {
         })
     }
 
-    pub fn encode_images(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let vision_features = self.vision_tower.forward(pixel_values)?;
+    /// Encode images: Gemma 4 vision tower → embedder projection.
+    ///
+    /// `pixel_values`       : `[B, L, 3·ps·ps]` flattened patches.
+    /// `pixel_position_ids` : `i64 [B, L, 2]` (`-1, -1` marks padding).
+    pub fn encode_images(
+        &self,
+        pixel_values: &Tensor,
+        pixel_position_ids: &Tensor,
+    ) -> Result<Tensor> {
+        let vision_features = self
+            .vision_tower
+            .forward(pixel_values, pixel_position_ids)?;
         self.embed_vision.forward(&vision_features)
     }
 

@@ -721,6 +721,120 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires HF download (~8 GB); run with --ignored"]
+    fn real_gemma4_vlm_vision_tower_forward() {
+        // Builds `Gemma4VisionTower` against the unsloth BnB checkpoint
+        // (vision_tower is on the skip list, so weights are plain BF16)
+        // and runs a forward pass on dummy patches. Exercises:
+        // - `model.vision_tower.patch_embedder.{input_proj.weight, position_embedding_table}`
+        // - All 16 encoder layers × (q/k/v/o `.linear.weight`,
+        //   q_norm, k_norm, input_layernorm, post_attention_layernorm,
+        //   pre/post_feedforward_layernorm, mlp.{gate,up,down}_proj.linear.weight)
+        // - `Gemma4VisionPooler` avg-pool over a 36-patch grid (k=3) → 4 soft tokens
+        //
+        // Run:
+        //   cargo test -p vllm-core --lib \
+        //       loader::tests::real_gemma4_vlm_vision_tower_forward \
+        //       -- --ignored --nocapture
+        use crate::models::gemma4_vision::{Gemma4VisionConfig, Gemma4VisionTower};
+        use candle_core::Tensor;
+
+        let model_id = "unsloth/gemma-4-E2B-it-unsloth-bnb-4bit";
+        let files = fetch_model_with_auth(model_id, "main", None, None)
+            .expect("fetch Gemma 4 BnB checkpoint");
+
+        let device = Device::Cpu;
+        // Vision tower weights are stored BF16; load as F32 on CPU since
+        // candle-core CPU matmul lacks BF16.
+        let dtype = DType::F32;
+        let vb =
+            load_weights(&files.weights, dtype, &device).expect("mmap BnB Gemma 4 safetensors");
+
+        let cfg = Gemma4VisionConfig::from_model_config(&files.config);
+        eprintln!(
+            "vision_config: hidden={} layers={} heads={} head_dim={} patch={} pool_k={} pos_emb_sz={} use_clip={}",
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+            cfg.num_attention_heads,
+            cfg.head_dim,
+            cfg.patch_size,
+            cfg.pooling_kernel_size,
+            cfg.position_embedding_size,
+            cfg.use_clipped_linears,
+        );
+
+        let vb_vt = vb.pp("model").pp("vision_tower");
+        let tower = Gemma4VisionTower::new(&cfg, vb_vt)
+            .expect("Gemma4VisionTower loads all weights from checkpoint");
+
+        // Dummy image: 3×3 = 9 patch grid in a single batch item.
+        // `pooling_kernel_size = 3` → 9/9 = 1 soft token.
+        let b = 1usize;
+        let l = 9usize;
+        let patch_px = 3 * cfg.patch_size * cfg.patch_size;
+        let pixels: Vec<f32> = (0..b * l * patch_px)
+            .map(|i| (i as f32).sin() * 0.1)
+            .collect();
+        let pixel_values =
+            Tensor::from_vec(pixels, (b, l, patch_px), &device).expect("pixel_values");
+        let mut pos_ids = Vec::with_capacity(b * l * 2);
+        for y in 0..3i64 {
+            for x in 0..3i64 {
+                pos_ids.push(x);
+                pos_ids.push(y);
+            }
+        }
+        let pixel_position_ids =
+            Tensor::from_vec(pos_ids, (b, l, 2), &device).expect("pixel_position_ids");
+
+        let out = tower
+            .forward(&pixel_values, &pixel_position_ids)
+            .expect("vision tower forward");
+        assert_eq!(out.dim(1).expect("hidden dim"), cfg.hidden_size);
+        assert!(
+            out.dim(0).expect("rows") >= 1,
+            "pooler must emit ≥1 soft token"
+        );
+
+        let flat: Vec<f32> = out
+            .to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .expect("flatten output");
+        assert_eq!(
+            flat.iter().filter(|v| v.is_nan()).count(),
+            0,
+            "NaN in vision output"
+        );
+        assert_eq!(
+            flat.iter().filter(|v| v.is_infinite()).count(),
+            0,
+            "inf in vision output"
+        );
+
+        let (min, max) = flat
+            .iter()
+            .copied()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| {
+                (a.min(v), b.max(v))
+            });
+        let mean: f32 = flat.iter().sum::<f32>() / flat.len() as f32;
+        eprintln!(
+            "gemma4 vision_tower output: tokens={} hidden={} min={min:.4} max={max:.4} mean={mean:.4}",
+            out.dim(0).unwrap(),
+            out.dim(1).unwrap(),
+        );
+        assert!((max - min).abs() > 1e-4, "vision output must have spread");
+
+        eprintln!(
+            "OK: Gemma 4 vision_tower exercised {} layers on {} patches → {} soft tokens",
+            cfg.num_hidden_layers,
+            l,
+            out.dim(0).unwrap(),
+        );
+    }
+
+    #[test]
     #[ignore = "requires HF download + CUDA GPU; run with --features cuda --ignored"]
     fn real_bnb_nf4_tinyllama_prefill_decode_cuda() {
         // CUDA-flavoured variant of the existing BnB TinyLlama test.

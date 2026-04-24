@@ -28,7 +28,9 @@ use candle_nn::VarBuilder;
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, KVCacheManager};
-use crate::multimodal::{MultimodalInputs, VisionEncoder, VisionEncoderConfig, VisionEncoderType};
+use crate::multimodal::MultimodalInputs;
+
+use super::gemma4_vision::{Gemma4VisionConfig, Gemma4VisionTower};
 
 use super::gemma4::Gemma4ForCausalLM;
 
@@ -37,7 +39,7 @@ use super::gemma4::Gemma4ForCausalLM;
 #[derive(Debug, Clone)]
 pub struct Gemma4VLMConfig {
     pub model_config: ModelConfig,
-    pub vision_config: VisionEncoderConfig,
+    pub vision_config: Gemma4VisionConfig,
     pub vision_hidden_size: usize,
     pub tokens_per_image: usize,
     pub image_token_id: u32,
@@ -45,71 +47,15 @@ pub struct Gemma4VLMConfig {
 
 impl Gemma4VLMConfig {
     pub fn from_model_config(cfg: &ModelConfig) -> Self {
-        let defaults = VisionEncoderConfig {
-            encoder_type: VisionEncoderType::SigLip,
-            hidden_size: 768,
-            intermediate_size: 3072,
-            num_attention_heads: 12,
-            num_hidden_layers: 12,
-            image_size: 224,
-            patch_size: 14,
-            num_channels: 3,
-            layer_norm_eps: 1e-6,
-        };
-
-        let vision_config = if let Some(vc) = cfg.extra.get("vision_config") {
-            VisionEncoderConfig {
-                encoder_type: VisionEncoderType::SigLip,
-                hidden_size: vc
-                    .get("hidden_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.hidden_size as u64) as usize,
-                intermediate_size: vc
-                    .get("intermediate_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.intermediate_size as u64)
-                    as usize,
-                num_attention_heads: vc
-                    .get("num_attention_heads")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.num_attention_heads as u64)
-                    as usize,
-                num_hidden_layers: vc
-                    .get("num_hidden_layers")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.num_hidden_layers as u64)
-                    as usize,
-                image_size: vc
-                    .get("image_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.image_size as u64) as usize,
-                patch_size: vc
-                    .get("patch_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(defaults.patch_size as u64) as usize,
-                num_channels: defaults.num_channels,
-                layer_norm_eps: vc
-                    .get("rms_norm_eps")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(defaults.layer_norm_eps),
-            }
-        } else {
-            defaults
-        };
-
+        let vision_config = Gemma4VisionConfig::from_model_config(cfg);
         let vision_hidden_size = vision_config.hidden_size;
+        let tokens_per_image = vision_config.default_output_length;
 
-        // default_output_length in vision_config controls tokens per image
-        let tokens_per_image = cfg
-            .extra
-            .get("vision_config")
-            .and_then(|vc| vc.get("default_output_length"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(280) as usize;
-
+        // `image_token_id` (new key) / legacy `image_token_index` alias.
         let image_token_id = cfg
             .extra
-            .get("image_token_index")
+            .get("image_token_id")
+            .or_else(|| cfg.extra.get("image_token_index"))
             .and_then(|v| v.as_u64())
             .unwrap_or(262144) as u32;
 
@@ -166,7 +112,7 @@ impl Gemma4MultimodalEmbedder {
 // ─── Model ──────────────────────────────────────────────────────────────────
 
 pub struct Gemma4ForConditionalGeneration {
-    vision_tower: VisionEncoder,
+    vision_tower: Gemma4VisionTower,
     embed_vision: Gemma4MultimodalEmbedder,
     language_model: Gemma4ForCausalLM,
     #[allow(dead_code)]
@@ -179,16 +125,21 @@ impl Gemma4ForConditionalGeneration {
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let config = Gemma4VLMConfig::from_model_config(cfg);
 
-        let vision_tower = VisionEncoder::new(&config.vision_config, vb.pp("vision_tower"))?;
+        // HF checkpoints wrap everything under a `model.*` root; descend
+        // once here so sub-module VarBuilders are positioned correctly.
+        let vb_root = vb.pp("model");
+
+        let vision_tower =
+            Gemma4VisionTower::new(&config.vision_config, vb_root.pp("vision_tower"))?;
 
         let embed_vision = Gemma4MultimodalEmbedder::new(
             config.vision_hidden_size,
             cfg.hidden_size,
-            config.vision_config.layer_norm_eps,
-            vb.pp("embed_vision"),
+            config.vision_config.rms_norm_eps,
+            vb_root.pp("embed_vision"),
         )?;
 
-        let language_model = Gemma4ForCausalLM::new(cfg, vb.pp("language_model"))?;
+        let language_model = Gemma4ForCausalLM::new(cfg, vb_root.pp("language_model"))?;
 
         Ok(Self {
             vision_tower,
@@ -201,8 +152,17 @@ impl Gemma4ForConditionalGeneration {
     }
 
     /// Encode images: vision encoder → embedder projection.
-    pub fn encode_images(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let vision_features = self.vision_tower.forward(pixel_values)?;
+    ///
+    /// `pixel_values`       : `[B, L, 3·ps·ps]` flattened patches.
+    /// `pixel_position_ids` : `i64 [B, L, 2]` (`-1, -1` marks padding).
+    pub fn encode_images(
+        &self,
+        pixel_values: &Tensor,
+        pixel_position_ids: &Tensor,
+    ) -> Result<Tensor> {
+        let vision_features = self
+            .vision_tower
+            .forward(pixel_values, pixel_position_ids)?;
         self.embed_vision.forward(&vision_features)
     }
 
@@ -378,7 +338,6 @@ mod tests {
         let cfg = test_model_config();
         let vlm_cfg = Gemma4VLMConfig::from_model_config(&cfg);
         assert_eq!(vlm_cfg.vision_config.hidden_size, 32);
-        assert_eq!(vlm_cfg.vision_config.image_size, 28);
         assert_eq!(vlm_cfg.vision_config.patch_size, 14);
         assert_eq!(vlm_cfg.tokens_per_image, 4);
         assert_eq!(vlm_cfg.image_token_id, 262144);
