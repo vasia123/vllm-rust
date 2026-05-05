@@ -36,50 +36,23 @@ use crate::layers::RotaryEmbedding;
 use super::tp_layers::{TpContext, TpEmbedding, TpGeGluMlp, TpLinear};
 
 // ─── Gemma3n RMSNorm (offset by +1, same as Gemma3) ────────────────────────
+//
+// Both `Gemma3nRmsNorm` and `UnweightedRmsNorm` are aliases over
+// `crate::layers::RmsNorm` since Phase 3a — variants `ScalePlusOne` and
+// `Unweighted` respectively.
 
-struct Gemma3nRmsNorm {
-    weight: Tensor,
-    eps: f64,
+type Gemma3nRmsNorm = crate::layers::RmsNorm;
+
+#[inline]
+fn gemma3n_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<Gemma3nRmsNorm> {
+    crate::layers::rms_norm_gemma(size, eps, vb)
 }
 
-impl Gemma3nRmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
-    }
-}
+type UnweightedRmsNorm = crate::layers::RmsNorm;
 
-impl Module for Gemma3nRmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let scale = (&self.weight.to_dtype(DType::F32)? + 1.0)?;
-        xs_normed.broadcast_mul(&scale)?.to_dtype(dtype)
-    }
-}
-
-// ─── RMSNorm without learned weight (for v_norm) ───────────────────────────
-
-struct UnweightedRmsNorm {
-    eps: f64,
-}
-
-impl UnweightedRmsNorm {
-    fn new(eps: f64) -> Self {
-        Self { eps }
-    }
-}
-
-impl Module for UnweightedRmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        xs_normed.to_dtype(dtype)
-    }
+#[inline]
+fn unweighted_rms_norm(eps: f64) -> UnweightedRmsNorm {
+    crate::layers::rms_norm_unweighted(eps)
 }
 
 // ─── Soft Capping ───────────────────────────────────────────────────────────
@@ -307,7 +280,7 @@ impl Gemma3nAltUp {
         )?;
         let modality_router =
             candle_nn::linear_no_bias(hidden_size, altup_num_inputs, vb.pp("modality_router"))?;
-        let router_norm = Gemma3nRmsNorm::new(hidden_size, rms_norm_eps, vb.pp("router_norm"))?;
+        let router_norm = gemma3n_rms_norm(hidden_size, rms_norm_eps, vb.pp("router_norm"))?;
         let router_input_scale = (hidden_size as f64).powf(-1.0);
         let correct_output_scale = vb.get(hidden_size, "correct_output_scale")?;
 
@@ -440,7 +413,7 @@ impl Gemma3nLaurelBlock {
         let linear_right =
             candle_nn::linear_no_bias(laurel_rank, hidden_size, vb.pp("linear_right"))?;
         let post_laurel_norm =
-            Gemma3nRmsNorm::new(hidden_size, rms_norm_eps, vb.pp("post_laurel_norm"))?;
+            gemma3n_rms_norm(hidden_size, rms_norm_eps, vb.pp("post_laurel_norm"))?;
 
         Ok(Self {
             linear_left,
@@ -537,9 +510,9 @@ impl Gemma3nAttention {
         let num_heads_per_gpu = num_heads / world_size;
         let num_kv_heads_per_gpu = num_kv_heads / world_size;
 
-        let q_norm = Gemma3nRmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = Gemma3nRmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-        let v_norm = UnweightedRmsNorm::new(cfg.rms_norm_eps);
+        let q_norm = gemma3n_rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = gemma3n_rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let v_norm = unweighted_rms_norm(cfg.rms_norm_eps);
 
         let is_local = extra_cfg.is_sliding_layer(layer_idx);
         let rope_theta = if is_local {
@@ -811,23 +784,23 @@ impl Gemma3nDecoderLayer {
         )?;
 
         let input_layernorm =
-            Gemma3nRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = Gemma3nRmsNorm::new(
+            gemma3n_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = gemma3n_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let pre_feedforward_layernorm = Gemma3nRmsNorm::new(
+        let pre_feedforward_layernorm = gemma3n_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("pre_feedforward_layernorm"),
         )?;
-        let post_feedforward_layernorm = Gemma3nRmsNorm::new(
+        let post_feedforward_layernorm = gemma3n_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
         )?;
-        let post_per_layer_input_norm = Gemma3nRmsNorm::new(
+        let post_per_layer_input_norm = gemma3n_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_per_layer_input_norm"),
@@ -1037,7 +1010,7 @@ impl Gemma3nForCausalLM {
             vb_m.pp("self_decoder").pp("per_layer_model_projection"),
         )?;
 
-        let per_layer_projection_norm = Gemma3nRmsNorm::new(
+        let per_layer_projection_norm = gemma3n_rms_norm(
             extra_cfg.hidden_size_per_layer_input,
             cfg.rms_norm_eps,
             vb_m.pp("self_decoder").pp("per_layer_projection_norm"),
@@ -1055,7 +1028,7 @@ impl Gemma3nForCausalLM {
             )?);
         }
 
-        let norm = Gemma3nRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = gemma3n_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         let lm_head = if world_size == 1 {
             let emb_weights = embed_tokens
@@ -1602,7 +1575,7 @@ mod tests {
 
     #[test]
     fn test_unweighted_rms_norm() {
-        let norm = UnweightedRmsNorm::new(1e-6);
+        let norm = unweighted_rms_norm(1e-6);
         let device = Device::Cpu;
         let x = Tensor::randn(0.0f32, 1.0, (2, 8), &device).expect("input");
         let out = norm.forward(&x).expect("forward");
@@ -1613,7 +1586,7 @@ mod tests {
     fn test_gemma3n_rms_norm_offset() {
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let norm = Gemma3nRmsNorm::new(8, 1e-6, vb.pp("norm")).expect("norm");
+        let norm = gemma3n_rms_norm(8, 1e-6, vb.pp("norm")).expect("norm");
 
         // With zero weights, scale = (0 + 1) = 1, so output should be normalized
         let x = Tensor::ones((1, 8), DType::F32, &device).expect("input");

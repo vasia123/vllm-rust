@@ -29,7 +29,7 @@ use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::multimodal::{MultimodalInputs, VisionEncoder, VisionEncoderConfig, VisionEncoderType};
 
-use super::gemma3::{Gemma3ForCausalLM, Gemma3RmsNorm};
+use super::gemma3::{gemma3_rms_norm, Gemma3ForCausalLM, Gemma3RmsNorm};
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -160,7 +160,7 @@ impl Gemma3MultiModalProjector {
             vb.get((vision_hidden, text_hidden), "mm_input_projection_weight")?;
 
         let mm_soft_emb_norm =
-            Gemma3RmsNorm::new(vision_hidden, layer_norm_eps, vb.pp("mm_soft_emb_norm"))?;
+            gemma3_rms_norm(vision_hidden, layer_norm_eps, vb.pp("mm_soft_emb_norm"))?;
 
         Ok(Self {
             mm_input_projection_weight,

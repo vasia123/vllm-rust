@@ -1,54 +1,139 @@
-use candle_core::{Module, Result, Tensor};
+use candle_core::{DType, Module, Result, Tensor, D};
 use candle_nn::VarBuilder;
+
+/// Three RMSNorm flavours used across the model zoo.
+///
+/// - `Standard`: classic `xs / sqrt(var + eps) * weight` (Llama, Qwen,
+///   Mistral, Gemma 4, …).
+/// - `ScalePlusOne`: `xs / sqrt(var + eps) * (1 + weight)` — the
+///   "Gemma trick" used by Gemma 1/2/3 to keep RMSNorm initial weights
+///   centred around 0 instead of 1. Order-of-ops sensitive in bf16,
+///   so this is implemented manually rather than through candle's
+///   fused kernel.
+/// - `Unweighted`: `xs / sqrt(var + eps)` with no scale at all
+///   (Gemma 4 `v_norm`, router norms in MoE attention). No weight
+///   tensor is loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RmsNormVariant {
+    Standard,
+    ScalePlusOne,
+    Unweighted,
+}
 
 /// RMSNorm layer with optional fused CUDA kernel acceleration.
 ///
 /// Drop-in replacement for `candle_nn::RmsNorm`. When the `cuda-layernorm`
-/// feature is enabled and the input tensor is on GPU, dispatches to a fused
-/// CUDA kernel that computes variance, normalization, and weight scaling in
-/// a single pass (5-15% throughput improvement over candle's multi-kernel path).
-/// Falls back to `candle_nn::ops::rms_norm` otherwise.
+/// feature is enabled, the variant is `Standard`, and the input tensor is
+/// on GPU, dispatches to a fused CUDA kernel that computes variance,
+/// normalization, and weight scaling in a single pass (5-15% throughput
+/// improvement over candle's multi-kernel path). Other variants take a
+/// manual F32-converted path that matches the per-model implementations
+/// the Gemma family historically shipped.
 #[derive(Clone, Debug)]
 pub struct RmsNorm {
-    weight: Tensor,
+    weight: Option<Tensor>,
     eps: f64,
+    variant: RmsNormVariant,
 }
 
 impl RmsNorm {
+    /// Construct a `Standard` RMSNorm from a weight tensor.
     pub fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+        Self {
+            weight: Some(weight),
+            eps,
+            variant: RmsNormVariant::Standard,
+        }
     }
 
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
+    /// Construct an RMSNorm with an explicit variant. `Unweighted`
+    /// ignores any weight argument (pass `None`).
+    pub fn with_variant(weight: Option<Tensor>, eps: f64, variant: RmsNormVariant) -> Self {
+        Self {
+            weight,
+            eps,
+            variant,
+        }
+    }
+
+    pub fn weight(&self) -> Option<&Tensor> {
+        self.weight.as_ref()
     }
 
     pub fn eps(&self) -> f64 {
         self.eps
     }
+
+    pub fn variant(&self) -> RmsNormVariant {
+        self.variant
+    }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda-layernorm")]
-        {
-            if crate::cuda_kernels::rms_norm_cuda_available(xs) {
-                let xs = xs.contiguous()?;
-                return crate::cuda_kernels::rms_norm_cuda(&xs, &self.weight, self.eps as f32);
+        match self.variant {
+            RmsNormVariant::Standard => {
+                let weight = self.weight.as_ref().expect("Standard RmsNorm needs weight");
+
+                #[cfg(feature = "cuda-layernorm")]
+                {
+                    if crate::cuda_kernels::rms_norm_cuda_available(xs) {
+                        let xs = xs.contiguous()?;
+                        return crate::cuda_kernels::rms_norm_cuda(&xs, weight, self.eps as f32);
+                    }
+                }
+
+                // Fallback: candle_nn ops (fused CUDA via candle for GPU, pure Rust for CPU)
+                candle_nn::ops::rms_norm(&xs.contiguous()?, weight, self.eps as f32)
+            }
+            RmsNormVariant::ScalePlusOne => {
+                let weight = self
+                    .weight
+                    .as_ref()
+                    .expect("ScalePlusOne RmsNorm needs weight");
+                // Manual `(1 + weight) * normed` path — order-of-ops
+                // sensitive in bf16, so we explicitly upcast to F32.
+                let dtype = xs.dtype();
+                let xs_f32 = xs.to_dtype(DType::F32)?;
+                let variance = xs_f32.sqr()?.mean_keepdim(D::Minus1)?;
+                let xs_normed = xs_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+                let scale = (weight.to_dtype(DType::F32)? + 1.0)?;
+                xs_normed.broadcast_mul(&scale)?.to_dtype(dtype)
+            }
+            RmsNormVariant::Unweighted => {
+                // No `weight` tensor — pure normalisation.
+                let dtype = xs.dtype();
+                let xs_f32 = xs.to_dtype(DType::F32)?;
+                let variance = xs_f32.sqr()?.mean_keepdim(D::Minus1)?;
+                let xs_normed = xs_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+                xs_normed.to_dtype(dtype)
             }
         }
-
-        // Fallback: candle_nn ops (fused CUDA via candle for GPU, pure Rust for CPU)
-        candle_nn::ops::rms_norm(&xs.contiguous()?, &self.weight, self.eps as f32)
     }
 }
 
-/// Create an RMSNorm layer, loading the weight from a VarBuilder.
+/// Create a `Standard` RMSNorm layer, loading the weight from a VarBuilder.
 ///
 /// Drop-in replacement for `candle_nn::rms_norm()`.
 pub fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
     let weight = vb.get(size, "weight")?;
     Ok(RmsNorm::new(weight, eps))
+}
+
+/// Create a `ScalePlusOne` RMSNorm — Gemma 1/2/3 style.
+pub fn rms_norm_gemma(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
+    let weight = vb.get(size, "weight")?;
+    Ok(RmsNorm::with_variant(
+        Some(weight),
+        eps,
+        RmsNormVariant::ScalePlusOne,
+    ))
+}
+
+/// Create an `Unweighted` RMSNorm — no weight tensor is read from
+/// `vb` (the variant takes none).
+pub fn rms_norm_unweighted(eps: f64) -> RmsNorm {
+    RmsNorm::with_variant(None, eps, RmsNormVariant::Unweighted)
 }
 
 #[cfg(test)]
@@ -139,7 +224,10 @@ mod tests {
         assert!(norm.is_ok());
 
         let norm = norm.unwrap();
-        assert_eq!(norm.weight().dims(), &[hidden]);
+        assert_eq!(
+            norm.weight().expect("Standard variant has weight").dims(),
+            &[hidden]
+        );
         assert_eq!(norm.eps(), eps);
     }
 
@@ -168,5 +256,74 @@ mod tests {
                 "weight=2 output should be 2x weight=1 output: {b} vs 2*{a}"
             );
         }
+    }
+
+    #[test]
+    fn test_scale_plus_one_matches_legacy_gemma_path() {
+        // ScalePlusOne should be byte-equal to the per-model `(1 +
+        // weight) * normed` implementation that the Gemma family
+        // historically shipped (see e.g. `models/gemma3.rs::Gemma3RmsNorm`).
+        let device = Device::Cpu;
+        let hidden = 32;
+        let eps = 1e-6;
+
+        // Pick non-trivial weights so weight ≠ 0 path is exercised.
+        let weight_data: Vec<f32> = (0..hidden).map(|i| -0.4 + 0.05 * i as f32).collect();
+        let weight = Tensor::from_vec(weight_data, hidden, &device).unwrap();
+        let norm = RmsNorm::with_variant(Some(weight.clone()), eps, RmsNormVariant::ScalePlusOne);
+
+        let input = Tensor::randn(0.0f32, 1.0, (4, hidden), &device).unwrap();
+        let actual = norm.forward(&input).unwrap();
+
+        // Reference: (1 + w) * (xs / sqrt(var + eps)).
+        let xs_f32 = input.to_dtype(DType::F32).unwrap();
+        let variance = xs_f32.sqr().unwrap().mean_keepdim(D::Minus1).unwrap();
+        let normed = xs_f32
+            .broadcast_div(&(variance + eps).unwrap().sqrt().unwrap())
+            .unwrap();
+        let scale = (weight.to_dtype(DType::F32).unwrap() + 1.0).unwrap();
+        let expected = normed.broadcast_mul(&scale).unwrap();
+
+        let a: Vec<f32> = actual.flatten_all().unwrap().to_vec1().unwrap();
+        let e: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-6, "Mismatch at {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn test_unweighted_drops_scale() {
+        // Unweighted RMSNorm must be the pure normalisation step —
+        // identical to `Standard` with weight=ones except no weight
+        // tensor is required.
+        let device = Device::Cpu;
+        let hidden = 16;
+        let eps = 1e-5;
+
+        let norm = rms_norm_unweighted(eps);
+        let input = Tensor::randn(0.0f32, 1.0, (2, hidden), &device).unwrap();
+        let actual = norm.forward(&input).unwrap();
+
+        let xs_f32 = input.to_dtype(DType::F32).unwrap();
+        let variance = xs_f32.sqr().unwrap().mean_keepdim(D::Minus1).unwrap();
+        let expected = xs_f32
+            .broadcast_div(&(variance + eps).unwrap().sqrt().unwrap())
+            .unwrap();
+
+        let a: Vec<f32> = actual.flatten_all().unwrap().to_vec1().unwrap();
+        let e: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-6, "Mismatch at {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_gemma_helper_loads_from_vb() {
+        // Smoke test: `rms_norm_gemma` constructs a `ScalePlusOne` variant.
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+        let norm = rms_norm_gemma(64, 1e-6, vb).unwrap();
+        assert_eq!(norm.variant(), RmsNormVariant::ScalePlusOne);
+        assert!(norm.weight().is_some());
     }
 }

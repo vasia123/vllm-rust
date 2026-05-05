@@ -39,50 +39,21 @@ use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 // `GemmaRMSNorm` with `(1 + weight)` offset. Using the offset here would
 // silently break every normalization in the model.
 
-struct Gemma4RmsNorm {
-    weight: Tensor,
-    eps: f64,
+// `Gemma4RmsNorm` is `Standard` and `UnweightedRmsNorm` is `Unweighted` —
+// both implemented by `crate::layers::RmsNorm` since Phase 3a.
+
+type Gemma4RmsNorm = crate::layers::RmsNorm;
+
+#[inline]
+fn gemma4_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<Gemma4RmsNorm> {
+    crate::layers::rms_norm(size, eps, vb)
 }
 
-impl Gemma4RmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
-    }
-}
+type UnweightedRmsNorm = crate::layers::RmsNorm;
 
-impl Module for Gemma4RmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        xs_normed
-            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?
-            .to_dtype(dtype)
-    }
-}
-
-// ─── RMSNorm without learned weight (V and router) ────────────────────────
-
-struct UnweightedRmsNorm {
-    eps: f64,
-}
-
-impl UnweightedRmsNorm {
-    fn new(eps: f64) -> Self {
-        Self { eps }
-    }
-}
-
-impl Module for UnweightedRmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        xs_normed.to_dtype(dtype)
-    }
+#[inline]
+fn unweighted_rms_norm(eps: f64) -> UnweightedRmsNorm {
+    crate::layers::rms_norm_unweighted(eps)
 }
 
 // ─── Soft capping helper ───────────────────────────────────────────────────
@@ -476,7 +447,7 @@ impl QuantizedGemma4Router {
         vb: VarBuilder,
         prefix: &str,
     ) -> Result<Self> {
-        let norm = UnweightedRmsNorm::new(rms_norm_eps);
+        let norm = unweighted_rms_norm(rms_norm_eps);
         let scale = vb.get(hidden_size, "scale")?;
         let gate =
             loader.load_linear(&format!("{prefix}.proj"), hidden_size, num_experts, false)?;
@@ -774,8 +745,8 @@ impl QuantizedGemma4Attention {
                 )?
             };
 
-            let k_norm = Gemma4RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-            let v_norm = UnweightedRmsNorm::new(cfg.rms_norm_eps);
+            let k_norm = gemma4_rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+            let v_norm = unweighted_rms_norm(cfg.rms_norm_eps);
 
             (Some(k_proj), Some(v_proj), Some(k_norm), Some(v_norm))
         };
@@ -787,7 +758,7 @@ impl QuantizedGemma4Attention {
             false,
         )?;
 
-        let q_norm = Gemma4RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let q_norm = gemma4_rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
 
         let rotary_emb = extra_cfg.build_rotary_for_layer(
             layer_idx,
@@ -1202,22 +1173,22 @@ impl QuantizedGemma4DecoderLayer {
             None
         };
 
-        let input_layernorm = Gemma4RmsNorm::new(
+        let input_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = Gemma4RmsNorm::new(
+        let post_attention_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("post_attention_layernorm"),
         )?;
-        let pre_feedforward_layernorm = Gemma4RmsNorm::new(
+        let pre_feedforward_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("pre_feedforward_layernorm"),
         )?;
-        let post_feedforward_layernorm = Gemma4RmsNorm::new(
+        let post_feedforward_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("post_feedforward_layernorm"),
@@ -1229,17 +1200,17 @@ impl QuantizedGemma4DecoderLayer {
             pre_feedforward_layernorm_2,
         ) = if moe.is_some() {
             (
-                Some(Gemma4RmsNorm::new(
+                Some(gemma4_rms_norm(
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
                     vb_layer.pp("post_feedforward_layernorm_1"),
                 )?),
-                Some(Gemma4RmsNorm::new(
+                Some(gemma4_rms_norm(
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
                     vb_layer.pp("post_feedforward_layernorm_2"),
                 )?),
-                Some(Gemma4RmsNorm::new(
+                Some(gemma4_rms_norm(
                     cfg.hidden_size,
                     cfg.rms_norm_eps,
                     vb_layer.pp("pre_feedforward_layernorm_2"),
@@ -1264,7 +1235,7 @@ impl QuantizedGemma4DecoderLayer {
                         cfg.hidden_size,
                         false,
                     )?),
-                    Some(Gemma4RmsNorm::new(
+                    Some(gemma4_rms_norm(
                         cfg.hidden_size,
                         cfg.rms_norm_eps,
                         vb_layer.pp("post_per_layer_input_norm"),
@@ -1530,7 +1501,7 @@ impl QuantizedGemma4ForCausalLM {
                     false,
                 )?;
 
-                let ple_norm = Gemma4RmsNorm::new(
+                let ple_norm = gemma4_rms_norm(
                     extra_cfg.hidden_size_per_layer_input,
                     cfg.rms_norm_eps,
                     vb_m.pp("per_layer_projection_norm"),
@@ -1554,7 +1525,7 @@ impl QuantizedGemma4ForCausalLM {
             )?);
         }
 
-        let norm = Gemma4RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = gemma4_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         let lm_head: Box<dyn QuantizedLinear> = if cfg.tie_word_embeddings {
             Box::new(TiedEmbeddingHead {

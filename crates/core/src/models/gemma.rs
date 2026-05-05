@@ -13,31 +13,15 @@ use super::tp_layers::{TpEmbedding, TpGeGluMlp, TpLinear};
 
 // ─── Gemma RMSNorm ───────────────────────────────────────────────────────────
 //
-// Gemma uses a modified RMSNorm: output = x * (1 + weight) / rms(x)
-// instead of the standard: output = x * weight / rms(x)
+// Gemma uses a modified RMSNorm: `output = x * (1 + weight) / rms(x)`
+// instead of the standard `output = x * weight / rms(x)`. Implemented
+// by `crate::layers::RmsNormVariant::ScalePlusOne` since Phase 3a;
+// `GemmaRmsNorm` is a type alias kept for callsite stability.
+type GemmaRmsNorm = crate::layers::RmsNorm;
 
-struct GemmaRmsNorm {
-    weight: Tensor,
-    eps: f64,
-}
-
-impl GemmaRmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
-    }
-}
-
-impl Module for GemmaRmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        // Gemma uses (1 + weight) instead of just weight
-        let scale = (&self.weight.to_dtype(DType::F32)? + 1.0)?;
-        xs_normed.broadcast_mul(&scale)?.to_dtype(dtype)
-    }
+#[inline]
+fn gemma_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<GemmaRmsNorm> {
+    crate::layers::rms_norm_gemma(size, eps, vb)
 }
 
 // ─── Attention ───────────────────────────────────────────────────────────────
@@ -315,8 +299,8 @@ impl GemmaDecoderLayer {
         let self_attn = GemmaAttention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
         let mlp = TpGeGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
-            GemmaRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = GemmaRmsNorm::new(
+            gemma_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = gemma_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -429,7 +413,7 @@ impl GemmaForCausalLM {
             layers.push(GemmaDecoderLayer::new_with_tp(cfg, vb_l.pp(i), pg)?);
         }
 
-        let norm = GemmaRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = gemma_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         // LM head: output projection to vocabulary
         // Gemma always uses tied embeddings
@@ -762,7 +746,7 @@ mod tests {
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
-        let norm = GemmaRmsNorm::new(4, 1e-6, vb).expect("build norm");
+        let norm = gemma_rms_norm(4, 1e-6, vb).expect("build norm");
 
         // With zero weights, (1 + weight) = 1, so output should be normalized input
         let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).expect("input");

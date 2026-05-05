@@ -17,27 +17,11 @@ use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 //
 // Gemma uses a modified RMSNorm: output = x * (1 + weight) / rms(x)
 
-struct GemmaRmsNorm {
-    weight: Tensor,
-    eps: f64,
-}
+type GemmaRmsNorm = crate::layers::RmsNorm;
 
-impl GemmaRmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
-    }
-}
-
-impl Module for GemmaRmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let scale = (&self.weight.to_dtype(DType::F32)? + 1.0)?;
-        xs_normed.broadcast_mul(&scale)?.to_dtype(dtype)
-    }
+#[inline]
+fn gemma_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<GemmaRmsNorm> {
+    crate::layers::rms_norm_gemma(size, eps, vb)
 }
 
 // ─── Quantized GeGLU MLP ────────────────────────────────────────────────────
@@ -335,12 +319,12 @@ impl QuantizedGemmaDecoderLayer {
         )?;
 
         let vb_layer = vb.pp("model").pp("layers").pp(layer_idx);
-        let input_layernorm = GemmaRmsNorm::new(
+        let input_layernorm = gemma_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = GemmaRmsNorm::new(
+        let post_attention_layernorm = gemma_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("post_attention_layernorm"),
@@ -438,7 +422,7 @@ impl QuantizedGemmaForCausalLM {
             )?);
         }
 
-        let norm = GemmaRmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = gemma_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         // Gemma always uses tied embeddings
         let lm_head = Box::new(TiedEmbeddingHead {

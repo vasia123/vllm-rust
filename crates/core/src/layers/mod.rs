@@ -12,7 +12,7 @@ pub use attention::{
 };
 pub use mask::causal_mask;
 pub use mlp::{fused_swiglu, SwiGluMlp};
-pub use normalization::{rms_norm, RmsNorm};
+pub use normalization::{rms_norm, rms_norm_gemma, rms_norm_unweighted, RmsNorm, RmsNormVariant};
 pub use rotary::{
     get_mrope_interleaved_id_list, MRoPEInterleaved, RotaryEmbedding, XDRotaryEmbedding,
 };

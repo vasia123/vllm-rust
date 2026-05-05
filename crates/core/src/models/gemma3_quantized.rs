@@ -27,27 +27,11 @@ use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 
 // ─── Gemma3 RMSNorm ────────────────────────────────────────────────────────
 
-struct Gemma3RmsNorm {
-    weight: Tensor,
-    eps: f64,
-}
+type Gemma3RmsNorm = crate::layers::RmsNorm;
 
-impl Gemma3RmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
-    }
-}
-
-impl Module for Gemma3RmsNorm {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let variance = xs.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let xs_normed = xs.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let scale = (&self.weight.to_dtype(DType::F32)? + 1.0)?;
-        xs_normed.broadcast_mul(&scale)?.to_dtype(dtype)
-    }
+#[inline]
+fn gemma3_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<Gemma3RmsNorm> {
+    crate::layers::rms_norm_gemma(size, eps, vb)
 }
 
 // ─── Soft Capping ──────────────────────────────────────────────────────────
@@ -470,22 +454,22 @@ impl QuantizedGemma3DecoderLayer {
         )?;
 
         let vb_layer = vb.pp("model").pp("layers").pp(layer_idx);
-        let input_layernorm = Gemma3RmsNorm::new(
+        let input_layernorm = gemma3_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = Gemma3RmsNorm::new(
+        let post_attention_layernorm = gemma3_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("post_attention_layernorm"),
         )?;
-        let pre_feedforward_layernorm = Gemma3RmsNorm::new(
+        let pre_feedforward_layernorm = gemma3_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("pre_feedforward_layernorm"),
         )?;
-        let post_feedforward_layernorm = Gemma3RmsNorm::new(
+        let post_feedforward_layernorm = gemma3_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb_layer.pp("post_feedforward_layernorm"),
@@ -598,7 +582,7 @@ impl QuantizedGemma3ForCausalLM {
             )?);
         }
 
-        let norm = Gemma3RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        let norm = gemma3_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         // Gemma3 always uses tied embeddings
         let lm_head = Box::new(TiedEmbeddingHead {

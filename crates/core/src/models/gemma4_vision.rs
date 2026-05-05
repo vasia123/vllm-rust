@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::config::ModelConfig;
 
-use super::gemma4::{Gemma4RmsNorm, UnweightedRmsNorm};
+use super::gemma4::{gemma4_rms_norm, unweighted_rms_norm, Gemma4RmsNorm, UnweightedRmsNorm};
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -485,9 +485,9 @@ impl Gemma4VisionAttention {
             vb.pp("o_proj"),
         )?;
 
-        let q_norm = Gemma4RmsNorm::new(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = Gemma4RmsNorm::new(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-        let v_norm = UnweightedRmsNorm::new(cfg.rms_norm_eps);
+        let q_norm = gemma4_rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = gemma4_rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let v_norm = unweighted_rms_norm(cfg.rms_norm_eps);
 
         Ok(Self {
             q_proj,
@@ -587,18 +587,18 @@ impl Gemma4VisionEncoderLayer {
         let self_attn = Gemma4VisionAttention::new(cfg, vb.pp("self_attn"))?;
         let mlp = Gemma4VisionMLP::new(cfg, vb.pp("mlp"))?;
         let input_layernorm =
-            Gemma4RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = Gemma4RmsNorm::new(
+            gemma4_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let pre_feedforward_layernorm = Gemma4RmsNorm::new(
+        let pre_feedforward_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("pre_feedforward_layernorm"),
         )?;
-        let post_feedforward_layernorm = Gemma4RmsNorm::new(
+        let post_feedforward_layernorm = gemma4_rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
