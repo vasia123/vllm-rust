@@ -1,5 +1,18 @@
 #[macro_use]
 mod macros;
+
+// ─── Architecture refactor (Phase 1) ────────────────────────────────
+//
+// `factory` and `traits` define the new dispatch surface. They land
+// without any model migrating onto them — the legacy match-arm
+// dispatch below is still the live path. `registry_v2` is the
+// phf-backed lookup table that Phase 2 will populate; behind a
+// feature flag for now.
+pub mod factory;
+#[cfg(feature = "model-registry-v2")]
+pub mod registry_v2;
+pub mod traits;
+
 pub mod afmoe;
 pub mod apertus;
 pub mod apertus_quantized;

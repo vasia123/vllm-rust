@@ -15,6 +15,10 @@ cuda-moe = ["cuda-kernels"]
 marlin = ["cuda-kernels"]
 image-loading = ["dep:image", "dep:base64"]
 audio = ["dep:symphonia"]
+# Phase 1 of the architecture refactor (registry-based dispatch). Off by
+# default until Phase 2 ships and the registry is populated; legacy
+# match-arm dispatch remains the live path until then.
+model-registry-v2 = ["dep:phf"]
 
 # Test tiers based on GPU memory requirements
 gpu-test-small = []      # Tests requiring < 2GB VRAM
@@ -40,6 +44,8 @@ flashinfer-rs = { git = "https://github.com/vasia123/flashinfer-rs", optional = 
 image = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
+phf = { workspace = true, optional = true }
+bitflags = { workspace = true }
 half.workspace = true
 rand.workspace = true
 libloading.workspace = true
