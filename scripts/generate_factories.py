@@ -349,8 +349,30 @@ def to_snake(name: str) -> str:
 
 
 def short_name(struct: str) -> str:
-    """`MixtralForCausalLM` → `mixtral`. Used for filename + factory name."""
+    """`MixtralForCausalLM` → `mixtral` when unambiguous, otherwise the
+    full snake_case name. Stripping `_for_causal_lm` collides for
+    families that ship both text-only (`FooForCausalLM`) and VLM
+    (`FooForConditionalGeneration`) variants, so the de-duplication is
+    handled by `aggregate_short_names` after grouping.
+    """
     return to_snake(struct).replace("_for_causal_lm", "").replace("_for_conditional_generation", "")
+
+
+def aggregate_short_names(structs: list[str]) -> dict[str, str]:
+    """Map each canonical struct → unique short name. Collisions get
+    the full snake_case form."""
+    shorts: dict[str, str] = {}
+    by_short: dict[str, list[str]] = {}
+    for s in structs:
+        short = short_name(s)
+        by_short.setdefault(short, []).append(s)
+    for short, group in by_short.items():
+        if len(group) == 1:
+            shorts[group[0]] = short
+        else:
+            for s in group:
+                shorts[s] = to_snake(s)
+    return shorts
 
 
 def display_name(struct: str) -> str:
@@ -544,12 +566,18 @@ def main() -> int:
     skipped = 0
     summary: list[tuple[str, int, str]] = []
 
-    for struct, entry in sorted(table.items()):
-        if struct == "__deprecated__":
+    canonical_keys = [k for k in table.keys() if k != "__deprecated__"]
+    # Disambiguate by canonical *arch_name* (not struct), since two
+    # arches can share a struct (e.g. `XLMRobertaModel` and
+    # `GteNewModel` both build `GteNewForEmbedding`).
+    short_map = aggregate_short_names(canonical_keys)
+
+    for canonical, entry in sorted(table.items()):
+        if canonical == "__deprecated__":
             # Deprecated arms are handled by a single hand-written
             # `deprecated.rs` (Phase 2.5). Skip generation here.
             continue
-        short = short_name(struct)
+        short = short_map.get(canonical, short_name(canonical))
         if not short:
             continue
         if short in skip:

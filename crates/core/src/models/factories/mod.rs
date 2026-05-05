@@ -11,7 +11,6 @@
 
 // The `pub mod factories;` declaration in `models/mod.rs` is already
 // gated on `model-registry-v2`; do not repeat the cfg here.
-
 pub mod afmoe;
 pub mod apertus;
 pub mod arcee;
@@ -63,9 +62,12 @@ pub mod fun_audio_chat;
 pub mod fuyu;
 pub mod gemma;
 pub mod gemma2;
-pub mod gemma3;
-pub mod gemma3n;
-pub mod gemma4;
+pub mod gemma3_for_causal_lm;
+pub mod gemma3_for_conditional_generation;
+pub mod gemma3n_for_causal_lm;
+pub mod gemma3n_for_conditional_generation;
+pub mod gemma4_for_causal_lm;
+pub mod gemma4_for_conditional_generation;
 pub mod glm;
 pub mod glm4;
 pub mod glm4_moe;
