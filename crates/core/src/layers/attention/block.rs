@@ -189,6 +189,14 @@ pub struct AttentionConfig {
     /// `V: num_kv_heads*head_dim`. Used by Phi3, GPT-2/BigCode, ChatGLM,
     /// DBRX, Falcon-style architectures.
     pub qkv_fused: bool,
+
+    /// QK-norm ordering relative to RoPE.
+    ///
+    /// `false` (default, used by Qwen3/Olmo2/Cohere): apply QK-norm BEFORE RoPE.
+    /// `true` (used by Hunyuan): apply QK-norm AFTER RoPE on the rotated Q/K.
+    ///
+    /// Only consulted when `qk_norm` is set.
+    pub qk_norm_after_rope: bool,
 }
 
 impl AttentionConfig {
@@ -209,6 +217,7 @@ impl AttentionConfig {
             proj_names: ProjNames::default(),
             bypass_rope: false,
             qkv_fused: false,
+            qk_norm_after_rope: false,
         }
     }
 
@@ -219,6 +228,11 @@ impl AttentionConfig {
 
     pub fn with_qkv_fused(mut self) -> Self {
         self.qkv_fused = true;
+        self
+    }
+
+    pub fn with_qk_norm_after_rope(mut self) -> Self {
+        self.qk_norm_after_rope = true;
         self
     }
 
@@ -307,6 +321,7 @@ pub struct AttentionBlock {
     manual_scale: f64,
     needs_manual: bool,
     bypass_rope: bool,
+    qk_norm_after_rope: bool,
 }
 
 impl AttentionBlock {
@@ -424,6 +439,7 @@ impl AttentionBlock {
             manual_scale: cfg.effective_scale(),
             needs_manual: cfg.needs_manual_path(),
             bypass_rope: cfg.bypass_rope,
+            qk_norm_after_rope: cfg.qk_norm_after_rope,
         })
     }
 
@@ -457,11 +473,22 @@ impl AttentionBlock {
         let (b_sz, q_len, _) = xs.dims3()?;
 
         let (q, k, v) = self.project_qkv(xs, b_sz, q_len, tp_ctx)?;
-        let (q, k) = self.apply_qk_norm(&q, &k)?;
-        let (q, k) = if self.bypass_rope {
-            (q, k)
+        // Default order: QK-norm → RoPE. Some architectures (Hunyuan) flip
+        // this to RoPE → QK-norm; controlled by `qk_norm_after_rope`.
+        let (q, k) = if self.qk_norm_after_rope {
+            let (q, k) = if self.bypass_rope {
+                (q, k)
+            } else {
+                self.rotary_emb.apply(&q, &k, seqlen_offset)?
+            };
+            self.apply_qk_norm(&q, &k)?
         } else {
-            self.rotary_emb.apply(&q, &k, seqlen_offset)?
+            let (q, k) = self.apply_qk_norm(&q, &k)?;
+            if self.bypass_rope {
+                (q, k)
+            } else {
+                self.rotary_emb.apply(&q, &k, seqlen_offset)?
+            }
         };
 
         let attn_output = if self.needs_manual {
@@ -509,12 +536,19 @@ impl AttentionBlock {
         let batch_size = sequences.len();
 
         let (q, k, v) = self.project_qkv(xs, batch_size, 1, tp_ctx)?;
-        let (q, k) = self.apply_qk_norm(&q, &k)?;
+        // Apply QK-norm before RoPE in the default ordering. For Hunyuan-style
+        // (qk_norm_after_rope), this is deferred to inside the per-seq loop.
+        let (q, k) = if self.qk_norm_after_rope {
+            (q, k)
+        } else {
+            self.apply_qk_norm(&q, &k)?
+        };
 
         // Fast batched CUDA decode path: only when no softcap / sliding-window /
-        // custom scale (i.e. paged_attention_cuda's defaults match).
+        // custom scale and no post-RoPE QK norm (the kernel applies RoPE
+        // internally and we cannot inject a norm step in between).
         #[cfg(feature = "cuda-kernels")]
-        if !self.needs_manual {
+        if !self.needs_manual && !self.qk_norm_after_rope {
             return self.cuda_decode_batch(&q, &k, &v, sequences, cache_engine, tp_ctx);
         }
 
@@ -531,6 +565,12 @@ impl AttentionBlock {
                 (q_i, k_i)
             } else {
                 self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?
+            };
+            // Hunyuan-style: QK-norm AFTER RoPE.
+            let (q_i, k_i) = if self.qk_norm_after_rope {
+                self.apply_qk_norm(&q_i, &k_i)?
+            } else {
+                (q_i, k_i)
             };
 
             let attn_out = if self.needs_manual {
