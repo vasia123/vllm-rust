@@ -176,6 +176,7 @@ impl ArcticDecoderLayer {
                 num_experts: arctic_cfg.num_local_experts,
                 top_k: arctic_cfg.num_experts_per_tok,
                 renormalize: arctic_cfg.num_experts_per_tok > 1,
+                scoring_func: crate::moe::ScoringFunc::Softmax,
                 inplace: true,
                 is_act_and_mul: true,
             };

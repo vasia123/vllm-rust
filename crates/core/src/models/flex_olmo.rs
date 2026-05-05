@@ -353,6 +353,7 @@ impl FlexOlmoDecoderLayer {
             num_experts: flex_cfg.num_experts,
             top_k: flex_cfg.num_experts_per_tok,
             renormalize: false,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };

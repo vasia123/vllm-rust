@@ -423,6 +423,7 @@ impl KimiDecoderLayer {
                 hidden_size: cfg.hidden_size,
                 intermediate_size: extra_cfg.moe_intermediate_size,
                 renormalize: false,
+                scoring_func: crate::moe::ScoringFunc::Softmax,
                 inplace: false,
                 is_act_and_mul: true,
             };

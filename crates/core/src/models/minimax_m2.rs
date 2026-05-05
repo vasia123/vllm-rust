@@ -32,6 +32,7 @@ use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig, QkNormVariant};
 use crate::layers::RotaryEmbedding;
+use crate::moe::{MoELayer, MoELayerConfig, ScoringFunc};
 
 use super::tp_layers::TpContext;
 
@@ -97,56 +98,36 @@ impl MiniMaxM2Config {
 
 // ─── MoE ────────────────────────────────────────────────────────────────────
 
-struct MiniMaxM2MoEExpert {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl MiniMaxM2MoEExpert {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("w1"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("w2"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("w3"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs)?)?;
-        let up = self.up_proj.forward(xs)?;
-        let hidden = gate.mul(&up)?;
-        self.down_proj.forward(&hidden)
-    }
-}
-
+// MiniMax-M2 MoE = top-k routing (softmax or sigmoid) + optional
+// `e_score_correction_bias` for sigmoid mode + Mixtral-style
+// `w1`/`w2`/`w3` expert weight paths. The bespoke per-token CPU
+// scalar loop has been replaced by the shared `MoELayer`, which uses
+// the same `MoEExpert` weight path layout (`experts.{i}.w{1,2,3}`)
+// and applies router-bias + sigmoid scoring through the existing
+// `RouterConfig` knobs.
 struct MiniMaxM2MoE {
-    gate: Linear,
-    experts: Vec<MiniMaxM2MoEExpert>,
-    e_score_correction_bias: Option<Tensor>,
-    num_experts: usize,
-    top_k: usize,
-    scoring_func: String,
+    inner: MoELayer,
 }
 
 impl MiniMaxM2MoE {
     fn new(cfg: &ModelConfig, m2_cfg: &MiniMaxM2Config, vb: VarBuilder) -> Result<Self> {
-        let gate = linear_no_bias(cfg.hidden_size, m2_cfg.num_local_experts, vb.pp("gate"))?;
+        let scoring_func = match m2_cfg.scoring_func.as_str() {
+            "sigmoid" => ScoringFunc::Sigmoid,
+            _ => ScoringFunc::Softmax,
+        };
 
-        let mut experts = Vec::with_capacity(m2_cfg.num_local_experts);
-        let vb_experts = vb.pp("experts");
-        for i in 0..m2_cfg.num_local_experts {
-            experts.push(MiniMaxM2MoEExpert::new(
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                vb_experts.pp(i),
-            )?);
-        }
+        let moe_cfg = MoELayerConfig {
+            hidden_size: cfg.hidden_size,
+            intermediate_size: cfg.intermediate_size,
+            num_experts: m2_cfg.num_local_experts,
+            top_k: m2_cfg.num_experts_per_tok,
+            renormalize: true,
+            scoring_func,
+            inplace: false,
+            is_act_and_mul: true,
+        };
 
-        let e_score_correction_bias = if m2_cfg.use_routing_bias {
+        let bias = if m2_cfg.use_routing_bias {
             Some(
                 vb.get(m2_cfg.num_local_experts, "e_score_correction_bias")?
                     .to_dtype(DType::F32)?,
@@ -155,78 +136,12 @@ impl MiniMaxM2MoE {
             None
         };
 
-        Ok(Self {
-            gate,
-            experts,
-            e_score_correction_bias,
-            num_experts: m2_cfg.num_local_experts,
-            top_k: m2_cfg.num_experts_per_tok,
-            scoring_func: m2_cfg.scoring_func.clone(),
-        })
+        let inner = MoELayer::new_with_router_bias(moe_cfg, vb, bias)?;
+        Ok(Self { inner })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let orig_shape = xs.dims().to_vec();
-        let hidden_dim = *orig_shape.last().unwrap();
-        let xs_2d = xs.reshape(((), hidden_dim))?;
-        let num_tokens = xs_2d.dim(0)?;
-
-        // Router in FP32
-        let mut router_logits = self.gate.forward(&xs_2d.to_dtype(DType::F32)?)?;
-
-        // Apply e_score_correction_bias if present
-        if let Some(ref bias) = self.e_score_correction_bias {
-            router_logits = router_logits.broadcast_add(bias)?;
-        }
-
-        // Scoring function
-        let routing_weights = match self.scoring_func.as_str() {
-            "sigmoid" => candle_nn::ops::sigmoid(&router_logits)?,
-            _ => candle_nn::ops::softmax_last_dim(&router_logits)?,
-        };
-
-        let routing_data: Vec<f32> = routing_weights.flatten_all()?.to_vec1()?;
-        let flat_data: Vec<f32> = xs_2d.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-
-        let mut output_data = vec![0.0f32; num_tokens * hidden_dim];
-
-        for token_idx in 0..num_tokens {
-            let weights =
-                &routing_data[token_idx * self.num_experts..(token_idx + 1) * self.num_experts];
-
-            let mut indexed: Vec<(usize, f32)> = weights.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Renormalize top-k weights
-            let top_sum: f32 = indexed[..self.top_k].iter().map(|(_, w)| w).sum();
-
-            let token_input = Tensor::from_vec(
-                flat_data[token_idx * hidden_dim..(token_idx + 1) * hidden_dim].to_vec(),
-                (1, hidden_dim),
-                xs.device(),
-            )?;
-
-            for &(expert_idx, weight) in indexed[..self.top_k].iter() {
-                let norm_weight = if top_sum > 0.0 {
-                    weight / top_sum
-                } else {
-                    1.0 / self.top_k as f32
-                };
-                let expert_out = self.experts[expert_idx].forward(&token_input)?;
-                let expert_data: Vec<f32> =
-                    expert_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                for j in 0..hidden_dim {
-                    output_data[token_idx * hidden_dim + j] += norm_weight * expert_data[j];
-                }
-            }
-        }
-
-        Tensor::from_vec(
-            output_data,
-            candle_core::Shape::from_dims(&orig_shape),
-            xs.device(),
-        )?
-        .to_dtype(xs.dtype())
+        self.inner.forward(xs)
     }
 }
 

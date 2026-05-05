@@ -91,6 +91,13 @@ pub struct MoELayerConfig {
     pub top_k: usize,
     /// Whether to renormalize routing weights.
     pub renormalize: bool,
+    /// Routing scoring function. Default `Softmax` (Mixtral, Qwen-MoE,
+    /// GraniteMoE, …); set `Sigmoid` for sigmoid-routed models
+    /// (MiniMax-M2 in sigmoid mode, GLM4-MoE, ERNIE 4.5-MoE).
+    /// When `Sigmoid`, the model owner is responsible for providing
+    /// the optional `e_score_correction_bias` via
+    /// [`MoELayer::new_with_router_bias`].
+    pub scoring_func: super::router::ScoringFunc,
     /// Whether to reuse the input buffer as the output buffer.
     /// Saves one allocation per forward pass. Currently a no-op in
     /// Candle (tensors are immutable); reserved for future CUDA kernel use.
@@ -99,6 +106,21 @@ pub struct MoELayerConfig {
     /// When true, each expert has gate+up projections with SiLU gating.
     /// When false, a plain activation is used without gating.
     pub is_act_and_mul: bool,
+}
+
+impl Default for MoELayerConfig {
+    fn default() -> Self {
+        Self {
+            hidden_size: 0,
+            intermediate_size: 0,
+            num_experts: 0,
+            top_k: 2,
+            renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
+            inplace: false,
+            is_act_and_mul: true,
+        }
+    }
 }
 
 /// MoE Layer that combines routing and expert execution.
@@ -129,15 +151,33 @@ pub struct MoELayer {
 impl MoELayer {
     /// Create a new MoE layer.
     pub fn new(config: MoELayerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_inner(config, vb, None)
+    }
+
+    /// Create a new MoE layer with an optional `e_score_correction_bias`
+    /// applied to router logits before scoring. Used by sigmoid-routed
+    /// models (MiniMax-M2 in sigmoid mode, GLM4-MoE, ERNIE 4.5-MoE,
+    /// DeepSeek V3) where the bias is loaded from the checkpoint as a
+    /// `[num_experts]` tensor.
+    pub fn new_with_router_bias(
+        config: MoELayerConfig,
+        vb: VarBuilder,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        Self::new_inner(config, vb, bias)
+    }
+
+    fn new_inner(config: MoELayerConfig, vb: VarBuilder, bias: Option<Tensor>) -> Result<Self> {
         let router_config = RouterConfig {
             hidden_size: config.hidden_size,
             num_experts: config.num_experts,
             top_k: config.top_k,
             renormalize: config.renormalize,
+            scoring_func: config.scoring_func,
             ..Default::default()
         };
 
-        let router = TopKRouter::new(router_config, vb.pp("gate"))?;
+        let router = TopKRouter::new_with_bias(router_config, vb.pp("gate"), bias)?;
 
         let expert_config = MoEExpertConfig {
             hidden_size: config.hidden_size,
@@ -495,7 +535,7 @@ impl Default for MoELayerWithSharedConfig {
             num_experts: 0,
             top_k: 2,
             renormalize: true,
-            scoring_func: super::router::ScoringFunc::Softmax,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             routed_scaling_factor: 1.0,
             gated_shared_expert: false,
             use_grouped_topk: false,
@@ -857,6 +897,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -877,6 +918,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -905,6 +947,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -928,6 +971,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -969,6 +1013,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1004,6 +1049,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1157,6 +1203,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: true,
             is_act_and_mul: true,
         };
@@ -1178,6 +1225,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1187,6 +1235,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: true,
             is_act_and_mul: true,
         };
@@ -1225,6 +1274,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: true, // requested, but should be auto-disabled
             ..Default::default()
         };
@@ -1247,6 +1297,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: true,
             ..Default::default()
         };
@@ -1300,6 +1351,7 @@ mod tests {
             num_experts: 4,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1337,6 +1389,7 @@ mod tests {
             num_experts,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1380,6 +1433,7 @@ mod tests {
             num_experts,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1429,6 +1483,7 @@ mod tests {
             num_experts,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };
@@ -1462,6 +1517,7 @@ mod tests {
             num_experts,
             top_k: 2,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };

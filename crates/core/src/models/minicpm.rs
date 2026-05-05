@@ -243,6 +243,7 @@ impl MiniCPMDecoderLayer {
                 num_experts: mini_cfg.num_experts,
                 top_k: mini_cfg.num_experts_per_tok,
                 renormalize: true,
+                scoring_func: crate::moe::ScoringFunc::Softmax,
                 inplace: true,
                 is_act_and_mul: true,
             };

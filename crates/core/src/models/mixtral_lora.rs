@@ -272,6 +272,7 @@ impl MixtralDecoderLayerWithLora {
             num_experts: cfg.num_local_experts,
             top_k: cfg.num_experts_per_tok,
             renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
             inplace: false,
             is_act_and_mul: true,
         };

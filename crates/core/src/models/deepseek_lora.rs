@@ -353,6 +353,7 @@ impl DeepSeekDecoderLayerWithLora {
                 num_experts: n_routed,
                 top_k,
                 renormalize: true,
+                scoring_func: crate::moe::ScoringFunc::Softmax,
                 inplace: false,
                 is_act_and_mul: true,
             };
