@@ -56,31 +56,12 @@ fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
 }
 
 // ─── Sliding Window Mask ────────────────────────────────────────────────────
+//
+// Reuse the shared implementation that powers `AttentionBlock`'s
+// sliding-window path; the gemma3 alternating local/global pattern uses
+// a different config but the same mask math.
 
-fn sliding_window_mask(
-    q_len: usize,
-    kv_len: usize,
-    seqlen_offset: usize,
-    window_size: usize,
-    dtype: DType,
-    device: &Device,
-) -> Result<Tensor> {
-    let mut mask = vec![f32::NEG_INFINITY; q_len * kv_len];
-
-    for i in 0..q_len {
-        let query_pos = seqlen_offset + i;
-        for j in 0..kv_len {
-            let is_causal = j <= query_pos;
-            let is_in_window = query_pos < window_size || j > query_pos - window_size;
-
-            if is_causal && is_in_window {
-                mask[i * kv_len + j] = 0.0;
-            }
-        }
-    }
-
-    Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
-}
+use crate::layers::attention::sliding_window_mask;
 
 // ─── Gemma3 Config Extraction ───────────────────────────────────────────────
 
