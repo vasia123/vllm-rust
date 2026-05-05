@@ -337,37 +337,12 @@ impl MiniMaxText01Mlp {
 
 // ─── MoE Layer ──────────────────────────────────────────────────────────────
 
+// MiniMax-Text01 MoE (routed-only path; the optional shared expert is
+// applied externally by `SharedExpert` with softmax/sigmoid mixing).
+// Mixtral-style `w1/w2/w3` expert weight paths under `experts.{i}`,
+// softmax router over `gate`. Shim over the shared `MoELayer`.
 struct MiniMaxText01MoE {
-    gate: Linear,
-    experts: Vec<MiniMaxText01MoEExpert>,
-    num_experts: usize,
-    top_k: usize,
-}
-
-struct MiniMaxText01MoEExpert {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl MiniMaxText01MoEExpert {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("w1"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("w2"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("w3"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs)?)?;
-        let up = self.up_proj.forward(xs)?;
-        let hidden = gate.mul(&up)?;
-        self.down_proj.forward(&hidden)
-    }
+    inner: crate::moe::MoELayer,
 }
 
 impl MiniMaxText01MoE {
@@ -378,84 +353,22 @@ impl MiniMaxText01MoE {
         top_k: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let gate = linear_no_bias(hidden_size, num_experts, vb.pp("gate"))?;
-
-        let mut experts = Vec::with_capacity(num_experts);
-        let vb_experts = vb.pp("experts");
-        for i in 0..num_experts {
-            experts.push(MiniMaxText01MoEExpert::new(
-                hidden_size,
-                intermediate_size,
-                vb_experts.pp(i),
-            )?);
-        }
-
-        Ok(Self {
-            gate,
-            experts,
+        let cfg = crate::moe::MoELayerConfig {
+            hidden_size,
+            intermediate_size,
             num_experts,
             top_k,
-        })
+            renormalize: true,
+            scoring_func: crate::moe::ScoringFunc::Softmax,
+            inplace: false,
+            is_act_and_mul: true,
+        };
+        let inner = crate::moe::MoELayer::new(cfg, vb)?;
+        Ok(Self { inner })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let orig_shape = xs.dims().to_vec();
-        let hidden_dim = *orig_shape.last().unwrap();
-        let xs_2d = xs.reshape(((), hidden_dim))?;
-        let num_tokens = xs_2d.dim(0)?;
-
-        // Router logits in FP32
-        let router_logits = self
-            .gate
-            .forward(&xs_2d.to_dtype(DType::F32)?)?
-            .to_dtype(xs.dtype())?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-
-        let routing_data: Vec<f32> = routing_weights
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1()?;
-        let flat_data: Vec<f32> = xs_2d.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-
-        let mut output_data = vec![0.0f32; num_tokens * hidden_dim];
-
-        for token_idx in 0..num_tokens {
-            let weights =
-                &routing_data[token_idx * self.num_experts..(token_idx + 1) * self.num_experts];
-
-            let mut indexed: Vec<(usize, f32)> = weights.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Renormalize top-k weights
-            let top_sum: f32 = indexed[..self.top_k].iter().map(|(_, w)| w).sum();
-
-            let token_input = Tensor::from_vec(
-                flat_data[token_idx * hidden_dim..(token_idx + 1) * hidden_dim].to_vec(),
-                (1, hidden_dim),
-                xs.device(),
-            )?;
-
-            for &(expert_idx, weight) in indexed[..self.top_k].iter() {
-                let norm_weight = if top_sum > 0.0 {
-                    weight / top_sum
-                } else {
-                    1.0 / self.top_k as f32
-                };
-                let expert_out = self.experts[expert_idx].forward(&token_input)?;
-                let expert_data: Vec<f32> =
-                    expert_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                for j in 0..hidden_dim {
-                    output_data[token_idx * hidden_dim + j] += norm_weight * expert_data[j];
-                }
-            }
-        }
-
-        Tensor::from_vec(
-            output_data,
-            candle_core::Shape::from_dims(&orig_shape),
-            xs.device(),
-        )?
-        .to_dtype(xs.dtype())
+        self.inner.forward(xs)
     }
 }
 
