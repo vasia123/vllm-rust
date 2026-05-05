@@ -1,11 +1,11 @@
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::attention::repeat_kv;
+use crate::layers::attention::{AttentionBlock, AttentionConfig};
 use crate::layers::RotaryEmbedding;
 
 // Re-export for public API
@@ -36,61 +36,16 @@ fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
     scaled.tanh()? * cap
 }
 
-/// Create a sliding window causal mask.
-///
-/// This mask allows attention only to positions within `window_size` tokens
-/// before the current position, while maintaining causality.
-///
-/// # Arguments
-/// * `q_len` - Number of query positions
-/// * `kv_len` - Number of key/value positions
-/// * `seqlen_offset` - Offset in the sequence (for decode phase)
-/// * `window_size` - Maximum number of tokens to attend to
-/// * `dtype` - Output dtype
-/// * `device` - Target device
-fn sliding_window_mask(
-    q_len: usize,
-    kv_len: usize,
-    seqlen_offset: usize,
-    window_size: usize,
-    dtype: DType,
-    device: &Device,
-) -> Result<Tensor> {
-    let mut mask = vec![f32::NEG_INFINITY; q_len * kv_len];
-
-    for i in 0..q_len {
-        let query_pos = seqlen_offset + i;
-        for j in 0..kv_len {
-            // Causal: can only attend to positions <= query_pos
-            // Sliding window: can only attend to positions >= query_pos - window_size + 1
-            let is_causal = j <= query_pos;
-            let is_in_window = query_pos < window_size || j > query_pos - window_size;
-
-            if is_causal && is_in_window {
-                mask[i * kv_len + j] = 0.0;
-            }
-        }
-    }
-
-    Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
-}
-
 // ─── Attention ───────────────────────────────────────────────────────────────
+//
+// Gemma2 = vanilla GQA + attention-logit softcap + per-layer alternating
+// sliding-window (even = sliding, odd = global) + custom q-scale derived
+// from `query_pre_attn_scalar`. All four axes are expressed declaratively
+// on `AttentionConfig`; the bespoke struct is now a thin shim over
+// `AttentionBlock`.
 
 struct Gemma2Attention {
-    q_proj: TpLinear,
-    k_proj: TpLinear,
-    v_proj: TpLinear,
-    o_proj: TpLinear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    scaling: f64,
-    /// Soft capping for attention logits (applied before softmax)
-    attn_logit_softcap: Option<f64>,
-    /// Sliding window size (None = global attention)
-    sliding_window: Option<usize>,
+    inner: AttentionBlock,
 }
 
 impl Gemma2Attention {
@@ -100,63 +55,44 @@ impl Gemma2Attention {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
-        let world_size = pg.world_size();
 
-        // For TP: num_heads and num_kv_heads must be divisible by world_size
-        if world_size > 1 {
-            if !num_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-            if !num_kv_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
+        // Gemma2: q-scale = 1 / sqrt(query_pre_attn_scalar). Default
+        // query_pre_attn_scalar = sqrt(head_dim), so default scale becomes
+        // 1 / head_dim^(1/4) — distinct from the AttentionBlock default
+        // 1 / sqrt(head_dim). Always set scale explicitly.
+        let query_pre_attn_scalar = cfg
+            .extra
+            .get("query_pre_attn_scalar")
+            .and_then(|v| v.as_f64())
+            .unwrap_or((head_dim as f64).sqrt());
+        let scale = 1.0 / query_pre_attn_scalar.sqrt();
+
+        // Even layers attend within a sliding window; odd layers are global.
+        let sliding_window = if layer_idx.is_multiple_of(2) {
+            cfg.sliding_window
+        } else {
+            None
+        };
+
+        let attn_logit_softcap = cfg
+            .extra
+            .get("attn_logit_softcapping")
+            .and_then(|v| v.as_f64());
+
+        let mut attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            head_dim,
+            cfg.hidden_size,
+        )
+        .with_scale(scale);
+        if let Some(cap) = attn_logit_softcap {
+            attn_cfg = attn_cfg.with_softcap(cap);
         }
-
-        // Q/K/V are column-parallel (split output heads)
-        // O is row-parallel (reduce partial outputs)
-        let q_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_heads * head_dim,
-            false,
-            false,
-            vb.pp("q_proj"),
-            pg,
-        )?;
-        let k_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            false,
-            false,
-            vb.pp("k_proj"),
-            pg,
-        )?;
-        let v_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            false,
-            false,
-            vb.pp("v_proj"),
-            pg,
-        )?;
-        let o_proj = TpLinear::row_parallel(
-            num_heads * head_dim,
-            cfg.hidden_size,
-            false,
-            true,
-            vb.pp("o_proj"),
-            pg,
-        )?;
-
-        // For TP: each GPU handles num_heads/world_size heads
-        let num_heads_per_gpu = num_heads / world_size;
-        let num_kv_heads_per_gpu = num_kv_heads / world_size;
+        if let Some(window) = sliding_window {
+            attn_cfg = attn_cfg.with_sliding_window(window);
+        }
 
         let rotary_emb = RotaryEmbedding::new(
             head_dim,
@@ -166,130 +102,30 @@ impl Gemma2Attention {
             vb.device(),
         )?;
 
-        // Gemma2 uses query_pre_attn_scalar for scaling
-        let query_pre_attn_scalar = cfg
-            .extra
-            .get("query_pre_attn_scalar")
-            .and_then(|v| v.as_f64())
-            .unwrap_or((head_dim as f64).sqrt());
-        let scaling = 1.0 / query_pre_attn_scalar.sqrt();
-
-        // Attention logit soft capping
-        let attn_logit_softcap = cfg
-            .extra
-            .get("attn_logit_softcapping")
-            .and_then(|v| v.as_f64());
-
-        // Gemma2 alternates between sliding window and global attention
-        // Even layers use sliding window, odd layers use global
-        let sliding_window = if layer_idx.is_multiple_of(2) {
-            cfg.sliding_window
-        } else {
-            None
-        };
-
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            rotary_emb,
-            num_heads: num_heads_per_gpu,
-            num_kv_heads: num_kv_heads_per_gpu,
-            head_dim,
-            scaling,
-            attn_logit_softcap,
-            sliding_window,
-        })
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
-        _attention_mask: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-        let device = xs.device();
-        let dtype = xs.dtype();
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        // Write new K, V to cache
-        // k is [b_sz, num_kv_heads, q_len, head_dim] = [1, 2, 5, 16]
-        // CacheEngine.write expects [num_kv_heads, num_tokens, head_dim] and transposes internally
-        let k_for_cache = k.squeeze(0)?.contiguous()?; // [num_kv_heads, q_len, head_dim]
-        let v_for_cache = v.squeeze(0)?.contiguous()?;
-        cache_engine
-            .write(&k_for_cache, &v_for_cache, slot_mapping)
-            .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-        // Read full K, V history from cache
-        // cache_engine.read returns [1, num_kv_heads, kv_len, head_dim]
-        let num_tokens = seqlen_offset + q_len;
-        let (k_full, v_full) = cache_engine
-            .read(block_table.block_ids(), num_tokens)
-            .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-
-        let kv_len = k_full.dim(2)?; // kv_len is at dim 2 in [1, kv_heads, kv_len, head_dim]
-
-        // GQA: repeat KV heads to match num_heads
-        let num_kv_groups = self.num_heads / self.num_kv_heads;
-        let k_full = repeat_kv(k_full, num_kv_groups)?; // [1, num_heads, kv_len, head_dim]
-        let v_full = repeat_kv(v_full, num_kv_groups)?;
-
-        // Apply custom scaling
-        let q = (q * self.scaling)?;
-
-        // Compute attention scores: [b, num_heads, q_len, kv_len]
-        let mut attn_weights = q.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
-
-        // Apply soft capping to attention logits (before softmax)
-        if let Some(cap) = self.attn_logit_softcap {
-            attn_weights = soft_cap(&attn_weights, cap)?;
-        }
-
-        // Create attention mask (causal or sliding window)
-        // Both return shape [1, 1, q_len, kv_len] for broadcasting
-        let mask = if let Some(window_size) = self.sliding_window {
-            sliding_window_mask(q_len, kv_len, seqlen_offset, window_size, dtype, device)?
-        } else {
-            // Standard causal mask already returns [1, 1, q_len, kv_len]
-            crate::layers::causal_mask(q_len, seqlen_offset, dtype, device)?
-        };
-
-        attn_weights = attn_weights.broadcast_add(&mask)?;
-
-        // Softmax and output
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v_full)?;
-
-        // Reshape to [b, q_len, num_heads * head_dim]
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-
-        self.o_proj.forward(&attn_output, tp_ctx)
+        self.inner.forward(
+            xs,
+            attention_mask,
+            seqlen_offset,
+            cache_engine,
+            block_table,
+            slot_mapping,
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -299,88 +135,8 @@ impl Gemma2Attention {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-        let device = xs.device();
-        let dtype = xs.dtype();
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Process each sequence individually to apply soft capping and sliding window
-        let mut outputs = Vec::with_capacity(batch_size);
-        let num_kv_groups = self.num_heads / self.num_kv_heads;
-
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.i(i)?.unsqueeze(0)?;
-            let k_i = k.i(i)?.unsqueeze(0)?;
-            let v_i = v.i(i)?.unsqueeze(0)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            // Write to cache
-            // k_i is [1, num_kv_heads, 1, head_dim], CacheEngine.write expects [num_kv_heads, 1, head_dim]
-            let k_for_cache = k_i.squeeze(0)?.contiguous()?; // [num_kv_heads, 1, head_dim]
-            let v_for_cache = v_i.squeeze(0)?.contiguous()?;
-            cache_engine
-                .write(&k_for_cache, &v_for_cache, &seq.slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-            // Read full KV history
-            // cache_engine.read returns [1, num_kv_heads, kv_len, head_dim]
-            let kv_len = seq.seqlen_offset + 1;
-            let (k_full, v_full) = cache_engine
-                .read(&seq.block_ids, kv_len)
-                .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-
-            // GQA: repeat KV heads
-            let k_full = repeat_kv(k_full, num_kv_groups)?; // [1, num_heads, kv_len, head_dim]
-            let v_full = repeat_kv(v_full, num_kv_groups)?;
-
-            // Apply scaling
-            let q_i = (q_i * self.scaling)?;
-
-            // Compute attention scores
-            let mut attn_weights = q_i.matmul(&k_full.transpose(D::Minus2, D::Minus1)?)?;
-
-            // Apply soft capping
-            if let Some(cap) = self.attn_logit_softcap {
-                attn_weights = soft_cap(&attn_weights, cap)?;
-            }
-
-            // Apply sliding window mask if needed
-            if let Some(window_size) = self.sliding_window {
-                let mask =
-                    sliding_window_mask(1, kv_len, seq.seqlen_offset, window_size, dtype, device)?;
-                attn_weights = attn_weights.broadcast_add(&mask)?;
-            }
-            // No causal mask needed for decode (single query token)
-
-            // Softmax and output
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_output = attn_weights.matmul(&v_full)?;
-
-            // Reshape: [1, num_heads, 1, head_dim] -> [1, 1, num_heads * head_dim]
-            let attn_output =
-                attn_output
-                    .transpose(1, 2)?
-                    .reshape((1, 1, self.num_heads * self.head_dim))?;
-
-            outputs.push(attn_output);
-        }
-
-        let attn_output = Tensor::cat(&outputs, 0)?;
-        self.o_proj.forward(&attn_output, tp_ctx)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 
