@@ -15,9 +15,12 @@
 //! - **Custom projection names** (`wo`/`out_proj`/`dense`, fused `qkv_proj` /
 //!   `Wqkv` / `query_key_value` / `c_attn`, custom q_norm/k_norm names)
 //! - **Fused QKV** (concat-style `[Q | K | V]` layout)
-//! - **Bypass RoPE** per-layer (Llama4 alternating non-RoPE layers)
+//! - **Bypass RoPE** per-layer (Llama4 alternating non-RoPE layers, GPT-2/OPT
+//!   with absolute position embeddings)
 //! - **Partial RoPE** through `RotaryEmbedding::new_partial` (GLM4, GPT-J,
-//!   GPT-NeoX, Nemotron, ChatGLM, …) — block treats RoPE as opaque
+//!   GPT-NeoX, Nemotron, ChatGLM, MiniMax-M2, …) — block treats RoPE as opaque
+//! - **Asymmetric Q/K/V input dim** via `with_qkv_input_size` (Eagle3 layer 0
+//!   projects `2 * hidden_size` while o_proj output stays `hidden_size`)
 //!
 //! Architectures that need exotic attention math — DeepSeek MLA absorption,
 //! Mamba/Jamba/Bamba SSM, GLA hybrids, ALiBi (MPT/Bloom/Jais/Baichuan),
