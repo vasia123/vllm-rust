@@ -1,3 +1,29 @@
+//! Rotary positional embedding (RoPE) variants used across the model zoo.
+//!
+//! Three production-grade types live here:
+//! - [`RotaryEmbedding`] — 1D RoPE with standard / partial / scaled
+//!   variants. Used by 137 text models (Llama, Qwen, Mistral, GLM, …).
+//! - [`XDRotaryEmbedding`] — section-split multi-axis RoPE used by
+//!   Qwen2-VL / Qwen3-VL where the rotary half-dim is split into
+//!   `[t_size, h_size, w_size]` sections, each consuming a different
+//!   position-id axis.
+//!
+//! ## Phase 3c — Vision-style 2D RoPE
+//!
+//! Two vision encoders ship a *third* style of 2D RoPE that doesn't
+//! fit either of the above:
+//! - [`crate::models::gemma4_vision::Gemma4VisionRotaryEmb`] — fixed-
+//!   shape per-batch, concatenates per-axis (cos, sin) along the head
+//!   dimension and applies them via `apply_multidimensional_rope`.
+//! - `models::moonvit::Rope2DPosEmb` — varlen RoPE keyed by
+//!   `(grid_h, grid_w)` per image; complex-mul interleaved layout.
+//!
+//! These two paradigms are kept in their respective vision modules
+//! pending Phase 4c, where they will move into a `VisionTowerFactory`
+//! alongside the encoder migration. Hoisting them now would force
+//! awkward generic plumbing without sharing real code with the LLM
+//! RoPE; deferring keeps the API surface small.
+
 use candle_core::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda-kernels")]
 use std::sync::OnceLock;
