@@ -4,7 +4,7 @@
 //! dispatch in `crates/core/src/models/mod.rs`. Bodies are lifted
 //! verbatim — re-running the generator overwrites this file.
 //!
-//! Capabilities: build
+//! Capabilities: build, build_with_tp
 
 #![allow(unused_imports, unused_variables)]
 
@@ -13,14 +13,16 @@ use std::any::Any;
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
+use crate::distributed::ProcessGroup;
 use crate::engine::ModelForward;
 
 use super::super::factory::{ArchFactory, ArchInfo, Capabilities};
+use super::super::tp_layers::TpContext;
 use super::super::*;
 
 pub const ARCH_NAMES: &[&str] = &["TeleFLMForCausalLM"];
 
-static INFO: ArchInfo = ArchInfo::new("TeleFLM", Capabilities::empty());
+static INFO: ArchInfo = ArchInfo::new("TeleFLM", Capabilities::TP);
 
 pub struct TeleFlmArchFactory;
 pub static FACTORY: TeleFlmArchFactory = TeleFlmArchFactory;
@@ -39,6 +41,21 @@ impl ArchFactory for TeleFlmArchFactory {
         vb: VarBuilder,
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Ok(Box::new(TeleFLMForCausalLM::new(cfg, vb)?))
+    }
+
+    /// TeleFLM under TP shares the Llama TP path — µScaling is applied
+    /// inside the dense Llama backbone, not at the TP level. This
+    /// matches the legacy `from_config_with_tp` arm in models/mod.rs.
+    fn build_with_tp(
+        &self,
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Box<dyn ModelForward>, ModelError> {
+        Ok(Box::new(LlamaForCausalLM::new_with_tp(
+            cfg, vb, pg, tp_ctx,
+        )?))
     }
 
     fn as_any(&self) -> &dyn Any {
