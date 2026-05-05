@@ -1,196 +1,90 @@
 //! Exaone4 model implementation (LG AI Research).
 //!
-//! Exaone4 differs from the original Exaone in several ways:
+//! Architectural features:
 //! - **Post-LN** architecture: LayerNorm after attention/MLP, before residual add
-//! - **Q/K normalization**: Per-head RMSNorm on Q and K projections
-//! - **SwiGLU MLP**: Packed gate_up_proj instead of separate gate/up
-//! - **Per-layer sliding window**: Configurable attention type per layer
+//! - **Per-head Q/K RMSNorm** on Q and K projections
+//! - **SwiGLU MLP** with separate gate_proj/up_proj
+//! - Vanilla GQA, no biases, no softcap, full RoPE
 
-use crate::layers::{rms_norm, RmsNorm};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{linear_no_bias, Embedding, Linear, VarBuilder};
+use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
+use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
-use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding, SwiGluMlp};
+use crate::kv_cache::{BlockTable, KVCacheManager};
+use crate::layers::attention::{AttentionBlock, AttentionConfig, QkNormVariant};
+use crate::layers::{rms_norm, RmsNorm, RotaryEmbedding};
+
+pub use super::tp_layers::TpContext;
+use super::tp_layers::{TpEmbedding, TpLinear, TpSwiGluMlp};
 
 // ─── Attention ──────────────────────────────────────────────────────────────
+//
+// Exaone4 = vanilla GQA + per-head RMSNorm on Q/K (head_dim).
 
 struct Exaone4Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    inner: AttentionBlock,
 }
 
 impl Exaone4Attention {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-
-        let q_proj = linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
-
-        // Per-head Q/K normalization (on head_dim)
-        let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let rope_theta = cfg
             .extra
             .get("rope_theta")
             .and_then(|v| v.as_f64())
-            .unwrap_or(1_000_000.0);
+            .unwrap_or(cfg.rope_theta);
+
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+        )
+        .with_qk_norm(QkNormVariant::PerHead, cfg.rms_norm_eps);
 
         let rotary_emb = RotaryEmbedding::new(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            rotary_emb,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-        })
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
-    fn apply_qk_norm(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        // Q: [batch, seq, num_heads * head_dim] → [batch, seq, num_heads, head_dim]
-        // Apply per-head RMSNorm on the head_dim dimension
-        let q_shape = q.dims().to_vec();
-        let k_shape = k.dims().to_vec();
-
-        let mut q_new_shape: Vec<usize> = q_shape[..q_shape.len() - 1].to_vec();
-        q_new_shape.extend_from_slice(&[self.num_heads, self.head_dim]);
-        let q_reshaped = q.reshape(q_new_shape.as_slice())?;
-        let q_normed = self.q_norm.forward(&q_reshaped)?;
-        let q_flat = q_normed.reshape(q_shape)?;
-
-        let mut k_new_shape: Vec<usize> = k_shape[..k_shape.len() - 1].to_vec();
-        k_new_shape.extend_from_slice(&[self.num_kv_heads, self.head_dim]);
-        let k_reshaped = k.reshape(k_new_shape.as_slice())?;
-        let k_normed = self.k_norm.forward(&k_reshaped)?;
-        let k_flat = k_normed.reshape(k_shape)?;
-
-        Ok((q_flat, k_flat))
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-        cache_engine: &mut CacheEngine,
+        cache_engine: &mut crate::kv_cache::CacheEngine,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
-        // Apply per-head Q/K normalization
-        let (q, k) = self.apply_qk_norm(&q, &k)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output)
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
-        cache_engine: &mut CacheEngine,
+        cache_engine: &mut crate::kv_cache::CacheEngine,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
-        let (q, k) = self.apply_qk_norm(&q, &k)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        let attn_output = Tensor::cat(&outputs, 0)?;
-        self.o_proj.forward(&attn_output)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 
@@ -198,15 +92,15 @@ impl Exaone4Attention {
 
 struct Exaone4DecoderLayer {
     self_attn: Exaone4Attention,
-    mlp: SwiGluMlp,
+    mlp: TpSwiGluMlp,
     post_attention_layernorm: RmsNorm,
     post_feedforward_layernorm: RmsNorm,
 }
 
 impl Exaone4DecoderLayer {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Exaone4Attention::new(cfg, vb.pp("self_attn"))?;
-        let mlp = SwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
+    fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
+        let self_attn = Exaone4Attention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
+        let mlp = TpSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
 
         let post_attention_layernorm = rms_norm(
             cfg.hidden_size,
@@ -237,6 +131,7 @@ impl Exaone4DecoderLayer {
         layer_idx: usize,
         block_table: &BlockTable,
         slot_mapping: &[usize],
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         // Post-LN: attention → norm → residual add
         let residual = xs;
@@ -247,13 +142,14 @@ impl Exaone4DecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             block_table,
             slot_mapping,
+            tp_ctx,
         )?;
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
         let xs = (residual + hidden)?;
 
         // Post-LN: MLP → norm → residual add
         let residual = &xs;
-        let hidden = self.mlp.forward(&xs)?;
+        let hidden = self.mlp.forward(&xs, tp_ctx)?;
         let hidden = self.post_feedforward_layernorm.forward(&hidden)?;
         residual + hidden
     }
@@ -264,18 +160,20 @@ impl Exaone4DecoderLayer {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
+        tp_ctx: &TpContext,
     ) -> Result<Tensor> {
         let residual = xs;
         let hidden = self.self_attn.forward_decode_batch(
             xs,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
+            tp_ctx,
         )?;
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
         let xs = (residual + hidden)?;
 
         let residual = &xs;
-        let hidden = self.mlp.forward(&xs)?;
+        let hidden = self.mlp.forward(&xs, tp_ctx)?;
         let hidden = self.post_feedforward_layernorm.forward(&hidden)?;
         residual + hidden
     }
@@ -284,32 +182,64 @@ impl Exaone4DecoderLayer {
 // ─── Model ──────────────────────────────────────────────────────────────────
 
 pub struct Exaone4ForCausalLM {
-    embed_tokens: Embedding,
+    embed_tokens: TpEmbedding,
     layers: Vec<Exaone4DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: TpLinear,
+    tp_ctx: TpContext,
     device: Device,
     dtype: DType,
 }
 
 impl Exaone4ForCausalLM {
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_tp(cfg, vb, &LocalProcessGroup::new(), TpContext::single_gpu())
+    }
+
+    pub fn new_with_tp(
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        tp_ctx: TpContext,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
+        let world_size = pg.world_size();
+
         let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+            TpEmbedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"), pg)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(Exaone4DecoderLayer::new(cfg, vb_l.pp(i))?);
+            layers.push(Exaone4DecoderLayer::new_with_tp(cfg, vb_l.pp(i), pg)?);
         }
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
-        let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+        let lm_head = if cfg.tie_word_embeddings && world_size == 1 {
+            let emb_weights = embed_tokens
+                .embeddings()
+                .expect("single GPU should have accessible embeddings")
+                .clone();
+            TpLinear::from_linear(candle_nn::Linear::new(emb_weights, None))
+        } else if cfg.tie_word_embeddings {
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true,
+                vb_m.pp("embed_tokens"),
+                pg,
+            )?
         } else {
-            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            TpLinear::column_parallel(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                true,
+                vb.pp("lm_head"),
+                pg,
+            )?
         };
 
         Ok(Self {
@@ -317,6 +247,7 @@ impl Exaone4ForCausalLM {
             layers,
             norm,
             lm_head,
+            tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -324,6 +255,10 @@ impl Exaone4ForCausalLM {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn tp_context(&self) -> &TpContext {
+        &self.tp_ctx
     }
 }
 
@@ -348,7 +283,7 @@ impl crate::engine::ModelForward for Exaone4ForCausalLM {
             )?)
         };
 
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
                 &xs,
@@ -358,10 +293,11 @@ impl crate::engine::ModelForward for Exaone4ForCausalLM {
                 layer_idx,
                 block_table,
                 slot_mapping,
+                &self.tp_ctx,
             )?;
         }
         xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     fn forward_decode_batch(
@@ -370,12 +306,18 @@ impl crate::engine::ModelForward for Exaone4ForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
+            xs = layer.forward_decode_batch(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                &self.tp_ctx,
+            )?;
         }
         xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     fn device(&self) -> &Device {
