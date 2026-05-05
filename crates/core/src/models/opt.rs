@@ -2,63 +2,60 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{embedding, layer_norm, Embedding, LayerNorm, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::distributed::LocalProcessGroup;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::paged_attention;
+use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig, ProjNames};
+use crate::layers::RotaryEmbedding;
+
+use super::tp_layers::TpContext;
 
 // OPT uses learned positional embeddings with offset=2
 
 // ─── OPT Attention ───────────────────────────────────────────────────────────
 
+// OPT = MHA + separate Q/K/V (with optional bias on all four projections)
+// + learned absolute position embeddings (no RoPE) + output proj name
+// `out_proj`. Implemented as a thin shim over AttentionBlock.
 struct OPTAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
-    num_heads: usize,
-    head_dim: usize,
-    #[allow(dead_code)]
-    enable_bias: bool,
+    inner: AttentionBlock,
+    tp_ctx: TpContext,
 }
 
 impl OPTAttention {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let head_dim = cfg.head_dim;
         let enable_bias = cfg
             .extra
             .get("enable_bias")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-
-        let (q_proj, k_proj, v_proj, out_proj) = if enable_bias {
-            (
-                candle_nn::linear(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?,
-                candle_nn::linear(cfg.hidden_size, num_heads * head_dim, vb.pp("k_proj"))?,
-                candle_nn::linear(cfg.hidden_size, num_heads * head_dim, vb.pp("v_proj"))?,
-                candle_nn::linear(num_heads * head_dim, cfg.hidden_size, vb.pp("out_proj"))?,
-            )
+        let bias = if enable_bias {
+            AttentionBias::ALL
         } else {
-            (
-                candle_nn::linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?,
-                candle_nn::linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("k_proj"))?,
-                candle_nn::linear_no_bias(cfg.hidden_size, num_heads * head_dim, vb.pp("v_proj"))?,
-                candle_nn::linear_no_bias(
-                    num_heads * head_dim,
-                    cfg.hidden_size,
-                    vb.pp("out_proj"),
-                )?,
-            )
+            AttentionBias::NONE
         };
 
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_attention_heads, // OPT is MHA: kv heads = q heads
+            cfg.head_dim,
+            cfg.hidden_size,
+        )
+        .with_bypass_rope()
+        .with_bias(bias)
+        .with_proj_names(ProjNames {
+            o: "out_proj",
+            ..Default::default()
+        });
+
+        // RoPE is bypassed; pass a minimal placeholder.
+        let rotary_emb = RotaryEmbedding::new(cfg.head_dim, 1, 10_000.0, vb.dtype(), vb.device())?;
+
+        let pg = LocalProcessGroup::new();
+        let inner = AttentionBlock::new(&attn_cfg, vb, &pg, rotary_emb)?;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            out_proj,
-            num_heads,
-            head_dim,
-            enable_bias: false, // field reserved for future use
+            inner,
+            tp_ctx: TpContext::single_gpu(),
         })
     }
 
@@ -72,38 +69,15 @@ impl OPTAttention {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // OPT uses no RoPE, positions are handled by learned embeddings
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_heads,
-            self.head_dim,
-        )?;
-
-        self.out_proj.forward(&attn_output)
+            &self.tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -112,46 +86,8 @@ impl OPTAttention {
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        let attn_output = Tensor::cat(&outputs, 0)?;
-        self.out_proj.forward(&attn_output)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, &self.tp_ctx)
     }
 }
 
