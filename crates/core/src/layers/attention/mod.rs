@@ -30,11 +30,16 @@
 
 pub mod auto_select;
 mod backend;
+pub mod block;
 pub mod flash;
 pub mod flashinfer;
 pub mod mla;
 pub mod naive;
 mod ops;
+
+pub use block::{
+    sliding_window_mask, soft_cap, AttentionBias, AttentionBlock, AttentionConfig, QkNormVariant,
+};
 
 // Re-export public types
 pub use backend::{
