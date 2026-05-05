@@ -17,7 +17,8 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig, ProjNames};
+use crate::layers::RotaryEmbedding;
 
 pub use super::tp_layers::TpContext;
 use super::tp_layers::{TpEmbedding, TpLinear};
@@ -65,82 +66,38 @@ impl FalconMlp {
 
 // ─── Attention ────────────────────────────────────────────────────────────────
 
+// Falcon = fused QKV (`query_key_value`, biased) + biased output proj
+// (`dense`) + RoPE. The bespoke CUDA fast-path decode is now covered by
+// AttentionBlock's own paged_attention_cuda path.
 struct FalconAttention {
-    query_key_value: TpLinear, // fused QKV projection
-    dense: TpLinear,           // output projection
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    q_size: usize,
-    kv_size: usize,
+    inner: AttentionBlock,
 }
 
 impl FalconAttention {
     fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-        let world_size = pg.world_size();
-
-        if world_size > 1 {
-            if !num_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-            if !num_kv_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-        }
-
-        let q_size = num_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let qkv_size = q_size + 2 * kv_size;
-
-        // Falcon uses fused QKV with bias - column parallel splits output
-        let query_key_value = TpLinear::column_parallel(
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
             cfg.hidden_size,
-            qkv_size,
-            true,  // bias
-            false, // no gather
-            vb.pp("query_key_value"),
-            pg,
-        )?;
-        let dense = TpLinear::row_parallel(
-            q_size,
-            cfg.hidden_size,
-            true, // bias
-            true, // input is parallel
-            vb.pp("dense"),
-            pg,
-        )?;
-
-        let num_heads_per_gpu = num_heads / world_size;
-        let num_kv_heads_per_gpu = num_kv_heads / world_size;
-        let q_size_per_gpu = num_heads_per_gpu * head_dim;
-        let kv_size_per_gpu = num_kv_heads_per_gpu * head_dim;
+        )
+        .with_qkv_fused()
+        .with_bias(AttentionBias::ALL)
+        .with_proj_names(ProjNames {
+            qkv: "query_key_value",
+            o: "dense",
+            ..Default::default()
+        });
 
         let rotary_emb = RotaryEmbedding::new(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
-        Ok(Self {
-            query_key_value,
-            dense,
-            rotary_emb,
-            num_heads: num_heads_per_gpu,
-            num_kv_heads: num_kv_heads_per_gpu,
-            head_dim,
-            q_size: q_size_per_gpu,
-            kv_size: kv_size_per_gpu,
-        })
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -154,40 +111,15 @@ impl FalconAttention {
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        // Fused QKV projection
-        let qkv = self.query_key_value.forward(xs, tp_ctx)?;
-        let (q, k, v) = self.split_qkv(&qkv)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Apply RoPE
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.dense.forward(&attn_output, tp_ctx)
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -197,124 +129,8 @@ impl FalconAttention {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let qkv = self.query_key_value.forward(xs, tp_ctx)?;
-        let (q, k, v) = self.split_qkv(&qkv)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        #[cfg(feature = "cuda-kernels")]
-        {
-            let q = q.squeeze(2)?;
-            let k = k.squeeze(2)?;
-            let v = v.squeeze(2)?;
-
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
-
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
-            cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-                }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
-
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
-
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-                self.head_dim,
-                cache_engine.block_size(),
-            )?;
-
-            self.dense.forward(&attn_output, tp_ctx)?.unsqueeze(1)
-        }
-
-        #[cfg(not(feature = "cuda-kernels"))]
-        {
-            let mut outputs = Vec::with_capacity(batch_size);
-            for (i, seq) in sequences.iter().enumerate() {
-                let q_i = q.narrow(0, i, 1)?;
-                let k_i = k.narrow(0, i, 1)?;
-                let v_i = v.narrow(0, i, 1)?;
-
-                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None,
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-                outputs.push(attn_out);
-            }
-
-            let attn_output = Tensor::cat(&outputs, 0)?;
-            self.dense.forward(&attn_output, tp_ctx)
-        }
-    }
-
-    /// Split fused QKV tensor into Q, K, V.
-    fn split_qkv(&self, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let (b_sz, seq_len, _) = qkv.dims3()?;
-
-        // QKV is packed as [Q, K, V] along last dimension
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        Ok((
-            q.reshape((b_sz, seq_len, self.q_size))?,
-            k.reshape((b_sz, seq_len, self.kv_size))?,
-            v.reshape((b_sz, seq_len, self.kv_size))?,
-        ))
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 
