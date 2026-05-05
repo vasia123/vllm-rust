@@ -4,16 +4,26 @@
 //! that captures the structural variations across the attention modules of 80%+
 //! of supported decoder-only architectures:
 //!
-//! - **Vanilla MHA / GQA / MQA** (Llama, Mistral, Qwen2, Yi, Solar, ...)
-//! - **GQA + per-head QK RMSNorm** (Qwen3, Olmo2, Cohere)
-//! - **GQA + attention-logit soft cap** (Gemma2)
-//! - **GQA + sliding-window mask** (Mistral local, Gemma3 local layers)
-//! - **GQA + bias on Q/K/V or O** (Qwen2 with bias=true)
-//! - **Custom attention scaling** (Gemma2 hidden-size-based scaling)
+//! - **Vanilla MHA / GQA / MQA** (Llama, Mistral, Qwen2, Yi, Solar, …)
+//! - **Per-head QK RMSNorm** (Qwen3, Olmo2, Cohere, Bailing-MoE, GLM4-MoE)
+//! - **Per-head QK LayerNorm** (Persimmon)
+//! - **QK-norm ordering** before RoPE (default) or after RoPE (Hunyuan)
+//! - **Attention-logit soft cap** (Gemma2)
+//! - **Sliding-window mask** (Mistral, Gemma3 local layers)
+//! - **Bias** on any subset of Q/K/V/O via [`AttentionBias`]
+//! - **Custom attention scaling** (Gemma2 hidden-size-based, Granite multiplier)
+//! - **Custom projection names** (`wo`/`out_proj`/`dense`, fused `qkv_proj` /
+//!   `Wqkv` / `query_key_value` / `c_attn`, custom q_norm/k_norm names)
+//! - **Fused QKV** (concat-style `[Q | K | V]` layout)
+//! - **Bypass RoPE** per-layer (Llama4 alternating non-RoPE layers)
+//! - **Partial RoPE** through `RotaryEmbedding::new_partial` (GLM4, GPT-J,
+//!   GPT-NeoX, Nemotron, ChatGLM, …) — block treats RoPE as opaque
 //!
 //! Architectures that need exotic attention math — DeepSeek MLA absorption,
-//! Mamba/Jamba/Bamba SSM, GLA hybrids, Phi3 fused-QKV interleave — stay
-//! bespoke and live in their model files.
+//! Mamba/Jamba/Bamba SSM, GLA hybrids, ALiBi (MPT/Bloom/Jais/Baichuan),
+//! linear attention (MiniMax, Kimi-Linear), gated attention (AfMoE),
+//! output gating (Qwen3-Next), asymmetric V-dim (MiMoV2-Flash), and
+//! flat-dim QK norm (OLMoE, FlexOlmo) stay bespoke in their model files.
 //!
 //! # Design
 //!
