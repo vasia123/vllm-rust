@@ -111,7 +111,7 @@ impl ArchFactory for LlamaArchFactory {
         cfg: &ModelConfig,
         vb: VarBuilder,
         stage: &PipelineStageConfig,
-    ) -> Result<Box<dyn ModelForward>, ModelError> {
+    ) -> Result<Box<dyn crate::engine::PipelineForward>, ModelError> {
         Ok(Box::new(LlamaForCausalLM::new_with_pp(cfg, vb, stage)?))
     }
 

@@ -465,7 +465,7 @@ METHOD_SIGS = {
     "build_with_pp": (
         "fn build_with_pp(&self, cfg: &ModelConfig, vb: VarBuilder, "
         "stage: &crate::distributed::PipelineStageConfig) "
-        "-> Result<Box<dyn ModelForward>, ModelError>"
+        "-> Result<Box<dyn crate::engine::PipelineForward>, ModelError>"
     ),
     "build_with_lora": (
         "fn build_with_lora(&self, cfg: &ModelConfig, vb: VarBuilder) "

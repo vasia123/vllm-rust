@@ -557,6 +557,19 @@ fn get_arch(cfg: &ModelConfig) -> Result<&str, ModelError> {
 /// Construct the appropriate model from config.architectures[0].
 pub fn from_config(cfg: &ModelConfig, vb: VarBuilder) -> Result<Box<dyn ModelForward>, ModelError> {
     let arch = get_arch(cfg)?;
+
+    // Phase 2 dispatch shim: prefer the registry when v2 is enabled.
+    // Falls back to the legacy match-arm dispatch below for arch_names
+    // that haven't been registered yet (deprecated arms, anything the
+    // generator missed). Phase 6 deletes the fallback once
+    // `tests/registry_completeness.rs` proves 100% coverage.
+    #[cfg(feature = "model-registry-v2")]
+    {
+        if let Some(factory) = registry_v2::lookup(arch) {
+            return factory.build(cfg, vb);
+        }
+    }
+
     match arch {
         "DeepseekForCausalLM"
         | "DeepseekV2ForCausalLM"
@@ -1015,6 +1028,17 @@ pub fn from_config_with_pp(
     stage: &PipelineStageConfig,
 ) -> Result<Box<dyn PipelineForward>, ModelError> {
     let arch = get_arch(cfg)?;
+
+    #[cfg(feature = "model-registry-v2")]
+    {
+        use factory::Capabilities;
+        if let Some(factory) = registry_v2::lookup(arch) {
+            if factory.info().supports(Capabilities::PP) {
+                return factory.build_with_pp(cfg, vb, stage);
+            }
+        }
+    }
+
     match arch {
         // Llama-family architectures all share LlamaForCausalLM internals.
         "LlamaForCausalLM"
@@ -1047,6 +1071,17 @@ pub fn from_config_encoder_decoder(
     vb: VarBuilder,
 ) -> Result<Box<dyn crate::engine::ModelForEncoderDecoder>, ModelError> {
     let arch = get_arch(cfg)?;
+
+    #[cfg(feature = "model-registry-v2")]
+    {
+        use factory::Capabilities;
+        if let Some(factory) = registry_v2::lookup(arch) {
+            if factory.info().supports(Capabilities::ENCODER_DECODER) {
+                return factory.build_encoder_decoder(cfg, vb);
+            }
+        }
+    }
+
     match arch {
         "T5ForConditionalGeneration" | "T5Model" => {
             Ok(Box::new(T5ForConditionalGeneration::new(cfg, vb)?))
@@ -1103,6 +1138,20 @@ pub fn from_config_with_quant(
     }
 
     let weight_loader = create_weight_loader_with_params(vb.clone(), quant_config);
+
+    // Phase 2 dispatch shim. Registry path takes over when the factory
+    // advertises `Capabilities::QUANTIZED`. Anything else falls through
+    // to the legacy match-arm — Phase 6 deletes the fallback once
+    // every quantized arch ships a `build_quant` override.
+    #[cfg(feature = "model-registry-v2")]
+    {
+        use factory::Capabilities;
+        if let Some(factory) = registry_v2::lookup(arch) {
+            if factory.info().supports(Capabilities::QUANTIZED) {
+                return factory.build_quant(cfg, vb, weight_loader.as_ref());
+            }
+        }
+    }
 
     match arch {
         "Qwen3ForCausalLM" => Ok(Box::new(QuantizedQwen3ForCausalLM::new(
@@ -1622,6 +1671,16 @@ pub fn from_config_with_tp(
         return from_config(cfg, vb);
     }
 
+    #[cfg(feature = "model-registry-v2")]
+    {
+        use factory::Capabilities;
+        if let Some(factory) = registry_v2::lookup(arch) {
+            if factory.info().supports(Capabilities::TP) {
+                return factory.build_with_tp(cfg, vb, pg, tp_ctx);
+            }
+        }
+    }
+
     match arch {
         "LlamaForCausalLM"
         | "LlamaModel"
@@ -1888,6 +1947,17 @@ pub fn from_config_with_lora(
     vb: VarBuilder,
 ) -> Result<LoraEnabledModel, ModelError> {
     let arch = get_arch(cfg)?;
+
+    #[cfg(feature = "model-registry-v2")]
+    {
+        use factory::Capabilities;
+        if let Some(factory) = registry_v2::lookup(arch) {
+            if factory.info().supports(Capabilities::LORA) {
+                return factory.build_with_lora(cfg, vb);
+            }
+        }
+    }
+
     match arch {
         "Qwen3ForCausalLM" => Ok(LoraEnabledModel::Qwen3(Qwen3WithLora::new(cfg, vb)?)),
         "LlamaForCausalLM" => Ok(LoraEnabledModel::Llama(LlamaWithLora::new(cfg, vb)?)),

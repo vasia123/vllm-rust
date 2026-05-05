@@ -46,7 +46,7 @@ use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
 use crate::distributed::{PipelineStageConfig, ProcessGroup};
-use crate::engine::{ModelForEncoderDecoder, ModelForward};
+use crate::engine::{ModelForEncoderDecoder, ModelForward, PipelineForward};
 
 use super::tp_layers::TpContext;
 use super::ModelError;
@@ -205,16 +205,18 @@ pub trait ArchFactory: Sync + 'static {
         Err(unsupported(self.canonical_name(), "tensor-parallel").into())
     }
 
-    /// Pipeline-parallel instantiation. `stage` is the pipeline-stage
-    /// descriptor expected by `LlamaForCausalLM::new_with_pp` and
-    /// friends (engine-side `PipelineStage`). Default `Unsupported`.
+    /// Pipeline-parallel instantiation. Returns `Box<dyn
+    /// PipelineForward>` (not `ModelForward`) because the engine-side
+    /// pipeline scheduler invokes a different forward signature on the
+    /// per-stage model — the dispatch `from_config_with_pp` uses the
+    /// same return type. Default `Unsupported`.
     #[allow(unused_variables)]
     fn build_with_pp(
         &self,
         cfg: &ModelConfig,
         vb: VarBuilder,
         stage: &PipelineStageConfig,
-    ) -> Result<Box<dyn ModelForward>, ModelError> {
+    ) -> Result<Box<dyn PipelineForward>, ModelError> {
         Err(unsupported(self.canonical_name(), "pipeline-parallel").into())
     }
 
