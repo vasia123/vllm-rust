@@ -1,17 +1,50 @@
-//! Mixture of Experts (MoE) module.
+//! Mixture of Experts (MoE) shared infrastructure.
 //!
-//! This module provides infrastructure for sparse MoE models like Mixtral,
-//! including expert routing and parallel expert execution.
+//! This module is the canonical home for sparse MoE primitives used by
+//! Mixtral, Qwen2/3-MoE, DeepSeek V2/V3, GLM4-MoE, ExaoneMoE,
+//! MiniMax-Text01/M2, ERNIE 4.5-MoE, GraniteMoE, OLMoE, Bailing-MoE,
+//! Pangu and the rest of the MoE zoo. The architectural rationale and
+//! the migration roadmap are recorded in [ADR-0011].
+//!
+//! [ADR-0011]: ../../../../docs/adr/0011-moe-router-and-layer.md
+//!
+//! ## Pick the right primitive
+//!
+//! | Use case | Primitive |
+//! |---|---|
+//! | Routed-only MoE (Mixtral, Qwen2/3-MoE, Grok-1) | [`MoELayer`] |
+//! | Routed + shared experts (DeepSeek family, MiniMax-M2 with shared, ExaoneMoE shared) | [`MoELayerWithShared`] |
+//! | Quantized expert weights (GPTQ-style INT4/INT8) | [`QuantizedMoELayer`] |
+//! | Expert-parallel sharding across ranks | [`EPMoELayer`] (+ [`EplbState`] for live load balancing) |
+//! | Just the routing component (when expert dispatch must stay bespoke) | [`TopKRouter`] |
+//!
+//! All routed paths share [`RouterConfig`] / [`ScoringFunc`] knobs:
+//! softmax vs. sigmoid scoring, plain vs. grouped top-k, optional
+//! `e_score_correction_bias` (DeepSeek V3 / GLM4-MoE), `routed_scaling_factor`,
+//! per-token renormalization.
+//!
+//! ## Why a single trait + single struct
+//!
+//! MoE routers across the zoo differ along ~6 declarative axes
+//! (scoring, top-k flavor, score bias, routed scale, group routing,
+//! renormalization). Encoding them as fields on `RouterConfig` collapses
+//! ~150 LOC of bespoke routing per model into a 10-line `RouterConfig`
+//! literal. The same applies to `MoELayer`'s expert dispatch: token
+//! grouping, fused GEMM, all-to-all dispatch — written once, optimized
+//! once.
 //!
 //! ## Submodules
 //!
-//! - [`expert_layer`]: Basic MoE expert and layer implementations
-//! - [`router`]: Top-K routing with softmax normalization
-//! - [`fused`]: Optimized fused MoE kernels (when enabled)
-//! - [`topk_softmax`]: Fused top-k softmax for routing (CUDA accelerated)
-//! - [`expert_map`]: Expert placement mapping for Expert Parallelism
-//! - [`token_dispatch`]: Token dispatch/combine for Expert Parallelism
-//! - [`ep_layer`]: Expert-parallel MoE layer implementation
+//! - [`expert_layer`]: [`MoEExpert`], [`MoELayer`], [`MoELayerWithShared`]
+//! - [`router`]: [`MoERouter`] trait + [`TopKRouter`] impl
+//! - [`quantized_experts`]: [`QuantizedMoELayer`] for INT4/INT8 weights
+//! - [`ep_layer`]: [`EPMoELayer`] expert-parallel variant
+//! - [`eplb`] / [`eplb_execute`]: live expert load balancing across ranks
+//! - [`expert_map`]: logical-to-physical expert mapping (EP)
+//! - [`fused`]: block-fused MoE GEMM kernels
+//! - [`topk_softmax`]: fused top-k + softmax kernel (CUDA-accelerated)
+//! - [`token_dispatch`]: token-to-expert dispatch metadata
+//! - [`lora`]: per-expert LoRA adapters
 //!
 //! ## Feature Flags
 //!
