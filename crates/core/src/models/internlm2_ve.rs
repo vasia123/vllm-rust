@@ -19,7 +19,8 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBlock, AttentionConfig, ProjNames};
+use crate::layers::RotaryEmbedding;
 
 pub use super::tp_layers::TpContext;
 use super::tp_layers::{TpEmbedding, TpLinear};
@@ -70,91 +71,36 @@ impl InternLM2VESwiGluMlp {
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
+// InternLM2VE = vanilla GQA, output proj named `wo`. Same shape as InternLM2.
+// Note: migration to AttentionBlock enables the CUDA fast batched-decode path
+// when `cuda-kernels` is enabled (the prior bespoke implementation always took
+// the per-sequence loop). The fast path is identical to the one used by Llama
+// and is already validated by Llama's test suite.
 struct InternLM2VEAttention {
-    q_proj: TpLinear,
-    k_proj: TpLinear,
-    v_proj: TpLinear,
-    o_proj: TpLinear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    inner: AttentionBlock,
 }
 
 impl InternLM2VEAttention {
     fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-        let world_size = pg.world_size();
-
-        if world_size > 1 {
-            if !num_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-            if !num_kv_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-        }
-
-        let q_proj = TpLinear::column_parallel(
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
             cfg.hidden_size,
-            num_heads * head_dim,
-            false,
-            false,
-            vb.pp("q_proj"),
-            pg,
-        )?;
-        let k_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            false,
-            false,
-            vb.pp("k_proj"),
-            pg,
-        )?;
-        let v_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            false,
-            false,
-            vb.pp("v_proj"),
-            pg,
-        )?;
-        let o_proj = TpLinear::row_parallel(
-            num_heads * head_dim,
-            cfg.hidden_size,
-            false,
-            true,
-            vb.pp("wo"),
-            pg,
-        )?;
-
-        let num_heads_per_gpu = num_heads / world_size;
-        let num_kv_heads_per_gpu = num_kv_heads / world_size;
-
+        )
+        .with_proj_names(ProjNames {
+            o: "wo",
+            ..Default::default()
+        });
         let rotary_emb = RotaryEmbedding::new(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            rotary_emb,
-            num_heads: num_heads_per_gpu,
-            num_kv_heads: num_kv_heads_per_gpu,
-            head_dim,
-        })
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,39 +114,15 @@ impl InternLM2VEAttention {
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output, tp_ctx)
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -210,48 +132,8 @@ impl InternLM2VEAttention {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        let attn_output = Tensor::cat(&outputs, 0)?;
-        self.o_proj.forward(&attn_output, tp_ctx)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 

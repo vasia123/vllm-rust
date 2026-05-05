@@ -164,6 +164,12 @@ pub struct AttentionConfig {
 
     /// VarBuilder names for the projections. Default: q_proj/k_proj/v_proj/o_proj.
     pub proj_names: ProjNames,
+
+    /// If true, skip RoPE entirely. Used by Llama4's "no-RoPE" layers (every
+    /// fourth layer or so), and similar architectures that interleave RoPE and
+    /// non-RoPE attention layers. The `RotaryEmbedding` passed at construction
+    /// time is still owned by the block but never invoked.
+    pub bypass_rope: bool,
 }
 
 impl AttentionConfig {
@@ -182,7 +188,13 @@ impl AttentionConfig {
             sliding_window: None,
             scale: None,
             proj_names: ProjNames::default(),
+            bypass_rope: false,
         }
+    }
+
+    pub fn with_bypass_rope(mut self) -> Self {
+        self.bypass_rope = true;
+        self
     }
 
     pub fn with_proj_names(mut self, names: ProjNames) -> Self {
@@ -260,6 +272,7 @@ pub struct AttentionBlock {
     /// uses its own internal default scale; we never override it there).
     manual_scale: f64,
     needs_manual: bool,
+    bypass_rope: bool,
 }
 
 impl AttentionBlock {
@@ -349,6 +362,7 @@ impl AttentionBlock {
             sliding_window: cfg.sliding_window,
             manual_scale: cfg.effective_scale(),
             needs_manual: cfg.needs_manual_path(),
+            bypass_rope: cfg.bypass_rope,
         })
     }
 
@@ -383,7 +397,11 @@ impl AttentionBlock {
 
         let (q, k, v) = self.project_qkv(xs, b_sz, q_len, tp_ctx)?;
         let (q, k) = self.apply_qk_norm(&q, &k)?;
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
+        let (q, k) = if self.bypass_rope {
+            (q, k)
+        } else {
+            self.rotary_emb.apply(&q, &k, seqlen_offset)?
+        };
 
         let attn_output = if self.needs_manual {
             self.manual_prefill(
@@ -448,7 +466,11 @@ impl AttentionBlock {
             let k_i = k.narrow(0, i, 1)?;
             let v_i = v.narrow(0, i, 1)?;
 
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
+            let (q_i, k_i) = if self.bypass_rope {
+                (q_i, k_i)
+            } else {
+                self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?
+            };
 
             let attn_out = if self.needs_manual {
                 self.manual_decode_one(
@@ -635,7 +657,11 @@ impl AttentionBlock {
         let v = v.squeeze(2)?;
 
         let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-        let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
+        let (q, k) = if self.bypass_rope {
+            (q, k)
+        } else {
+            self.rotary_emb.apply_varlen(&q, &k, &positions)?
+        };
 
         let all_slot_mapping: Vec<usize> = sequences
             .iter()
