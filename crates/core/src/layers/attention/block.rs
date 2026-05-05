@@ -54,6 +54,8 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::VarBuilder;
 
+use candle_nn::{layer_norm, LayerNorm, Module};
+
 use crate::distributed::ProcessGroup;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine};
@@ -67,8 +69,11 @@ use crate::models::tp_layers::{TpContext, TpLinear};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QkNormVariant {
     /// Per-head RMSNorm on Q and K (head_dim-sized weight).
-    /// Used by Qwen3, Olmo2, Cohere.
+    /// Used by Qwen3, Olmo2, Cohere, Bailing-MoE.
     PerHead,
+    /// Per-head LayerNorm on Q and K (head_dim-sized weight + bias).
+    /// Used by Persimmon.
+    PerHeadLayerNorm,
 }
 
 /// Bias presence on the four projections.
@@ -302,12 +307,17 @@ enum QkvProjection {
     Fused(TpLinear),
 }
 
+/// Per-head normalization layers between QKV projection and attention.
+enum QkNormPair {
+    PerHeadRms { q: RmsNorm, k: RmsNorm },
+    PerHeadLayerNorm { q: LayerNorm, k: LayerNorm },
+}
+
 pub struct AttentionBlock {
     qkv: QkvProjection,
     o_proj: TpLinear,
     rotary_emb: RotaryEmbedding,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
+    qk_norm: Option<QkNormPair>,
 
     // Per-GPU counts (post-sharding).
     num_heads: usize,
@@ -409,28 +419,23 @@ impl AttentionBlock {
             pg,
         )?;
 
-        let (q_norm, k_norm) = match cfg.qk_norm {
-            None => (None, None),
-            Some(QkNormVariant::PerHead) => (
-                Some(rms_norm(
-                    cfg.head_dim,
-                    cfg.qk_norm_eps,
-                    vb.pp(names.q_norm),
-                )?),
-                Some(rms_norm(
-                    cfg.head_dim,
-                    cfg.qk_norm_eps,
-                    vb.pp(names.k_norm),
-                )?),
-            ),
+        let qk_norm = match cfg.qk_norm {
+            None => None,
+            Some(QkNormVariant::PerHead) => Some(QkNormPair::PerHeadRms {
+                q: rms_norm(cfg.head_dim, cfg.qk_norm_eps, vb.pp(names.q_norm))?,
+                k: rms_norm(cfg.head_dim, cfg.qk_norm_eps, vb.pp(names.k_norm))?,
+            }),
+            Some(QkNormVariant::PerHeadLayerNorm) => Some(QkNormPair::PerHeadLayerNorm {
+                q: layer_norm(cfg.head_dim, cfg.qk_norm_eps, vb.pp(names.q_norm))?,
+                k: layer_norm(cfg.head_dim, cfg.qk_norm_eps, vb.pp(names.k_norm))?,
+            }),
         };
 
         Ok(Self {
             qkv,
             o_proj,
             rotary_emb,
-            q_norm,
-            k_norm,
+            qk_norm,
             num_heads: cfg.num_heads / world_size,
             num_kv_heads: cfg.num_kv_heads / world_size,
             head_dim: cfg.head_dim,
@@ -644,9 +649,15 @@ impl AttentionBlock {
     }
 
     fn apply_qk_norm(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        match (&self.q_norm, &self.k_norm) {
-            (Some(qn), Some(kn)) => Ok((apply_per_head_norm(q, qn)?, apply_per_head_norm(k, kn)?)),
-            _ => Ok((q.clone(), k.clone())),
+        match &self.qk_norm {
+            None => Ok((q.clone(), k.clone())),
+            Some(QkNormPair::PerHeadRms { q: qn, k: kn }) => {
+                Ok((apply_per_head_norm(q, qn)?, apply_per_head_norm(k, kn)?))
+            }
+            Some(QkNormPair::PerHeadLayerNorm { q: qn, k: kn }) => Ok((
+                apply_per_head_layer_norm(q, qn)?,
+                apply_per_head_layer_norm(k, kn)?,
+            )),
         }
     }
 
@@ -840,6 +851,15 @@ impl AttentionBlock {
             None => causal_mask(q_len, seqlen_offset, dtype, device),
         }
     }
+}
+
+/// Apply LayerNorm per attention head (mirror of `apply_per_head_norm` but for
+/// LayerNorm). Reshapes `[b, h, s, d]` → `[b*h*s, d]`, applies norm, reshapes back.
+fn apply_per_head_layer_norm(x: &Tensor, norm: &LayerNorm) -> Result<Tensor> {
+    let (b, h, s, d) = x.dims4()?;
+    let x = x.reshape((b * h * s, d))?;
+    let x = norm.forward(&x)?;
+    x.reshape((b, h, s, d))
 }
 
 // ─── Free functions ──────────────────────────────────────────────────────────
