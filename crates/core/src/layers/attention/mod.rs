@@ -38,7 +38,8 @@ pub mod naive;
 mod ops;
 
 pub use block::{
-    sliding_window_mask, soft_cap, AttentionBias, AttentionBlock, AttentionConfig, QkNormVariant,
+    sliding_window_mask, soft_cap, AttentionBias, AttentionBlock, AttentionConfig, ProjNames,
+    QkNormVariant,
 };
 
 // Re-export public types

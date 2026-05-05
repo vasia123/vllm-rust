@@ -104,6 +104,31 @@ impl AttentionBias {
     };
 }
 
+/// VarBuilder names for the four projections.
+///
+/// Different model families use different conventions:
+/// - Llama family: `q_proj`, `k_proj`, `v_proj`, `o_proj` (default).
+/// - InternLM2: `q_proj`, `k_proj`, `v_proj`, `wo`.
+/// - Exaone: `q_proj`, `k_proj`, `v_proj`, `out_proj`.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjNames {
+    pub q: &'static str,
+    pub k: &'static str,
+    pub v: &'static str,
+    pub o: &'static str,
+}
+
+impl Default for ProjNames {
+    fn default() -> Self {
+        Self {
+            q: "q_proj",
+            k: "k_proj",
+            v: "v_proj",
+            o: "o_proj",
+        }
+    }
+}
+
 /// Configuration for a single attention block.
 ///
 /// Constructed via builder-style helpers. Defaults match the most common case
@@ -136,6 +161,9 @@ pub struct AttentionConfig {
     /// Default (None) means `1/sqrt(head_dim)`. Used by Gemma2 which has
     /// a hidden-size-based scaling.
     pub scale: Option<f64>,
+
+    /// VarBuilder names for the projections. Default: q_proj/k_proj/v_proj/o_proj.
+    pub proj_names: ProjNames,
 }
 
 impl AttentionConfig {
@@ -153,7 +181,13 @@ impl AttentionConfig {
             softcap: None,
             sliding_window: None,
             scale: None,
+            proj_names: ProjNames::default(),
         }
+    }
+
+    pub fn with_proj_names(mut self, names: ProjNames) -> Self {
+        self.proj_names = names;
+        self
     }
 
     pub fn with_bias(mut self, bias: AttentionBias) -> Self {
@@ -258,12 +292,13 @@ impl AttentionBlock {
             }
         }
 
+        let names = cfg.proj_names;
         let q_proj = TpLinear::column_parallel(
             cfg.hidden_size,
             cfg.num_heads * cfg.head_dim,
             cfg.bias.q,
             false,
-            vb.pp("q_proj"),
+            vb.pp(names.q),
             pg,
         )?;
         let k_proj = TpLinear::column_parallel(
@@ -271,7 +306,7 @@ impl AttentionBlock {
             cfg.num_kv_heads * cfg.head_dim,
             cfg.bias.k,
             false,
-            vb.pp("k_proj"),
+            vb.pp(names.k),
             pg,
         )?;
         let v_proj = TpLinear::column_parallel(
@@ -279,7 +314,7 @@ impl AttentionBlock {
             cfg.num_kv_heads * cfg.head_dim,
             cfg.bias.v,
             false,
-            vb.pp("v_proj"),
+            vb.pp(names.v),
             pg,
         )?;
         let o_proj = TpLinear::row_parallel(
@@ -287,7 +322,7 @@ impl AttentionBlock {
             cfg.hidden_size,
             cfg.bias.o,
             true,
-            vb.pp("o_proj"),
+            vb.pp(names.o),
             pg,
         )?;
 
