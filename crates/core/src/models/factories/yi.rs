@@ -20,7 +20,7 @@ use super::super::*;
 
 pub const ARCH_NAMES: &[&str] = &["YiForCausalLM"];
 
-static INFO: ArchInfo = ArchInfo::new("Yi", Capabilities::TP);
+static INFO: ArchInfo = ArchInfo::new("Yi", Capabilities::TP.union(Capabilities::QUANTIZED));
 
 pub struct YiArchFactory;
 pub static FACTORY: YiArchFactory = YiArchFactory;
@@ -49,6 +49,19 @@ impl ArchFactory for YiArchFactory {
         tp_ctx: super::super::tp_layers::TpContext,
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Ok(Box::new(YiForCausalLM::new_with_tp(cfg, vb, pg, tp_ctx)?))
+    }
+
+    fn build_quant(
+        &self,
+        cfg: &ModelConfig,
+        vb: VarBuilder<'static>,
+        weight_loader: &dyn crate::quantization::QuantizedWeightLoader,
+    ) -> Result<Box<dyn ModelForward>, ModelError> {
+        Ok(Box::new(QuantizedLlamaForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader,
+        )?))
     }
 
     fn as_any(&self) -> &dyn Any {

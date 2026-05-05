@@ -20,7 +20,7 @@ use super::super::*;
 
 pub const ARCH_NAMES: &[&str] = &["SeedOssForCausalLM"];
 
-static INFO: ArchInfo = ArchInfo::new("SeedOss", Capabilities::TP);
+static INFO: ArchInfo = ArchInfo::new("SeedOss", Capabilities::TP.union(Capabilities::QUANTIZED));
 
 pub struct SeedOssArchFactory;
 pub static FACTORY: SeedOssArchFactory = SeedOssArchFactory;
@@ -50,6 +50,19 @@ impl ArchFactory for SeedOssArchFactory {
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Ok(Box::new(SeedOssForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
+        )?))
+    }
+
+    fn build_quant(
+        &self,
+        cfg: &ModelConfig,
+        vb: VarBuilder<'static>,
+        weight_loader: &dyn crate::quantization::QuantizedWeightLoader,
+    ) -> Result<Box<dyn ModelForward>, ModelError> {
+        Ok(Box::new(QuantizedLlamaForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader,
         )?))
     }
 

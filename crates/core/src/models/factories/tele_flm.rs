@@ -22,7 +22,7 @@ use super::super::*;
 
 pub const ARCH_NAMES: &[&str] = &["TeleFLMForCausalLM"];
 
-static INFO: ArchInfo = ArchInfo::new("TeleFLM", Capabilities::TP);
+static INFO: ArchInfo = ArchInfo::new("TeleFLM", Capabilities::TP.union(Capabilities::QUANTIZED));
 
 pub struct TeleFlmArchFactory;
 pub static FACTORY: TeleFlmArchFactory = TeleFlmArchFactory;
@@ -55,6 +55,19 @@ impl ArchFactory for TeleFlmArchFactory {
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Ok(Box::new(LlamaForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
+        )?))
+    }
+
+    fn build_quant(
+        &self,
+        cfg: &ModelConfig,
+        vb: VarBuilder<'static>,
+        weight_loader: &dyn crate::quantization::QuantizedWeightLoader,
+    ) -> Result<Box<dyn ModelForward>, ModelError> {
+        Ok(Box::new(QuantizedLlamaForCausalLM::new(
+            cfg,
+            vb,
+            weight_loader,
         )?))
     }
 
