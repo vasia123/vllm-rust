@@ -6,7 +6,8 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBlock, AttentionConfig};
+use crate::layers::RotaryEmbedding;
 
 pub use super::tp_layers::TpContext;
 use super::tp_layers::{TpEmbedding, TpLinear};
@@ -74,67 +75,23 @@ impl Phi3FusedSwiGluMlp {
 //
 // Phi-3 uses fused QKV projection instead of separate Q/K/V.
 
+// Phi3 = vanilla GQA + fused qkv_proj + LongRoPE (su-scaled rotary).
 struct Phi3Attention {
-    qkv_proj: TpLinear,
-    o_proj: TpLinear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    inner: AttentionBlock,
 }
 
 impl Phi3Attention {
     fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-        let world_size = pg.world_size();
-
-        if world_size > 1 {
-            if !num_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-            if !num_kv_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-        }
-
-        // Fused QKV: output dim = (num_heads + 2 * num_kv_heads) * head_dim
-        let qkv_out_dim = (num_heads + 2 * num_kv_heads) * head_dim;
-        let qkv_proj = TpLinear::column_parallel(
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
             cfg.hidden_size,
-            qkv_out_dim,
-            false,
-            false,
-            vb.pp("qkv_proj"),
-            pg,
-        )?;
-        let o_proj = TpLinear::row_parallel(
-            num_heads * head_dim,
-            cfg.hidden_size,
-            false,
-            true,
-            vb.pp("o_proj"),
-            pg,
-        )?;
-
-        let num_heads_per_gpu = num_heads / world_size;
-        let num_kv_heads_per_gpu = num_kv_heads / world_size;
-
-        let rotary_emb = Self::build_rotary_embedding(cfg, head_dim, vb.dtype(), vb.device())?;
-
-        Ok(Self {
-            qkv_proj,
-            o_proj,
-            rotary_emb,
-            num_heads: num_heads_per_gpu,
-            num_kv_heads: num_kv_heads_per_gpu,
-            head_dim,
-        })
+        )
+        .with_qkv_fused();
+        let rotary_emb = Self::build_rotary_embedding(cfg, cfg.head_dim, vb.dtype(), vb.device())?;
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
     /// Build the rotary embedding, selecting su-scaled (LongRoPE) when
@@ -211,33 +168,6 @@ impl Phi3Attention {
         )
     }
 
-    /// Split fused QKV output into separate Q, K, V tensors.
-    fn split_qkv(
-        &self,
-        qkv: &Tensor,
-        b_sz: usize,
-        seq_len: usize,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let q_dim = self.num_heads * self.head_dim;
-        let kv_dim = self.num_kv_heads * self.head_dim;
-
-        let q = qkv.narrow(candle_core::D::Minus1, 0, q_dim)?;
-        let k = qkv.narrow(candle_core::D::Minus1, q_dim, kv_dim)?;
-        let v = qkv.narrow(candle_core::D::Minus1, q_dim + kv_dim, kv_dim)?;
-
-        let q = q
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        Ok((q, k, v))
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -249,28 +179,15 @@ impl Phi3Attention {
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let qkv = self.qkv_proj.forward(xs, tp_ctx)?;
-        let (q, k, v) = self.split_qkv(&qkv, b_sz, q_len)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output, tp_ctx)
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -280,98 +197,8 @@ impl Phi3Attention {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let qkv = self.qkv_proj.forward(xs, tp_ctx)?;
-        let (q, k, v) = self.split_qkv(&qkv, batch_size, 1)?;
-
-        #[cfg(feature = "cuda-kernels")]
-        {
-            let q = q.squeeze(2)?;
-            let k = k.squeeze(2)?;
-            let v = v.squeeze(2)?;
-
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
-
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
-            cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-                }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
-
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
-
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-                self.head_dim,
-                cache_engine.block_size(),
-            )?;
-
-            self.o_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)
-        }
-
-        #[cfg(not(feature = "cuda-kernels"))]
-        {
-            let mut outputs = Vec::with_capacity(batch_size);
-            for (i, seq) in sequences.iter().enumerate() {
-                let q_i = q.narrow(0, i, 1)?;
-                let k_i = k.narrow(0, i, 1)?;
-                let v_i = v.narrow(0, i, 1)?;
-
-                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None,
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-                outputs.push(attn_out);
-            }
-
-            let attn_output = Tensor::cat(&outputs, 0)?;
-            self.o_proj.forward(&attn_output, tp_ctx)
-        }
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 
@@ -832,37 +659,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_phi3_fused_qkv_split() {
-        // Verify that fused QKV output is correctly split into Q, K, V
-        let cfg = test_config();
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-        let pg = LocalProcessGroup::new();
-
-        let attn =
-            Phi3Attention::new_with_tp(&cfg, vb.pp("self_attn"), &pg).expect("build attention");
-
-        let b_sz = 1;
-        let seq_len = 3;
-        let qkv_dim = (cfg.num_attention_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim;
-        let fake_qkv =
-            Tensor::zeros((b_sz, seq_len, qkv_dim), DType::F32, &device).expect("fake qkv");
-
-        let (q, k, v) = attn.split_qkv(&fake_qkv, b_sz, seq_len).expect("split");
-        assert_eq!(
-            q.dims(),
-            &[b_sz, cfg.num_attention_heads, seq_len, cfg.head_dim]
-        );
-        assert_eq!(
-            k.dims(),
-            &[b_sz, cfg.num_key_value_heads, seq_len, cfg.head_dim]
-        );
-        assert_eq!(
-            v.dims(),
-            &[b_sz, cfg.num_key_value_heads, seq_len, cfg.head_dim]
-        );
-    }
+    // Note: the explicit fused QKV split test was removed when Phi3Attention
+    // was migrated to AttentionBlock; the splitting logic now lives in
+    // AttentionBlock::project_qkv and is validated by the model's full forward
+    // tests below.
 
     #[test]
     fn test_phi3_fused_mlp_split() {

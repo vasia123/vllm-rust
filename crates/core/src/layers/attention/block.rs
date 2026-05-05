@@ -104,18 +104,24 @@ impl AttentionBias {
     };
 }
 
-/// VarBuilder names for the four projections.
+/// VarBuilder names for the QKV/O projections.
 ///
 /// Different model families use different conventions:
-/// - Llama family: `q_proj`, `k_proj`, `v_proj`, `o_proj` (default).
-/// - InternLM2: `q_proj`, `k_proj`, `v_proj`, `wo`.
-/// - Exaone: `q_proj`, `k_proj`, `v_proj`, `out_proj`.
+/// - Llama family:  separate `q_proj`, `k_proj`, `v_proj`, `o_proj` (default).
+/// - InternLM2:     `q_proj`, `k_proj`, `v_proj`, `wo`.
+/// - Exaone:        `q_proj`, `k_proj`, `v_proj`, `out_proj`.
+/// - Phi3:          fused `qkv_proj` + `o_proj`.
+/// - ChatGLM:       fused `query_key_value` + `dense`.
+/// - GPT-2 / BigCode: fused `c_attn` + `c_proj`.
+///
+/// `qkv` is only used when `AttentionConfig::qkv_fused` is true.
 #[derive(Debug, Clone, Copy)]
 pub struct ProjNames {
     pub q: &'static str,
     pub k: &'static str,
     pub v: &'static str,
     pub o: &'static str,
+    pub qkv: &'static str,
 }
 
 impl Default for ProjNames {
@@ -125,6 +131,7 @@ impl Default for ProjNames {
             k: "k_proj",
             v: "v_proj",
             o: "o_proj",
+            qkv: "qkv_proj",
         }
     }
 }
@@ -170,6 +177,13 @@ pub struct AttentionConfig {
     /// non-RoPE attention layers. The `RotaryEmbedding` passed at construction
     /// time is still owned by the block but never invoked.
     pub bypass_rope: bool,
+
+    /// If true, use a single fused `qkv_proj` weight that produces
+    /// `[Q | K | V]` concatenated along the last axis with shapes
+    /// `Q: num_heads*head_dim`, `K: num_kv_heads*head_dim`,
+    /// `V: num_kv_heads*head_dim`. Used by Phi3, GPT-2/BigCode, ChatGLM,
+    /// DBRX, Falcon-style architectures.
+    pub qkv_fused: bool,
 }
 
 impl AttentionConfig {
@@ -189,11 +203,17 @@ impl AttentionConfig {
             scale: None,
             proj_names: ProjNames::default(),
             bypass_rope: false,
+            qkv_fused: false,
         }
     }
 
     pub fn with_bypass_rope(mut self) -> Self {
         self.bypass_rope = true;
+        self
+    }
+
+    pub fn with_qkv_fused(mut self) -> Self {
+        self.qkv_fused = true;
         self
     }
 
@@ -252,10 +272,19 @@ impl AttentionConfig {
 /// heads), O is row-parallel (reduce partial outputs). The internal
 /// `num_heads` / `num_kv_heads` fields hold the **per-GPU** counts after
 /// sharding — matching the existing bespoke convention.
+/// QKV projection layout: separate (Llama-style) or fused (Phi3-style).
+enum QkvProjection {
+    Separate {
+        q: TpLinear,
+        k: TpLinear,
+        v: TpLinear,
+    },
+    /// Concatenated layout `[Q | K | V]` along the last axis.
+    Fused(TpLinear),
+}
+
 pub struct AttentionBlock {
-    q_proj: TpLinear,
-    k_proj: TpLinear,
-    v_proj: TpLinear,
+    qkv: QkvProjection,
     o_proj: TpLinear,
     rotary_emb: RotaryEmbedding,
     q_norm: Option<RmsNorm>,
@@ -306,30 +335,51 @@ impl AttentionBlock {
         }
 
         let names = cfg.proj_names;
-        let q_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            cfg.num_heads * cfg.head_dim,
-            cfg.bias.q,
-            false,
-            vb.pp(names.q),
-            pg,
-        )?;
-        let k_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            cfg.num_kv_heads * cfg.head_dim,
-            cfg.bias.k,
-            false,
-            vb.pp(names.k),
-            pg,
-        )?;
-        let v_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            cfg.num_kv_heads * cfg.head_dim,
-            cfg.bias.v,
-            false,
-            vb.pp(names.v),
-            pg,
-        )?;
+        let qkv = if cfg.qkv_fused {
+            // The fused projection cannot have heterogeneous bias on Q/K/V, so
+            // we require all three flags to agree.
+            if cfg.bias.q != cfg.bias.k || cfg.bias.k != cfg.bias.v {
+                return Err(candle_core::Error::Msg(
+                    "fused QKV requires bias.q == bias.k == bias.v".to_string(),
+                ));
+            }
+            let qkv_dim = (cfg.num_heads + 2 * cfg.num_kv_heads) * cfg.head_dim;
+            QkvProjection::Fused(TpLinear::column_parallel(
+                cfg.hidden_size,
+                qkv_dim,
+                cfg.bias.q,
+                false,
+                vb.pp(names.qkv),
+                pg,
+            )?)
+        } else {
+            QkvProjection::Separate {
+                q: TpLinear::column_parallel(
+                    cfg.hidden_size,
+                    cfg.num_heads * cfg.head_dim,
+                    cfg.bias.q,
+                    false,
+                    vb.pp(names.q),
+                    pg,
+                )?,
+                k: TpLinear::column_parallel(
+                    cfg.hidden_size,
+                    cfg.num_kv_heads * cfg.head_dim,
+                    cfg.bias.k,
+                    false,
+                    vb.pp(names.k),
+                    pg,
+                )?,
+                v: TpLinear::column_parallel(
+                    cfg.hidden_size,
+                    cfg.num_kv_heads * cfg.head_dim,
+                    cfg.bias.v,
+                    false,
+                    vb.pp(names.v),
+                    pg,
+                )?,
+            }
+        };
         let o_proj = TpLinear::row_parallel(
             cfg.num_heads * cfg.head_dim,
             cfg.hidden_size,
@@ -348,9 +398,7 @@ impl AttentionBlock {
         };
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv,
             o_proj,
             rotary_emb,
             q_norm,
@@ -513,17 +561,30 @@ impl AttentionBlock {
         seq: usize,
         tp_ctx: &TpContext,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
+        let (q_flat, k_flat, v_flat) = match &self.qkv {
+            QkvProjection::Separate { q, k, v } => (
+                q.forward(xs, tp_ctx)?,
+                k.forward(xs, tp_ctx)?,
+                v.forward(xs, tp_ctx)?,
+            ),
+            QkvProjection::Fused(qkv) => {
+                let qkv_out = qkv.forward(xs, tp_ctx)?;
+                let q_dim = self.num_heads * self.head_dim;
+                let kv_dim = self.num_kv_heads * self.head_dim;
+                let q = qkv_out.narrow(D::Minus1, 0, q_dim)?;
+                let k = qkv_out.narrow(D::Minus1, q_dim, kv_dim)?;
+                let v = qkv_out.narrow(D::Minus1, q_dim + kv_dim, kv_dim)?;
+                (q, k, v)
+            }
+        };
 
-        let q = q
+        let q = q_flat
             .reshape((batch, seq, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = k
+        let k = k_flat
             .reshape((batch, seq, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let v = v
+        let v = v_flat
             .reshape((batch, seq, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         Ok((q, k, v))
