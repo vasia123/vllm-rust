@@ -5,87 +5,45 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBlock, AttentionConfig, ProjNames};
+use crate::layers::RotaryEmbedding;
 
 use super::tp_layers::{TpContext, TpEmbedding, TpLinear};
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
+// GPT-J = MHA (no GQA) + separate Q/K/V/out_proj + partial RoPE (rotary_dim
+// from cfg.extra, GPT-J split-style not NeoX-style). No bias.
 struct GPTJAttention {
-    q_proj: TpLinear,
-    k_proj: TpLinear,
-    v_proj: TpLinear,
-    out_proj: TpLinear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    head_dim: usize,
+    inner: AttentionBlock,
 }
 
 impl GPTJAttention {
     fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let head_dim = cfg.head_dim;
-        let world_size = pg.world_size();
-
         let rotary_dim = cfg
             .extra
             .get("rotary_dim")
             .and_then(|v| v.as_u64())
             .unwrap_or(head_dim as u64) as usize;
         let partial_factor = rotary_dim as f64 / head_dim as f64;
-
-        let q_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_heads * head_dim,
-            false,
-            false,
-            vb.pp("q_proj"),
-            pg,
-        )?;
-        let k_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_heads * head_dim,
-            false,
-            false,
-            vb.pp("k_proj"),
-            pg,
-        )?;
-        let v_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_heads * head_dim,
-            false,
-            false,
-            vb.pp("v_proj"),
-            pg,
-        )?;
-        let out_proj = TpLinear::row_parallel(
-            num_heads * head_dim,
-            cfg.hidden_size,
-            false,
-            true,
-            vb.pp("out_proj"),
-            pg,
-        )?;
-
+        let attn_cfg = AttentionConfig::gqa(num_heads, num_heads, head_dim, cfg.hidden_size)
+            .with_proj_names(ProjNames {
+                o: "out_proj",
+                ..Default::default()
+            });
         let rotary_emb = RotaryEmbedding::new_partial(
             head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             partial_factor,
-            false, // GPT-J style (not NeoX)
+            false, // GPT-J split-style
             vb.dtype(),
             vb.device(),
         )?;
-
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            out_proj,
-            rotary_emb,
-            num_heads: num_heads / world_size,
-            head_dim,
-        })
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -99,39 +57,15 @@ impl GPTJAttention {
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_heads,
-            self.head_dim,
-        )?;
-
-        self.out_proj.forward(&attn_output, tp_ctx)
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -141,49 +75,8 @@ impl GPTJAttention {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Per-sequence: RoPE + cache write/read + attention
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        let attn_output = Tensor::cat(&outputs, 0)?;
-        self.out_proj.forward(&attn_output, tp_ctx)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 
