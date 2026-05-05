@@ -628,30 +628,9 @@ pub fn from_config_with_pp(
         }
     }
 
-    match arch {
-        // Llama-family architectures all share LlamaForCausalLM internals.
-        "LlamaForCausalLM"
-        | "LlamaModel"
-        | "LLaMAForCausalLM"
-        | "AquilaModel"
-        | "AquilaForCausalLM"
-        | "CwmForCausalLM"
-        | "InternLMForCausalLM"
-        | "InternLM3ForCausalLM"
-        | "IQuestCoderForCausalLM"
-        | "XverseForCausalLM"
-        | "SolarForCausalLM"
-        | "Fairseq2LlamaForCausalLM"
-        | "OrionForCausalLM"
-        | "OlmoForCausalLM"
-        | "SmolLM3ForCausalLM"
-        | "MistralForCausalLM" => Ok(Box::new(llama::LlamaForCausalLM::new_with_pp(
-            cfg, vb, stage,
-        )?)),
-        other => Err(ModelError::UnsupportedArchitecture(format!(
-            "{other} does not support pipeline parallelism yet; use --pipeline-parallel-size 1"
-        ))),
-    }
+    Err(ModelError::UnsupportedArchitecture(format!(
+        "{arch} does not support pipeline parallelism yet; use --pipeline-parallel-size 1"
+    )))
 }
 
 /// Construct an encoder-decoder model from config.architectures[0].
@@ -671,18 +650,7 @@ pub fn from_config_encoder_decoder(
         }
     }
 
-    match arch {
-        "T5ForConditionalGeneration" | "T5Model" => {
-            Ok(Box::new(T5ForConditionalGeneration::new(cfg, vb)?))
-        }
-        "WhisperForConditionalGeneration" => {
-            Ok(Box::new(WhisperForConditionalGeneration::new(cfg, vb)?))
-        }
-        "NemotronParseForConditionalGeneration" => Ok(Box::new(
-            nemotron_parse::NemotronParseForConditionalGeneration::new(cfg, vb)?,
-        )),
-        other => Err(ModelError::UnsupportedArchitecture(other.into())),
-    }
+    Err(ModelError::UnsupportedArchitecture(arch.into()))
 }
 
 /// Construct a quantized model with automatic quantization detection.

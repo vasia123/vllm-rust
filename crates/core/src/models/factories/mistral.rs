@@ -4,7 +4,8 @@
 //! dispatch in `crates/core/src/models/mod.rs`. Bodies are lifted
 //! verbatim — re-running the generator overwrites this file.
 //!
-//! Capabilities: build, build_quant, build_with_lora, build_with_tp
+//! Capabilities: build, build_quant, build_with_lora, build_with_tp,
+//! build_with_pp
 
 #![allow(unused_imports, unused_variables)]
 
@@ -13,7 +14,8 @@ use std::any::Any;
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
-use crate::engine::ModelForward;
+use crate::distributed::PipelineStageConfig;
+use crate::engine::{ModelForward, PipelineForward};
 
 use super::super::factory::{ArchFactory, ArchInfo, Capabilities};
 use super::super::*;
@@ -24,7 +26,8 @@ static INFO: ArchInfo = ArchInfo::new(
     "Mistral",
     Capabilities::LORA
         .union(Capabilities::QUANTIZED)
-        .union(Capabilities::TP),
+        .union(Capabilities::TP)
+        .union(Capabilities::PP),
 );
 
 pub struct MistralArchFactory;
@@ -69,6 +72,21 @@ impl ArchFactory for MistralArchFactory {
         Ok(Box::new(MistralForCausalLM::new_with_tp(
             cfg, vb, pg, tp_ctx,
         )?))
+    }
+
+    /// Mistral PP routes through the Llama backbone (the legacy
+    /// `from_config_with_pp` arm did the same — Mistral and Llama
+    /// share the dense decoder layout, so the pipeline stage logic
+    /// reuses Llama's implementation).
+    fn build_with_pp(
+        &self,
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+        stage: &PipelineStageConfig,
+    ) -> Result<Box<dyn PipelineForward>, ModelError> {
+        Ok(Box::new(
+            super::super::llama::LlamaForCausalLM::new_with_pp(cfg, vb, stage)?,
+        ))
     }
 
     fn build_with_lora(
