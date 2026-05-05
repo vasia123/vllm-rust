@@ -212,6 +212,16 @@ pub struct AttentionConfig {
     ///
     /// Only consulted when `qk_norm` is set.
     pub qk_norm_after_rope: bool,
+
+    /// Optional override for the input dimension of the Q/K/V projections.
+    ///
+    /// Defaults to `hidden_size` (the residual stream dimension). Used by
+    /// architectures whose Q/K/V projections accept a wider input than the
+    /// hidden state — for example Eagle 3's first decoder layer, where
+    /// `qkv_input_size = 2 * hidden_size` because the layer-0 input is the
+    /// concatenation of token embeddings and target hidden states. The
+    /// `o_proj` output dimension is always `hidden_size`.
+    pub qkv_input_size: Option<usize>,
 }
 
 impl AttentionConfig {
@@ -233,7 +243,15 @@ impl AttentionConfig {
             bypass_rope: false,
             qkv_fused: false,
             qk_norm_after_rope: false,
+            qkv_input_size: None,
         }
+    }
+
+    /// Override the Q/K/V projection input dimension (default = `hidden_size`).
+    /// `o_proj` output dimension is always `hidden_size`.
+    pub fn with_qkv_input_size(mut self, size: usize) -> Self {
+        self.qkv_input_size = Some(size);
+        self
     }
 
     pub fn with_bypass_rope(mut self) -> Self {
@@ -385,7 +403,7 @@ impl AttentionBlock {
             }
             let qkv_dim = (cfg.num_heads + 2 * cfg.num_kv_heads) * cfg.head_dim;
             QkvProjection::Fused(TpLinear::column_parallel(
-                cfg.hidden_size,
+                cfg.qkv_input_size.unwrap_or(cfg.hidden_size),
                 qkv_dim,
                 cfg.bias.q,
                 false,
@@ -393,9 +411,10 @@ impl AttentionBlock {
                 pg,
             )?)
         } else {
+            let qkv_in = cfg.qkv_input_size.unwrap_or(cfg.hidden_size);
             QkvProjection::Separate {
                 q: TpLinear::column_parallel(
-                    cfg.hidden_size,
+                    qkv_in,
                     cfg.num_heads * cfg.head_dim,
                     cfg.bias.q,
                     false,
@@ -403,7 +422,7 @@ impl AttentionBlock {
                     pg,
                 )?,
                 k: TpLinear::column_parallel(
-                    cfg.hidden_size,
+                    qkv_in,
                     cfg.num_kv_heads * cfg.head_dim,
                     cfg.bias.k,
                     false,
@@ -411,7 +430,7 @@ impl AttentionBlock {
                     pg,
                 )?,
                 v: TpLinear::column_parallel(
-                    cfg.hidden_size,
+                    qkv_in,
                     cfg.num_kv_heads * cfg.head_dim,
                     cfg.bias.v,
                     false,
