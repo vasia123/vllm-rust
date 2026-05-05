@@ -18,7 +18,8 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{causal_mask, paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig, QkNormVariant};
+use crate::layers::{causal_mask, RotaryEmbedding};
 use crate::multimodal::{MultimodalInputs, VisionEncoder, VisionEncoderConfig, VisionEncoderType};
 
 use super::tp_layers::{TpContext, TpEmbedding, TpLinear};
@@ -222,63 +223,52 @@ impl ImageProjectorMLP {
 
 // ─── LLM Attention ──────────────────────────────────────────────────────────
 
-/// Molmo2 attention with GQA and optional Q/K normalization.
-#[allow(dead_code)]
+/// Molmo2 attention.
+///
+/// = fused QKV (`qkv_proj`, biased) + biased `o_proj` + optional per-head
+/// RMS QK-norm + RoPE.
+///
+/// NOTE: the previous bespoke implementation was missing the `o_proj`
+/// application — it returned `paged_attention(...)` directly. Migrating
+/// to AttentionBlock fixes this latent bug; the `o_proj` weights are
+/// now correctly applied to the attention output before the residual add.
 struct Molmo2Attention {
-    qkv_proj: Linear,
-    o_proj: Linear,
-    q_norm: Option<RmsNorm>,
-    k_norm: Option<RmsNorm>,
-    rotary: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    num_kv_groups: usize,
+    inner: AttentionBlock,
+    tp_ctx: TpContext,
 }
 
 impl Molmo2Attention {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-
-        let total_qkv = (num_heads + 2 * num_kv_heads) * head_dim;
-        let qkv_proj = candle_nn::linear(cfg.hidden_size, total_qkv, vb.pp("qkv_proj"))?;
-        let o_proj = candle_nn::linear(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
-
         let use_qk_norm = cfg
             .extra
             .get("use_qk_norm")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let (q_norm, k_norm) = if use_qk_norm {
-            (
-                Some(rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?),
-                Some(rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?),
-            )
-        } else {
-            (None, None)
-        };
+        let mut attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+        )
+        .with_qkv_fused()
+        .with_bias(AttentionBias::ALL);
+        if use_qk_norm {
+            attn_cfg = attn_cfg.with_qk_norm(QkNormVariant::PerHead, cfg.rms_norm_eps);
+        }
 
-        let rotary = RotaryEmbedding::new(
-            head_dim,
+        let rotary_emb = RotaryEmbedding::new(
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
+        let pg = LocalProcessGroup::new();
+        let inner = AttentionBlock::new(&attn_cfg, vb, &pg, rotary_emb)?;
         Ok(Self {
-            qkv_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            rotary,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_kv_groups: num_heads / num_kv_heads,
+            inner,
+            tp_ctx: TpContext::single_gpu(),
         })
     }
 
@@ -291,53 +281,14 @@ impl Molmo2Attention {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (batch, seq_len, _) = x.dims3()?;
-
-        let qkv = self.qkv_proj.forward(x)?;
-
-        let q_dim = self.num_heads * self.head_dim;
-        let kv_dim = self.num_kv_heads * self.head_dim;
-
-        let q = qkv.narrow(2, 0, q_dim)?;
-        let k = qkv.narrow(2, q_dim, kv_dim)?;
-        let v = qkv.narrow(2, q_dim + kv_dim, kv_dim)?;
-
-        let q = q
-            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Optional Q/K normalization
-        let q = if let Some(ref norm) = self.q_norm {
-            norm.forward(&q)?
-        } else {
-            q
-        };
-        let k = if let Some(ref norm) = self.k_norm {
-            norm.forward(&k)?
-        } else {
-            k
-        };
-
-        let (q, k) = self.rotary.apply(&q, &k, seqlen_offset)?;
-
-        paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            x,
             mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
+            &self.tp_ctx,
         )
     }
 }
