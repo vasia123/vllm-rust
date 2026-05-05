@@ -62,6 +62,7 @@ mod quantized_experts;
 mod router;
 mod token_dispatch;
 pub mod topk_softmax;
+mod tp_layer;
 
 pub use ep_layer::{EPMoEConfig, EPMoELayer};
 pub use eplb::{EplbConfig, EplbState, ExpertLoadStats};
@@ -77,3 +78,7 @@ pub use quantized_experts::{QuantizedMoEExpert, QuantizedMoELayer, QuantizedMoEL
 pub use router::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 pub use token_dispatch::{DispatchMetadata, TokenDispatcher};
 pub use topk_softmax::{topk_softmax, TopKSoftmaxConfig};
+pub use tp_layer::{
+    TpMoEExpert, TpMoEExpertConfig, TpMoELayer, TpMoELayerConfig, TpMoELayerWithShared,
+    TpMoELayerWithSharedConfig,
+};
