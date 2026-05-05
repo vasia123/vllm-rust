@@ -404,6 +404,14 @@ enum Command {
         /// against VLM checkpoints (Gemma 4, etc.) on tight GPUs.
         #[arg(long, default_value_t = false)]
         text_only: bool,
+
+        /// Number of KV cache blocks (mirrors `serve --num-blocks`).
+        /// Each block is `block_size · num_layers · num_kv_heads ·
+        /// head_dim · 2 (K+V)` bytes — for an 8 GB GPU running a
+        /// quantized 8B model, 512 blocks already cost ~2 GiB. Drop
+        /// this when VRAM is tight, raise it for longer contexts.
+        #[arg(long, default_value_t = 512)]
+        num_blocks: usize,
     },
 }
 
@@ -952,6 +960,7 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             multi_step_count,
             text_only,
+            num_blocks,
         } => {
             let prompts = if prompt.is_empty() {
                 vec!["Hello, world".to_string()]
@@ -966,6 +975,7 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 multi_step_count,
                 text_only,
+                num_blocks,
             )
             .await
         }
@@ -2277,6 +2287,7 @@ async fn run_generate(
     max_tokens: usize,
     multi_step_count: usize,
     text_only: bool,
+    num_blocks: usize,
 ) -> anyhow::Result<()> {
     eprintln!("Loading model: {model_id}");
     let mut files = loader::fetch_model(&model_id)?;
@@ -2321,7 +2332,7 @@ async fn run_generate(
 
     let cache_config = CacheConfig {
         block_size: 16,
-        num_blocks: 512,
+        num_blocks,
         num_layers: files.config.num_hidden_layers,
         num_kv_heads: files.config.num_key_value_heads,
         head_dim: files.config.head_dim,
@@ -2403,7 +2414,7 @@ async fn run_generate(
 
             let draft_cache_config = CacheConfig {
                 block_size: 16,
-                num_blocks: 512,
+                num_blocks,
                 num_layers: draft_files.config.num_hidden_layers,
                 num_kv_heads: draft_files.config.num_key_value_heads,
                 head_dim: draft_files.config.head_dim,
