@@ -80,38 +80,46 @@ invocation.
 - This ADR rewritten to record the actual decision (default-on)
   rather than the deferral that the original draft proposed.
 
-### What's still legacy
+### Cleanup status
 
-The five `from_config*` functions in `models/mod.rs` retain their
-match-arm bodies after the `registry_v2::lookup` shortcut. Cleanup
-status, function-by-function:
+All five `from_config*` functions have had their legacy match-arm
+bodies removed:
 
-| Function | Match-arm cleanup | Reason |
-|----------|------------------|--------|
+| Function | Match-arm cleanup | Notes |
+|----------|------------------|-------|
 | `from_config` | **Done** (−411 LOC) | All 326 arches have factories with `build` |
-| `from_config_with_quant` | Pending | 35 arches need `Capabilities::QUANTIZED` + `build_quant` overrides on their factories |
-| `from_config_with_pp` | Pending | Only 1 factory has `Capabilities::PP`; needs Llama-family expansion |
-| `from_config_with_lora` | Pending | 7 arches need `Capabilities::LORA` + `build_with_lora` overrides |
-| `from_config_encoder_decoder` | Pending | Few factories have `Capabilities::ENCODER_DECODER`; needs Whisper / T5 / BART expansion |
+| `from_config_with_quant` | **Done** (−234 LOC) | After adding QUANTIZED + build_quant to Yi/Baichuan/SeedOss/TeleFLM factories |
+| `from_config_with_pp` | **Done** (−25 LOC) | After adding PP + build_with_pp to Mistral factory (routes through Llama backbone) |
+| `from_config_with_lora` | **Done** (−24 LOC) | All 11 LoRA-enabled arches already covered |
+| `from_config_encoder_decoder` | **Done** (−13 LOC) | T5 / Whisper / NemotronParse already covered |
+| `from_config_with_tp` | **Done** (−232 LOC) | After adding TP + build_with_tp to TeleFLM factory |
 
-The blocker for the four pending functions: each requires per-factory
-work (add the capability bit + override the corresponding
-`build_with_*` method). That work is mechanical but model-by-model
-risky — silently removing an arm without a working override would
-break inference.
+Cumulative reduction: **−935 LOC** in `models/mod.rs` (2607 → 1672, −36%).
 
-The natural cohort for completing this is: for each pending function,
-walk its match arms, identify the missing factories, add the
-capability + override, then delete the legacy arm. Tracked as Phase
-9.4-cont in the plan.
+Every dispatch fn now follows the same shape:
 
-Until that completes, the legacy match arms remain as the live path
-for those four dispatch fns, and the registry-based path is dormant
-for them. No correctness regression — every arch still routes to the
-right model.
+```rust
+pub fn from_config_with_X(cfg, vb, ...) -> Result<...> {
+    let arch = get_arch(cfg)?;
 
-The original "removing them" cleanup paragraph below stays for the
-historical record; it describes the eventual end state.
+    #[cfg(feature = "model-registry-v2")]
+    if let Some(factory) = registry_v2::lookup(arch) {
+        if factory.info().supports(Capabilities::X) {
+            return factory.build_with_X(...);
+        }
+    }
+
+    Err(ModelError::UnsupportedArchitecture(arch.into()))
+}
+```
+
+The `from_config` function additionally retains a deprecation table
+for HuggingFace arch_names whose models were removed in upstream vLLM
+(MotifForCausalLM, Phi3SmallForCausalLM, Phi4FlashForCausalLM,
+Phi4MultimodalForCausalLM, BartForConditionalGeneration / BartModel /
+MBart / Donut / Florence2, MllamaForConditionalGeneration). These arms
+return `UnsupportedArchitecture` with an actionable message naming
+the upstream removal version and the recommended replacement.
 
   The cleanup is straightforward: replace each match-arm body with a
   `Err(ModelError::UnsupportedArchitecture(...))` and trust the
