@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
+default = ["model-registry-v2"]
 test-utils = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 flash-attn = ["dep:candle-flash-attn"]
