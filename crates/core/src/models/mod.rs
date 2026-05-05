@@ -1283,31 +1283,7 @@ pub fn from_config_with_lora(
         }
     }
 
-    match arch {
-        "Qwen3ForCausalLM" => Ok(LoraEnabledModel::Qwen3(Qwen3WithLora::new(cfg, vb)?)),
-        "LlamaForCausalLM" => Ok(LoraEnabledModel::Llama(LlamaWithLora::new(cfg, vb)?)),
-        "MistralForCausalLM" => Ok(LoraEnabledModel::Mistral(MistralWithLora::new(cfg, vb)?)),
-        "Qwen2ForCausalLM" => Ok(LoraEnabledModel::Qwen2(Qwen2WithLora::new(cfg, vb)?)),
-        "GemmaForCausalLM" => Ok(LoraEnabledModel::Gemma(GemmaWithLora::new(cfg, vb)?)),
-        "Gemma2ForCausalLM" => Ok(LoraEnabledModel::Gemma2(Gemma2WithLora::new(cfg, vb)?)),
-        "Gemma3ForCausalLM" | "Gemma3TextModel" => {
-            Ok(LoraEnabledModel::Gemma3(Gemma3WithLora::new(cfg, vb)?))
-        }
-        "Phi3ForCausalLM" => Ok(LoraEnabledModel::Phi3(Phi3WithLora::new(cfg, vb)?)),
-        "MixtralForCausalLM" => Ok(LoraEnabledModel::Mixtral(MixtralWithLora::new(cfg, vb)?)),
-        "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => {
-            Ok(LoraEnabledModel::Olmo2(Olmo2WithLora::new(cfg, vb)?))
-        }
-        "DeepseekV2ForCausalLM"
-        | "DeepseekV3ForCausalLM"
-        | "DeepseekV32ForCausalLM"
-        | "DeepseekForCausalLM"
-        | "GlmMoeDsaForCausalLM"
-        | "MistralLarge3ForCausalLM" => {
-            Ok(LoraEnabledModel::DeepSeek(DeepSeekWithLora::new(cfg, vb)?))
-        }
-        other => Err(ModelError::UnsupportedArchitecture(other.into())),
-    }
+    Err(ModelError::UnsupportedArchitecture(arch.into()))
 }
 
 delegate_model_forward! {
