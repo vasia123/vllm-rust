@@ -1,56 +1,121 @@
 use candle_core::{Module, Result, Tensor};
-use candle_nn::{linear_no_bias, Linear, VarBuilder};
+use candle_nn::{linear, linear_no_bias, Linear, VarBuilder};
 
-/// SwiGLU MLP used by Llama, Qwen3, Mistral, and others.
+/// Gate/up activation paired with the multiplicative GLU pattern used
+/// by SwiGLU (`silu(gate) * up`) and GeGLU (`gelu(gate) * up`). Most
+/// modern decoder-only families use `Silu`; the Gemma family uses
+/// `GeluPytorchTanh` (PyTorch's tanh-approximation GELU).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GluActivation {
+    /// `silu(x) = x * sigmoid(x)` — Llama, Mistral, Qwen, Yi, …
+    Silu,
+    /// Standard GELU (erf form).
+    Gelu,
+    /// PyTorch's tanh-approximation GELU — Gemma family text MLPs +
+    /// Gemma 4 vision tower.
+    GeluPytorchTanh,
+}
+
+impl GluActivation {
+    fn apply(&self, gate: &Tensor) -> Result<Tensor> {
+        match self {
+            GluActivation::Silu => gate.apply(&candle_nn::Activation::Silu),
+            GluActivation::Gelu => gate.gelu_erf(),
+            GluActivation::GeluPytorchTanh => gate.gelu(),
+        }
+    }
+}
+
+/// Configuration for [`SwiGluMlp`]. Every existing call site uses the
+/// vanilla `SwiGLU` shape (no bias, SiLU); the additional knobs cover
+/// Gemma family GeGLU + biased Phi3-style variants.
+#[derive(Clone, Debug)]
+pub struct MlpConfig {
+    pub activation: GluActivation,
+    pub has_bias: bool,
+    pub use_fused_kernel: bool,
+}
+
+impl Default for MlpConfig {
+    fn default() -> Self {
+        Self {
+            activation: GluActivation::Silu,
+            has_bias: false,
+            use_fused_kernel: true,
+        }
+    }
+}
+
+/// Gate/up/down GLU MLP used across the model zoo.
 ///
-/// Implements the SwiGLU activation function: SwiGLU(x) = silu(gate_proj(x)) * up_proj(x)
-/// followed by a down projection.
+/// Default shape (`MlpConfig::default()`) is the SwiGLU pattern:
+///   `down_proj(silu(gate_proj(x)) * up_proj(x))`
+/// which covers Llama, Qwen, Mistral, Yi, Solar, …
 ///
-/// When the `cuda-fused-activations` feature is enabled and the input is on a CUDA device,
-/// the silu activation and element-wise multiplication are fused into a single kernel,
-/// saving memory bandwidth.
+/// Pass `MlpConfig { activation: GluActivation::GeluPytorchTanh, .. }`
+/// for Gemma-style GeGLU. Pass `has_bias: true` for Phi3-style
+/// biased variants. The `cuda-fused-activations` fast path applies
+/// to the SiLU variant only — other activations take the straight
+/// `apply * up` path.
 pub struct SwiGluMlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
-    /// Whether to use the fused CUDA kernel when available
+    activation: GluActivation,
+    /// Whether to use the fused CUDA kernel when available (Silu only).
     use_fused_kernel: bool,
 }
 
 impl SwiGluMlp {
     pub fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            use_fused_kernel: true,
-        })
+        Self::new_with_cfg(hidden_size, intermediate_size, vb, MlpConfig::default())
     }
 
     /// Create a new SwiGluMlp with explicit control over fused kernel usage.
-    ///
-    /// # Arguments
-    /// - `hidden_size`: Input/output dimension
-    /// - `intermediate_size`: Intermediate (expanded) dimension
-    /// - `vb`: Variable builder for loading weights
-    /// - `use_fused_kernel`: Whether to use fused CUDA kernel when available
     pub fn new_with_config(
         hidden_size: usize,
         intermediate_size: usize,
         vb: VarBuilder,
         use_fused_kernel: bool,
     ) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+        Self::new_with_cfg(
+            hidden_size,
+            intermediate_size,
+            vb,
+            MlpConfig {
+                use_fused_kernel,
+                ..MlpConfig::default()
+            },
+        )
+    }
+
+    /// Construct with a full `MlpConfig`. Used by Gemma-style GeGLU,
+    /// Phi3-style biased SwiGLU, and any future activation variants.
+    pub fn new_with_cfg(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        cfg: MlpConfig,
+    ) -> Result<Self> {
+        let (gate_proj, up_proj, down_proj) = if cfg.has_bias {
+            (
+                linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
+                linear(hidden_size, intermediate_size, vb.pp("up_proj"))?,
+                linear(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+            )
+        } else {
+            (
+                linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
+                linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
+                linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+            )
+        };
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
-            use_fused_kernel,
+            activation: cfg.activation,
+            use_fused_kernel: cfg.use_fused_kernel,
         })
     }
 
@@ -77,21 +142,17 @@ impl Module for SwiGluMlp {
         let gate = self.gate_proj.forward(xs)?;
         let up = self.up_proj.forward(xs)?;
 
-        // Use fused kernel if available and enabled
+        // Fast path: SiLU + fused CUDA kernel.
         #[cfg(feature = "cuda-fused-activations")]
-        let activation_result = if self.should_use_fused(&gate) {
-            crate::cuda_kernels::fused_swiglu(&gate, &up)?
-        } else {
-            let gate_silu = gate.apply(&candle_nn::Activation::Silu)?;
-            (gate_silu * up)?
-        };
+        if self.activation == GluActivation::Silu && self.should_use_fused(&gate) {
+            return self
+                .down_proj
+                .forward(&crate::cuda_kernels::fused_swiglu(&gate, &up)?);
+        }
 
-        #[cfg(not(feature = "cuda-fused-activations"))]
-        let activation_result = {
-            let gate_silu = gate.apply(&candle_nn::Activation::Silu)?;
-            (gate_silu * up)?
-        };
-
+        // Generic path: activation(gate) * up → down_proj.
+        let gate_act = self.activation.apply(&gate)?;
+        let activation_result = (gate_act * up)?;
         activation_result.apply(&self.down_proj)
     }
 }
@@ -432,6 +493,59 @@ mod tests {
                 (f - u).abs() < 1e-5,
                 "MLP fused vs unfused mismatch: fused={f}, unfused={u}"
             );
+        }
+    }
+
+    #[test]
+    fn test_geglu_activation_path() {
+        // GeGLU = gelu(gate) * up. Verify the new MlpConfig variant
+        // produces the right shape and is finite — bit-exactness against
+        // a hand-computed reference is covered by Phase 4 golden tests.
+        let device = Device::Cpu;
+        let hidden_size = 64;
+        let intermediate_size = 128;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let mlp = SwiGluMlp::new_with_cfg(
+            hidden_size,
+            intermediate_size,
+            vb,
+            MlpConfig {
+                activation: GluActivation::GeluPytorchTanh,
+                has_bias: false,
+                use_fused_kernel: false,
+            },
+        )
+        .expect("build GeGLU MLP");
+
+        let x = Tensor::randn(0.0f32, 1.0, (2, 4, hidden_size), &device).unwrap();
+        let out = mlp.forward(&x).expect("forward");
+        assert_eq!(out.dims(), &[2, 4, hidden_size]);
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(v.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_glu_activation_apply_matches_inline() {
+        // Sanity: GluActivation::apply matches the inline expressions
+        // used inside `forward`. Catches regressions if we ever swap
+        // the underlying candle ops.
+        let device = Device::Cpu;
+        let x = Tensor::randn(0.0f32, 1.0, (16,), &device).unwrap();
+
+        let silu = GluActivation::Silu.apply(&x).unwrap();
+        let silu_ref = x.apply(&candle_nn::Activation::Silu).unwrap();
+        let a: Vec<f32> = silu.to_vec1().unwrap();
+        let b: Vec<f32> = silu_ref.to_vec1().unwrap();
+        for (i, j) in a.iter().zip(b.iter()) {
+            assert!((i - j).abs() < 1e-7);
+        }
+
+        let gelu = GluActivation::GeluPytorchTanh.apply(&x).unwrap();
+        let gelu_ref = x.gelu().unwrap();
+        let a: Vec<f32> = gelu.to_vec1().unwrap();
+        let b: Vec<f32> = gelu_ref.to_vec1().unwrap();
+        for (i, j) in a.iter().zip(b.iter()) {
+            assert!((i - j).abs() < 1e-7);
         }
     }
 }
