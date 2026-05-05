@@ -114,7 +114,8 @@ impl AttentionBias {
 /// - ChatGLM:       fused `query_key_value` + `dense`.
 /// - GPT-2 / BigCode: fused `c_attn` + `c_proj`.
 ///
-/// `qkv` is only used when `AttentionConfig::qkv_fused` is true.
+/// `qkv` is only used when `AttentionConfig::qkv_fused` is true. The
+/// `q_norm`/`k_norm` names are only consulted when `qk_norm` is set.
 #[derive(Debug, Clone, Copy)]
 pub struct ProjNames {
     pub q: &'static str,
@@ -122,6 +123,8 @@ pub struct ProjNames {
     pub v: &'static str,
     pub o: &'static str,
     pub qkv: &'static str,
+    pub q_norm: &'static str,
+    pub k_norm: &'static str,
 }
 
 impl Default for ProjNames {
@@ -132,6 +135,8 @@ impl Default for ProjNames {
             v: "v_proj",
             o: "o_proj",
             qkv: "qkv_proj",
+            q_norm: "q_norm",
+            k_norm: "k_norm",
         }
     }
 }
@@ -392,8 +397,16 @@ impl AttentionBlock {
         let (q_norm, k_norm) = match cfg.qk_norm {
             None => (None, None),
             Some(QkNormVariant::PerHead) => (
-                Some(rms_norm(cfg.head_dim, cfg.qk_norm_eps, vb.pp("q_norm"))?),
-                Some(rms_norm(cfg.head_dim, cfg.qk_norm_eps, vb.pp("k_norm"))?),
+                Some(rms_norm(
+                    cfg.head_dim,
+                    cfg.qk_norm_eps,
+                    vb.pp(names.q_norm),
+                )?),
+                Some(rms_norm(
+                    cfg.head_dim,
+                    cfg.qk_norm_eps,
+                    vb.pp(names.k_norm),
+                )?),
             ),
         };
 
