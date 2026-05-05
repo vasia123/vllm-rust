@@ -227,6 +227,12 @@ bespoke and are documented in `layers/attention/block.rs`:
 These models implement attention in their own file. The plan is **80%
 covered by `AttentionBlock`, 20% bespoke** — pragmatic and reviewable.
 
+The CI guardrail `crates/core/tests/no_local_attention.rs` enforces
+this discipline: any new model file with a bespoke `Attention` struct
+must either use `AttentionBlock` or be added to
+`BESPOKE_ATTENTION_FILES` with a one-line reason. This catches drift
+at PR time. See ADR-0010 for the full rationale.
+
 ## Common gotchas
 
 - **`bias.q == bias.k == bias.v` for fused QKV.** A single fused weight

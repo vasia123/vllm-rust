@@ -63,6 +63,13 @@
 //! end up with O(2^N) configuration flags and unreadable forward kernels. We
 //! deliberately leave bespoke attentions bespoke. The plan is **80% covered by
 //! `AttentionBlock`, 20% bespoke** — pragmatic, reviewable, performant.
+//!
+//! The decision is recorded in [ADR-0010] and enforced at CI by
+//! `crates/core/tests/no_local_attention.rs`, which lists every bespoke
+//! attention with a one-line reason and fails when a new one is added
+//! without justification.
+//!
+//! [ADR-0010]: ../../../../docs/adr/0010-attention-block-consolidation.md
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::VarBuilder;
