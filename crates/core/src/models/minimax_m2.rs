@@ -27,9 +27,13 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::distributed::LocalProcessGroup;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{apply_per_head_norm, paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig, QkNormVariant};
+use crate::layers::RotaryEmbedding;
+
+use super::tp_layers::TpContext;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -228,45 +232,33 @@ impl MiniMaxM2MoE {
 
 // ─── Attention ──────────────────────────────────────────────────────────────
 
+// MiniMax-M2 = fused QKV (optional bias on QKV; o_proj never biased) +
+// per-head RMS QK-norm + (optional) partial RoPE based on `rotary_dim`.
 struct MiniMaxM2Attention {
-    qkv_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    q_size: usize,
-    kv_size: usize,
+    inner: AttentionBlock,
+    tp_ctx: TpContext,
 }
 
 impl MiniMaxM2Attention {
     fn new(cfg: &ModelConfig, m2_cfg: &MiniMaxM2Config, vb: VarBuilder) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
-        let q_size = num_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let total_qkv = q_size + 2 * kv_size;
 
-        let qkv_proj = if m2_cfg.attention_bias {
-            let w = vb
-                .pp("qkv_proj")
-                .get((total_qkv, cfg.hidden_size), "weight")?;
-            let b = vb.pp("qkv_proj").get(total_qkv, "bias")?;
-            Linear::new(w, Some(b))
+        let bias = if m2_cfg.attention_bias {
+            AttentionBias::QKV_ONLY
         } else {
-            linear_no_bias(cfg.hidden_size, total_qkv, vb.pp("qkv_proj"))?
+            AttentionBias::NONE
         };
 
-        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            head_dim,
+            cfg.hidden_size,
+        )
+        .with_qkv_fused()
+        .with_bias(bias)
+        .with_qk_norm(QkNormVariant::PerHead, cfg.rms_norm_eps);
 
-        // Per-head Q/K normalization
-        let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
-
-        // Partial RoPE based on rotary_dim
         let rotary_emb = if m2_cfg.rotary_dim < head_dim {
             let partial_factor = m2_cfg.rotary_dim as f64 / head_dim as f64;
             RotaryEmbedding::new_partial(
@@ -288,17 +280,11 @@ impl MiniMaxM2Attention {
             )?
         };
 
+        let pg = LocalProcessGroup::new();
+        let inner = AttentionBlock::new(&attn_cfg, vb, &pg, rotary_emb)?;
         Ok(Self {
-            qkv_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            rotary_emb,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            q_size,
-            kv_size,
+            inner,
+            tp_ctx: TpContext::single_gpu(),
         })
     }
 
@@ -312,45 +298,15 @@ impl MiniMaxM2Attention {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Per-head RMSNorm on Q and K
-        let q = apply_per_head_norm(&q, &self.q_norm)?;
-        let k = apply_per_head_norm(&k, &self.k_norm)?;
-
-        // RoPE
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output)
+            &self.tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -359,51 +315,8 @@ impl MiniMaxM2Attention {
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let q = apply_per_head_norm(&q, &self.q_norm)?;
-        let k = apply_per_head_norm(&k, &self.k_norm)?;
-
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        Tensor::cat(&outputs, 0)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, &self.tp_ctx)
     }
 }
 
@@ -755,10 +668,10 @@ mod tests {
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
 
-        let attn = MiniMaxM2Attention::new(&cfg, &m2_cfg, vb.pp("attn")).expect("attn");
-        assert_eq!(attn.num_heads, cfg.num_attention_heads);
-        assert_eq!(attn.num_kv_heads, cfg.num_key_value_heads);
-        assert_eq!(attn.head_dim, cfg.head_dim);
+        // Smoke test: attention with fused QKV + QK-norm + (optional) partial
+        // RoPE builds with this config. End-to-end behavior is exercised by
+        // the forward tests below.
+        MiniMaxM2Attention::new(&cfg, &m2_cfg, vb.pp("attn")).expect("attn");
     }
 
     // ─── Forward Tests ──────────────────────────────────────────────────────────
