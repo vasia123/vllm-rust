@@ -28,13 +28,10 @@ fn gemma2_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<Gemma2RmsNor
 // Gemma2 uses soft capping: cap * tanh(x / cap)
 // This prevents extreme logits while preserving gradients
 
-fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
-    if cap <= 0.0 {
-        return Ok(xs.clone());
-    }
-    let scaled = (xs / cap)?;
-    scaled.tanh()? * cap
-}
+// Reuse the shared `tanh`-based softcap from `layers::attention`. Used
+// here for the final-logits softcap; the per-layer attention softcap
+// is applied inside `AttentionBlock` via `with_softcap`.
+use crate::layers::attention::soft_cap;
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 //

@@ -46,14 +46,10 @@ pub(crate) fn gemma3_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<G
 }
 
 // ─── Soft Capping ───────────────────────────────────────────────────────────
+//
+// Reuse the shared `tanh`-based softcap from `layers::attention`.
 
-fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
-    if cap <= 0.0 {
-        return Ok(xs.clone());
-    }
-    let scaled = (xs / cap)?;
-    scaled.tanh()? * cap
-}
+use crate::layers::attention::soft_cap;
 
 // ─── Sliding Window Mask ────────────────────────────────────────────────────
 //

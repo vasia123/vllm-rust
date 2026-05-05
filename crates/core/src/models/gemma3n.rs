@@ -56,14 +56,10 @@ fn unweighted_rms_norm(eps: f64) -> UnweightedRmsNorm {
 }
 
 // ─── Soft Capping ───────────────────────────────────────────────────────────
+//
+// Reuse the shared `tanh`-based softcap from `layers::attention`.
 
-fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
-    if cap <= 0.0 {
-        return Ok(xs.clone());
-    }
-    let scaled = (xs / cap)?;
-    scaled.tanh()? * cap
-}
+use crate::layers::attention::soft_cap;
 
 // ─── Sliding Window Mask ────────────────────────────────────────────────────
 //
