@@ -16,8 +16,12 @@ use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::distributed::LocalProcessGroup;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig};
+use crate::layers::RotaryEmbedding;
+
+use super::tp_layers::TpContext;
 
 // ─── Eagle1 Config ─────────────────────────────────────────────────────────
 
@@ -85,60 +89,39 @@ impl Eagle1Mlp {
 
 // ─── Eagle1 Attention ──────────────────────────────────────────────────────
 
+// Eagle1 = vanilla GQA + RoPE + optional QKV bias (o_proj never biased).
 struct Eagle1Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    inner: AttentionBlock,
+    tp_ctx: TpContext,
 }
 
 impl Eagle1Attention {
     fn new(cfg: &ModelConfig, vb: VarBuilder, attention_bias: bool) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-
-        let q_proj = candle_nn::linear_b(
+        let bias = if attention_bias {
+            AttentionBias::QKV_ONLY
+        } else {
+            AttentionBias::NONE
+        };
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
             cfg.hidden_size,
-            num_heads * head_dim,
-            attention_bias,
-            vb.pp("q_proj"),
-        )?;
-        let k_proj = candle_nn::linear_b(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            attention_bias,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = candle_nn::linear_b(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            attention_bias,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+        )
+        .with_bias(bias);
 
         let rotary_emb = RotaryEmbedding::new(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
+        let pg = LocalProcessGroup::new();
+        let inner = AttentionBlock::new(&attn_cfg, vb, &pg, rotary_emb)?;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            rotary_emb,
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            inner,
+            tp_ctx: TpContext::single_gpu(),
         })
     }
 
@@ -152,39 +135,15 @@ impl Eagle1Attention {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output)
+            &self.tp_ctx,
+        )
     }
 }
 
