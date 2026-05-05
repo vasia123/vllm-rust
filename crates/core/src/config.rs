@@ -179,8 +179,15 @@ pub struct ModelConfig {
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
     pub tie_word_embeddings: bool,
-    pub bos_token_id: u32,
-    pub eos_token_id: u32,
+    // Optional: some checkpoints (Qwen3, Mistral base, certain Llama
+    // forks) omit these entirely at the config-root level — they live
+    // in the tokenizer config or `generation_config.json` instead. We
+    // keep them `None` when absent rather than defaulting to 0, which
+    // is indistinguishable from "BOS/EOS *is* token 0" in the tokenizer.
+    #[serde(default)]
+    pub bos_token_id: Option<u32>,
+    #[serde(default)]
+    pub eos_token_id: Option<u32>,
 
     #[serde(default, deserialize_with = "deserialize_sliding_window")]
     pub sliding_window: Option<usize>,
@@ -207,8 +214,8 @@ impl Default for ModelConfig {
             rms_norm_eps: 1e-6,
             rope_theta: 10000.0,
             tie_word_embeddings: false,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             sliding_window: None,
             attention_bias: None,
             extra: serde_json::Map::new(),
@@ -478,8 +485,8 @@ mod tests {
         assert_eq!(config.rms_norm_eps, 1e-6);
         assert_eq!(config.rope_theta, 1_000_000.0);
         assert!(config.tie_word_embeddings);
-        assert_eq!(config.bos_token_id, 151643);
-        assert_eq!(config.eos_token_id, 151645);
+        assert_eq!(config.bos_token_id, Some(151643));
+        assert_eq!(config.eos_token_id, Some(151645));
     }
 
     #[test]
@@ -639,7 +646,7 @@ mod tests {
         // `eos_token_id` at top level is an array `[1, 106]`; the
         // collapser picks the first element. (`text_config.eos_token_id`
         // is 1, so both paths agree here.)
-        assert_eq!(cfg.eos_token_id, 1);
+        assert_eq!(cfg.eos_token_id, Some(1));
         // Architecture is preserved so the VLM dispatch still fires.
         assert_eq!(cfg.architectures, vec!["Gemma4ForConditionalGeneration"]);
     }

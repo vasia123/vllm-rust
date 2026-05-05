@@ -132,8 +132,8 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 5000000.0, // Yi uses different rope_theta
             tie_word_embeddings: false,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             sliding_window: None,
             attention_bias: Some(false),
             extra: serde_json::Map::new(),

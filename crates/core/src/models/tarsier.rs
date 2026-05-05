@@ -559,8 +559,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             tie_word_embeddings: false,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             extra: {
                 let mut m = serde_json::Map::new();
                 m.insert(

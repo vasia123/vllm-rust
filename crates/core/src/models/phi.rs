@@ -596,8 +596,8 @@ mod tests {
             rms_norm_eps: 1e-5, // Phi uses layer_norm_eps
             rope_theta: 10000.0,
             tie_word_embeddings: false, // Phi doesn't tie embeddings
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             sliding_window: None,
             attention_bias: Some(true), // Phi uses bias
             extra: serde_json::Map::new(),

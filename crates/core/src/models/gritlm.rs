@@ -128,7 +128,9 @@ pub struct GritLM {
 impl GritLM {
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let inner = LlamaForCausalLM::new(cfg, vb)?;
-        let token_patterns = GritLMTokenIds::new(cfg.bos_token_id);
+        // GritLM's token-pattern matcher keys off BOS; fall back to 1
+        // (sentencepiece convention) when the checkpoint omits it.
+        let token_patterns = GritLMTokenIds::new(cfg.bos_token_id.unwrap_or(1));
 
         Ok(Self {
             inner,
@@ -278,8 +280,8 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 10000.0,
             tie_word_embeddings: true,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             sliding_window: None,
             attention_bias: Some(false),
             extra: serde_json::Map::new(),

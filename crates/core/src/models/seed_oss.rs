@@ -520,8 +520,8 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0, // SeedOss default
             tie_word_embeddings: true,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             sliding_window: None,
             attention_bias: Some(true),
             extra: serde_json::Map::new(),

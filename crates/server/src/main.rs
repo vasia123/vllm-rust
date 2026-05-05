@@ -1692,7 +1692,10 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     );
     let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
 
-    let eos_token_id = files.config.eos_token_id;
+    // `eos_token_id` may be absent in the config.json (Qwen3, Mistral
+    // base). Fall back to 0; stop logic still honors stop_strings +
+    // max_tokens + chat template markers when EOS is unset.
+    let eos_token_id = files.config.eos_token_id.unwrap_or(0);
     let engine_tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
 
     // Build speculative config once; acceptance_method is always carried through.
@@ -2314,7 +2317,9 @@ async fn run_generate(
     );
     let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
 
-    let eos_token_id = files.config.eos_token_id;
+    // Fall back to 0 when missing (Qwen3-style configs); stop logic is
+    // also driven by stop_strings + max_tokens.
+    let eos_token_id = files.config.eos_token_id.unwrap_or(0);
 
     let handle = if let Some(ref draft_id) = draft_model_id {
         eprintln!("Loading draft model: {draft_id}");
