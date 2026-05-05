@@ -109,17 +109,6 @@ impl Plamo3Attention {
             &self.tp_ctx,
         )
     }
-
-    #[allow(dead_code)]
-    fn forward_decode_batch(
-        &self,
-        xs: &Tensor,
-        sequences: &[DecodeSequenceMetadata],
-        cache_engine: &mut CacheEngine,
-    ) -> Result<Tensor> {
-        self.inner
-            .forward_decode_batch(xs, sequences, cache_engine, &self.tp_ctx)
-    }
 }
 
 // ─── Decoder Layer ───────────────────────────────────────────────────────────
