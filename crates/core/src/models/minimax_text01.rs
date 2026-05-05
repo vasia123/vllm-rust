@@ -38,9 +38,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::config::ModelConfig;
+use crate::distributed::LocalProcessGroup;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBlock, AttentionConfig};
+use crate::layers::RotaryEmbedding;
+
+use super::tp_layers::TpContext;
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -730,46 +734,35 @@ impl MiniMaxText01LinearAttention {
 
 // ─── Standard Attention ─────────────────────────────────────────────────────
 
+// Standard (non-linear) MiniMax-Text01 attention: vanilla GQA + fused
+// QKV (no bias) + RoPE. The lightning-attention path stays bespoke.
 struct MiniMaxText01Attention {
-    qkv_proj: Linear,
-    o_proj: Linear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    q_size: usize,
-    kv_size: usize,
+    inner: AttentionBlock,
+    tp_ctx: TpContext,
 }
 
 impl MiniMaxText01Attention {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-        let q_size = num_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let total_qkv = q_size + 2 * kv_size;
-
-        let qkv_proj = linear_no_bias(cfg.hidden_size, total_qkv, vb.pp("qkv_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+        )
+        .with_qkv_fused();
 
         let rotary_emb = RotaryEmbedding::new(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
+        let pg = LocalProcessGroup::new();
+        let inner = AttentionBlock::new(&attn_cfg, vb, &pg, rotary_emb)?;
         Ok(Self {
-            qkv_proj,
-            o_proj,
-            rotary_emb,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            q_size,
-            kv_size,
+            inner,
+            tp_ctx: TpContext::single_gpu(),
         })
     }
 
@@ -783,40 +776,15 @@ impl MiniMaxText01Attention {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output)
+            &self.tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -825,48 +793,8 @@ impl MiniMaxText01Attention {
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        Tensor::cat(&outputs, 0)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, &self.tp_ctx)
     }
 }
 
@@ -874,7 +802,7 @@ impl MiniMaxText01Attention {
 
 enum AttentionVariant {
     Linear(MiniMaxText01LinearAttention),
-    Full(MiniMaxText01Attention),
+    Full(Box<MiniMaxText01Attention>),
 }
 
 // ─── Feed-forward Variant ───────────────────────────────────────────────────
@@ -929,7 +857,10 @@ impl MiniMaxText01DecoderLayer {
                 vb.pp("self_attn"),
             )?)
         } else {
-            AttentionVariant::Full(MiniMaxText01Attention::new(cfg, vb.pp("self_attn"))?)
+            AttentionVariant::Full(Box::new(MiniMaxText01Attention::new(
+                cfg,
+                vb.pp("self_attn"),
+            )?))
         };
 
         let expert_count = minimax_cfg.expert_count(layer_idx);
