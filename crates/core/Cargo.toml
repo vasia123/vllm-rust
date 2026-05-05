@@ -70,3 +70,7 @@ harness = false
 [[bench]]
 name = "quantization_bench"
 harness = false
+
+[[bench]]
+name = "moe_routing_bench"
+harness = false
