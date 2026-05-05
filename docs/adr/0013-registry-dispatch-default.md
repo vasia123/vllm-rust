@@ -82,13 +82,36 @@ invocation.
 
 ### What's still legacy
 
-- `from_config*` functions in `models/mod.rs` retain their match-arm
-  bodies after the `registry_v2::lookup` shortcut. Removing them is
-  a follow-up cleanup that should be paired with a deprecation
-  window — the legacy match arms are dead code at runtime once the
-  registry covers every arch_name, but a contributor adding a new
-  model under the legacy pattern would silently route through the
-  fallback rather than failing fast.
+The five `from_config*` functions in `models/mod.rs` retain their
+match-arm bodies after the `registry_v2::lookup` shortcut. Cleanup
+status, function-by-function:
+
+| Function | Match-arm cleanup | Reason |
+|----------|------------------|--------|
+| `from_config` | **Done** (−411 LOC) | All 326 arches have factories with `build` |
+| `from_config_with_quant` | Pending | 35 arches need `Capabilities::QUANTIZED` + `build_quant` overrides on their factories |
+| `from_config_with_pp` | Pending | Only 1 factory has `Capabilities::PP`; needs Llama-family expansion |
+| `from_config_with_lora` | Pending | 7 arches need `Capabilities::LORA` + `build_with_lora` overrides |
+| `from_config_encoder_decoder` | Pending | Few factories have `Capabilities::ENCODER_DECODER`; needs Whisper / T5 / BART expansion |
+
+The blocker for the four pending functions: each requires per-factory
+work (add the capability bit + override the corresponding
+`build_with_*` method). That work is mechanical but model-by-model
+risky — silently removing an arm without a working override would
+break inference.
+
+The natural cohort for completing this is: for each pending function,
+walk its match arms, identify the missing factories, add the
+capability + override, then delete the legacy arm. Tracked as Phase
+9.4-cont in the plan.
+
+Until that completes, the legacy match arms remain as the live path
+for those four dispatch fns, and the registry-based path is dormant
+for them. No correctness regression — every arch still routes to the
+right model.
+
+The original "removing them" cleanup paragraph below stays for the
+historical record; it describes the eventual end state.
 
   The cleanup is straightforward: replace each match-arm body with a
   `Err(ModelError::UnsupportedArchitecture(...))` and trust the
