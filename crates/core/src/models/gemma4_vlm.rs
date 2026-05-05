@@ -112,13 +112,26 @@ impl Gemma4MultimodalEmbedder {
 // ─── Model ──────────────────────────────────────────────────────────────────
 
 pub struct Gemma4ForConditionalGeneration {
-    vision_tower: Gemma4VisionTower,
-    embed_vision: Gemma4MultimodalEmbedder,
+    vision_tower: Option<Gemma4VisionTower>,
+    embed_vision: Option<Gemma4MultimodalEmbedder>,
     language_model: Gemma4ForCausalLM,
     #[allow(dead_code)]
     config: Gemma4VLMConfig,
     device: Device,
     dtype: DType,
+}
+
+/// `cfg.extra` flag honored by both Gemma 4 VLM constructors: when set
+/// the vision tower + multimodal embedder are skipped at load time so
+/// the language model fits a smaller VRAM budget. Image inputs become
+/// errors in that mode (see `encode_images` / `merge_multimodal`).
+pub(crate) const SKIP_MULTIMODAL_KEY: &str = "vllm_rust.disable_multimodal";
+
+pub(crate) fn should_skip_multimodal(cfg: &ModelConfig) -> bool {
+    cfg.extra
+        .get(SKIP_MULTIMODAL_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 impl Gemma4ForConditionalGeneration {
@@ -129,15 +142,20 @@ impl Gemma4ForConditionalGeneration {
         // once here so sub-module VarBuilders are positioned correctly.
         let vb_root = vb.pp("model");
 
-        let vision_tower =
-            Gemma4VisionTower::new(&config.vision_config, vb_root.pp("vision_tower"))?;
+        let skip_mm = should_skip_multimodal(cfg);
 
-        let embed_vision = Gemma4MultimodalEmbedder::new(
-            config.vision_hidden_size,
-            cfg.hidden_size,
-            config.vision_config.rms_norm_eps,
-            vb_root.pp("embed_vision"),
-        )?;
+        let (vision_tower, embed_vision) = if skip_mm {
+            (None, None)
+        } else {
+            let vt = Gemma4VisionTower::new(&config.vision_config, vb_root.pp("vision_tower"))?;
+            let ev = Gemma4MultimodalEmbedder::new(
+                config.vision_hidden_size,
+                cfg.hidden_size,
+                config.vision_config.rms_norm_eps,
+                vb_root.pp("embed_vision"),
+            )?;
+            (Some(vt), Some(ev))
+        };
 
         let language_model = Gemma4ForCausalLM::new(cfg, vb_root.pp("language_model"))?;
 
@@ -160,10 +178,18 @@ impl Gemma4ForConditionalGeneration {
         pixel_values: &Tensor,
         pixel_position_ids: &Tensor,
     ) -> Result<Tensor> {
-        let vision_features = self
-            .vision_tower
-            .forward(pixel_values, pixel_position_ids)?;
-        self.embed_vision.forward(&vision_features)
+        let vt = self.vision_tower.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "Gemma 4 VLM was loaded with multimodal disabled (text-only mode); \
+                 image inputs are not supported in this configuration"
+                    .to_string(),
+            )
+        })?;
+        let ev = self.embed_vision.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("embed_vision projector was skipped at load time".to_string())
+        })?;
+        let vision_features = vt.forward(pixel_values, pixel_position_ids)?;
+        ev.forward(&vision_features)
     }
 
     fn merge_multimodal(
@@ -175,12 +201,22 @@ impl Gemma4ForConditionalGeneration {
             return Ok(text_embeddings.clone());
         }
 
+        // If the user disabled multimodal at load time, refuse to mix in
+        // image embeddings rather than silently dropping them.
+        let Some(embed_vision) = self.embed_vision.as_ref() else {
+            return Err(candle_core::Error::Msg(
+                "Gemma 4 VLM was loaded with multimodal disabled but the request \
+                 carries image embeddings — re-load without --text-only or drop the images"
+                    .to_string(),
+            ));
+        };
+
         let (_batch_size, seq_len, _hidden_size) = text_embeddings.dims3()?;
         let mut merged = text_embeddings.to_vec3::<f32>()?;
 
         for (position, processed) in &mm_inputs.image_embeddings {
             let vision_emb = processed.embedding.unsqueeze(0)?;
-            let projected = self.embed_vision.forward(&vision_emb)?;
+            let projected = embed_vision.forward(&vision_emb)?;
             let projected = projected.squeeze(0)?;
             let emb_vec: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
 
@@ -356,6 +392,35 @@ mod tests {
             model.err()
         );
         assert!(model.unwrap().supports_multimodal());
+    }
+
+    #[test]
+    fn test_text_only_skips_vision_tower() {
+        // With `vllm_rust.disable_multimodal=true` set, VLM construction
+        // must skip the vision tower + embed_vision projector and image
+        // inputs must be rejected at runtime.
+        let device = Device::Cpu;
+        let mut cfg = test_model_config();
+        cfg.extra.insert(
+            super::super::gemma4_vlm::SKIP_MULTIMODAL_KEY.to_string(),
+            serde_json::json!(true),
+        );
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Gemma4ForConditionalGeneration::new(&cfg, vb).expect("text-only build");
+
+        // Internals must be `None`.
+        assert!(model.vision_tower.is_none(), "vision_tower must be skipped");
+        assert!(model.embed_vision.is_none(), "embed_vision must be skipped");
+
+        // `encode_images` must return a clear error.
+        let dummy_pixels = Tensor::zeros((1, 1, 768), DType::F32, &device).unwrap();
+        let dummy_pos = Tensor::zeros((1, 1, 2), DType::I64, &device).unwrap();
+        let err = model.encode_images(&dummy_pixels, &dummy_pos).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("text-only") || msg.contains("multimodal"),
+            "expected clear text-only error, got: {msg}"
+        );
     }
 
     #[test]

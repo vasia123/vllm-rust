@@ -158,8 +158,8 @@ impl Gemma4MultimodalEmbedder {
 // ─── Quantized VLM ────────────────────────────────────────────────────────
 
 pub struct QuantizedGemma4ForConditionalGeneration {
-    vision_tower: Gemma4VisionTower,
-    embed_vision: Gemma4MultimodalEmbedder,
+    vision_tower: Option<Gemma4VisionTower>,
+    embed_vision: Option<Gemma4MultimodalEmbedder>,
     language_model: QuantizedGemma4ForCausalLM,
     #[allow(dead_code)]
     config: Gemma4VLMConfig,
@@ -189,15 +189,20 @@ impl QuantizedGemma4ForConditionalGeneration {
         // `RemappingWeightLoader` fast path below.
         let vb_root = vb.pp("model");
 
-        let vision_tower =
-            Gemma4VisionTower::new(&config.vision_config, vb_root.pp("vision_tower"))?;
+        let skip_mm = super::gemma4_vlm::should_skip_multimodal(cfg);
 
-        let embed_vision = Gemma4MultimodalEmbedder::new(
-            config.vision_hidden_size,
-            cfg.hidden_size,
-            config.vision_config.rms_norm_eps,
-            vb_root.pp("embed_vision"),
-        )?;
+        let (vision_tower, embed_vision) = if skip_mm {
+            (None, None)
+        } else {
+            let vt = Gemma4VisionTower::new(&config.vision_config, vb_root.pp("vision_tower"))?;
+            let ev = Gemma4MultimodalEmbedder::new(
+                config.vision_hidden_size,
+                cfg.hidden_size,
+                config.vision_config.rms_norm_eps,
+                vb_root.pp("embed_vision"),
+            )?;
+            (Some(vt), Some(ev))
+        };
 
         // Language model lives at `model.language_model.*`. Hand the
         // inner quantized constructor a VarBuilder already positioned at
@@ -228,10 +233,18 @@ impl QuantizedGemma4ForConditionalGeneration {
         pixel_values: &Tensor,
         pixel_position_ids: &Tensor,
     ) -> Result<Tensor> {
-        let vision_features = self
-            .vision_tower
-            .forward(pixel_values, pixel_position_ids)?;
-        self.embed_vision.forward(&vision_features)
+        let vt = self.vision_tower.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "Gemma 4 VLM was loaded with multimodal disabled (text-only mode); \
+                 image inputs are not supported in this configuration"
+                    .to_string(),
+            )
+        })?;
+        let ev = self.embed_vision.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("embed_vision projector was skipped at load time".to_string())
+        })?;
+        let vision_features = vt.forward(pixel_values, pixel_position_ids)?;
+        ev.forward(&vision_features)
     }
 
     fn merge_multimodal(
@@ -243,12 +256,20 @@ impl QuantizedGemma4ForConditionalGeneration {
             return Ok(text_embeddings.clone());
         }
 
+        let Some(embed_vision) = self.embed_vision.as_ref() else {
+            return Err(candle_core::Error::Msg(
+                "Gemma 4 quantized VLM was loaded with multimodal disabled but the request \
+                 carries image embeddings — re-load without --text-only or drop the images"
+                    .to_string(),
+            ));
+        };
+
         let (_batch_size, seq_len, _hidden_size) = text_embeddings.dims3()?;
         let mut merged = text_embeddings.to_vec3::<f32>()?;
 
         for (position, processed) in &mm_inputs.image_embeddings {
             let vision_emb = processed.embedding.unsqueeze(0)?;
-            let projected = self.embed_vision.forward(&vision_emb)?;
+            let projected = embed_vision.forward(&vision_emb)?;
             let projected = projected.squeeze(0)?;
             let emb_vec: Vec<Vec<f32>> = projected.to_dtype(DType::F32)?.to_vec2()?;
 

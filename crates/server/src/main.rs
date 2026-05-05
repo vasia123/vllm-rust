@@ -397,6 +397,13 @@ enum Command {
         /// Decode steps per scheduler invocation
         #[arg(long, default_value_t = 4)]
         multi_step_count: usize,
+
+        /// Skip vision / audio towers when loading multimodal checkpoints.
+        /// Frees the VRAM their encoder weights would consume; image or
+        /// audio inputs become errors. Useful for text-only benchmarks
+        /// against VLM checkpoints (Gemma 4, etc.) on tight GPUs.
+        #[arg(long, default_value_t = false)]
+        text_only: bool,
     },
 }
 
@@ -944,6 +951,7 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             multi_step_count,
+            text_only,
         } => {
             let prompts = if prompt.is_empty() {
                 vec!["Hello, world".to_string()]
@@ -957,6 +965,7 @@ async fn main() -> anyhow::Result<()> {
                 prompts,
                 max_tokens,
                 multi_step_count,
+                text_only,
             )
             .await
         }
@@ -2267,9 +2276,19 @@ async fn run_generate(
     prompts: Vec<String>,
     max_tokens: usize,
     multi_step_count: usize,
+    text_only: bool,
 ) -> anyhow::Result<()> {
     eprintln!("Loading model: {model_id}");
-    let files = loader::fetch_model(&model_id)?;
+    let mut files = loader::fetch_model(&model_id)?;
+    if text_only {
+        // Hint downstream VLM constructors to skip vision / audio
+        // towers. Currently honored by Gemma 4 (text + quantized).
+        eprintln!("Text-only mode: vision / audio towers will be skipped at load time");
+        files.config.extra.insert(
+            "vllm_rust.disable_multimodal".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
 
     let device = Device::new_cuda(0)?;
     let dtype = DType::BF16;
