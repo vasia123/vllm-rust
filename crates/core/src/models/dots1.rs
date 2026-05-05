@@ -13,10 +13,14 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, Embedding, Linear, VarBuilder};
 
 use crate::config::ModelConfig;
+use crate::distributed::LocalProcessGroup;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBias, AttentionBlock, AttentionConfig, QkNormVariant};
+use crate::layers::RotaryEmbedding;
 use crate::moe::{MoELayerWithShared, MoELayerWithSharedConfig, ScoringFunc};
+
+use super::tp_layers::TpContext;
 
 // ---- Dots1-specific config parsing ----------------------------------------
 
@@ -131,77 +135,47 @@ impl Dots1MLP {
 }
 
 // ---- Attention (merged QKV, Q/K norm, RoPE) --------------------------------
+//
+// Dots1 = fused QKV linear (optional bias) + per-head RMSNorm on Q/K
+// (head_dim) + RoPE. o_proj has no bias. Bias is uniform across QKV
+// (single fused weight), matching `AttentionBias::QKV_ONLY`.
 
 struct Dots1Attention {
-    qkv_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    q_size: usize,
-    kv_size: usize,
+    inner: AttentionBlock,
+    tp_ctx: TpContext,
 }
 
 impl Dots1Attention {
     fn new(cfg: &ModelConfig, dots1_cfg: &Dots1Config, vb: VarBuilder) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-        let q_size = num_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let total_qkv = q_size + 2 * kv_size;
-
-        let qkv_proj = if dots1_cfg.attention_bias {
-            candle_nn::linear(cfg.hidden_size, total_qkv, vb.pp("qkv_proj"))?
+        let bias = if dots1_cfg.attention_bias {
+            AttentionBias::QKV_ONLY
         } else {
-            linear_no_bias(cfg.hidden_size, total_qkv, vb.pp("qkv_proj"))?
+            AttentionBias::NONE
         };
-        let o_proj = linear_no_bias(q_size, cfg.hidden_size, vb.pp("o_proj"))?;
 
-        let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.hidden_size,
+        )
+        .with_qkv_fused()
+        .with_bias(bias)
+        .with_qk_norm(QkNormVariant::PerHead, cfg.rms_norm_eps);
 
         let rotary_emb = RotaryEmbedding::new(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             vb.dtype(),
             vb.device(),
         )?;
-
+        let pg = LocalProcessGroup::new();
+        let inner = AttentionBlock::new(&attn_cfg, vb, &pg, rotary_emb)?;
         Ok(Self {
-            qkv_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            rotary_emb,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            q_size,
-            kv_size,
+            inner,
+            tp_ctx: TpContext::single_gpu(),
         })
-    }
-
-    fn apply_qk_norm(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let q_shape = q.dims().to_vec();
-        let k_shape = k.dims().to_vec();
-
-        // q: [..., num_heads * head_dim] -> [..., num_heads, head_dim]
-        let mut q_new_shape: Vec<usize> = q_shape[..q_shape.len() - 1].to_vec();
-        q_new_shape.extend_from_slice(&[self.num_heads, self.head_dim]);
-        let q_normed = self.q_norm.forward(&q.reshape(q_new_shape.as_slice())?)?;
-        let q_flat = q_normed.reshape(q_shape)?;
-
-        let mut k_new_shape: Vec<usize> = k_shape[..k_shape.len() - 1].to_vec();
-        k_new_shape.extend_from_slice(&[self.num_kv_heads, self.head_dim]);
-        let k_normed = self.k_norm.forward(&k.reshape(k_new_shape.as_slice())?)?;
-        let k_flat = k_normed.reshape(k_shape)?;
-
-        Ok((q_flat, k_flat))
     }
 
     fn forward(
@@ -213,42 +187,15 @@ impl Dots1Attention {
         block_table: &BlockTable,
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let (q, k) = self.apply_qk_norm(&q, &k)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output)
+            &self.tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -257,51 +204,8 @@ impl Dots1Attention {
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(2, 0, self.q_size)?;
-        let k = qkv.narrow(2, self.q_size, self.kv_size)?;
-        let v = qkv.narrow(2, self.q_size + self.kv_size, self.kv_size)?;
-
-        let (q, k) = self.apply_qk_norm(&q, &k)?;
-
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let mut outputs = Vec::with_capacity(batch_size);
-        for (i, seq) in sequences.iter().enumerate() {
-            let q_i = q.narrow(0, i, 1)?;
-            let k_i = k.narrow(0, i, 1)?;
-            let v_i = v.narrow(0, i, 1)?;
-
-            let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-            let attn_out = paged_attention(
-                &q_i,
-                &k_i,
-                &v_i,
-                None,
-                seq.seqlen_offset,
-                cache_engine,
-                &seq.block_ids,
-                &seq.slot_mapping,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            )?;
-            outputs.push(attn_out);
-        }
-
-        let attn_output = Tensor::cat(&outputs, 0)?;
-        self.o_proj.forward(&attn_output)
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, &self.tp_ctx)
     }
 }
 
@@ -718,12 +622,10 @@ mod tests {
         let device = Device::Cpu;
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
 
-        let attn = Dots1Attention::new(&cfg, &dots1_cfg, vb.pp("self_attn")).unwrap();
-        assert_eq!(attn.num_heads, cfg.num_attention_heads);
-        assert_eq!(attn.num_kv_heads, cfg.num_key_value_heads);
-        assert_eq!(attn.head_dim, cfg.head_dim);
-        assert_eq!(attn.q_size, cfg.num_attention_heads * cfg.head_dim);
-        assert_eq!(attn.kv_size, cfg.num_key_value_heads * cfg.head_dim);
+        // Smoke test: attention with fused QKV + QK-norm builds with this
+        // config. Head/projection shapes are enforced by AttentionBlock and
+        // exercised end-to-end by the forward tests below.
+        Dots1Attention::new(&cfg, &dots1_cfg, vb.pp("self_attn")).unwrap();
     }
 
     #[test]
@@ -867,36 +769,6 @@ mod tests {
             "Dots1 with attention bias should construct: {:?}",
             model.err()
         );
-    }
-
-    #[test]
-    fn test_dots1_qk_norm_shape() {
-        let cfg = test_config();
-        let dots1_cfg = Dots1Config::from_model_config(&cfg);
-        let device = Device::Cpu;
-        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
-
-        let attn = Dots1Attention::new(&cfg, &dots1_cfg, vb.pp("self_attn")).unwrap();
-
-        // Verify Q/K norm preserves shape
-        let batch = 2;
-        let seq = 3;
-        let q = Tensor::zeros(
-            (batch, seq, cfg.num_attention_heads * cfg.head_dim),
-            DType::F32,
-            &device,
-        )
-        .unwrap();
-        let k = Tensor::zeros(
-            (batch, seq, cfg.num_key_value_heads * cfg.head_dim),
-            DType::F32,
-            &device,
-        )
-        .unwrap();
-
-        let (q_normed, k_normed) = attn.apply_qk_norm(&q, &k).unwrap();
-        assert_eq!(q_normed.dims(), q.dims());
-        assert_eq!(k_normed.dims(), k.dims());
     }
 
     #[test]
