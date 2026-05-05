@@ -15,7 +15,8 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::{paged_attention, RotaryEmbedding};
+use crate::layers::attention::{AttentionBlock, AttentionConfig};
+use crate::layers::RotaryEmbedding;
 
 // Re-export for public API
 pub use super::tp_layers::TpContext;
@@ -30,81 +31,22 @@ const GLM_IS_NEOX_STYLE: bool = false;
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
+// GLM (chatglm-like, no fused QKV here) = vanilla GQA, no bias, partial RoPE
+// (factor 0.5, split-style not NeoX).
 struct GlmAttention {
-    q_proj: TpLinear,
-    k_proj: TpLinear,
-    v_proj: TpLinear,
-    o_proj: TpLinear,
-    rotary_emb: RotaryEmbedding,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    inner: AttentionBlock,
 }
 
 impl GlmAttention {
     fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
-        let world_size = pg.world_size();
-
-        // For TP: num_heads and num_kv_heads must be divisible by world_size
-        if world_size > 1 {
-            if !num_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-            if !num_kv_heads.is_multiple_of(world_size) {
-                return Err(candle_core::Error::Msg(format!(
-                    "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-                )));
-            }
-        }
-
-        // Q/K/V are column-parallel (split output heads)
-        // O is row-parallel (reduce partial outputs)
-        // GLM uses no bias on all projections
-        let q_proj = TpLinear::column_parallel(
+        let attn_cfg = AttentionConfig::gqa(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
             cfg.hidden_size,
-            num_heads * head_dim,
-            false, // no bias
-            false, // no gather (goes to local attention)
-            vb.pp("q_proj"),
-            pg,
-        )?;
-        let k_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            false,
-            false,
-            vb.pp("k_proj"),
-            pg,
-        )?;
-        let v_proj = TpLinear::column_parallel(
-            cfg.hidden_size,
-            num_kv_heads * head_dim,
-            false,
-            false,
-            vb.pp("v_proj"),
-            pg,
-        )?;
-        let o_proj = TpLinear::row_parallel(
-            num_heads * head_dim,
-            cfg.hidden_size,
-            false, // no bias
-            true,  // input is parallel (from local attention)
-            vb.pp("o_proj"),
-            pg,
-        )?;
-
-        // For TP: each GPU handles num_heads/world_size heads
-        let num_heads_per_gpu = num_heads / world_size;
-        let num_kv_heads_per_gpu = num_kv_heads / world_size;
-
-        // GLM-specific rotary embedding: partial factor 0.5, split style
+        );
         let rotary_emb = RotaryEmbedding::new_partial(
-            head_dim,
+            cfg.head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
             GLM_PARTIAL_ROTARY_FACTOR,
@@ -112,17 +54,8 @@ impl GlmAttention {
             vb.dtype(),
             vb.device(),
         )?;
-
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            rotary_emb,
-            num_heads: num_heads_per_gpu,
-            num_kv_heads: num_kv_heads_per_gpu,
-            head_dim,
-        })
+        let inner = AttentionBlock::new(&attn_cfg, vb, pg, rotary_emb)?;
+        Ok(Self { inner })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -136,41 +69,15 @@ impl GlmAttention {
         slot_mapping: &[usize],
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        let q = q
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Apply partial RoPE (GLM-specific: only rotates half of head_dim)
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-
-        // Paged attention
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
+        self.inner.forward(
+            xs,
             attention_mask,
             seqlen_offset,
             cache_engine,
-            block_table.block_ids(),
+            block_table,
             slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
-
-        self.o_proj.forward(&attn_output, tp_ctx)
+            tp_ctx,
+        )
     }
 
     fn forward_decode_batch(
@@ -180,118 +87,8 @@ impl GlmAttention {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
-        let batch_size = sequences.len();
-
-        // Batched Q/K/V projections: [batch, 1, hidden] -> [batch, 1, proj_dim]
-        let q = self.q_proj.forward(xs, tp_ctx)?;
-        let k = self.k_proj.forward(xs, tp_ctx)?;
-        let v = self.v_proj.forward(xs, tp_ctx)?;
-
-        // Reshape to [batch, heads, 1, head_dim]
-        let q = q
-            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        #[cfg(feature = "cuda-kernels")]
-        {
-            // Squeeze seq_len=1 dim: [batch, heads, 1, head_dim] -> [batch, heads, head_dim]
-            let q = q.squeeze(2)?;
-            let k = k.squeeze(2)?;
-            let v = v.squeeze(2)?;
-
-            // Batched RoPE with per-sequence positions
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
-
-            // Write new K/V to cache
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
-            cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-            // Build block_tables: [num_seqs, max_blocks_per_seq] u32
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-                }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
-
-            // Build seq_lens: total KV length per sequence (including new token)
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
-
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-                self.head_dim,
-                cache_engine.block_size(),
-            )?;
-
-            // [batch, hidden] -> [batch, 1, hidden] to match residual shape
-            self.o_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)
-        }
-
-        #[cfg(not(feature = "cuda-kernels"))]
-        {
-            // Per-sequence: RoPE (position-dependent) + cache write/read + attention
-            let mut outputs = Vec::with_capacity(batch_size);
-            for (i, seq) in sequences.iter().enumerate() {
-                let q_i = q.narrow(0, i, 1)?;
-                let k_i = k.narrow(0, i, 1)?;
-                let v_i = v.narrow(0, i, 1)?;
-
-                let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
-
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None, // no causal mask for single-token decode
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-                outputs.push(attn_out);
-            }
-
-            let attn_output = Tensor::cat(&outputs, 0)?;
-            self.o_proj.forward(&attn_output, tp_ctx)
-        }
+        self.inner
+            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
     }
 }
 
