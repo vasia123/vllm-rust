@@ -45,8 +45,10 @@ use std::fmt;
 use candle_nn::VarBuilder;
 
 use crate::config::ModelConfig;
-use crate::engine::ModelForward;
+use crate::distributed::{PipelineStageConfig, ProcessGroup};
+use crate::engine::{ModelForEncoderDecoder, ModelForward};
 
+use super::tp_layers::TpContext;
 use super::ModelError;
 
 // ─── ArchInfo + Capabilities ────────────────────────────────────────────────
@@ -159,45 +161,59 @@ pub trait ArchFactory: Sync + 'static {
     /// routing / capability validation without constructing the model.
     fn info(&self) -> &'static ArchInfo;
 
-    /// Plain (unquantized, single-GPU, no LoRA) instantiation.
-    fn build(&self, cfg: &ModelConfig, vb: VarBuilder)
-        -> Result<Box<dyn ModelForward>, ModelError>;
+    /// Plain (unquantized, single-GPU, no LoRA) instantiation. Default
+    /// returns `Unsupported` so speculative-only / encoder-decoder-only
+    /// archs (Eagle / MTP / T5 / Whisper) don't have to fake a method
+    /// they never actually expose to the standard dispatch.
+    #[allow(unused_variables)]
+    fn build(
+        &self,
+        cfg: &ModelConfig,
+        vb: VarBuilder,
+    ) -> Result<Box<dyn ModelForward>, ModelError> {
+        Err(unsupported(self.canonical_name(), "build").into())
+    }
 
-    /// Quantized instantiation. Default returns `Unsupported`. Override
-    /// for archs that have a `XxxQuantized*` companion type.
+    /// Quantized instantiation. The dispatch shim builds the
+    /// `weight_loader` once from the detected `DetectedQuantConfig` and
+    /// hands it in here, so factories don't repeat the
+    /// `create_weight_loader_with_params(...)` boilerplate. Default
+    /// returns `Unsupported`.
     #[allow(unused_variables)]
     fn build_quant(
         &self,
         cfg: &ModelConfig,
         vb: VarBuilder<'static>,
-        quant: &crate::quantization::DetectedQuantConfig,
+        weight_loader: &dyn crate::quantization::QuantizedWeightLoader,
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Err(unsupported(self.canonical_name(), "quantized").into())
     }
 
     /// Tensor-parallel instantiation. Default returns `Unsupported`.
+    /// Concrete types are taken directly because `ProcessGroup` is
+    /// already `dyn`-safe and `TpContext` is `Clone + Copy`-friendly,
+    /// so factories can call `LlamaForCausalLM::new_with_tp(cfg, vb,
+    /// pg, tp_ctx)` straight through with no downcast dance.
     #[allow(unused_variables)]
     fn build_with_tp(
         &self,
         cfg: &ModelConfig,
         vb: VarBuilder,
-        // The signature here mirrors the existing Phase-2 dispatch wire:
-        // we pass opaque references via &dyn so the trait stays object-
-        // safe and we don't import `LocalProcessGroup` / `TpContext`
-        // into every factory file. The shim in mod.rs casts back.
-        process_group: &dyn std::any::Any,
-        tp_ctx: &dyn std::any::Any,
+        process_group: &dyn ProcessGroup,
+        tp_ctx: TpContext,
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Err(unsupported(self.canonical_name(), "tensor-parallel").into())
     }
 
-    /// Pipeline-parallel instantiation. Default returns `Unsupported`.
+    /// Pipeline-parallel instantiation. `stage` is the pipeline-stage
+    /// descriptor expected by `LlamaForCausalLM::new_with_pp` and
+    /// friends (engine-side `PipelineStage`). Default `Unsupported`.
     #[allow(unused_variables)]
     fn build_with_pp(
         &self,
         cfg: &ModelConfig,
         vb: VarBuilder,
-        stage: &dyn std::any::Any,
+        stage: &PipelineStageConfig,
     ) -> Result<Box<dyn ModelForward>, ModelError> {
         Err(unsupported(self.canonical_name(), "pipeline-parallel").into())
     }
@@ -210,7 +226,7 @@ pub trait ArchFactory: Sync + 'static {
         &self,
         cfg: &ModelConfig,
         vb: VarBuilder,
-    ) -> Result<Box<dyn ModelForward>, ModelError> {
+    ) -> Result<super::LoraEnabledModel, ModelError> {
         Err(unsupported(self.canonical_name(), "lora").into())
     }
 
@@ -221,7 +237,7 @@ pub trait ArchFactory: Sync + 'static {
         &self,
         cfg: &ModelConfig,
         vb: VarBuilder,
-    ) -> Result<Box<dyn ModelForward>, ModelError> {
+    ) -> Result<Box<dyn ModelForEncoderDecoder>, ModelError> {
         Err(unsupported(self.canonical_name(), "encoder-decoder").into())
     }
 

@@ -8,6 +8,8 @@ mod macros;
 // dispatch below is still the live path. `registry_v2` is the
 // phf-backed lookup table that Phase 2 will populate; behind a
 // feature flag for now.
+#[cfg(feature = "model-registry-v2")]
+pub mod factories;
 pub mod factory;
 #[cfg(feature = "model-registry-v2")]
 pub mod registry_v2;
