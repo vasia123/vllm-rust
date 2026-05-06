@@ -13,10 +13,9 @@ use std::collections::HashMap;
 
 use candle_core::{DType, Device, Result, Tensor};
 
+use super::awq_marlin::AwqMarlinLinear;
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
-use super::marlin::{
-    check_marlin_supports_shape, MarlinConfig, MarlinLinear, MARLIN_SUPPORTED_GROUP_SIZES,
-};
+use super::marlin::{check_marlin_supports_shape, MarlinConfig, MARLIN_SUPPORTED_GROUP_SIZES};
 
 /// AWQ-gemm nibble interleaving within a u32 word.
 ///
@@ -349,10 +348,14 @@ impl QuantizationConfig for AwqConfig {
         bias: bool,
         device: &Device,
     ) -> Result<Box<dyn QuantizedLinear>> {
-        // Try to use Marlin if conditions are met
+        // Try to use Marlin if conditions are met. Wrap in AwqMarlinLinear
+        // so the AWQ checkpoint format (interleaved nibbles, output-axis
+        // packing) is repacked to GPTQ layout at load time — feeding raw
+        // AWQ tensors to MarlinLinear directly would silently produce
+        // garbage outputs because MarlinLinear assumes GPTQ packing.
         if self.use_marlin && self.can_use_marlin_for_shape(in_features, out_features) {
             if let Some(marlin_config) = self.to_marlin_config() {
-                return Ok(Box::new(MarlinLinear::new(
+                return Ok(Box::new(AwqMarlinLinear::new(
                     in_features,
                     out_features,
                     bias,

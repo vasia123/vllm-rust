@@ -99,7 +99,7 @@ impl QuantizationConfig for AwqMarlinConfig {
         bias: bool,
         device: &Device,
     ) -> Result<Box<dyn QuantizedLinear>> {
-        Ok(Box::new(MarlinLinear::new(
+        Ok(Box::new(AwqMarlinLinear::new(
             in_features,
             out_features,
             bias,
@@ -115,22 +115,14 @@ impl QuantizationConfig for AwqMarlinConfig {
 
 // ─── AWQ nibble deinterleaving ────────────────────────────────────────────────
 
-/// Repack `qweight` from AWQ nibble ordering to GPTQ sequential ordering (CPU).
+/// Repack `qweight` per-word: AWQ interleaved nibble order → GPTQ sequential.
 ///
-/// AWQ packs 8 int4 values per u32 in interleaved even-odd order:
-/// nibble positions 0..7 hold `[v0, v2, v4, v6, v1, v3, v5, v7]`.
-///
-/// GPTQ packs them sequentially:
-/// nibble positions 0..7 hold `[v0, v1, v2, v3, v4, v5, v6, v7]`.
+/// Shape is preserved.  Suitable for `qzeros` (where AWQ and GPTQ share
+/// the same `[num_groups, N/8]` layout) but **NOT** for `qweight`, where
+/// AWQ packs along the output axis (`[K, N/8]`) and GPTQ packs along the
+/// input axis (`[K/8, N]`) — for that, use [`awq_to_gptq_qweight`].
 ///
 /// Applies `undo_pack = {0,4,1,5,2,6,3,7}` per 32-bit word.
-///
-/// NOTE: The vLLM CUDA reference performs AWQ → Marlin directly via
-/// `awq_marlin_repack.cu`.  This CPU fallback produces GPTQ ordering, which
-/// `MarlinLinear::process_weights` then converts to Marlin tile format via
-/// `repack_gptq_to_marlin`.  The result is numerically equivalent.
-/// A direct CUDA path can be added by implementing the PTX function
-/// `awq_marlin_repack_int4` in `marlin_gemm.cu`.
 pub(crate) fn repack_awq_nibbles(qweight: &Tensor) -> Result<Tensor> {
     let shape = qweight.shape().clone();
     let device = qweight.device().clone();
@@ -158,6 +150,87 @@ pub(crate) fn repack_awq_nibbles(qweight: &Tensor) -> Result<Tensor> {
     Tensor::from_vec(reordered, &shape, &Device::Cpu)?.to_device(&device)
 }
 
+/// Repack AWQ `qweight` (`[K, N/8]`, packed along the output axis with
+/// interleaved nibble ordering) into GPTQ sequential layout (`[K/8, N]`,
+/// packed along the input axis).
+///
+/// This is what vLLM's `awq_marlin_repack` CUDA kernel does; we provide
+/// a CPU implementation here so the loader can run AWQ checkpoints
+/// through the Marlin kernel (or GPTQ fallback) without any per-forward
+/// dequantization.  The transform is one-shot at load time.
+///
+/// Steps:
+/// 1. For each `(k, n)`, extract the int4 nibble from the AWQ word
+///    `qweight_awq[k, n/8]` at position `undo_pack[n % 8]`.
+/// 2. Pack 8 consecutive `k`-values (k = k_block * 8 + i, i in 0..8) into
+///    a single u32 in **sequential** nibble order:
+///    `gptq_word = sum_i nib(k_block*8 + i, n) << (i * 4)`.
+///
+/// Result lives on the same device as the input.
+pub(crate) fn awq_to_gptq_qweight(
+    awq_qweight: &Tensor,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Tensor> {
+    const PACK_FACTOR: usize = 8;
+    if !in_features.is_multiple_of(PACK_FACTOR) {
+        candle_core::bail!(
+            "awq_to_gptq_qweight: in_features ({in_features}) must be divisible by 8"
+        );
+    }
+    if !out_features.is_multiple_of(PACK_FACTOR) {
+        candle_core::bail!(
+            "awq_to_gptq_qweight: out_features ({out_features}) must be divisible by 8"
+        );
+    }
+    let packed_n = out_features / PACK_FACTOR;
+    let packed_k = in_features / PACK_FACTOR;
+
+    if awq_qweight.dtype() != DType::U32 {
+        candle_core::bail!(
+            "awq_to_gptq_qweight: qweight must be U32, got {:?}",
+            awq_qweight.dtype()
+        );
+    }
+    if awq_qweight.dims() != [in_features, packed_n] {
+        candle_core::bail!(
+            "awq_to_gptq_qweight: qweight shape {:?} != expected [{in_features}, {packed_n}]",
+            awq_qweight.dims()
+        );
+    }
+
+    let original_device = awq_qweight.device().clone();
+    let words: Vec<u32> = awq_qweight
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+    let mut out = vec![0u32; packed_k * out_features];
+    for n in 0..out_features {
+        let undo_shift = AWQ_UNDO_PACK_SHIFTS[n % PACK_FACTOR];
+        let n_block = n / PACK_FACTOR;
+        for kb in 0..packed_k {
+            let k_base = kb * PACK_FACTOR;
+            let mut word: u32 = 0;
+            for i in 0..PACK_FACTOR {
+                let k = k_base + i;
+                let awq_word = words[k * packed_n + n_block];
+                let nib = (awq_word >> undo_shift) & 0xF;
+                word |= nib << (i * 4);
+            }
+            out[kb * out_features + n] = word;
+        }
+    }
+
+    Tensor::from_vec(out, (packed_k, out_features), &Device::Cpu)?.to_device(&original_device)
+}
+
+/// Bit-shift positions per output lane in an AWQ packed word.
+///
+/// AWQ encodes 8 int4 outputs in a u32 with `undo_pack = {0,4,1,5,2,6,3,7}`,
+/// so output `i` lives at bit offset `undo_pack[i] * 4`.
+const AWQ_UNDO_PACK_SHIFTS: [u32; 8] = [0, 16, 4, 20, 8, 24, 12, 28];
+
 /// Convert one u32 word from AWQ interleaved nibble ordering to GPTQ
 /// sequential nibble ordering.
 ///
@@ -175,6 +248,95 @@ fn awq_to_gptq_u32(w: u32) -> u32 {
     let n7 = (w >> 28) & 0xF;
     // output = [n0, n4, n1, n5, n2, n6, n3, n7]
     n0 | (n4 << 4) | (n1 << 8) | (n5 << 12) | (n2 << 16) | (n6 << 20) | (n3 << 24) | (n7 << 28)
+}
+
+// ─── AwqMarlinLinear ─────────────────────────────────────────────────────────
+
+/// Linear layer that loads AWQ checkpoints and runs through Marlin
+/// (or, when the `marlin` feature is off, through the GPTQ CUDA fallback).
+///
+/// On `load_weights`, this layer:
+/// 1. Repacks AWQ `qweight` (`[K, N/8]`, output-axis interleaved) into
+///    GPTQ sequential layout (`[K/8, N]`) via [`awq_to_gptq_qweight`].
+/// 2. Repacks AWQ `qzeros` (`[num_groups, N/8]`) into sequential nibble
+///    ordering via [`repack_awq_nibbles`] (shape preserved).
+/// 3. Hands the GPTQ-style tensors to the inner [`MarlinLinear`], whose
+///    own `load_weights` then performs the GPTQ → Marlin tile repack.
+///
+/// All forward passes delegate to `MarlinLinear::forward`, which uses
+/// the Marlin INT4 kernel when `feature = "marlin"`, otherwise falls
+/// back to `gptq_cuda::gptq_gemm` (via `cuda-kernels`).  Either way is
+/// dramatically faster than `AwqLinear`'s per-forward CPU dequant.
+#[derive(Debug)]
+pub struct AwqMarlinLinear {
+    inner: MarlinLinear,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl AwqMarlinLinear {
+    /// Create a new AWQ-Marlin linear layer.
+    pub fn new(
+        in_features: usize,
+        out_features: usize,
+        has_bias: bool,
+        marlin_config: MarlinConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        let inner = MarlinLinear::new(in_features, out_features, has_bias, marlin_config, device)?;
+        Ok(Self {
+            inner,
+            in_features,
+            out_features,
+        })
+    }
+}
+
+impl QuantizedLinear for AwqMarlinLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.inner.forward(x)
+    }
+
+    fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
+        let mut repacked: HashMap<String, Tensor> = HashMap::with_capacity(weights.len());
+
+        if let Some(qw) = weights.get("qweight") {
+            let gptq_qw = awq_to_gptq_qweight(qw, self.in_features, self.out_features)?;
+            repacked.insert("qweight".to_string(), gptq_qw);
+        }
+        if let Some(qz) = weights.get("qzeros") {
+            // qzeros share the same shape between AWQ and GPTQ
+            // (`[num_groups, N/8]`); only the nibble order inside each
+            // u32 word changes.
+            let gptq_qz = repack_awq_nibbles(qz)?;
+            repacked.insert("qzeros".to_string(), gptq_qz);
+        }
+        // Scales and bias are layout-compatible: pass through.
+        if let Some(s) = weights.get("scales") {
+            repacked.insert("scales".to_string(), s.clone());
+        }
+        if let Some(b) = weights.get("bias") {
+            repacked.insert("bias".to_string(), b.clone());
+        }
+
+        self.inner.load_weights(&repacked)
+    }
+
+    fn weight_dtype(&self) -> DType {
+        self.inner.weight_dtype()
+    }
+
+    fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    fn has_bias(&self) -> bool {
+        self.inner.has_bias()
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -238,6 +400,58 @@ mod tests {
         let qweight = Tensor::zeros((16usize, 64usize), DType::U32, &device).unwrap();
         let result = repack_awq_nibbles(&qweight).unwrap();
         assert_eq!(result.dims(), &[16, 64]);
+    }
+
+    #[test]
+    fn test_awq_to_gptq_qweight_shape_transposes_packing_axis() {
+        // AWQ qweight shape: [K, N/8]; GPTQ output: [K/8, N].
+        let device = Device::Cpu;
+        let k = 64usize;
+        let n = 32usize;
+        let qw = Tensor::zeros((k, n / 8), DType::U32, &device).unwrap();
+        let gptq = awq_to_gptq_qweight(&qw, k, n).unwrap();
+        assert_eq!(gptq.dims(), &[k / 8, n]);
+    }
+
+    #[test]
+    fn test_awq_to_gptq_qweight_known_value() {
+        // Build a 1×1 (in nibble units) AWQ matrix where K=8, N=8.
+        // AWQ shape: [K=8, N/8=1]. Each row k stores 8 nibbles for the
+        // 8 outputs of column-block 0, in undo_pack order.
+        // GPTQ shape after repack: [K/8=1, N=8]. Column n stores 8
+        // nibbles for inputs k=0..7, in sequential order.
+        //
+        // Use a unique value per (k, n): nib(k, n) = (k + 1) (mod 16),
+        // independent of n. After repack, every GPTQ word equals
+        // sum_i (i+1) << (i*4).
+        let device = Device::Cpu;
+        let k = 8usize;
+        let n = 8usize;
+        let mut awq_words = Vec::with_capacity(k);
+        for ki in 0..k {
+            let v = ((ki + 1) & 0xF) as u32;
+            // All 8 output lanes hold the same value v, so the AWQ word
+            // is v repeated in every nibble — identical regardless of
+            // undo_pack order.
+            let mut word: u32 = 0;
+            for shift in (0..32).step_by(4) {
+                word |= v << shift;
+            }
+            awq_words.push(word);
+        }
+        let awq = Tensor::from_vec(awq_words, (k, n / 8), &device).unwrap();
+        let gptq = awq_to_gptq_qweight(&awq, k, n).unwrap();
+        let out: Vec<u32> = gptq.flatten_all().unwrap().to_vec1().unwrap();
+
+        let mut expected_word: u32 = 0;
+        for ki in 0..k {
+            let v = ((ki + 1) & 0xF) as u32;
+            expected_word |= v << (ki * 4);
+        }
+        assert_eq!(out.len(), n);
+        for &w in &out {
+            assert_eq!(w, expected_word);
+        }
     }
 
     #[test]
