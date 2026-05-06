@@ -57,9 +57,12 @@ Server: `--num-blocks 96 --max-requests 4 --max-model-len 1024
 | + Stage 9 (AwqMarlin live + AWQ GEMV kernel for M ≤ 16) | ~21 s  | ~600     | **~11.6**    | ~10 ms / 36    |
 | + Stage 10-1 (RoPE positions: zero-copy U32 → kernel)   | ~21 s  | ~600     | **~13.0**    | ~9 ms / 36     |
 | + Stage 10-α (split-K GEMV: ×4 / ×8 thread-per-column)  | ~21 s  | ~600     | **~20.0**    | ~6 ms / 36     |
+| + Stage 10-β (vec4 LDG GEMV on transposed qweight)      | ~21 s  | ~600     | **~40.5**    | ~3 ms / 36     |
+| + Stage 10-γ (skip zero-init of GEMV output buffer)     | ~21 s  | ~600     | **~42 / 50** | ~3 ms / 36     |
 
-Cumulative speedup vs the Stages 1–6 baseline: **~333×** decode tok/s
-without changing any model architecture, KV cache layout, or sampler.
+Cumulative speedup vs the Stages 1–6 baseline: **~700× steady, ~830×
+at peak** decode tok/s — with the original target of ≥ 50 tok/s reached
+on a warm cache.
 
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
@@ -202,6 +205,21 @@ to close to ≥ 50 tok/s.
   doubling, ~50% wall-clock improvement: 13 → 20 tok/s. Beyond ×8
   the kernel is memory-bandwidth-bound — adding more threads no
   longer helps without restructuring qweight access.
+- **Stage 10-β** vec4 LDG on transposed qweight. The previous
+  layouts (`[K/8, N]`) put the K-axis on the strided dimension —
+  every packed_k step landed in a fresh cache line. `AwqMarlinLinear`
+  now stores qweight as `[N, K/8]` (one strided GPU copy at load
+  time), and the new `awq_gemv_int4_kt_bf16` kernel issues one
+  `uint4` LDG (16 B = 4 packed words = 32 packed int4 weights) per
+  inner iteration, quartering the per-thread issue rate. AWQ INT4-ZP
+  dispatch routes here for every M (decode and prefill); the older
+  variants stay as fallbacks if a future shape misses the gate.
+  20 → 40 tok/s.
+- **Stage 10-γ** Skip zero-init on the GEMV output buffer. Every
+  element is written exactly once by the kernel; the implicit memset
+  inside `alloc_zeros::<bf16>` was dead work on each of the 252
+  per-token GEMV launches. Switched to `unsafe alloc::<bf16>`. Pushed
+  steady-state to 42 tok/s with peaks above 50.
 
 Python vLLM was not present in the test environment (no apples-to-apples
 comparison was made on this run). The vllm-rust numbers above are real
