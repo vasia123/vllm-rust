@@ -557,7 +557,7 @@ mod tests {
         // Use actual non-zero gate weights to verify routing logic.
         let device = Device::Cpu;
 
-        let config = RouterConfig {
+        let _config = RouterConfig {
             hidden_size: 2,
             num_experts: 4,
             top_k: 2,

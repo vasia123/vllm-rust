@@ -3,8 +3,8 @@
 //! Provides GPU-accelerated FP8 quantization for Ada Lovelace+ GPUs (sm_89+).
 
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, Layout, Result, Shape,
-    Storage, Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, Layout, Result, Shape, Storage,
+    Tensor,
 };
 
 const FP8_QUANT_PTX: &str = include_str!("../../kernels/fp8_quant.ptx");
@@ -742,7 +742,7 @@ pub fn fp8_dequant_weights(weight: &Tensor, scale: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device};
 
     #[test]
     fn test_fp8_quant_requires_cuda() {

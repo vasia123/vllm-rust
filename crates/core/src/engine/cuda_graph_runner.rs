@@ -190,8 +190,6 @@ struct CaptureBuffers {
     input_ids: Tensor,
     /// Output hidden states / logits
     output: Tensor,
-    /// Vocab size for output allocation
-    vocab_size: usize,
 }
 
 /// A captured CUDA graph with its associated buffers.
@@ -444,11 +442,7 @@ impl CudaGraphRunner {
                 CapturedGraph {
                     graph,
                     graph_exec,
-                    buffers: CaptureBuffers {
-                        input_ids,
-                        output,
-                        vocab_size: self.vocab_size,
-                    },
+                    buffers: CaptureBuffers { input_ids, output },
                 },
             );
             captured += 1;

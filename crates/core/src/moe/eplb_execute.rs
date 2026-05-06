@@ -266,11 +266,15 @@ mod tests {
 
     // ─── Simulated multi-rank communicator ───────────────────────────────────
 
+    /// Per-rank submission for the simulated all-to-all: the flat send tensor
+    /// plus per-destination split sizes.
+    type RankSend = (Tensor, Vec<usize>);
+
     /// Shared state for a group of `SimComm` instances running in separate threads.
     struct SimState {
         ep_size: usize,
-        // Submissions slot: each rank stores (send_flat, send_splits) before the barrier.
-        sends: Mutex<Vec<Option<(Tensor, Vec<usize>)>>>,
+        // Submissions slot: each rank stores its `RankSend` before the barrier.
+        sends: Mutex<Vec<Option<RankSend>>>,
         /// Reusable barrier — automatically resets after `ep_size` threads wait.
         /// Used twice per `all_to_all_v` call (submit phase + read phase).
         barrier: Barrier,
@@ -317,7 +321,7 @@ mod tests {
             &self,
             tensor: &Tensor,
             send_splits: &[usize],
-            recv_splits: &[usize],
+            _recv_splits: &[usize],
         ) -> DistResult<Tensor> {
             // Phase 1 — submit
             {

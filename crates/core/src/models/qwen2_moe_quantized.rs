@@ -744,9 +744,7 @@ impl crate::engine::ModelForward for QuantizedQwen2MoeForCausalLM {
 mod tests {
     use super::*;
     use crate::kv_cache::{config::CacheConfig, KVCacheDtype};
-    use crate::quantization::{
-        create_weight_loader_with_params, DetectedQuantConfig, QuantizationMethod,
-    };
+    use crate::quantization::{create_weight_loader_with_params, DetectedQuantConfig};
 
     fn test_config() -> ModelConfig {
         let mut extra = serde_json::Map::new();

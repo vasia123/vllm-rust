@@ -756,7 +756,6 @@ mod tests {
         assert_eq!(model.layers.len(), cfg.num_hidden_layers);
     }
 
-    #[test]
     // NOTE: tests for the `sinks` tensor allocation and per-layer `sliding_window`
     // field assignment were removed during the AttentionBlock migration. Both
     // fields existed in the bespoke OaiAttention struct but were never applied
