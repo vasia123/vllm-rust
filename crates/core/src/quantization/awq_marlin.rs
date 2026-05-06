@@ -312,6 +312,15 @@ impl QuantizedLinear for AwqMarlinLinear {
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                target: "vllm_core::marlin_path",
+                "AwqMarlinLinear::load_weights live (in={}, out={})",
+                self.in_features, self.out_features
+            );
+        });
+
         let mut repacked: HashMap<String, Tensor> = HashMap::with_capacity(weights.len());
 
         if let Some(qw) = weights.get("qweight") {
@@ -325,12 +334,25 @@ impl QuantizedLinear for AwqMarlinLinear {
             let gptq_qz = repack_awq_nibbles(qz)?;
             repacked.insert("qzeros".to_string(), gptq_qz);
         }
-        // Scales and bias are layout-compatible: pass through.
+        // HuggingFace AWQ checkpoints store `scales` in F16. The Marlin
+        // and decode-GEMV kernels both consume BF16 scales (the activation
+        // dtype on Ampere+); convert at load time so each forward avoids
+        // a per-call cast.
         if let Some(s) = weights.get("scales") {
-            repacked.insert("scales".to_string(), s.clone());
+            let scales = if s.dtype() == DType::BF16 {
+                s.clone()
+            } else {
+                s.to_dtype(DType::BF16)?
+            };
+            repacked.insert("scales".to_string(), scales);
         }
         if let Some(b) = weights.get("bias") {
-            repacked.insert("bias".to_string(), b.clone());
+            let bias = if b.dtype() == DType::BF16 {
+                b.clone()
+            } else {
+                b.to_dtype(DType::BF16)?
+            };
+            repacked.insert("bias".to_string(), bias);
         }
 
         self.inner.load_weights(&repacked)

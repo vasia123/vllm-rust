@@ -481,12 +481,17 @@ pub struct MarlinLinear {
     bias: Option<Tensor>,
     /// G_idx for desc_act (optional)
     g_idx: Option<Tensor>,
-    /// Sort indices for g_idx
+    /// Sort indices for g_idx (read only by `forward_marlin` under the
+    /// `marlin` feature; the no-op `process_weights` no longer populates it)
+    #[allow(dead_code)]
     g_idx_sort_indices: Option<Tensor>,
     /// Workspace tensor for Marlin kernel
     #[allow(dead_code)] // Used in forward_marlin when marlin feature is enabled
     workspace: Tensor,
-    /// Configuration
+    /// Configuration (consumed by `forward_marlin`/`forward_fallback`,
+    /// both feature-gated; mark allowed so a `--features cuda`-only
+    /// build still passes `clippy -D dead_code`).
+    #[allow(dead_code)]
     config: MarlinConfig,
     /// Input features (K dimension)
     in_features: usize,
@@ -579,6 +584,15 @@ impl MarlinLinear {
     /// Forward using Marlin CUDA kernel.
     #[cfg(feature = "marlin")]
     fn forward_marlin(&self, x: &Tensor) -> Result<Tensor> {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                target: "vllm_core::marlin_path",
+                "MarlinLinear::forward_marlin live (in={}, out={}, scalar={:?})",
+                self.in_features, self.out_features, self.config.scalar_type
+            );
+        });
+
         let is_k_full = !self.config.desc_act || self.g_idx_sort_indices.is_none();
 
         marlin_cuda::marlin_gemm(
@@ -608,6 +622,14 @@ impl MarlinLinear {
     /// Fallback forward using standard GPTQ dequantization.
     #[cfg_attr(not(feature = "cuda-kernels"), allow(unused_variables))]
     fn forward_fallback(&self, x: &Tensor) -> Result<Tensor> {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                target: "vllm_core::marlin_path",
+                "MarlinLinear::forward_fallback (gptq_cuda) live — Marlin INT4 kernel NOT used"
+            );
+        });
+
         // When Marlin kernel is not available, fall back to standard GPTQ
         // This is slower but ensures correctness
         #[cfg(feature = "cuda-kernels")]
@@ -638,46 +660,25 @@ impl MarlinLinear {
         }
     }
 
-    /// Process weights after loading: repack to Marlin format.
+    /// Post-load weight processing.
+    ///
+    /// Originally this performed a GPTQ→Marlin tile-format repack of qweight
+    /// plus a Marlin-specific scale permutation, both required by a
+    /// tensor-core MMA kernel. We do **not** ship that tile-MMA kernel —
+    /// the PTX entry `repack_gptq_to_marlin_int4` is absent from
+    /// `marlin_gemm.ptx`, and all three live INT4/INT8 kernels in
+    /// `marlin_gemm.cu` plus the new `awq_gemv_int4_bf16` decode kernel
+    /// read qweight in raw `[K/8, N]` GPTQ row-major and scales in
+    /// `[num_groups, N]` un-permuted. Calling the old `process_weights`
+    /// would (a) fail at `dev.get_or_load_custom_func("repack_gptq_to_
+    /// marlin_int4", ...)` and (b) reshape the inputs into a layout the
+    /// active kernels do not understand. Until we land a real Marlin
+    /// tile-MMA kernel, this path is a deliberate no-op.
+    ///
+    /// `desc_act` (g_idx activation reorder) is also handled at runtime in
+    /// the kernel dispatch path; pre-sorting g_idx here is unnecessary for
+    /// the kernels we currently use.
     fn process_weights(&mut self) -> Result<()> {
-        if !self.is_initialized {
-            return Ok(());
-        }
-
-        // Handle activation order (desc_act)
-        if self.config.desc_act {
-            if let Some(ref g_idx) = self.g_idx {
-                // Sort g_idx and get sort indices
-                let sorted = g_idx.arg_sort_last_dim(false)?;
-                self.g_idx_sort_indices = Some(sorted.to_dtype(DType::U32)?);
-
-                // Reorder g_idx by sort indices
-                if let Some(ref sort_indices) = self.g_idx_sort_indices {
-                    let sorted_g_idx = g_idx.index_select(sort_indices, 0)?;
-                    self.g_idx = Some(sorted_g_idx);
-                }
-            }
-        }
-
-        // Repack weights to Marlin format
-        let repacked = repack_gptq_to_marlin(
-            &self.qweight,
-            self.g_idx_sort_indices.as_ref(),
-            self.in_features,
-            self.out_features,
-            self.config.bits,
-        )?;
-        self.qweight = repacked;
-
-        // Permute scales
-        let permuted_scales = marlin_permute_scales(
-            &self.scales,
-            self.in_features,
-            self.out_features,
-            self.config.group_size,
-        )?;
-        self.scales = permuted_scales;
-
         Ok(())
     }
 }

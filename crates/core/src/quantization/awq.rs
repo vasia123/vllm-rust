@@ -353,7 +353,18 @@ impl QuantizationConfig for AwqConfig {
         // packing) is repacked to GPTQ layout at load time — feeding raw
         // AWQ tensors to MarlinLinear directly would silently produce
         // garbage outputs because MarlinLinear assumes GPTQ packing.
-        if self.use_marlin && self.can_use_marlin_for_shape(in_features, out_features) {
+        let supports_shape = self.can_use_marlin_for_shape(in_features, out_features);
+        let has_marlin_config = self.to_marlin_config().is_some();
+        tracing::debug!(
+            target: "vllm_core::marlin_path",
+            in_features = in_features,
+            out_features = out_features,
+            use_marlin = self.use_marlin,
+            supports_shape = supports_shape,
+            has_marlin_config = has_marlin_config,
+            "AwqConfig::create_linear gating"
+        );
+        if self.use_marlin && supports_shape {
             if let Some(marlin_config) = self.to_marlin_config() {
                 return Ok(Box::new(AwqMarlinLinear::new(
                     in_features,
@@ -509,6 +520,15 @@ impl AwqLinear {
 
 impl QuantizedLinear for AwqLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                target: "vllm_core::marlin_path",
+                "AwqLinear::forward (legacy CPU dequant per call) live — in={}, out={}",
+                self.in_features, self.out_features
+            );
+        });
+
         // Dequantized weight lives in F16 but the caller's activation
         // dtype may be F32/BF16 — preserve the input dtype on the way
         // out so downstream ops (norms, RoPE) don't see a mixed-dtype

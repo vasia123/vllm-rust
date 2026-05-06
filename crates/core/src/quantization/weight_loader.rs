@@ -24,7 +24,7 @@ fn vb_get_as<S: Into<candle_core::Shape>>(
 }
 
 use super::awq::{AwqConfig, AwqLinear};
-use super::awq_marlin::{repack_awq_nibbles, AwqMarlinConfig};
+use super::awq_marlin::{repack_awq_nibbles, AwqMarlinConfig, AwqMarlinLinear};
 use super::bitsandbytes::{BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType};
 use super::config::{QuantizationConfig, QuantizedLinear};
 use super::fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
@@ -430,15 +430,6 @@ impl QuantizedWeightLoader for AwqWeightLoader {
 
         let vb = self.vb.pp(prefix);
 
-        let mut linear = AwqLinear::new(
-            in_features,
-            out_features,
-            bias,
-            self.config.bits,
-            self.config.group_size,
-            &self.device,
-        )?;
-
         // HuggingFace AWQ gemm format (this is the ONLY native layout vLLM
         // publishes for AWQ checkpoints): qweight is packed along the
         // output axis, shape `[in_features, out_features / pack_factor]`,
@@ -492,6 +483,39 @@ impl QuantizedWeightLoader for AwqWeightLoader {
             }
         }
 
+        // Route through `AwqMarlinLinear` when the AWQ config and tensor
+        // shapes both clear the Marlin gate. `AwqConfig::create_linear`
+        // applies the same gate, but the production loader path does not
+        // go through `create_linear` — without this hook, every AWQ run
+        // silently falls back to the CPU dequant fast path of `AwqLinear`,
+        // which is ~1000× slower than the Marlin INT4 / decode-GEMV
+        // kernels we ship.
+        if self.config.use_marlin
+            && self
+                .config
+                .can_use_marlin_for_shape(in_features, out_features)
+        {
+            if let Some(marlin_config) = self.config.to_marlin_config() {
+                let mut marlin_linear = AwqMarlinLinear::new(
+                    in_features,
+                    out_features,
+                    bias,
+                    marlin_config,
+                    &self.device,
+                )?;
+                marlin_linear.load_weights(&weights)?;
+                return Ok(Box::new(marlin_linear));
+            }
+        }
+
+        let mut linear = AwqLinear::new(
+            in_features,
+            out_features,
+            bias,
+            self.config.bits,
+            self.config.group_size,
+            &self.device,
+        )?;
         linear.load_weights(&weights)?;
         Ok(Box::new(linear))
     }
