@@ -21,7 +21,7 @@ use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{paged_attention, AlibiAttentionBias};
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear};
+use super::tp_layers::{TpEmbedding, TpFusedSwiGluMlp, TpLinear};
 
 // ─── Step1 Config Extraction ────────────────────────────────────────────────
 
@@ -357,55 +357,10 @@ impl Step1Attention {
     }
 }
 
-// ─── MLP ────────────────────────────────────────────────────────────────────
-
-struct Step1MLP {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-}
-
-impl Step1MLP {
-    fn new_with_tp(
-        hidden_size: usize,
-        intermediate_size: usize,
-        bias: bool,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        // Merged gate+up projection: hidden_size -> 2*intermediate_size
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            bias,
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            bias,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs, tp_ctx)?;
-        // SiLU-and-Mul: split into gate and up, then silu(gate) * up
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = candle_nn::ops::silu(&chunks[0])?;
-        let intermediate = gate.mul(&chunks[1])?;
-        self.down_proj.forward(&intermediate, tp_ctx)
-    }
-}
+// Step1's MLP is the fused-gate-up SwiGLU pattern with optional bias
+// (controlled by `mlp_bias` in config.extra). Use the unified
+// `TpFusedSwiGluMlp` from `tp_layers`.
+type Step1MLP = TpFusedSwiGluMlp;
 
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
@@ -425,7 +380,7 @@ impl Step1DecoderLayer {
     ) -> Result<Self> {
         let self_attn = Step1Attention::new_with_tp(cfg, step_cfg, vb.pp("self_attn"), pg)?;
 
-        let mlp = Step1MLP::new_with_tp(
+        let mlp = Step1MLP::new_with_bias(
             cfg.hidden_size,
             cfg.intermediate_size,
             step_cfg.mlp_bias,
@@ -1115,7 +1070,7 @@ mod tests {
         let pg = LocalProcessGroup::new();
         let tp_ctx = TpContext::single_gpu();
 
-        let mlp = Step1MLP::new_with_tp(64, 128, false, vb.pp("mlp"), &pg).unwrap();
+        let mlp = Step1MLP::new_with_bias(64, 128, false, vb.pp("mlp"), &pg).unwrap();
 
         let input = Tensor::zeros((2, 64), DType::F32, &device).expect("input");
         let output = mlp.forward(&input, &tp_ctx);

@@ -423,7 +423,7 @@ pub struct TpFusedSwiGluMlp {
 }
 
 impl TpFusedSwiGluMlp {
-    /// Create a fused-gate-up SwiGLU MLP.
+    /// Create a fused-gate-up SwiGLU MLP **without** bias.
     ///
     /// Weight layout: `gate_up_proj.weight` has shape
     /// `[2 * intermediate_size, hidden_size]` with `[gate || up]`
@@ -434,10 +434,25 @@ impl TpFusedSwiGluMlp {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
+        Self::new_with_bias(hidden_size, intermediate_size, false, vb, pg)
+    }
+
+    /// Create a fused-gate-up SwiGLU MLP with optional bias.
+    ///
+    /// Used by Step1, Ernie 4.5-MoE, and other architectures whose
+    /// config has an `mlp_bias` flag. The bias applies uniformly to
+    /// both the fused `gate_up_proj` and the `down_proj` projections.
+    pub fn new_with_bias(
+        hidden_size: usize,
+        intermediate_size: usize,
+        bias: bool,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let gate_up_proj = TpLinear::column_parallel(
             hidden_size,
             2 * intermediate_size,
-            false,
+            bias,
             false,
             vb.pp("gate_up_proj"),
             pg,
@@ -445,7 +460,7 @@ impl TpFusedSwiGluMlp {
         let down_proj = TpLinear::row_parallel(
             intermediate_size,
             hidden_size,
-            false,
+            bias,
             true,
             vb.pp("down_proj"),
             pg,

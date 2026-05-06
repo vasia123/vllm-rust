@@ -24,7 +24,7 @@ use crate::layers::RotaryEmbedding;
 use crate::moe::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear, TpSwiGluMlp};
+use super::tp_layers::{TpEmbedding, TpFusedSwiGluMlp, TpLinear, TpSwiGluMlp};
 
 // ─── Pangu Config (parsed from ModelConfig.extra) ───────────────────────────
 
@@ -110,54 +110,11 @@ impl PanguConfig {
 
 // ─── Pangu MLP (SwiGLU: merged gate+up, then down) ─────────────────────────
 
-struct PanguMLP {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-}
-
-impl PanguMLP {
-    fn new_with_tp(
-        hidden_size: usize,
-        intermediate_size: usize,
-        _bias: bool,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        // Merged gate+up projection: hidden_size -> 2*intermediate_size
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            false, // bias not implemented for simplicity (most Pangu configs use bias=false)
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            false,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs, tp_ctx)?;
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = &chunks[0];
-        let up = &chunks[1];
-        let gate_act = candle_nn::ops::silu(gate)?;
-        let intermediate = gate_act.mul(up)?;
-        self.down_proj.forward(&intermediate, tp_ctx)
-    }
-}
+// Pangu's MLP is fused-gate-up SwiGLU without bias. The legacy
+// `PanguMLP::new_with_tp` accepted a `_bias` flag, but every caller in
+// Pangu V1 passes `false` (matching the upstream architecture which
+// stores the MLP without bias).
+type PanguMLP = TpFusedSwiGluMlp;
 
 // ─── MoE Expert ─────────────────────────────────────────────────────────────
 
@@ -264,10 +221,9 @@ impl PanguMoE {
 
         let shared_expert = if let Some(n_shared) = pangu_cfg.n_shared_experts {
             let shared_intermediate = pangu_cfg.moe_intermediate_size * n_shared;
-            Some(PanguMLP::new_with_tp(
+            Some(PanguMLP::new(
                 hidden_size,
                 shared_intermediate,
-                false,
                 vb.pp("shared_experts"),
                 pg,
             )?)
@@ -1640,7 +1596,7 @@ mod tests {
         let pg = LocalProcessGroup::new();
         let tp_ctx = TpContext::single_gpu();
 
-        let mlp = PanguMLP::new_with_tp(64, 128, false, vb.pp("mlp"), &pg).unwrap();
+        let mlp = PanguMLP::new(64, 128, vb.pp("mlp"), &pg).unwrap();
 
         let input = Tensor::zeros((2, 64), DType::F32, &device).expect("input");
         let output = mlp.forward(&input, &tp_ctx);

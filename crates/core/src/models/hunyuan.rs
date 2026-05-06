@@ -31,7 +31,7 @@ use crate::layers::RotaryEmbedding;
 use crate::moe::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear, TpSwiGluMlp};
+use super::tp_layers::{TpEmbedding, TpFusedSwiGluMlp, TpLinear, TpSwiGluMlp};
 
 // ---- HunYuan Config (parsed from ModelConfig.extra) ----
 
@@ -322,50 +322,10 @@ impl HunYuanMoEExpert {
 
 // ---- Shared MLP (gate_up merged) ----
 
-struct HunYuanSharedMLP {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-}
-
-impl HunYuanSharedMLP {
-    fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        bias: bool,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            bias,
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            bias,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs, tp_ctx)?;
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = candle_nn::ops::silu(&chunks[0])?;
-        let hidden = gate.mul(&chunks[1])?;
-        self.down_proj.forward(&hidden, tp_ctx)
-    }
-}
+// Fused gate_up SwiGLU (no bias). The legacy `HunYuanSharedMLP::new`
+// took a `bias` flag, but every caller in HunyuanV1 passes `false` —
+// the upstream architecture stores the shared MLP without bias.
+type HunYuanSharedMLP = TpFusedSwiGluMlp;
 
 // ---- SparseMoE Block (router + experts + optional shared expert) ----
 
@@ -419,7 +379,6 @@ impl HunYuanSparseMoeBlock {
             Some(HunYuanSharedMLP::new(
                 hidden_size,
                 shared_intermediate,
-                false,
                 vb.pp("shared_mlp"),
                 pg,
             )?)
@@ -1519,7 +1478,7 @@ mod tests {
         let pg = LocalProcessGroup::new();
         let tp_ctx = TpContext::single_gpu();
 
-        let shared = HunYuanSharedMLP::new(64, 128, false, vb.pp("shared"), &pg).unwrap();
+        let shared = HunYuanSharedMLP::new(64, 128, vb.pp("shared"), &pg).unwrap();
 
         let input = Tensor::zeros((2, 64), DType::F32, &device).expect("input");
         let output = shared.forward(&input, &tp_ctx);

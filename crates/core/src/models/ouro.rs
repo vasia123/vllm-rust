@@ -23,7 +23,7 @@ use crate::layers::attention::{AttentionBlock, AttentionConfig};
 use crate::layers::RotaryEmbedding;
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear};
+use super::tp_layers::{TpEmbedding, TpFusedSwiGluMlp, TpLinear};
 
 // ─── Ouro Config (parsed from ModelConfig.extra) ────────────────────────────
 
@@ -41,55 +41,6 @@ impl OuroConfig {
             .unwrap_or(4);
 
         Self { total_ut_steps }
-    }
-}
-
-// ─── MLP ────────────────────────────────────────────────────────────────────
-
-struct OuroMLP {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-}
-
-impl OuroMLP {
-    fn new_with_tp(
-        hidden_size: usize,
-        intermediate_size: usize,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            false,
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            false,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs, tp_ctx)?;
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = &chunks[0];
-        let up = &chunks[1];
-        let gate_act = candle_nn::ops::silu(gate)?;
-        let intermediate = gate_act.mul(up)?;
-        self.down_proj.forward(&intermediate, tp_ctx)
     }
 }
 
@@ -186,7 +137,7 @@ impl OuroAttention {
 /// stability for the multi-pass UT architecture.
 struct OuroDecoderLayer {
     self_attn: OuroAttention,
-    mlp: OuroMLP,
+    mlp: TpFusedSwiGluMlp,
     input_layernorm: RmsNorm,
     input_layernorm_2: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -202,7 +153,7 @@ impl OuroDecoderLayer {
     ) -> Result<Self> {
         let self_attn = OuroAttention::new_with_tp(cfg, ouro_cfg, vb.pp("self_attn"), pg)?;
 
-        let mlp = OuroMLP::new_with_tp(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
+        let mlp = TpFusedSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
 
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -824,7 +775,7 @@ mod tests {
         let pg = LocalProcessGroup::new();
         let tp_ctx = TpContext::single_gpu();
 
-        let mlp = OuroMLP::new_with_tp(64, 128, vb.pp("mlp"), &pg).unwrap();
+        let mlp = TpFusedSwiGluMlp::new(64, 128, vb.pp("mlp"), &pg).unwrap();
 
         let input = Tensor::zeros((2, 64), DType::F32, &device).expect("input");
         let output = mlp.forward(&input, &tp_ctx);
