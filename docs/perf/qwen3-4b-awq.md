@@ -59,10 +59,20 @@ Server: `--num-blocks 96 --max-requests 4 --max-model-len 1024
 | + Stage 10-α (split-K GEMV: ×4 / ×8 thread-per-column)  | ~21 s  | ~600     | **~20.0**    | ~6 ms / 36     |
 | + Stage 10-β (vec4 LDG GEMV on transposed qweight)      | ~21 s  | ~600     | **~40.5**    | ~3 ms / 36     |
 | + Stage 10-γ (skip zero-init of GEMV output buffer)     | ~21 s  | ~600     | **~42 / 50** | ~3 ms / 36     |
+| + Stage 10-δ (uninit alloc on RoPE/PA/RMSNorm/SwiGLU)   | ~21 s  | ~600     | **~44 / 50** | ~3 ms / 36     |
 
-Cumulative speedup vs the Stages 1–6 baseline: **~700× steady, ~830×
-at peak** decode tok/s — with the original target of ≥ 50 tok/s reached
-on a warm cache.
+Cumulative speedup vs the Stages 1–6 baseline: **~733× steady (44 tok/s
+on a 256-token sustained run), peaks ~50** — original ≥ 50 tok/s
+target reached on warm-cache short prompts.
+
+The remaining gap to a steady ≥ 50 tok/s (about ~10%) sits behind a
+known but non-trivial blocker: the production `start_engine` path
+never invokes `StandardExecution::warmup`, so `self.graph_runner`
+stays `None` and every decode call falls through to the eager dispatch
+in `helpers.rs:783`. Wiring the warmup into the runtime — and
+solving the persistent-buffer requirement that CUDA-graph capture
+imposes (cudarc still allocates dynamically inside the captured
+stream) — is the natural next stage.
 
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
@@ -220,6 +230,11 @@ to close to ≥ 50 tok/s.
   inside `alloc_zeros::<bf16>` was dead work on each of the 252
   per-token GEMV launches. Switched to `unsafe alloc::<bf16>`. Pushed
   steady-state to 42 tok/s with peaks above 50.
+- **Stage 10-δ** Same uninit-alloc swap on every other hot-path
+  output buffer: RoPE (overwritten by `memcpy_dtod` before the
+  kernel), paged-attention V1, RMSNorm BF16, SwiGLU (BF16 + F16),
+  and the GeGLU activation. ~108 extra zero-init memsets per token
+  removed; steady-state 42 → 44 tok/s.
 
 Python vLLM was not present in the test environment (no apples-to-apples
 comparison was made on this run). The vllm-rust numbers above are real
