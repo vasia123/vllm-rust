@@ -293,8 +293,43 @@ pub struct TpSwiGluMlp {
     down_proj: TpLinear,
 }
 
+/// Weight-name aliases for TP MLP projections.
+///
+/// Most model families use the canonical Llama-style triple
+/// (`gate_proj` / `up_proj` / `down_proj`). InternLM2 uses
+/// `feed_forward.{w1, w3, w2}` instead — `w1`/`w3` are gate/up
+/// (the order is *not* alphabetical), `w2` is down.
+#[derive(Clone, Copy, Debug)]
+pub struct GluProjNames {
+    pub gate: &'static str,
+    pub up: &'static str,
+    pub down: &'static str,
+}
+
+impl GluProjNames {
+    /// Llama / Mistral / Qwen / Gemma standard triple.
+    pub const STANDARD: Self = Self {
+        gate: "gate_proj",
+        up: "up_proj",
+        down: "down_proj",
+    };
+    /// InternLM2 / Yi `feed_forward.{w1,w3,w2}` aliases.
+    pub const W1_W3_W2: Self = Self {
+        gate: "w1",
+        up: "w3",
+        down: "w2",
+    };
+}
+
+impl Default for GluProjNames {
+    fn default() -> Self {
+        Self::STANDARD
+    }
+}
+
 impl TpSwiGluMlp {
-    /// Create a SwiGLU MLP layer.
+    /// Create a SwiGLU MLP layer with the canonical Llama-style weight
+    /// names (`gate_proj` / `up_proj` / `down_proj`).
     ///
     /// For single GPU, uses regular linear layers.
     /// For multi-GPU, uses column/row-parallel linear layers.
@@ -304,6 +339,27 @@ impl TpSwiGluMlp {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
+        Self::new_with_proj_names(
+            hidden_size,
+            intermediate_size,
+            vb,
+            pg,
+            GluProjNames::STANDARD,
+        )
+    }
+
+    /// Create a SwiGLU MLP layer with custom weight-name aliases.
+    ///
+    /// Used by InternLM2 / Yi (`w1` / `w3` / `w2`) and any future
+    /// family that diverges from the Llama-style triple. The TP
+    /// sharding is identical — only the VarBuilder lookup differs.
+    pub fn new_with_proj_names(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+        names: GluProjNames,
+    ) -> Result<Self> {
         // Gate and Up are column-parallel (split intermediate)
         // Down is row-parallel (reduce outputs)
         let gate_proj = TpLinear::column_parallel(
@@ -311,7 +367,7 @@ impl TpSwiGluMlp {
             intermediate_size,
             false,
             false, // no gather, goes to element-wise mul with up
-            vb.pp("gate_proj"),
+            vb.pp(names.gate),
             pg,
         )?;
         let up_proj = TpLinear::column_parallel(
@@ -319,7 +375,7 @@ impl TpSwiGluMlp {
             intermediate_size,
             false,
             false,
-            vb.pp("up_proj"),
+            vb.pp(names.up),
             pg,
         )?;
         let down_proj = TpLinear::row_parallel(
@@ -327,7 +383,7 @@ impl TpSwiGluMlp {
             hidden_size,
             false,
             true, // input is parallel
-            vb.pp("down_proj"),
+            vb.pp(names.down),
             pg,
         )?;
 
@@ -343,6 +399,76 @@ impl TpSwiGluMlp {
         let gate = self.gate_proj.forward(xs, tp_ctx)?;
         let up = self.up_proj.forward(xs, tp_ctx)?;
         // SwiGLU: silu(gate) * up
+        let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
+        self.down_proj.forward(&hidden, tp_ctx)
+    }
+}
+
+/// Tensor-parallel SwiGLU MLP with **fused** gate+up projection.
+///
+/// Phi-3 family stores `gate_proj` and `up_proj` as a single
+/// `gate_up_proj` weight `[hidden, 2 * intermediate]`. After the
+/// projection, the output is split: first half is gate, second
+/// half is up. Saves one matmul of overhead at inference time.
+///
+/// In TP mode the fused weight is column-parallel — the `2 *
+/// intermediate` dim is split across ranks, so each rank holds
+/// its slice of (gate || up) interleaved. The split into gate/up
+/// happens locally after the projection.
+pub struct TpFusedSwiGluMlp {
+    gate_up_proj: TpLinear,
+    down_proj: TpLinear,
+    /// Local intermediate size = `intermediate_size / world_size`.
+    local_intermediate: usize,
+}
+
+impl TpFusedSwiGluMlp {
+    /// Create a fused-gate-up SwiGLU MLP.
+    ///
+    /// Weight layout: `gate_up_proj.weight` has shape
+    /// `[2 * intermediate_size, hidden_size]` with `[gate || up]`
+    /// row order (matching Phi-3 / vLLM convention).
+    pub fn new(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
+        let gate_up_proj = TpLinear::column_parallel(
+            hidden_size,
+            2 * intermediate_size,
+            false,
+            false,
+            vb.pp("gate_up_proj"),
+            pg,
+        )?;
+        let down_proj = TpLinear::row_parallel(
+            intermediate_size,
+            hidden_size,
+            false,
+            true,
+            vb.pp("down_proj"),
+            pg,
+        )?;
+
+        let local_intermediate = intermediate_size / pg.world_size();
+
+        Ok(Self {
+            gate_up_proj,
+            down_proj,
+            local_intermediate,
+        })
+    }
+
+    /// Forward pass: fused projection → split → SwiGLU → down.
+    pub fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
+        let fused = self.gate_up_proj.forward(xs, tp_ctx)?;
+        let gate = fused.narrow(candle_core::D::Minus1, 0, self.local_intermediate)?;
+        let up = fused.narrow(
+            candle_core::D::Minus1,
+            self.local_intermediate,
+            self.local_intermediate,
+        )?;
         let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
         self.down_proj.forward(&hidden, tp_ctx)
     }
@@ -548,6 +674,53 @@ mod tests {
         let output = mlp.forward(&input, &tp_ctx).unwrap();
 
         assert_eq!(output.dims(), &[2, 3, 64]);
+    }
+
+    #[test]
+    fn tp_swiglu_mlp_with_proj_names_w123() {
+        // InternLM2-style w1/w3/w2 naming. Sharding is identical to the
+        // canonical triple — only VarBuilder lookup differs. Verify both
+        // construction succeeds and output shape is unchanged.
+        let pg = LocalProcessGroup::new();
+        let vb = make_vb(&Device::Cpu);
+        let tp_ctx = TpContext::single_gpu();
+
+        let mlp = TpSwiGluMlp::new_with_proj_names(
+            64,
+            256,
+            vb.pp("feed_forward"),
+            &pg,
+            GluProjNames::W1_W3_W2,
+        )
+        .unwrap();
+
+        let input = Tensor::ones(&[2, 3, 64], DType::F32, &Device::Cpu).unwrap();
+        let output = mlp.forward(&input, &tp_ctx).unwrap();
+        assert_eq!(output.dims(), &[2, 3, 64]);
+    }
+
+    #[test]
+    fn tp_fused_swiglu_mlp_single_gpu() {
+        let pg = LocalProcessGroup::new();
+        let vb = make_vb(&Device::Cpu);
+        let tp_ctx = TpContext::single_gpu();
+
+        let mlp = TpFusedSwiGluMlp::new(64, 256, vb.pp("mlp"), &pg).unwrap();
+
+        let input = Tensor::ones(&[2, 3, 64], DType::F32, &Device::Cpu).unwrap();
+        let output = mlp.forward(&input, &tp_ctx).unwrap();
+        assert_eq!(output.dims(), &[2, 3, 64]);
+    }
+
+    #[test]
+    fn glu_proj_names_constants() {
+        assert_eq!(GluProjNames::STANDARD.gate, "gate_proj");
+        assert_eq!(GluProjNames::STANDARD.up, "up_proj");
+        assert_eq!(GluProjNames::STANDARD.down, "down_proj");
+        assert_eq!(GluProjNames::W1_W3_W2.gate, "w1");
+        assert_eq!(GluProjNames::W1_W3_W2.up, "w3");
+        assert_eq!(GluProjNames::W1_W3_W2.down, "w2");
+        assert_eq!(GluProjNames::default().gate, "gate_proj");
     }
 
     #[test]

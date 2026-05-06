@@ -18,54 +18,7 @@ use crate::layers::attention::{AttentionBlock, AttentionConfig, ProjNames};
 use crate::layers::RotaryEmbedding;
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear};
-
-// ─── MLP with InternLM2 naming ──────────────────────────────────────────────
-//
-// InternLM2 uses w1 (gate), w3 (up), w2 (down) under `feed_forward`.
-
-pub(crate) struct InternLM2SwiGluMlp {
-    w1: TpLinear, // gate_proj
-    w3: TpLinear, // up_proj
-    w2: TpLinear, // down_proj
-}
-
-impl InternLM2SwiGluMlp {
-    pub(crate) fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        let w1 = TpLinear::column_parallel(
-            hidden_size,
-            intermediate_size,
-            false,
-            false,
-            vb.pp("w1"),
-            pg,
-        )?;
-        let w3 = TpLinear::column_parallel(
-            hidden_size,
-            intermediate_size,
-            false,
-            false,
-            vb.pp("w3"),
-            pg,
-        )?;
-        let w2 =
-            TpLinear::row_parallel(intermediate_size, hidden_size, false, true, vb.pp("w2"), pg)?;
-
-        Ok(Self { w1, w3, w2 })
-    }
-
-    pub(crate) fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate = self.w1.forward(xs, tp_ctx)?;
-        let up = self.w3.forward(xs, tp_ctx)?;
-        let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        self.w2.forward(&hidden, tp_ctx)
-    }
-}
+use super::tp_layers::{GluProjNames, TpEmbedding, TpLinear, TpSwiGluMlp};
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
@@ -139,7 +92,7 @@ impl InternLM2Attention {
 
 pub(crate) struct InternLM2DecoderLayer {
     self_attn: InternLM2Attention,
-    mlp: InternLM2SwiGluMlp,
+    mlp: TpSwiGluMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -151,11 +104,12 @@ impl InternLM2DecoderLayer {
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
         let self_attn = InternLM2Attention::new_with_tp(cfg, vb.pp("attention"), pg)?;
-        let mlp = InternLM2SwiGluMlp::new(
+        let mlp = TpSwiGluMlp::new_with_proj_names(
             cfg.hidden_size,
             cfg.intermediate_size,
             vb.pp("feed_forward"),
             pg,
+            GluProjNames::W1_W3_W2,
         )?;
         let input_layernorm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("attention_norm"))?;
         let post_attention_layernorm =

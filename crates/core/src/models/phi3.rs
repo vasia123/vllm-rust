@@ -10,66 +10,7 @@ use crate::layers::attention::{AttentionBlock, AttentionConfig};
 use crate::layers::RotaryEmbedding;
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear};
-
-// ─── Fused SwiGLU MLP ───────────────────────────────────────────────────────
-//
-// Phi-3 fuses gate_proj and up_proj into a single gate_up_proj weight.
-// After projection, we split the output: first half is gate, second is up.
-
-struct Phi3FusedSwiGluMlp {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-    intermediate_size: usize,
-}
-
-impl Phi3FusedSwiGluMlp {
-    fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        // gate_up_proj: [hidden_size, 2 * intermediate_size] (fused)
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            false,
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            false,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        // TP splits the fused dim, so local intermediate_size = intermediate_size / world_size
-        let local_intermediate = intermediate_size / pg.world_size();
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            intermediate_size: local_intermediate,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let fused = self.gate_up_proj.forward(xs, tp_ctx)?;
-        let gate = fused.narrow(candle_core::D::Minus1, 0, self.intermediate_size)?;
-        let up = fused.narrow(
-            candle_core::D::Minus1,
-            self.intermediate_size,
-            self.intermediate_size,
-        )?;
-        let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        self.down_proj.forward(&hidden, tp_ctx)
-    }
-}
+use super::tp_layers::{TpEmbedding, TpFusedSwiGluMlp, TpLinear};
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 //
@@ -206,7 +147,7 @@ impl Phi3Attention {
 
 struct Phi3DecoderLayer {
     self_attn: Phi3Attention,
-    mlp: Phi3FusedSwiGluMlp,
+    mlp: TpFusedSwiGluMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -214,8 +155,7 @@ struct Phi3DecoderLayer {
 impl Phi3DecoderLayer {
     fn new_with_tp(cfg: &ModelConfig, vb: VarBuilder, pg: &dyn ProcessGroup) -> Result<Self> {
         let self_attn = Phi3Attention::new_with_tp(cfg, vb.pp("self_attn"), pg)?;
-        let mlp =
-            Phi3FusedSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
+        let mlp = TpFusedSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), pg)?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -672,11 +612,8 @@ mod tests {
         let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
         let pg = LocalProcessGroup::new();
 
-        let mlp =
-            Phi3FusedSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), &pg)
-                .expect("build mlp");
-
-        assert_eq!(mlp.intermediate_size, cfg.intermediate_size);
+        let mlp = TpFusedSwiGluMlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"), &pg)
+            .expect("build mlp");
 
         let tp_ctx = TpContext::single_gpu();
         let input = Tensor::zeros((1, 3, cfg.hidden_size), DType::F32, &device).expect("input");
