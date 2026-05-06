@@ -5,3 +5,6 @@ frontend/dist/*
 !frontend/dist/.gitkeep
 .claude/scheduled_tasks.lock
 scripts/__pycache__/
+
+# Local Python virtualenv for benchmark scripts.
+.venv/
