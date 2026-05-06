@@ -231,7 +231,10 @@ impl PagedAttnOp {
 
         let head_dim = self.head_dim;
         let elem_count = num_seqs * self.num_heads * head_dim;
-        let output_slice = dev.alloc_zeros::<T>(elem_count)?;
+        // Each (seq, head) block writes a full `head_dim` slice of output;
+        // every byte is covered before any read. SAFETY: kernel never
+        // reads `output_slice` before writing it.
+        let output_slice = unsafe { dev.alloc::<T>(elem_count) }?;
 
         let func = dev.get_or_load_custom_func(T::KERNEL_V1, "paged_attention", PTX)?;
 
@@ -1344,7 +1347,8 @@ impl CustomOp2 for FusedSwiGluOp {
 
         match (&gate_storage.slice, &up_storage.slice) {
             (CudaStorageSlice::BF16(gate_slice), CudaStorageSlice::BF16(up_slice)) => {
-                let output_slice = dev.alloc_zeros::<half::bf16>(elem_count)?;
+                // SAFETY: SwiGLU writes every output element; uninit safe.
+                let output_slice = unsafe { dev.alloc::<half::bf16>(elem_count) }?;
 
                 let func =
                     dev.get_or_load_custom_func("fused_swiglu_bf16", "swiglu", SWIGLU_PTX)?;
@@ -1365,7 +1369,8 @@ impl CustomOp2 for FusedSwiGluOp {
                 Ok((output_storage, gate_shape.clone()))
             }
             (CudaStorageSlice::F16(gate_slice), CudaStorageSlice::F16(up_slice)) => {
-                let output_slice = dev.alloc_zeros::<half::f16>(elem_count)?;
+                // SAFETY: SwiGLU writes every output element; uninit safe.
+                let output_slice = unsafe { dev.alloc::<half::f16>(elem_count) }?;
 
                 let func =
                     dev.get_or_load_custom_func("fused_swiglu_fp16", "swiglu", SWIGLU_PTX)?;
@@ -1532,7 +1537,9 @@ impl CustomOp1 for RmsNormOp {
 
         match (&input_storage.slice, &weight_storage.slice) {
             (CudaStorageSlice::BF16(input_slice), CudaStorageSlice::BF16(weight_slice)) => {
-                let output_slice = dev.alloc_zeros::<bf16>(num_tokens * hidden_size)?;
+                // SAFETY: RMSNorm fills every output element via the
+                // per-token block; uninit safe.
+                let output_slice = unsafe { dev.alloc::<bf16>(num_tokens * hidden_size) }?;
                 let func =
                     dev.get_or_load_custom_func("rms_norm_bf16", "layernorm", LAYERNORM_PTX)?;
 
@@ -1785,8 +1792,13 @@ impl CustomOp1 for RopeOp {
 
         match &input_storage.slice {
             CudaStorageSlice::BF16(input_slice) => {
-                // Copy input to output buffer (kernel modifies in-place)
-                let mut output_slice = dev.alloc_zeros::<bf16>(total_elems)?;
+                // Copy input to output buffer (kernel modifies in-place).
+                // The buffer is fully overwritten by `memcpy_dtod` before
+                // the kernel reads it; the implicit zero-init in
+                // `alloc_zeros` was dead work — switch to uninit alloc.
+                // SAFETY: every byte is initialised by `memcpy_dtod` prior
+                // to any read.
+                let mut output_slice = unsafe { dev.alloc::<bf16>(total_elems) }?;
                 dev.memcpy_dtod(input_slice, &mut output_slice)?;
 
                 let func = dev.get_or_load_custom_func(kernel_name, "rope", ROPE_PTX)?;
@@ -2040,7 +2052,8 @@ impl CustomOp1 for GeluAndMulOp {
 
         match &input_storage.slice {
             CudaStorageSlice::BF16(input_slice) => {
-                let output_slice = dev.alloc_zeros::<bf16>(num_tokens * d)?;
+                // SAFETY: gelu/silu kernel writes every output element.
+                let output_slice = unsafe { dev.alloc::<bf16>(num_tokens * d) }?;
                 let func_name = format!("{suffix}_bf16");
                 let func =
                     dev.get_or_load_custom_func(&func_name, "activations", ACTIVATIONS_PTX)?;
