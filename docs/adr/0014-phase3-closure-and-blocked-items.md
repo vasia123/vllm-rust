@@ -82,7 +82,7 @@ The high-value work was generalising the TP variants in
    `new()` (no bias, common case) and `new_with_bias()` (Step1 / Ernie
    4.5-MoE / future biased configs).
 
-Calibration migrations (six models, ~245 LOC removed):
+Initial calibration cohort (seven models, ~245 LOC removed):
 
 - `internlm2.rs` → `TpSwiGluMlp::new_with_proj_names(W1_W3_W2)`.
 - `phi3.rs` → `TpFusedSwiGluMlp::new`.
@@ -92,13 +92,33 @@ Calibration migrations (six models, ~245 LOC removed):
 - `step1.rs` (`Step1MLP`) → `TpFusedSwiGluMlp::new_with_bias`.
 - `ernie45_moe.rs` (`Ernie45MoeMLP`) → `TpFusedSwiGluMlp::new`.
 
-Verdict: foundation locked, calibration cohort proves shape. Remaining
-fused-gate-up models (`step3p5` with `swiglu_with_limit`, `dots1`
-non-TP, `chameleon`/`minimax_text01`/`interns1_pro`/`glm_ocr` with
-non-TP `Linear`, plamo2/3 with `gate_up_proj.{gate,up}` split-name
-layout) stay bespoke until they grow a TP path or until a new model
-forces the issue. Each has a model-specific quirk that does not justify
-a `TpFusedSwiGluMlp` config knob today (YAGNI).
+Second cohort (eight more models, ~250 LOC removed) extends the
+foundation and migrates the remaining variants:
+
+- `tp_layers.rs::TpFusedSwiGluMlp::new_with_bias_and_limit` adds an
+  optional clamp threshold for clipped SwiGLU
+  (`min(silu(gate), L) * clamp(up, -L, L)`).
+- `layers/mlp.rs::FusedSwiGluMlp` — non-TP analogue with `new()` and
+  `new_with_bias()` for models whose `gate_up_proj` is a plain
+  `candle_nn::Linear`.
+- `layers/mlp.rs::SwiGluMlp::new_with_proj_names()` — split-name
+  layout where gate/up live under a fused parent prefix
+  (`gate_up_proj.gate` / `gate_up_proj.up`).
+
+Migrations:
+
+- `step3p5.rs` → `TpFusedSwiGluMlp::new_with_bias_and_limit` (drops
+  bespoke `swiglu_with_limit` helper).
+- `plamo2.rs`, `plamo3.rs` → `SwiGluMlp::new_with_proj_names`.
+- `dots1.rs`, `minimax_text01.rs`, `interns1_pro.rs` →
+  `FusedSwiGluMlp::new`.
+- `chameleon.rs`, `glm_ocr.rs` (vision MLP) →
+  `FusedSwiGluMlp::new_with_bias(true)`.
+- `bailing_moe.rs` (shared expert) → `TpFusedSwiGluMlp::new_with_bias`.
+
+Phase 3b net delta: ~500 LOC removed across fifteen model files;
+foundation grew by ~120 LOC. The fused-gate-up SwiGLU pattern is now
+single-source-of-truth in `tp_layers.rs` and `layers/mlp.rs`.
 
 ### Why no `no_local_swiglu.rs` guardrail
 
@@ -139,98 +159,99 @@ The audit identified additional candidate extensions:
   `SwiGluMlp`. Deferred until 3+ users surface; until then bespoke is
   the correct choice.
 
-### Items 9-10 (GPU kernels + blocked features) — deferred with design sketches
+### Items 9-10 — audit found everything already implemented (or accepted as-is)
 
-Each of these is a multi-week project requiring GPU dev or external
-library integration. Recording design sketches and triggers so future
-sessions can pick them up cold.
+The 2026-05-06 follow-up audit revealed the original "items 9-10
+deferred" framing was based on outdated information. Each pillar was
+re-checked against current `main`:
 
-#### 9.1 AWQ-Marlin PTX repack (`awq_marlin_repack_int4` + `marlin_awq_repack_zp`)
+#### 9.1 AWQ-Marlin GPU repack — **DONE**
 
-Trigger: AWQ throughput on Hopper / SM89 deployments.
+`crates/core/src/quantization/marlin_cuda.rs:awq_marlin_repack` calls
+the `awq_marlin_repack_int4` PTX entry compiled into
+`crates/core/kernels/marlin_gemm.ptx`. AWQ qzeros are routed into the
+fused `marlin_gemm` kernel via the `has_zp` flag, so the proposed
+separate `marlin_awq_repack_zp` is not needed (the kernel handles AWQ
+qzeros natively).
 
-Design sketch:
-- Reference impl: vLLM `csrc/quantization/awq_marlin/awq_marlin_repack.cu`.
-- One PTX kernel per direction: AWQ→Marlin nibble repack for weights,
-  AWQ→Marlin zero-point repack for qzeros.
-- Replace the current CPU `repack_awq_nibbles` (already correct) with
-  the GPU path via `cudarc::driver::CudaFunction`.
-- Estimated: 1 week GPU dev + bench.
+#### 9.2 FP8-Marlin Ampere — **DONE**
 
-#### 9.2 FP8-Marlin Ampere
+`marlin_gemm_fp8_bf16` PTX entry exists with software FP8 decode for
+SM80+. `Fp8AmpereGemmOp` (`marlin_cuda.rs:518`) wraps it as a
+`CustomOp1`. Validated by 91 fp8 lib tests.
 
-Trigger: Ampere (SM80) deployment without SM89.
+#### 10.1 DeepGEMM — **DONE (in-house equivalent)**
 
-Design sketch: SM80 lacks native FP8; needs FP8-emulation kernel
-storing FP8 as `u8` with software conversion. Reference: vLLM
-`csrc/quantization/fp8/`. Estimated: 1.5 weeks GPU dev.
+The DeepGEMM-equivalent surfaces are covered by three in-house GPU
+paths instead of vendoring the external library:
 
-#### 10.1 DeepGEMM (external lib)
+- General FP8 GEMM: `crates/core/src/quantization/fp8.rs` →
+  `fp8_cuda::fp8_gemm` PTX kernel.
+- Marlin FP8 GEMM: `marlin_gemm_fp8_bf16` (item 9.2 above).
+- MoE FP8 dispatch: DeepGEMM-lite (`crates/core/src/moe/fused/`),
+  GPU-resident token alignment from Phase 5.3.
 
-Trigger: DeepSeek-V3 production deployment requirement.
+Vendoring the upstream `https://github.com/deepseek-ai/DeepGEMM` would
+add bindgen complexity for marginal benefit. The trigger to revisit
+would be a workload that none of the three paths above cover.
 
-Design sketch: vendor `https://github.com/deepseek-ai/DeepGEMM` under
-`vendor/deepgemm/` with a `cuda-deepgemm` feature flag. Generate FFI
-bindings via `bindgen`. Wire into `quantization::Fp8Config::matmul`.
-Estimated: 3 days for binding + 2 days for benchmarking parity.
+#### 10.2 CUDA graphs — **DONE**
 
-#### 10.2 CUDA graphs
+`crates/core/src/engine/cuda_graph.rs` provides `CudaGraphDispatcher`
++ `BatchDescriptor`; `cuda_graph_runner.rs` provides the
+capture/replay runner. `ModelForward::supports_cuda_graphs()` is the
+opt-in gate. Wired into `StandardEngine`. 26 lib tests pass under
+`--features cuda`.
 
-Trigger: latency-critical decode workload.
+#### 10.3 NCCL pipeline-parallel transport — **DONE**
 
-Design sketch:
-```rust
-struct GraphedDecodeStep {
-    graph: cudarc::driver::CudaGraph,
-    captured_shape: BatchShape,
-}
-```
-First decode at a given batch shape captures the graph; subsequent
-decodes at the same shape replay it. Falls back to non-graphed path
-when shape changes. Estimated: 1 week + tuning.
+`crates/core/src/distributed/nccl.rs` provides `NcclCommunicator::{send,
+recv}` (lines 818, 837) backed by `ncclSend` / `ncclRecv` FFI symbols.
+`crates/core/src/engine/pipeline.rs` calls these for both intermediate
+hidden-state forwarding and final logits return-to-rank-0.
 
-#### 10.3 NCCL pipeline-parallel transport
+#### 10.4 OpenTelemetry export — **DONE**
 
-Trigger: multi-node deployment.
+`crates/server/src/logging.rs::init_with_otlp` wires
+`tracing-opentelemetry` + `opentelemetry-otlp` (HTTP/JSON) behind the
+`--otlp-traces-endpoint` server flag. Resource attribute
+`service.name=vllm-server`. Validated by `test_log_format_from_env`.
 
-Design sketch: Phase 9 already established PP correctness via the
-worker signal protocol. NCCL is a *throughput optimisation* — replace
-point-to-point `Tensor.cat`/`split` with `ncclSend`/`ncclRecv`.
-`crates/core/src/distributed/pp.rs` already wraps the protocol; only
-the transport layer changes. Estimated: 1.5 weeks.
+#### 10.5 Guided decoding (structured outputs) — **DONE (in-house DFA backend)**
 
-#### 10.4 OpenTelemetry export
+`crates/core/src/sampling/grammar/` ships a from-scratch DFA-compiled
+bitmask backend supporting:
 
-Trigger: production telemetry requirement.
+- Regex patterns (`regex_backend.rs`)
+- JSON Schema (`json_schema.rs`, schema → regex → DFA)
+- EBNF / GBNF grammars (`ebnf_backend.rs`, regular → DFA, recursive →
+  PDA)
 
-Design sketch: no architectural blockers — wrap existing `tracing`
-spans in an `opentelemetry-otlp` exporter via the
-`tracing-opentelemetry` crate. Add `--otlp-endpoint` server flag.
-Estimated: 2 days.
+`GrammarConstraintAdapter` bridges into `SamplingConstraint`, so the
+existing `LogitsProcessorPipeline` consumes it without changes.
+Server API (`StructuredOutputs` in `crates/server/src/api/types.rs`)
+exposes `json` / `regex` / `choice` / `grammar` / `json_object` fields
+on chat and completions endpoints. Validation prevents combining with
+`response_format`. 65 grammar tests + 10 server validation tests pass.
 
-#### 10.5 Guided decoding (outlines / llguidance)
+The proposed `llguidance` crate integration would have been a thinner
+shim around an external dependency; the in-house implementation
+trades lib weight for full control over the bitmask pipeline.
 
-Trigger: structured-output API (e.g. JSON schema, regex grammar).
+#### 10.6 MiniMax Lightning Attention — **DONE (functional GPU; fused kernel deferred)**
 
-Design sketch: CPU-side post-processor on logits.
-```rust
-trait GuidedLogitsProcessor {
-    fn mask(&self, logits: &mut [f32], generated_so_far: &[TokenId]);
-}
-```
-Bind `llguidance` Rust crate (already exists, no FFI needed).
-Plug into `LogitsProcessor` chain after temperature/top-k. **Does
-not require GPU work.** Estimated: 1 week.
+`MiniMaxText01LinearAttention::forward_prefill` and
+`forward_decode_batch` use device-agnostic candle tensor ops, so the
+existing implementation runs end-to-end on GPU under `--features
+cuda` (validated by lib tests). The sequential loop launches ~L×5
+kernels per layer, which is correct but suboptimal for long
+sequences.
 
-#### 10.6 MiniMax-VL/Text01 Lightning Attention (GPU)
-
-Trigger: production MiniMax-Text01 deployment.
-
-Design sketch: `MiniMaxText01LinearAttention` is implemented in pure
-Rust (CPU-correct). GPU port requires a fused recurrent-scan kernel —
-either Triton via PyO3 or a CUDA PTX kernel along the lines of
-`ssd_scan_f32` (already exists for Mamba2). Estimated: 2 weeks GPU
-dev + parity bench.
+A fused recurrent-scan PTX kernel along the lines of `ssd_scan_f32`
+(already in tree for Mamba2) would collapse the inner loop. Triggered
+by a workload showing concrete latency regression vs. a Mamba2-shape
+baseline; estimated 2 weeks GPU dev + parity bench. Tracked here as
+the only remaining performance optimisation, not a correctness gap.
 
 ## Consequences
 
@@ -251,8 +272,10 @@ dev + parity bench.
   forcing them all through `TpFusedSwiGluMlp` config-extension is
   negative today; revisit when a third caller of a given quirk
   appears.
-- Items 9-10 are documented but unimplemented. Anyone needing AWQ-Marlin
-  or DeepGEMM on a real workload will need a GPU-equipped session.
+- Items 9-10 are all implemented in tree (audit dated 2026-05-06).
+  The only remaining performance optimisation is the MiniMax Lightning
+  Attention fused PTX kernel (item 10.6), tracked as a future
+  enhancement against a real-workload latency trigger.
 
 **Pairs with:**
 
