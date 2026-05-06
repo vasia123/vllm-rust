@@ -433,9 +433,9 @@ mod tests {
         let vocab_size = 50usize;
         let mut logits_data = vec![-100.0f32; 3 * vocab_size];
         // Position 0 predicts token 20
-        logits_data[0 * vocab_size + 20] = 100.0;
+        logits_data[20] = 100.0;
         // Position 1 predicts token 30
-        logits_data[1 * vocab_size + 30] = 100.0;
+        logits_data[vocab_size + 30] = 100.0;
         // Position 2 predicts token 40 (bonus token)
         logits_data[2 * vocab_size + 40] = 100.0;
 
@@ -457,9 +457,9 @@ mod tests {
         let vocab_size = 100usize;
         let mut logits_data = vec![-100.0f32; 3 * vocab_size];
         // Position 0 predicts token 20 (matches)
-        logits_data[0 * vocab_size + 20] = 100.0;
+        logits_data[20] = 100.0;
         // Position 1 predicts token 99 (doesn't match 30)
-        logits_data[1 * vocab_size + 99] = 100.0;
+        logits_data[vocab_size + 99] = 100.0;
 
         let logits = Tensor::from_vec(logits_data, (3, vocab_size), &Device::Cpu).unwrap();
         let accepted = tree.verify_and_accept(&logits, 0.0).unwrap();
@@ -476,7 +476,7 @@ mod tests {
         let vocab_size = 100usize;
         let mut logits_data = vec![-100.0f32; 3 * vocab_size];
         // Position 0 predicts token 99 (doesn't match 20)
-        logits_data[0 * vocab_size + 99] = 100.0;
+        logits_data[99] = 100.0;
 
         let logits = Tensor::from_vec(logits_data, (3, vocab_size), &Device::Cpu).unwrap();
         let accepted = tree.verify_and_accept(&logits, 0.0).unwrap();
