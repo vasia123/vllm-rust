@@ -1088,7 +1088,23 @@ pub(crate) fn check_finished(
     }
 
     if !state.stop_strings.is_empty() {
-        if let Ok(text) = tokenizer.decode(&state.generated_token_ids) {
+        // Detokenizing every accumulated token each decode step is O(N)
+        // and dominates check_finished for long generations. We only need
+        // enough of the tail to decide whether the suffix matches any
+        // stop string. Budget = max(stop_string byte length) tokens × 2,
+        // floored at 16 — large enough to absorb multi-byte UTF-8 splits
+        // and BPE continuations in practice, far smaller than full
+        // history for any non-trivial generation.
+        let max_stop_bytes = state
+            .stop_strings
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        let budget = max_stop_bytes.saturating_mul(2).max(16);
+        let start = state.generated_token_ids.len().saturating_sub(budget);
+        let tail = &state.generated_token_ids[start..];
+        if let Ok(text) = tokenizer.decode(tail) {
             for stop_str in &state.stop_strings {
                 if text.ends_with(stop_str.as_str()) {
                     let trim = if state.include_stop_str_in_output {
