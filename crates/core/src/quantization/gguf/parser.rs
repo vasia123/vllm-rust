@@ -523,6 +523,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is an arbitrary F32 round-trip value, not π.
     fn test_gguf_value_conversions() {
         let val = GgufValue::U32(42);
         assert_eq!(val.as_u32(), Some(42));

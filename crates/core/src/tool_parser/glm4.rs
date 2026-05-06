@@ -347,6 +347,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is an arbitrary numeric sample, not π.
     fn deserialize_value_json_number() {
         assert_eq!(deserialize_value("42"), serde_json::json!(42));
         assert_eq!(deserialize_value("3.14"), serde_json::json!(3.14));

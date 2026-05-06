@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(mamba_cfg.d_inner, 768 * 2); // default expand=2
         assert_eq!(mamba_cfg.d_state, 16); // default
         assert_eq!(mamba_cfg.d_conv, 4); // default
-        assert_eq!(mamba_cfg.dt_rank, (768 + 15) / 16); // ceil(768/16) = 48
+        assert_eq!(mamba_cfg.dt_rank, 768_usize.div_ceil(16)); // ceil(768/16) = 48
     }
 
     #[test]
@@ -712,7 +712,7 @@ mod tests {
         let data: Vec<f32> = result.flatten_all().expect("flat").to_vec1().expect("vec");
         for val in &data {
             assert!(
-                (*val - 0.6931).abs() < 1e-3,
+                (*val - std::f32::consts::LN_2).abs() < 1e-3,
                 "softplus(0) should be ln(2), got {}",
                 val
             );

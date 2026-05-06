@@ -813,6 +813,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is an arbitrary sample metric value, not π.
     fn prometheus_metric_with_labels() {
         let metric = PrometheusMetric {
             name: "test_metric".to_string(),
