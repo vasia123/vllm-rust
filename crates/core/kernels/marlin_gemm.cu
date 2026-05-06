@@ -458,6 +458,64 @@ extern "C" __global__ void awq_marlin_repack_int4(
         (n2 << 16) | (n6 << 20) | (n3 << 24) | (n7 << 28);
 }
 
+// ─── Full AWQ → GPTQ qweight repack (packing axis transpose) ────────────────
+//
+// AWQ stores quantised weights as `[K, N/8]` u32 — eight int4 values packed
+// along the OUTPUT axis with `undo_pack = {0,4,1,5,2,6,3,7}` interleaving.
+// GPTQ stores them as `[K/8, N]` u32 — eight int4 values packed along the
+// INPUT axis in sequential nibble order.
+//
+// `awq_marlin_repack_int4` only handles the per-word nibble reorder (good
+// for qzeros, where AWQ and GPTQ shapes match). For qweight we additionally
+// need to transpose the packing axis. Doing this on the host with a strided
+// scalar Rust loop took 5+ minutes for Qwen3-4B — every inner read hit a
+// fresh cache line. This kernel does the same transform end-to-end on the
+// GPU in milliseconds.
+//
+// One thread per output cell `(kb, n)`:
+//   gptq_word = 0
+//   for i in 0..8:
+//       k = kb * 8 + i
+//       awq_word = input[k, n / 8]             // strided read across 8 rows
+//       nib      = (awq_word >> undo_shift(n % 8)) & 0xF
+//       gptq_word |= nib << (i * 4)
+//   output[kb, n] = gptq_word                  // coalesced along N
+//
+// undo_shift(j) = AWQ_UNDO_PACK[j] * 4 = {0, 16, 4, 20, 8, 24, 12, 28}
+//
+// Reads aren't coalesced (8-way strided across rows), but at sm_89 the L2
+// soaks them up; the Rust CPU path was hitting DRAM every iteration, so
+// even a memory-bound version of this kernel beats it by orders of
+// magnitude. Coalesced WRITES along the N axis cover the only big-bandwidth
+// edge.
+extern "C" __global__ void awq_to_gptq_qweight_int4(
+    unsigned int* __restrict__ output,       // [packed_k = K/8, N]
+    const unsigned int* __restrict__ input,  // [K, packed_n = N/8]
+    int packed_k,                            // K / 8
+    int n,                                   // N (output_size)
+    int packed_n                             // N / 8
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;     // 0 ≤ col < n
+    int row = blockIdx.y * blockDim.y + threadIdx.y;     // 0 ≤ row < packed_k
+    if (row >= packed_k || col >= n) return;
+
+    // AWQ output-lane → bit shift (AWQ_UNDO_PACK[j] * 4):
+    //   {0, 4, 1, 5, 2, 6, 3, 7} * 4 = {0, 16, 4, 20, 8, 24, 12, 28}
+    static const unsigned int kUndoShifts[8] = {0u, 16u, 4u, 20u, 8u, 24u, 12u, 28u};
+    unsigned int undo_shift = kUndoShifts[col & 7u];
+    int n_block = col >> 3;            // col / 8
+
+    int k_base = row * 8;
+    unsigned int word = 0u;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        unsigned int awq_word = input[(k_base + i) * packed_n + n_block];
+        unsigned int nib = (awq_word >> undo_shift) & 0xFu;
+        word |= nib << (i * 4);
+    }
+    output[row * n + col] = word;
+}
+
 // ─── FP8 E4M3 GEMM for Ampere (software decode) ─────────────────────────────
 //
 // Performs output = input @ dequant(weight).T + bias

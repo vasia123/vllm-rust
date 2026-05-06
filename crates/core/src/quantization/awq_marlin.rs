@@ -199,6 +199,20 @@ pub(crate) fn awq_to_gptq_qweight(
         );
     }
 
+    // GPU fast path: a single CUDA kernel that does both the nibble
+    // deinterleave and the packing-axis transpose. Replaces a strided
+    // scalar Rust loop on the host that took 5+ minutes for Qwen3-4B
+    // (252 linear layers × ~12M iterations each, every read on a fresh
+    // cache line).
+    #[cfg(feature = "marlin")]
+    if awq_qweight.device().is_cuda() {
+        return super::marlin_cuda::awq_to_gptq_qweight_cuda(
+            awq_qweight,
+            in_features,
+            out_features,
+        );
+    }
+
     let original_device = awq_qweight.device().clone();
     let words: Vec<u32> = awq_qweight
         .to_device(&Device::Cpu)?

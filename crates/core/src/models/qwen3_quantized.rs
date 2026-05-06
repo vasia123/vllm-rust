@@ -189,11 +189,12 @@ impl QuantizedQwen3Attention {
         self.o_proj.forward(&attn_output)
     }
 
-    fn forward_decode_batch(
+    fn forward_decode_batch_with_shared(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
+        shared: Option<&crate::layers::attention::DecodeBatchShared>,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
@@ -221,37 +222,73 @@ impl QuantizedQwen3Attention {
             let k = k.squeeze(2)?;
             let v = v.squeeze(2)?;
 
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
+            // Reuse pre-built per-forward shared tensors when supplied.
+            // Without `shared`, every decoder layer used to rebuild
+            // `block_tables` / `seq_lens` via `Tensor::from_vec` — 36
+            // host->device uploads per Qwen3-4B token and the implicit
+            // syncs that come with them.
+            let positions_owned: Vec<usize>;
+            let positions: &[usize] = match shared {
+                Some(s) => &s.positions,
+                None => {
+                    positions_owned = sequences.iter().map(|s| s.seqlen_offset).collect();
+                    &positions_owned
+                }
+            };
+            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, positions)?;
 
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
+            let slot_mapping_owned: Vec<usize>;
+            let all_slot_mapping: &[usize] = match shared {
+                Some(s) => &s.all_slot_mapping,
+                None => {
+                    slot_mapping_owned = sequences
+                        .iter()
+                        .flat_map(|s| s.slot_mapping.iter().copied())
+                        .collect();
+                    &slot_mapping_owned
+                }
+            };
             cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
+                .write_batch(&k, &v, all_slot_mapping)
                 .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
 
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-                }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
+            let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len): (
+                Tensor,
+                Tensor,
+                usize,
+                usize,
+            ) = match shared {
+                Some(s) => (
+                    s.block_tables.clone(),
+                    s.seq_lens.clone(),
+                    s.max_blocks_per_seq,
+                    s.max_seq_len,
+                ),
+                None => {
+                    let max_blocks_per_seq = sequences
+                        .iter()
+                        .map(|s| s.block_ids.len())
+                        .max()
+                        .unwrap_or(1);
+                    let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
+                    for (i, seq) in sequences.iter().enumerate() {
+                        for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                            bt_data[i * max_blocks_per_seq + j] = block_id as u32;
+                        }
+                    }
+                    let bt =
+                        Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
 
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+                    let seq_lens_data: Vec<u32> = sequences
+                        .iter()
+                        .map(|s| (s.seqlen_offset + 1) as u32)
+                        .collect();
+                    let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
+                    let sl = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+
+                    (bt, sl, max_blocks_per_seq, max_seq_len)
+                }
+            };
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
@@ -275,6 +312,10 @@ impl QuantizedQwen3Attention {
 
         #[cfg(not(feature = "cuda-kernels"))]
         {
+            // CPU fallback path doesn't use the shared bundle (no GPU
+            // kernel to feed pre-built tensors into); explicitly mark it
+            // consumed so `-D unused-variables` stays clean.
+            let _ = shared;
             let mut outputs = Vec::with_capacity(batch_size);
             for (i, seq) in sequences.iter().enumerate() {
                 let q_i = q.narrow(0, i, 1)?;
@@ -392,12 +433,24 @@ impl QuantizedQwen3DecoderLayer {
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
     ) -> Result<Tensor> {
+        self.forward_decode_batch_with_shared(xs, sequences, kv_cache_mgr, layer_idx, None)
+    }
+
+    fn forward_decode_batch_with_shared(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        layer_idx: usize,
+        shared: Option<&crate::layers::attention::DecodeBatchShared>,
+    ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward_decode_batch(
+        let xs = self.self_attn.forward_decode_batch_with_shared(
             &xs,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
+            shared,
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
@@ -572,6 +625,37 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
             xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
         }
 
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs)
+    }
+
+    /// Override the default trait fall-through so the per-forward shared
+    /// decode tensors built in `engine::helpers::execute_batched_decode_with_graph`
+    /// reach every attention layer. Without this override the quantized
+    /// path silently rebuilt block_tables/seq_lens 36× per token via
+    /// per-layer `Tensor::from_vec` host->device uploads.
+    fn forward_decode_batch_with_ctx(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        ctx: &crate::engine::cuda_graph::ForwardContext,
+    ) -> Result<Tensor> {
+        let shared: Option<&crate::layers::attention::DecodeBatchShared> = ctx
+            .decode_shared
+            .as_ref()
+            .and_then(|arc| arc.downcast_ref::<crate::layers::attention::DecodeBatchShared>());
+
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward_decode_batch_with_shared(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                shared,
+            )?;
+        }
         let xs = self.norm.forward(&xs)?;
         self.lm_head.forward(&xs)
     }

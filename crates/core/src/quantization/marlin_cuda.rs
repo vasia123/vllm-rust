@@ -566,6 +566,116 @@ pub fn awq_marlin_repack(qweight: &Tensor, size_k: usize, size_n: usize) -> Resu
     qweight.apply_op1(op)
 }
 
+/// CUDA op for full AWQ qweight → GPTQ qweight transform.
+///
+/// Both transposes the packing axis (`[K, N/8]` → `[K/8, N]`) and reorders
+/// the nibbles within each u32 from AWQ interleaved to GPTQ sequential.
+/// On the host this was an O(K·N) strided scalar Rust loop — 2.85 billion
+/// random-access reads for Qwen3-4B's 252 linear layers, 5+ minutes wall
+/// time. The kernel runs the same transform in milliseconds.
+struct AwqToGptqQweightOp {
+    in_features: usize,  // K
+    out_features: usize, // N
+}
+
+impl CustomOp1 for AwqToGptqQweightOp {
+    fn name(&self) -> &'static str {
+        "awq_to_gptq_qweight_int4"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("awq_to_gptq_qweight_int4 requires CUDA")
+    }
+
+    fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        if !self.in_features.is_multiple_of(8) {
+            candle_core::bail!(
+                "awq_to_gptq_qweight_int4: in_features ({}) must be divisible by 8",
+                self.in_features
+            );
+        }
+        if !self.out_features.is_multiple_of(8) {
+            candle_core::bail!(
+                "awq_to_gptq_qweight_int4: out_features ({}) must be divisible by 8",
+                self.out_features
+            );
+        }
+
+        let dev = &storage.device;
+        let func = dev.get_or_load_custom_func(
+            "awq_to_gptq_qweight_int4",
+            "marlin_gemm",
+            MARLIN_GEMM_PTX,
+        )?;
+
+        let packed_k = self.in_features / 8;
+        let packed_n = self.out_features / 8;
+
+        // Output: [packed_k, N]
+        let elem_count = packed_k * self.out_features;
+        let output = dev.alloc_zeros::<u32>(elem_count)?;
+
+        let input = match &storage.slice {
+            CudaStorageSlice::U32(s) => s,
+            _ => candle_core::bail!("awq_to_gptq_qweight_int4: qweight must be U32"),
+        };
+
+        const BLOCK: u32 = 16;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (self.out_features as u32).div_ceil(BLOCK),
+                (packed_k as u32).div_ceil(BLOCK),
+                1,
+            ),
+            block_dim: (BLOCK, BLOCK, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let packed_k_i32 = packed_k as i32;
+        let n_i32 = self.out_features as i32;
+        let packed_n_i32 = packed_n as i32;
+
+        let mut builder = func.builder();
+        builder.arg(&output);
+        builder.arg(input);
+        builder.arg(&packed_k_i32);
+        builder.arg(&n_i32);
+        builder.arg(&packed_n_i32);
+
+        unsafe { builder.launch(cfg) }.map_err(|e| {
+            candle_core::Error::Msg(format!("awq_to_gptq_qweight_int4 launch: {e}"))
+        })?;
+
+        let output_storage = CudaStorage {
+            slice: CudaStorageSlice::U32(output),
+            device: dev.clone(),
+        };
+        Ok((
+            output_storage,
+            Shape::from_dims(&[packed_k, self.out_features]),
+        ))
+    }
+}
+
+/// Transform AWQ qweight `[K, N/8]` (output-axis interleaved) into GPTQ
+/// qweight `[K/8, N]` (input-axis sequential) on the GPU.
+///
+/// One-shot at load time; replaces the strided scalar Rust loop in
+/// `awq_to_gptq_qweight` (`crates/core/src/quantization/awq_marlin.rs`).
+pub fn awq_to_gptq_qweight_cuda(
+    qweight: &Tensor,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Tensor> {
+    let op = AwqToGptqQweightOp {
+        in_features,
+        out_features,
+    };
+    qweight.apply_op1(op)
+}
+
 // ─── FP8 E4M3 GEMM for Ampere (software decode) ─────────────────────────────
 
 /// CUDA op for FP8 E4M3 GEMM via software decode on Ampere (sm_80+).
