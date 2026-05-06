@@ -822,20 +822,18 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
 
     // Step 5: Sample tokens and update state.
     //
-    // GPU fast path: if all sequences are GPU-eligible (no penalties, logit bias,
-    // constraints, logprobs, or bad words), sample entirely on GPU. Only the
-    // final token IDs ([batch_size] u32) are transferred back — not the full
-    // [batch_size, vocab_size] logit matrix.
+    // GPU fast path: every sequence in the batch must be `gpu_eligible_strict`
+    // (no multiplicative penalties, no min_p/typical_p, no allowed-list
+    // whitelist, no beam search), no constraints (FSM-based guided
+    // decoding), and no logprobs requested.  Additive modifiers
+    // (logit_bias, freq+pres penalties, banned tokens, bad words) get
+    // folded into a single `index_add` on the GPU before temperature
+    // scaling, so they no longer force a full logits → CPU transfer.
     let all_gpu_eligible = batch_ids.iter().all(|&id| {
         requests.get(&id).is_some_and(|r| {
-            r.state.sampling_params.gpu_eligible()
+            r.state.sampling_params.gpu_eligible_strict()
                 && r.state.num_top_logprobs.is_none()
                 && r.state.constraint.is_none()
-                && r.state
-                    .sampling_params
-                    .bad_words_token_ids
-                    .as_ref()
-                    .is_none_or(|bw| bw.is_empty())
         })
     });
 
@@ -853,12 +851,90 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             })
             .collect();
 
-        // Build per-sequence GPU sampling configs (immutable borrow)
+        // Build per-sequence GPU sampling configs and additive diffs.
+        let mut diffs: Vec<sampling::gpu::LogitsDiff> = Vec::new();
         let configs: Vec<sampling::gpu::GpuSamplingConfig> = batch_ids
             .iter()
             .enumerate()
             .map(|(i, &id)| {
-                let params = &requests[&id].state.sampling_params;
+                let req = &requests[&id];
+                let params = &req.state.sampling_params;
+                let seq_idx = i as u32;
+
+                // Frequency + presence penalties — counted over generated
+                // tokens, applied once per unique token.
+                if params.frequency_penalty != 0.0 || params.presence_penalty != 0.0 {
+                    let mut counts: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
+                    for &t in &req.state.generated_token_ids {
+                        *counts.entry(t).or_insert(0) += 1;
+                    }
+                    for (&token_id, &count) in &counts {
+                        let delta = -(params.frequency_penalty * count as f32
+                            + if count > 0 {
+                                params.presence_penalty
+                            } else {
+                                0.0
+                            });
+                        if delta != 0.0 {
+                            diffs.push(sampling::gpu::LogitsDiff {
+                                seq_idx,
+                                token_id,
+                                delta,
+                            });
+                        }
+                    }
+                }
+                // Logit bias.
+                if let Some(ref bias) = params.logit_bias {
+                    for &(token_id, delta) in bias {
+                        diffs.push(sampling::gpu::LogitsDiff {
+                            seq_idx,
+                            token_id,
+                            delta,
+                        });
+                    }
+                }
+                // Banned tokens — set to -inf via additive sentinel.
+                if let Some(ref banned) = params.banned_token_ids {
+                    for &token_id in banned {
+                        diffs.push(sampling::gpu::LogitsDiff {
+                            seq_idx,
+                            token_id,
+                            delta: f32::NEG_INFINITY,
+                        });
+                    }
+                }
+                // Bad words — only the final token of a matched prefix is
+                // disabled this step.  Collect those that match into the
+                // diff list.
+                if let Some(ref bad_words) = params.bad_words_token_ids {
+                    for word in bad_words {
+                        if word.is_empty() {
+                            continue;
+                        }
+                        if word.len() == 1 {
+                            diffs.push(sampling::gpu::LogitsDiff {
+                                seq_idx,
+                                token_id: word[0],
+                                delta: f32::NEG_INFINITY,
+                            });
+                            continue;
+                        }
+                        let prefix_len = word.len() - 1;
+                        let gen = &req.state.generated_token_ids;
+                        if gen.len() < prefix_len {
+                            continue;
+                        }
+                        if gen[gen.len() - prefix_len..] == word[..prefix_len] {
+                            diffs.push(sampling::gpu::LogitsDiff {
+                                seq_idx,
+                                token_id: word[word.len() - 1],
+                                delta: f32::NEG_INFINITY,
+                            });
+                        }
+                    }
+                }
+
                 if params.is_greedy() {
                     sampling::gpu::GpuSamplingConfig {
                         inv_temperature: 0.0,
@@ -877,7 +953,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             })
             .collect();
 
-        match sampling::gpu::gpu_sample_batch(&last_logits, &configs) {
+        match sampling::gpu::gpu_sample_batch_with_diffs(&last_logits, &configs, &diffs) {
             Ok(token_ids) => {
                 for (i, &req_id) in batch_ids.iter().enumerate() {
                     let Some(req) = requests.get_mut(&req_id) else {

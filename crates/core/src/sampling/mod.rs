@@ -122,21 +122,43 @@ impl SamplingParams {
         self.beam_search.is_some()
     }
 
-    /// Whether this sequence can use the GPU sampling fast path.
+    /// Whether this sequence can use the GPU sampling fast path with no
+    /// pre-temperature logit modifiers — argmax / top-k / top-p / temperature
+    /// only.
     ///
-    /// GPU sampling handles greedy (argmax) and standard top-k/top-p multinomial.
-    /// Sequences requiring penalties, logit bias, min_p, typical_p, constraints,
-    /// banned/allowed tokens, or bad words must fall back to CPU sampling.
+    /// Multiplicative or filter-style modifiers (repetition_penalty, min_p,
+    /// typical_p, allowed-list whitelisting, beam search) still bail out to
+    /// the CPU path.
     pub fn gpu_eligible(&self) -> bool {
+        self.gpu_eligible_strict() && !self.has_additive_diffs()
+    }
+
+    /// Strict variant: every modifier the GPU sampler can't model is absent.
+    /// Additive penalties, logit bias, banned tokens, and bad words are
+    /// folded into the GPU path via `gpu_apply_logits_diff`, so they do
+    /// not block this check.
+    pub fn gpu_eligible_strict(&self) -> bool {
         self.repetition_penalty == 1.0
-            && self.frequency_penalty == 0.0
-            && self.presence_penalty == 0.0
             && self.min_p == 0.0
             && self.typical_p == 1.0
-            && self.logit_bias.is_none()
-            && self.banned_token_ids.is_none()
             && self.allowed_token_ids.is_none()
             && self.beam_search.is_none()
+    }
+
+    /// Whether this sequence carries any purely-additive logit diffs that
+    /// `gpu_apply_logits_diff` can fold into the GPU sampling pipeline.
+    pub fn has_additive_diffs(&self) -> bool {
+        self.frequency_penalty != 0.0
+            || self.presence_penalty != 0.0
+            || self.logit_bias.as_ref().is_some_and(|b| !b.is_empty())
+            || self
+                .banned_token_ids
+                .as_ref()
+                .is_some_and(|b| !b.is_empty())
+            || self
+                .bad_words_token_ids
+                .as_ref()
+                .is_some_and(|b| !b.is_empty())
     }
 
     /// Create sampling params configured for beam search.

@@ -2279,6 +2279,7 @@ fn report_gpu_mem(tag: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_generate(
     model_id: String,
     draft_model_id: Option<String>,

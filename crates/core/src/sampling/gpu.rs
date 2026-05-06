@@ -447,6 +447,60 @@ pub fn gpu_temperature_scale(logits: &Tensor, inv_temps: &[f32]) -> Result<Tenso
     logits_f32.broadcast_mul(&scales)
 }
 
+// ─── Additive logit diffs (penalties, bias, banned tokens) ─────────────────
+
+/// One additive change to a single `(seq_idx, token_id)` cell of the logits
+/// matrix.  Multiple entries that hit the same cell are summed by
+/// `index_add`, so callers can stack `freq_penalty + pres_penalty + bias`
+/// for the same token without pre-merging on the host.
+#[derive(Debug, Clone, Copy)]
+pub struct LogitsDiff {
+    pub seq_idx: u32,
+    pub token_id: u32,
+    pub delta: f32,
+}
+
+/// Apply a batch of additive diffs to a `[num_seqs, vocab_size]` logits
+/// tensor in a single GPU `index_add` (or its CPU equivalent).
+///
+/// This is the GPU counterpart to the CPU helpers
+/// `apply_logit_bias`, `apply_frequency_presence_penalty`,
+/// `apply_banned_tokens`, and `apply_bad_words` — together they cover every
+/// purely-additive logit modifier the sampler currently supports.
+/// Multiplicative effects (repetition penalty) are NOT covered here and stay
+/// on the CPU path.
+///
+/// Empty `diffs` is a no-op and returns the input as-is — the caller can
+/// build the vector unconditionally without checking the fast path.
+pub fn gpu_apply_logits_diff(logits: &Tensor, diffs: &[LogitsDiff]) -> Result<Tensor> {
+    if diffs.is_empty() {
+        return Ok(logits.clone());
+    }
+    let (num_seqs, vocab_size) = logits.dims2()?;
+    let vocab_u32 = vocab_size as u32;
+
+    // Build flat (seq_idx * vocab_size + token_id) indices on the host.
+    // index_add is O(diffs.len()) so this is small (sum of unique generated
+    // tokens across the batch) and dominated by GPU launch latency rather
+    // than transfer cost.
+    let mut indices: Vec<u32> = Vec::with_capacity(diffs.len());
+    let mut values: Vec<f32> = Vec::with_capacity(diffs.len());
+    for d in diffs {
+        debug_assert!(d.seq_idx < num_seqs as u32);
+        debug_assert!(d.token_id < vocab_u32);
+        indices.push(d.seq_idx * vocab_u32 + d.token_id);
+        values.push(d.delta);
+    }
+
+    let device = logits.device();
+    let idx_t = Tensor::from_vec(indices, diffs.len(), device)?;
+    let val_t = Tensor::from_vec(values, diffs.len(), device)?;
+
+    let flat = logits.flatten_all()?;
+    let updated = flat.index_add(&idx_t, &val_t, 0)?;
+    updated.reshape((num_seqs, vocab_size))
+}
+
 // ─── Batched GPU sampling pipeline ──────────────────────────────────────────
 
 /// Per-sequence sampling configuration for the batched GPU pipeline.
@@ -475,12 +529,26 @@ pub struct GpuSamplingConfig {
 /// Accepts logits of any float dtype (BF16/F16/F32). Internally cast to F32 once
 /// so that downstream kernels and CPU paths see a uniform dtype contract.
 pub fn gpu_sample_batch(logits: &Tensor, configs: &[GpuSamplingConfig]) -> Result<Vec<u32>> {
+    gpu_sample_batch_with_diffs(logits, configs, &[])
+}
+
+/// Same as [`gpu_sample_batch`], but applies a batch of additive logit diffs
+/// (logit_bias, freq+pres penalties, banned tokens, bad words) on-GPU before
+/// temperature scaling.  The eligibility check in the caller is responsible
+/// for ensuring no multiplicative or filter-style modifiers slipped in.
+pub fn gpu_sample_batch_with_diffs(
+    logits: &Tensor,
+    configs: &[GpuSamplingConfig],
+    diffs: &[LogitsDiff],
+) -> Result<Vec<u32>> {
     let (num_seqs, _vocab_size) = logits.dims2()?;
     assert_eq!(num_seqs, configs.len());
 
     // Establish the sampler-path dtype contract: all downstream ops see F32 logits.
     // No-op when the input tensor is already F32.
-    let logits = &logits.to_dtype(DType::F32)?;
+    let logits = logits.to_dtype(DType::F32)?;
+    let logits = gpu_apply_logits_diff(&logits, diffs)?;
+    let logits = &logits;
 
     // Check if all greedy — fast path
     let all_greedy = configs.iter().all(|c| c.inv_temperature == 0.0);
@@ -1137,6 +1205,100 @@ mod tests {
 
         let ids = gpu_sample_batch(&logits, &configs).unwrap();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_gpu_apply_logits_diff_empty_is_noop() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &device).unwrap();
+        let out = gpu_apply_logits_diff(&logits, &[]).unwrap();
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_gpu_apply_logits_diff_basic_add() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.0f32; 6], (2, 3), &device).unwrap();
+        let diffs = vec![
+            LogitsDiff {
+                seq_idx: 0,
+                token_id: 1,
+                delta: 5.0,
+            },
+            LogitsDiff {
+                seq_idx: 1,
+                token_id: 2,
+                delta: -2.5,
+            },
+        ];
+        let out = gpu_apply_logits_diff(&logits, &diffs).unwrap();
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(v, vec![0.0, 5.0, 0.0, 0.0, 0.0, -2.5]);
+    }
+
+    #[test]
+    fn test_gpu_apply_logits_diff_accumulates_same_cell() {
+        // Two diffs hitting the same (seq, token) must sum.
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![10.0f32, 10.0], (1, 2), &device).unwrap();
+        let diffs = vec![
+            LogitsDiff {
+                seq_idx: 0,
+                token_id: 0,
+                delta: 1.0,
+            },
+            LogitsDiff {
+                seq_idx: 0,
+                token_id: 0,
+                delta: 2.0,
+            },
+        ];
+        let out = gpu_apply_logits_diff(&logits, &diffs).unwrap();
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(v, vec![13.0, 10.0]);
+    }
+
+    #[test]
+    fn test_gpu_sample_batch_with_diffs_logit_bias_overrides() {
+        // Without bias, argmax of [1, 5, 3] is index 1.
+        // Add +100 to index 0 — argmax must shift to 0.
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, 5.0, 3.0], (1, 3), &device).unwrap();
+        let configs = vec![GpuSamplingConfig {
+            inv_temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            rand_val: 0.0,
+        }];
+        let diffs = vec![LogitsDiff {
+            seq_idx: 0,
+            token_id: 0,
+            delta: 100.0,
+        }];
+        let ids = gpu_sample_batch_with_diffs(&logits, &configs, &diffs).unwrap();
+        assert_eq!(ids, vec![0]);
+    }
+
+    #[test]
+    fn test_gpu_sample_batch_with_diffs_banned_neg_inf() {
+        // Argmax originally points at index 2 (logit 5); ban it with -inf;
+        // expect index 1 (logit 4).
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![3.0f32, 4.0, 5.0], (1, 3), &device).unwrap();
+        let configs = vec![GpuSamplingConfig {
+            inv_temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            rand_val: 0.0,
+        }];
+        let diffs = vec![LogitsDiff {
+            seq_idx: 0,
+            token_id: 2,
+            delta: f32::NEG_INFINITY,
+        }];
+        let ids = gpu_sample_batch_with_diffs(&logits, &configs, &diffs).unwrap();
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]
