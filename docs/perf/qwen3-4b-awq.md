@@ -45,17 +45,92 @@ backend-to-backend on identical hardware.
 ## Measured numbers
 
 Hardware: NVIDIA GeForce RTX 4060 Laptop, 8 GiB VRAM, sm_89 (Ada).
-Build: `cargo build --release -p vllm-server --features cuda-full`,
-commit `1fb4016` (perf/awq-cuda-fast-path merged into main).
+Build: `cargo build --release -p vllm-server --features cuda-full`.
 Server: `--num-blocks 96 --max-requests 4 --max-model-len 1024
 --enforce-eager`. Warmup run discarded.
 
-| Backend                       | Concurrency | TTFT (ms) | tok/s/req | Aggregate tok/s |
-| ----------------------------- | ----------- | --------- | --------- | --------------- |
-| vllm-rust (`cuda-full`, eager) | 1          | ~17 000   | ~0.05     | ~0.05           |
-| vllm-rust (`cuda-full`, eager) | 4          | (timeout — see analysis) |   |        |
-| vllm-rust (`cuda-full`, eager) | 8          | (timeout — see analysis) |   |        |
-| Python vLLM                    | 1, 4, 8    | not installed on box     |   |        |
+| Build state                                            | Startup | TTFT (ms) | decode tok/s | per-layer time |
+| ------------------------------------------------------ | ------- | --------- | ------------ | -------------- |
+| Stages 1–6 (initial baseline)                          | ~5 min  | ~17 000   | ~0.05        | not measured   |
+| + Stage 7 (decode shared tensors) wired on Qwen3-AWQ¹  | ~5 min  | ~17 000   | ~0.06        | ~460 ms / 36   |
+| + Stage 8 (CUDA `awq_to_gptq_qweight_int4` kernel)     | **21 s** | ~17 000  | ~0.06        | ~460 ms / 36   |
+
+Python vLLM was not installed on the test box, so no head-to-head
+comparison was made on this run.
+
+¹ The first attempt at Stage 7 placed the override on
+`Qwen3ForCausalLM`; the runtime path for AWQ models is actually
+`QuantizedQwen3ForCausalLM` (registry's `build_quant`), so the override
+was dormant. Fixed by mirroring the `_with_shared` plumbing into
+`models/qwen3_quantized.rs` and overriding
+`forward_decode_batch_with_ctx` on the quantized class. Confirmed live
+via `tracing::info!` instrumentation: `decode_shared_present=true` on
+every forward.
+
+Stage 8's startup win is the headline so far: AWQ→GPTQ qweight repack
+moved from a strided scalar Rust loop (5+ minutes for 36×7 = 252 linear
+layers, ~2.85 G random-access reads) to a single CUDA kernel
+(`awq_to_gptq_qweight_int4` in `crates/core/kernels/marlin_gemm.cu`).
+
+## Diagnosis: the remaining bottleneck is per-linear kernel cadence
+
+Per-forward timing instrumentation in
+`QuantizedQwen3ForCausalLM::forward_decode_batch_with_ctx` shows:
+
+```
+total_ms        = 16720
+embed_ms        =     0.05
+first_layer_ms  =   591    (cold)
+layers_total_ms = 16670    (36 layers × ~460 ms each)
+norm_ms         =     0.02
+lm_head_ms      =    50
+```
+
+So 99.7 % of the decode-step wall-clock lives in 36 decoder layers, and
+embedding / final norm / lm_head are negligible. Each decoder layer
+issues 7 quantized linear forwards (q/k/v/o + gate/up/down) plus
+RMSNorm, RoPE, paged_attention. With ~460 ms / layer at batch=1 that's
+roughly 60 ms per `MarlinLinear::forward_marlin` call.
+
+Marlin's INT4 GEMM is tuned for M ≥ 64; at M = 1 (single-token decode,
+batch=1) the kernel is heavily SM-underutilised. Combined with the
+candle CustomOp1 wrapper boundaries — each `apply_op1` has small but
+non-zero per-call overhead — this stacks into the ~60 ms per call we
+observe.
+
+vLLM hides this with two mechanisms we don't yet have on the AWQ path:
+
+1. **CUDA graphs over the whole decoder layer** so the per-call overhead
+   amortises to a single `cuGraphLaunch` per token. Our CUDA graph
+   infrastructure exists but `--enforce-eager` was used here on
+   purpose — and Qwen3-AWQ's quantized kernels haven't yet been
+   verified compatible with capture.
+2. **A specialised batch=1 GEMV kernel** (`marlin_gemv` /
+   `gemv_awq_kernel`) that skips the full Marlin tile dispatch in favour
+   of a thin GEMV path. The current Marlin kernel always enters its
+   tile-mma loop even when M = 1.
+
+Both are next-stage fixes; they are out of scope for the present
+landed work and are tracked separately.
+
+## Stage attribution (cumulative on this branch)
+
+- **Stage 1**  AWQ→Marlin layout repack at load via `AwqMarlinLinear`,
+  feeding the Marlin INT4 kernel correctly (was silently wrong before).
+- **Stage 2A** Repaired the `marlin` / `flashinfer` /
+  `cuda-layernorm` / `cuda-fused-activations` / `cuda-moe` builds
+  against the bumped cudarc/candle stack.
+- **Stage 3**  Folded additive logit modifiers into the GPU sampler
+  (`gpu_apply_logits_diff`).
+- **Stage 4**  Wired CUDA-graph capture into warmup (infra only;
+  `--enforce-eager` for these measurements).
+- **Stage 5**  Detokenize tail of `generated_token_ids` instead of all.
+- **Stage 7**  `DecodeBatchShared` built once per forward; reused by
+  every attention layer through `ForwardContext.decode_shared`.
+  Wired on `Qwen3ForCausalLM` (eager path) and
+  `QuantizedQwen3ForCausalLM` (AWQ runtime path).
+- **Stage 8**  GPU `awq_to_gptq_qweight_int4` kernel — startup
+  ~5 min → ~21 s.
 
 Python vLLM was not present in the test environment (no apples-to-apples
 comparison was made on this run). The vllm-rust numbers above are real
