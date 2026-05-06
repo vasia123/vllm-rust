@@ -14,6 +14,134 @@ use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
 use crate::layers::{apply_per_head_norm, paged_attention, RotaryEmbedding};
 use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 
+// ─── Decode-path profiler ────────────────────────────────────────────────────
+//
+// Diagnostic instrumentation: when env `VLLM_PROFILE_DECODE=1` is set at
+// process start, per-component wall-clock times inside the AWQ decoder hot
+// path are accumulated in microseconds and dumped via `tracing::info!` once
+// per `PROFILE_EVERY` forward calls. Each measured block ends with
+// `dev.synchronize()` so the timer captures actual GPU work rather than
+// kernel-launch latency.
+//
+// All overhead lives behind a once-initialised flag — the fast path is a
+// single relaxed atomic load when profiling is off.
+
+#[cfg(feature = "cuda")]
+mod decode_profile {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const PROFILE_EVERY: usize = 100;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var("VLLM_PROFILE_DECODE").is_ok())
+    }
+
+    pub static QKV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QK_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROPE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PAGED_ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static O_PROJ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MLP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static IN_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LAYERS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Time `f`, sync the device, and add the elapsed nanoseconds to `slot`.
+    pub fn time<T>(
+        dev: &candle_core::Device,
+        slot: &AtomicU64,
+        f: impl FnOnce() -> candle_core::Result<T>,
+    ) -> candle_core::Result<T> {
+        if !enabled() {
+            return f();
+        }
+        let t0 = Instant::now();
+        let out = f()?;
+        if let candle_core::Device::Cuda(cd) = dev {
+            cd.cuda_stream()
+                .synchronize()
+                .map_err(|e| candle_core::Error::Msg(format!("profile sync: {e}")))?;
+        }
+        slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    pub fn maybe_dump() {
+        if !enabled() {
+            return;
+        }
+        let n = LAYERS_DONE.fetch_add(1, Ordering::Relaxed) + 1;
+        if !n.is_multiple_of(PROFILE_EVERY) {
+            return;
+        }
+        // Snapshot-then-reset each slot so the dump and the subsequent
+        // accumulation window stay independent.
+        let snap = |a: &AtomicU64| (a.swap(0, Ordering::Relaxed) as f64) / 1_000.0;
+        let s_in = snap(&IN_NORM_NS);
+        let s_qkv = snap(&QKV_NS);
+        let s_qkn = snap(&QK_NORM_NS);
+        let s_rope = snap(&ROPE_NS);
+        let s_cw = snap(&CACHE_WRITE_NS);
+        let s_pa = snap(&PAGED_ATTN_NS);
+        let s_op = snap(&O_PROJ_NS);
+        let s_pn = snap(&POST_NORM_NS);
+        let s_mlp = snap(&MLP_NS);
+        let total = s_in + s_qkv + s_qkn + s_rope + s_cw + s_pa + s_op + s_pn + s_mlp;
+        let n = PROFILE_EVERY as f64;
+        tracing::info!(
+            target: "vllm_core::decode_profile",
+            "decode breakdown ({} layer-calls, μs/call): in_norm={:.1} qkv={:.1} \
+             qk_norm={:.1} rope={:.1} cache_w={:.1} paged_attn={:.1} o_proj={:.1} \
+             post_norm={:.1} mlp={:.1} | sum={:.1}",
+            PROFILE_EVERY,
+            s_in / n,
+            s_qkv / n,
+            s_qkn / n,
+            s_rope / n,
+            s_cw / n,
+            s_pa / n,
+            s_op / n,
+            s_pn / n,
+            s_mlp / n,
+            total / n,
+        );
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(dead_code)]
+mod decode_profile {
+    use std::sync::atomic::AtomicU64;
+
+    pub static QKV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QK_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROPE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PAGED_ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static O_PROJ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MLP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static IN_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// CPU-only build: profiling is a no-op and falls through to `f`.
+    #[inline(always)]
+    pub fn time<T>(
+        _dev: &candle_core::Device,
+        _slot: &AtomicU64,
+        f: impl FnOnce() -> candle_core::Result<T>,
+    ) -> candle_core::Result<T> {
+        f()
+    }
+
+    #[inline(always)]
+    pub fn maybe_dump() {}
+}
+
 // ─── Quantized SwiGLU MLP ────────────────────────────────────────────────────
 
 struct QuantizedSwiGluMlp {
@@ -197,10 +325,14 @@ impl QuantizedQwen3Attention {
         shared: Option<&crate::layers::attention::DecodeBatchShared>,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
+        let dev = xs.device();
 
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let (q, k, v) = decode_profile::time(dev, &decode_profile::QKV_NS, || {
+            let q = self.q_proj.forward(xs)?;
+            let k = self.k_proj.forward(xs)?;
+            let v = self.v_proj.forward(xs)?;
+            Ok((q, k, v))
+        })?;
 
         let q = q
             .reshape((batch_size, 1, self.num_heads, self.head_dim))?
@@ -213,8 +345,11 @@ impl QuantizedQwen3Attention {
             .transpose(1, 2)?;
 
         // Qwen3-specific: per-head RMSNorm
-        let q = apply_per_head_norm(&q, &self.q_norm)?;
-        let k = apply_per_head_norm(&k, &self.k_norm)?;
+        let (q, k) = decode_profile::time(dev, &decode_profile::QK_NORM_NS, || {
+            let q = apply_per_head_norm(&q, &self.q_norm)?;
+            let k = apply_per_head_norm(&k, &self.k_norm)?;
+            Ok((q, k))
+        })?;
 
         #[cfg(feature = "cuda-kernels")]
         {
@@ -235,7 +370,9 @@ impl QuantizedQwen3Attention {
                     &positions_owned
                 }
             };
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, positions)?;
+            let (q, k) = decode_profile::time(dev, &decode_profile::ROPE_NS, || {
+                self.rotary_emb.apply_varlen(&q, &k, positions)
+            })?;
 
             let slot_mapping_owned: Vec<usize>;
             let all_slot_mapping: &[usize] = match shared {
@@ -248,9 +385,11 @@ impl QuantizedQwen3Attention {
                     &slot_mapping_owned
                 }
             };
-            cache_engine
-                .write_batch(&k, &v, all_slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+            decode_profile::time(dev, &decode_profile::CACHE_WRITE_NS, || {
+                cache_engine
+                    .write_batch(&k, &v, all_slot_mapping)
+                    .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))
+            })?;
 
             let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len): (
                 Tensor,
@@ -292,22 +431,26 @@ impl QuantizedQwen3Attention {
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-                self.head_dim,
-                cache_engine.block_size(),
-            )?;
+            let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
+                crate::cuda_kernels::paged_attention_cuda(
+                    &q,
+                    cache_engine.k_cache(),
+                    cache_engine.v_cache(),
+                    &block_tables,
+                    &seq_lens,
+                    scale,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    max_blocks_per_seq,
+                    max_seq_len,
+                    self.head_dim,
+                    cache_engine.block_size(),
+                )
+            })?;
 
-            self.o_proj.forward(&attn_output.unsqueeze(1)?)
+            decode_profile::time(dev, &decode_profile::O_PROJ_NS, || {
+                self.o_proj.forward(&attn_output.unsqueeze(1)?)
+            })
         }
 
         #[cfg(not(feature = "cuda-kernels"))]
@@ -445,7 +588,10 @@ impl QuantizedQwen3DecoderLayer {
         shared: Option<&crate::layers::attention::DecodeBatchShared>,
     ) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
+        let dev = xs.device();
+        let xs = decode_profile::time(dev, &decode_profile::IN_NORM_NS, || {
+            self.input_layernorm.forward(xs)
+        })?;
         let xs = self.self_attn.forward_decode_batch_with_shared(
             &xs,
             sequences,
@@ -454,9 +600,11 @@ impl QuantizedQwen3DecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&xs)?)?;
+        let normed = decode_profile::time(dev, &decode_profile::POST_NORM_NS, || {
+            self.post_attention_layernorm.forward(&xs)
+        })?;
+        let xs = decode_profile::time(dev, &decode_profile::MLP_NS, || self.mlp.forward(&normed))?;
+        decode_profile::maybe_dump();
         residual + xs
     }
 }
