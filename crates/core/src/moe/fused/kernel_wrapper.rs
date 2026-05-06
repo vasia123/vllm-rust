@@ -150,6 +150,15 @@ fn i64_to_i32_vec(values: &[i64]) -> Result<Vec<i32>> {
 /// # Returns
 /// `(sorted_token_ids, expert_ids, total_tokens_pp_dev, num_tokens_post_padded, num_valid_tokens)`
 #[cfg(feature = "cuda-kernels")]
+type MoeAlignResult = (
+    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // sorted_token_ids
+    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // expert_ids
+    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // total_tokens_post_padded (scalar)
+    usize,                                             // num_tokens_post_padded
+    usize,                                             // num_valid_tokens
+);
+
+#[cfg(feature = "cuda-kernels")]
 fn moe_align_block_size_gpu(
     topk_ids_i32: &candle_core::cuda::cudarc::driver::CudaSlice<i32>,
     num_tokens: usize,
@@ -157,22 +166,14 @@ fn moe_align_block_size_gpu(
     num_experts: usize,
     block_size: usize,
     dev: &candle_core::cuda::CudaDevice,
-) -> candle_core::Result<(
-    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // sorted_token_ids
-    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // expert_ids
-    candle_core::cuda::cudarc::driver::CudaSlice<i32>, // total_tokens_post_padded (scalar)
-    usize,                                             // num_tokens_post_padded
-    usize,                                             // num_valid_tokens
-)> {
+) -> candle_core::Result<MoeAlignResult> {
     use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
 
     let numel = num_tokens * top_k;
     // Upper bound: every expert could get all tokens (rounded up to block boundary)
-    let max_tokens_padded = (numel + num_experts * block_size - 1) / (num_experts * block_size)
-        * num_experts
-        * block_size
+    let max_tokens_padded = numel.div_ceil(num_experts * block_size) * num_experts * block_size
         + num_experts * block_size;
-    let max_blocks = (max_tokens_padded + block_size - 1) / block_size;
+    let max_blocks = max_tokens_padded.div_ceil(block_size);
 
     // Allocate GPU buffers — these never cross the PCIe bus (except the scalar).
     let sorted_token_ids = dev
@@ -228,7 +229,7 @@ fn moe_align_block_size_gpu(
             "fused_moe_align",
             MOE_ALIGN_PTX,
         )?;
-        let blocks_y = ((numel + 255) / 256) as u32;
+        let blocks_y = numel.div_ceil(256) as u32;
         let cfg = LaunchConfig {
             grid_dim: (1, blocks_y.max(1), 1),
             block_dim: (256, 1, 1),
@@ -540,7 +541,7 @@ impl candle_core::CustomOp1 for FusedMoECudaOp {
                 "fused_moe_align",
                 MOE_ALIGN_PTX,
             )?;
-            let blocks = ((numel + 255) / 256) as u32;
+            let blocks = numel.div_ceil(256) as u32;
             let cfg = LaunchConfig {
                 grid_dim: (blocks.max(1), 1, 1),
                 block_dim: (256, 1, 1),

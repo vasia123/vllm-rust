@@ -960,6 +960,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // 2D index iteration with positional assertions
     fn test_bloom_alibi_bias_changes_attention_output() {
         // Verify that ALiBi bias produces different results than no bias.
         let device = Device::Cpu;

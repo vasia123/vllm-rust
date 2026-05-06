@@ -550,6 +550,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // 2D index iteration with positional assertions
     fn test_alibi_bias_with_kv_cache() {
         // Test when kv_len > seq_len (decode with cached KV)
         let device = Device::Cpu;

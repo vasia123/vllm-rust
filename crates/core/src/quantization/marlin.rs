@@ -613,14 +613,14 @@ impl MarlinLinear {
                 self.scales.to_dtype(DType::BF16)?
             };
 
-            return gptq_cuda::gptq_gemm(
+            gptq_cuda::gptq_gemm(
                 x,
                 &self.qweight,
                 &scales_bf16,
                 &self.qzeros,
                 self.bias.as_ref(),
                 self.config.group_size,
-            );
+            )
         }
 
         #[cfg(not(feature = "cuda-kernels"))]

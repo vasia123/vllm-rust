@@ -141,7 +141,8 @@ mod tests {
     fn test_causal_conv1d_prefill_causality() {
         // With impulse at position 0 and kernel [1, 0, 0, 0], only position 0 is affected.
         let device = Device::Cpu;
-        let mut vals = vec![0.0f32; 1 * 1 * 8];
+        // shape: batch=1, channels=1, seq=8 → 8 elements
+        let mut vals = vec![0.0f32; 8];
         vals[0] = 1.0; // impulse at t=0, d=0
         let x = Tensor::new(vals.as_slice(), &device)
             .unwrap()

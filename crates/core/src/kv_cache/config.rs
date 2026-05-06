@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn estimate_kv_budget_insufficient_memory() {
         // Model takes more memory than available
-        let total = 1 * 1024 * 1024 * 1024; // 1 GiB
+        let total = 1024 * 1024 * 1024; // 1 GiB
         let budget = estimate_kv_budget_bytes(total, 0.9, 2_000_000_000, DType::BF16);
         // 2B params * 2 = 4GB > 0.9 * 1GB → 0
         assert_eq!(budget, 0);

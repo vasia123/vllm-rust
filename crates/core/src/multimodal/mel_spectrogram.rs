@@ -426,7 +426,7 @@ mod tests {
         for row in &mel {
             for &v in row {
                 assert!(
-                    v >= -0.1 && v <= 2.5,
+                    (-0.1..=2.5).contains(&v),
                     "mel value {v} out of expected range [0, 2.5]"
                 );
             }

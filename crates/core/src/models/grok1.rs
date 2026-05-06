@@ -31,6 +31,18 @@ use super::tp_layers::{TpEmbedding, TpLinear};
 const DEFAULT_ATTN_OUTPUT_MULTIPLIER: f64 = 0.08838834764831845;
 const DEFAULT_OUTPUT_MULTIPLIER_SCALE: f64 = 0.5773502691896257;
 const DEFAULT_EMBEDDING_MULTIPLIER_SCALE: f64 = 78.38367176906169;
+
+// Compile-time guards on the documented Grok-1 scaling ranges. If a future
+// edit moves a constant out of its expected band, the build fails instead of
+// a unit test, surfacing the regression at the change site.
+const _: () = {
+    assert!(DEFAULT_EMBEDDING_MULTIPLIER_SCALE > 1.0);
+    assert!(DEFAULT_EMBEDDING_MULTIPLIER_SCALE < 100.0);
+    assert!(DEFAULT_OUTPUT_MULTIPLIER_SCALE > 0.0);
+    assert!(DEFAULT_OUTPUT_MULTIPLIER_SCALE < 1.0);
+    assert!(DEFAULT_ATTN_OUTPUT_MULTIPLIER > 0.0);
+    assert!(DEFAULT_ATTN_OUTPUT_MULTIPLIER < 1.0);
+};
 const DEFAULT_ROUTER_LOGIT_SOFTCAP: f64 = 30.0;
 
 // ─── Grok1 Config (parsed from ModelConfig.extra) ───────────────────────────
@@ -996,17 +1008,9 @@ mod tests {
     fn test_grok1_embedding_multiplier_applied() {
         let device = Device::Cpu;
 
-        // Verify the embedding multiplier constant is non-trivial
-        assert!(DEFAULT_EMBEDDING_MULTIPLIER_SCALE > 1.0);
-        assert!(DEFAULT_EMBEDDING_MULTIPLIER_SCALE < 100.0);
-
-        // Verify the output multiplier is a valid scaling factor
-        assert!(DEFAULT_OUTPUT_MULTIPLIER_SCALE > 0.0);
-        assert!(DEFAULT_OUTPUT_MULTIPLIER_SCALE < 1.0);
-
-        // Verify attn multiplier is small (dampens attention output)
-        assert!(DEFAULT_ATTN_OUTPUT_MULTIPLIER > 0.0);
-        assert!(DEFAULT_ATTN_OUTPUT_MULTIPLIER < 1.0);
+        // Range invariants on the scaling constants are enforced at compile
+        // time by `const _: () = { ... }` near their definitions; this test
+        // only validates the runtime behavior that depends on them.
 
         // Verify softcap constant
         let logits = Tensor::new(&[50.0_f32], &device).unwrap();

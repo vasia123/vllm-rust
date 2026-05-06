@@ -510,10 +510,10 @@ mod tests {
         let hs2 = Tensor::zeros((1usize, 1usize, 64usize), DType::F32, &device).unwrap();
         let _ = proposer.set_target_hidden_states(req_id, hs2);
         let result = proposer.propose_for_request(req_id, 10, &mut state, &tokenizer);
-        // Should either fail gracefully or return empty
-        match result {
-            Ok(tokens) => assert!(tokens.is_empty()),
-            Err(_) => {} // acceptable — request was preempted
+        // Should either fail gracefully or return empty.
+        // Err is acceptable — request was preempted.
+        if let Ok(tokens) = result {
+            assert!(tokens.is_empty());
         }
     }
 

@@ -1604,7 +1604,7 @@ mod tests {
         let config = fcfs_config(4, 512, false);
 
         // Create two identical schedulers
-        let mut scheduler_a = Scheduler::new(config.clone());
+        let mut scheduler_a = Scheduler::new(config);
         let mut scheduler_b = Scheduler::new(config);
 
         // Add identical waiting requests
@@ -1643,7 +1643,7 @@ mod tests {
         // Same property test but with running requests that get preempted
         let config = fcfs_config(4, 512, false);
 
-        let mut scheduler_a = Scheduler::new(config.clone());
+        let mut scheduler_a = Scheduler::new(config);
         let mut scheduler_b = Scheduler::new(config);
 
         let mut states = HashMap::new();

@@ -357,8 +357,10 @@ mod tests {
 
     #[test]
     fn test_warmup_stats_jit_failed_count() {
-        let mut stats = WarmupStats::default();
-        stats.jit_warmed_sizes = vec![1, 2, 4];
+        let stats = WarmupStats {
+            jit_warmed_sizes: vec![1, 2, 4],
+            ..Default::default()
+        };
 
         assert_eq!(stats.jit_failed_count(6), 3);
         assert_eq!(stats.jit_failed_count(3), 0);

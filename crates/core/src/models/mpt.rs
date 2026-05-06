@@ -959,6 +959,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // 2D index iteration with positional assertions
     fn test_mpt_alibi_bias_changes_attention_output() {
         let device = Device::Cpu;
 

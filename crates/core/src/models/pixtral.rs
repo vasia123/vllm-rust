@@ -1114,7 +1114,8 @@ mod tests {
     fn test_position_meshgrid() {
         let sizes = vec![(2, 3), (1, 2)];
         let positions = position_meshgrid(&sizes);
-        assert_eq!(positions.len(), 2 * 3 + 1 * 2);
+        // 2×3 grid + 1×2 grid = 6 + 2 = 8 positions
+        assert_eq!(positions.len(), 2 * 3 + 2);
         assert_eq!(positions[0], (0, 0));
         assert_eq!(positions[1], (0, 1));
         assert_eq!(positions[2], (0, 2));

@@ -112,6 +112,7 @@ mod tests {
 
     /// When A=0, delta_a = exp(0) = 1 and the scan becomes a simple accumulation.
     #[test]
+    #[allow(clippy::needless_range_loop)] // index iteration with positional assertions
     fn selective_scan_a_zero_identity() {
         let device = Device::Cpu;
         let dtype = DType::F32;
@@ -173,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // index iteration with positional assertions
     fn selective_scan_with_initial_state() {
         let device = Device::Cpu;
         let dtype = DType::F32;

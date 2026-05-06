@@ -448,36 +448,38 @@ mod tests {
 
     #[test]
     fn test_config_custom() {
-        let mut cfg = ModelConfig::default();
-        cfg.extra = make_extra(json!({
-            "force_image_size": 224,
-            "vit_hidden_size": 64,
-            "projector_hidden_size": 128,
-            "downsample_ratio": 0.5,
-            "vision_config": {
-                "hidden_size": 64,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "patch_size": 16,
-            },
-            "text_config": {
-                "architectures": ["LlamaForCausalLM"],
-                "hidden_size": 32,
-                "intermediate_size": 64,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 4,
-                "head_dim": 8,
-                "vocab_size": 100,
-                "max_position_embeddings": 128,
-                "hidden_act": "silu",
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false,
-                "bos_token_id": 1,
-                "eos_token_id": 2,
-            }
-        }));
+        let cfg = ModelConfig {
+            extra: make_extra(json!({
+                "force_image_size": 224,
+                "vit_hidden_size": 64,
+                "projector_hidden_size": 128,
+                "downsample_ratio": 0.5,
+                "vision_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "patch_size": 16,
+                },
+                "text_config": {
+                    "architectures": ["LlamaForCausalLM"],
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 4,
+                    "head_dim": 8,
+                    "vocab_size": 100,
+                    "max_position_embeddings": 128,
+                    "hidden_act": "silu",
+                    "rms_norm_eps": 1e-6,
+                    "rope_theta": 10000.0,
+                    "tie_word_embeddings": false,
+                    "bos_token_id": 1,
+                    "eos_token_id": 2,
+                }
+            })),
+            ..ModelConfig::default()
+        };
         let vl_cfg = NemotronVLConfig::from_model_config(&cfg).unwrap();
         // image_size=224, patch_size=16 → 196 patches; /4 = 49 tokens
         assert_eq!(vl_cfg.num_vision_tokens(), 49);

@@ -486,7 +486,7 @@ mod tests {
             "model-00001-of-00020.safetensors".to_string(),
             "model-00011-of-00020.safetensors".to_string(),
         ];
-        files.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
+        files.sort_by_key(|a| natural_sort_key(a));
         assert_eq!(
             files,
             vec![
@@ -505,7 +505,7 @@ mod tests {
             "model-2-of-20.safetensors".to_string(),
             "model-1-of-20.safetensors".to_string(),
         ];
-        files.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
+        files.sort_by_key(|a| natural_sort_key(a));
         assert_eq!(
             files,
             vec![
@@ -1169,7 +1169,7 @@ mod tests {
         eprintln!(
             "bnb last-token logits: argmax={argmax} max={max_val:.4} mean={mean:.4} gap={gap:.4}"
         );
-        assert!((argmax as usize) < cfg.vocab_size);
+        assert!(argmax < cfg.vocab_size);
         assert!(
             gap > 1e-3,
             "BnB NF4 logits must show real spread (gap={gap}); flat distribution would \
@@ -1325,10 +1325,7 @@ mod tests {
             "last-token logits: argmax={} max={:.4} mean={:.4} gap={:.4}",
             argmax, max_val, mean, max_gap
         );
-        assert!(
-            (argmax as usize) < cfg.vocab_size,
-            "argmax must be a valid vocab id"
-        );
+        assert!(argmax < cfg.vocab_size, "argmax must be a valid vocab id");
         assert!(
             max_gap > 1e-3,
             "logits must have meaningful spread (max-mean gap {max_gap}); \
@@ -1404,7 +1401,6 @@ mod tests {
         //     -- --ignored --nocapture
         //
         // Takes ~5-10 minutes on a laptop CPU.
-        use crate::engine::ModelForward;
         use crate::kv_cache::{config::CacheConfig, BlockTable, KVCacheDtype, KVCacheManager};
         use crate::models::Gemma4ForCausalLM;
         use candle_core::Tensor;
@@ -1675,7 +1671,7 @@ mod tests {
             gap > 1e-3,
             "GGUF logits must have spread (gap={gap}); suggests dequant failure"
         );
-        assert!((argmax as usize) < cfg.vocab_size);
+        assert!(argmax < cfg.vocab_size);
 
         // Follow-up decode step.
         block_table.advance(seq_len);

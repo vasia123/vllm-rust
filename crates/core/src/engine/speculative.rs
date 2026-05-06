@@ -971,7 +971,7 @@ mod tests {
         let logits = Tensor::from_vec(logits_data, (1, 2, 8), &candle_core::Device::Cpu).unwrap();
 
         // Draft tokens match exactly
-        let draft_tokens = vec![5u32, 3];
+        let draft_tokens = [5u32, 3];
         let mut accepted = 0;
 
         for (i, &draft_token) in draft_tokens.iter().enumerate().take(2) {
@@ -996,7 +996,7 @@ mod tests {
         let logits = Tensor::from_vec(logits_data, (1, 2, 8), &candle_core::Device::Cpu).unwrap();
 
         // Draft tokens: first matches, second doesn't
-        let draft_tokens = vec![5u32, 7];
+        let draft_tokens = [5u32, 7];
         let mut accepted = 0;
 
         for (i, &draft_token) in draft_tokens.iter().enumerate().take(2) {

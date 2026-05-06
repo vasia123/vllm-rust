@@ -154,6 +154,15 @@ pub const PASSTHROUGH_AUDIO_SPEC: AudioSpec = AudioSpec {
     normalize_amplitude: false,
 };
 
+// Compile-time invariants on the named audio specs. Future edits that flip
+// the documented semantics fail the build at the change site.
+const _: () = {
+    assert!(matches!(MONO_AUDIO_SPEC.target_channels, Some(1)));
+    assert!(MONO_AUDIO_SPEC.normalize_amplitude);
+    assert!(PASSTHROUGH_AUDIO_SPEC.target_channels.is_none());
+    assert!(!PASSTHROUGH_AUDIO_SPEC.normalize_amplitude);
+};
+
 /// Raw audio data with metadata.
 #[derive(Debug, Clone)]
 pub struct AudioData {
@@ -923,16 +932,8 @@ mod tests {
         assert!(matches!(result, Err(AudioError::InvalidData(_))));
     }
 
-    #[test]
-    fn test_predefined_specs() {
-        // Test MONO_AUDIO_SPEC
-        assert_eq!(MONO_AUDIO_SPEC.target_channels, Some(1));
-        assert!(MONO_AUDIO_SPEC.normalize_amplitude);
-
-        // Test PASSTHROUGH_AUDIO_SPEC
-        assert!(PASSTHROUGH_AUDIO_SPEC.target_channels.is_none());
-        assert!(!PASSTHROUGH_AUDIO_SPEC.normalize_amplitude);
-    }
+    // Predefined-spec invariants are checked at compile time via the
+    // `const _: () = { ... };` block near their definitions.
 
     #[test]
     fn test_channel_reduction_default() {

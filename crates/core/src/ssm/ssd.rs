@@ -285,10 +285,9 @@ pub fn ssd_forward(
 ) -> Result<(Tensor, Tensor)> {
     #[cfg(feature = "cuda-kernels")]
     if x.device().is_cuda() {
-        match super::ssd_cuda::ssd_scan(x, dt, a, b, c, d, state, heads_per_group) {
-            Ok(result) => return Ok(result),
-            // Constraint violations (head_dim or d_state too large) fall through.
-            Err(_) => {}
+        // Constraint violations (head_dim or d_state too large) fall through.
+        if let Ok(result) = super::ssd_cuda::ssd_scan(x, dt, a, b, c, d, state, heads_per_group) {
+            return Ok(result);
         }
     }
     ssd_sequential(x, dt, a, b, c, d, state, heads_per_group)
@@ -480,7 +479,7 @@ mod tests {
     #[test]
     fn ssd_state_carry() {
         let dev = Device::Cpu;
-        let dtype = DType::F32;
+        let _dtype = DType::F32;
         let (x, dt, a, b, c, d, state) = make_inputs(&dev);
 
         // Run half the sequence at a time and carry state

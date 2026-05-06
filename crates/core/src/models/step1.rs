@@ -797,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // 2D index iteration with positional assertions
     fn test_sqrt_alibi_bias_sqrt_distance() {
         let device = Device::Cpu;
         let num_heads = 8;
@@ -830,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // 2D index iteration with positional assertions
     fn test_sqrt_alibi_bias_with_cache() {
         let device = Device::Cpu;
         let num_heads = 4;
