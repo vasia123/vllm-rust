@@ -55,6 +55,11 @@ Server: `--num-blocks 96 --max-requests 4 --max-model-len 1024
 | + Stage 7 (decode shared tensors) wired on Qwen3-AWQ¹  | ~5 min  | ~17 000   | ~0.06        | ~460 ms / 36   |
 | + Stage 8 (CUDA `awq_to_gptq_qweight_int4` kernel)     | **21 s** | ~17 000  | ~0.06        | ~460 ms / 36   |
 | + Stage 9 (AwqMarlin live + AWQ GEMV kernel for M ≤ 16) | ~21 s  | ~600     | **~11.6**    | ~10 ms / 36    |
+| + Stage 10-1 (RoPE positions: zero-copy U32 → kernel)   | ~21 s  | ~600     | **~13.0**    | ~9 ms / 36     |
+| + Stage 10-α (split-K GEMV: ×4 / ×8 thread-per-column)  | ~21 s  | ~600     | **~20.0**    | ~6 ms / 36     |
+
+Cumulative speedup vs the Stages 1–6 baseline: **~333×** decode tok/s
+without changing any model architecture, KV cache layout, or sampler.
 
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
@@ -183,6 +188,20 @@ to close to ≥ 50 tok/s.
   (9-C) new `awq_gemv_int4_bf16` kernel takes over for `M ≤ 16` and
   scale/zp dtype is normalised at load time.
   Single-stream decode: 0.06 → 11.6 tok/s.
+- **Stage 10-1** RoPE no longer round-trips position indices through
+  the host. The U32 positions tensor is handed straight to the kernel
+  (the bit pattern of u32 and i32 matches for non-negative position
+  indices). 144 device↔host syncs per token eliminated; small numerical
+  win (11.6 → 13.0 tok/s), but the bigger value is unblocking CUDA-graph
+  capture of the RoPE op for a future stage.
+- **Stage 10-α** Split-K GEMV. The serial kernel’s single warp per
+  block left ~10% of Ada SM warp slots active at Qwen3 N = 2560.
+  Two new variants fan each output column across 4 or 8 cooperating
+  threads (one warp each), with a cascading dispatch that picks the
+  largest split the shape allows. ~28% → ~56% theoretical occupancy
+  doubling, ~50% wall-clock improvement: 13 → 20 tok/s. Beyond ×8
+  the kernel is memory-bandwidth-bound — adding more threads no
+  longer helps without restructuring qweight access.
 
 Python vLLM was not present in the test environment (no apples-to-apples
 comparison was made on this run). The vllm-rust numbers above are real
