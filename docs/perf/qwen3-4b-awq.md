@@ -119,6 +119,43 @@ without it CUDA capture is unreachable. The eager path with the new
 GEMV variants and uninit allocs already delivers ~733× of baseline on
 warm hardware.
 
+## Stage 12 — pool-backed GEMV output buffers
+
+`crates/core/src/engine/output_pool.rs` introduces a process-global
+shape-keyed buffer pool.  At the top of every decode forward
+`OutputPool::global().reset_cursors()` rewinds the per-shape
+round-robin cursors; `MarlinLinear::forward_marlin` reserves the
+output tensor for AWQ INT4-ZP linears from the pool and routes the
+launch through a new `InplaceOp2` (`MarlinGemmInplaceOp`) which writes
+into the pool-owned storage in place.  The 252 per-token
+`cuMemAlloc` round-trips the GEMV path used to make are eliminated;
+the pool only allocates on first observation of a new shape, and
+reuses the same `CudaSlice` thereafter.
+
+| Build state                                              | tok/s steady (10-run median) | tok/s peak |
+| -------------------------------------------------------- | ---------------------------- | ---------- |
+| Stage 11 (eager, no pool)                                | ~42–44                       | ~50        |
+| **Stage 12 (eager, pooled GEMV outputs)**                | **~43.7**                    | **~48.6**  |
+
+The eager-path gain is within run-to-run noise — `cuMemAlloc` on
+8 GB Ada laptops is fast (~3-6 µs) compared to the kernel itself, so
+amortising it gives a modest improvement.  The strategic value is
+infrastructure: CUDA Graph capture no longer trips on GEMV
+allocation; the pool is reusable for any future op that wants the
+same treatment.
+
+Capture **still** aborts with `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`,
+now traced to candle's intermediate tensor allocations:
+`Tensor::cat`, `.contiguous()` after a transpose, arithmetic
+operators (`xs + residual`), `Tensor::zeros` from
+`build_decode_batch_shared`, and the per-call output buffers inside
+RoPE, paged-attention, RMSNorm, SwiGLU, and the activation kernels.
+Each of those falls outside the quantization layer and keeps using
+plain `cuMemAlloc`.  Bringing them onto the pool requires either
+porting each kernel to its own `InplaceOpN` variant (similar surgery
+to what we did for GEMV) or a deeper candle fork that swaps the
+default allocator out for `cuMemAllocAsync` from a captured pool.
+
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
 
