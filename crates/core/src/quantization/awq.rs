@@ -797,9 +797,12 @@ mod tests {
                 AwqLinear::new(in_features, out_features, false, bits, group_size, &device)
                     .unwrap();
 
-            // Create quantized weights
+            // Create quantized weights using the canonical AWQ layout:
+            //   qweight: [in_features, out_features / pack_factor]
+            //   scales:  [num_groups,  out_features]
+            //   qzeros:  [num_groups,  out_features / pack_factor]
             let qweight = Tensor::zeros(
-                &[in_features / pack_factor, out_features],
+                &[in_features, out_features / pack_factor],
                 DType::U32,
                 &device,
             )
