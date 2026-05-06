@@ -65,14 +65,29 @@ Cumulative speedup vs the Stages 1–6 baseline: **~733× steady (44 tok/s
 on a 256-token sustained run), peaks ~50** — original ≥ 50 tok/s
 target reached on warm-cache short prompts.
 
-The remaining gap to a steady ≥ 50 tok/s (about ~10%) sits behind a
-known but non-trivial blocker: the production `start_engine` path
-never invokes `StandardExecution::warmup`, so `self.graph_runner`
-stays `None` and every decode call falls through to the eager dispatch
-in `helpers.rs:783`. Wiring the warmup into the runtime — and
-solving the persistent-buffer requirement that CUDA-graph capture
-imposes (cudarc still allocates dynamically inside the captured
-stream) — is the natural next stage.
+The remaining gap to a steady ≥ 50 tok/s (about ~10%) is now
+quantified:
+
+1. `start_engine` was wired into `start_engine_with_warmup` (it had
+   been silently bypassing it). JIT precompiles batch sizes
+   1, 2, 4, 8, 16, 32 at boot, smoothing first-token latency.
+2. CUDA stream capture itself remains blocked one level lower:
+   `cuStreamBeginCapture_v2` returns `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`
+   (code 900) on every batch because candle 0.9 + cudarc 0.16 dispatch
+   every kernel through the CudaContext's *default* stream, and
+   `default_stream()` returns a stream whose underlying handle is the
+   legacy null stream — on which CUDA stream capture is unconditionally
+   forbidden. Capturing a freshly created non-default stream would
+   record an empty queue.
+3. Honest diagnostics now distinguish "graph captured" from "JIT
+   fallback" in the warmup log, and `try_capture_decode_step` emits the
+   exact CUDA driver error code on every failure path.
+
+Closing the gap therefore needs upstream-architectural work in candle
+(use a non-default stream) or a bypass that hand-rolls graph node
+insertion, neither of which fits in this branch. The eager path with
+the new GEMV variants and uninit allocs already gets us to ~733× of
+baseline on warm hardware.
 
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
