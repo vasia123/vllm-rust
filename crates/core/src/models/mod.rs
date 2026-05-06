@@ -719,6 +719,81 @@ pub fn detect_quantization(model_dir: &Path) -> DetectedQuantConfig {
     detect_from_directory(model_dir)
 }
 
+// ─── Speculative-draft routing ──────────────────────────────────────────────
+//
+// All five speculative protocols (MTP / Eagle-1 / Eagle-3 / Medusa /
+// MLP Speculator) use the same `(ModelConfig, VarBuilder) -> Result<...>`
+// shape but return different trait types because their decode-time
+// protocols are genuinely different (MTP fixed target_hs vs Eagle chain
+// vs Medusa head-bank vs MLPSpec separate prefix). The 5 dispatch
+// functions are kept for API-level type safety, and `DraftKind` +
+// `speculative_kind_for` provide one-shot introspection so callers
+// (e.g. the server's draft-model loader) can route to the correct
+// constructor without re-implementing the arch_name → protocol map.
+
+/// Speculative-decoding draft protocol kind for a given architecture.
+///
+/// Returned by [`speculative_kind_for`] so callers can dispatch to the
+/// correct `*_from_config` constructor without hard-coded arch_name
+/// lists. `MlpSpeculator` is its own kind because its model type is
+/// concrete (not boxed-trait).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftKind {
+    /// Multi-Token Prediction — fixed target hidden state for all K steps.
+    Mtp,
+    /// Eagle-1 — chained hidden-state propagation with shared head.
+    Eagle1,
+    /// Eagle-3 — Llama backbone variant of Eagle.
+    Eagle3,
+    /// Medusa — head-bank predicting K tokens in parallel from one hidden state.
+    Medusa,
+    /// MLP Speculator — separate small MLP model with `speculator.*` weights.
+    MlpSpeculator,
+}
+
+/// Look up the speculative protocol kind for a HuggingFace
+/// architecture name. Returns `None` when the architecture is not a
+/// speculative-decoding draft.
+///
+/// Mirrors the dispatch tables in `mtp_from_config` /
+/// `eagle1_from_config` / `eagle3_from_config` / `medusa_from_config` /
+/// `mlp_speculator_from_config` — the single source of truth for
+/// "which protocol does this draft model use".
+pub fn speculative_kind_for(arch: &str) -> Option<DraftKind> {
+    match arch {
+        // MTP
+        "DeepSeekMTPModel"
+        | "ErnieMTPModel"
+        | "ExaoneMoeMTP"
+        | "Glm4MoeMTPModel"
+        | "Glm4MoeLiteMTPModel"
+        | "GlmOcrMTPModel"
+        | "LongCatFlashMTPModel"
+        | "MiMoMTPModel"
+        | "OpenPanguMTPModel"
+        | "Qwen3NextMTP"
+        | "Step3p5MTP" => Some(DraftKind::Mtp),
+        // Eagle-1
+        "EagleLlamaForCausalLM"
+        | "EagleLlama4ForCausalLM"
+        | "EagleMiniCPMForCausalLM"
+        | "EagleDeepSeekMTPModel"
+        | "EagleDeepseekV3ForCausalLM"
+        | "EagleMistralLarge3ForCausalLM" => Some(DraftKind::Eagle1),
+        // Eagle-3
+        "Eagle3LlamaForCausalLM"
+        | "LlamaForCausalLMEagle3"
+        | "Eagle3Qwen2_5vlForCausalLM"
+        | "Eagle3Qwen3vlForCausalLM"
+        | "Eagle3MistralLarge3ForCausalLM" => Some(DraftKind::Eagle3),
+        // Medusa
+        "MedusaModel" => Some(DraftKind::Medusa),
+        // MLP Speculator
+        "MLPSpeculatorPreTrainedModel" => Some(DraftKind::MlpSpeculator),
+        _ => None,
+    }
+}
+
 /// Construct the appropriate MTP draft model from `cfg.architectures[0]`.
 ///
 /// Used by the speculative decoding engine to load the correct MTP model type.
@@ -1146,6 +1221,37 @@ pub trait ModelForwardWithLora: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculative_kind_routes_known_architectures() {
+        // One representative per kind covers the dispatch table well
+        // enough; the *_from_config functions exhaustively test the
+        // arch_name lists in their own tests.
+        assert_eq!(
+            speculative_kind_for("DeepSeekMTPModel"),
+            Some(DraftKind::Mtp)
+        );
+        assert_eq!(
+            speculative_kind_for("EagleLlamaForCausalLM"),
+            Some(DraftKind::Eagle1)
+        );
+        assert_eq!(
+            speculative_kind_for("EagleDeepseekV3ForCausalLM"),
+            Some(DraftKind::Eagle1),
+            "Python registry alias for legacy EagleDeepSeekMTPModel"
+        );
+        assert_eq!(
+            speculative_kind_for("Eagle3LlamaForCausalLM"),
+            Some(DraftKind::Eagle3)
+        );
+        assert_eq!(speculative_kind_for("MedusaModel"), Some(DraftKind::Medusa));
+        assert_eq!(
+            speculative_kind_for("MLPSpeculatorPreTrainedModel"),
+            Some(DraftKind::MlpSpeculator)
+        );
+        assert_eq!(speculative_kind_for("LlamaForCausalLM"), None);
+        assert_eq!(speculative_kind_for("UnknownArch"), None);
+    }
 
     fn minimal_config(arch: &str) -> ModelConfig {
         ModelConfig {
