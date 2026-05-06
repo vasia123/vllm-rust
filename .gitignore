@@ -8,3 +8,9 @@ scripts/__pycache__/
 
 # Local Python virtualenv for benchmark scripts.
 .venv/
+
+# Vendored candle fork — populated by `scripts/setup-vendor-candle.sh`.
+# Kept out of the main repo to avoid committing ~1 GB of upstream candle
+# examples; the setup script reproduces the patched branch deterministically
+# on a fresh checkout.
+vendor/

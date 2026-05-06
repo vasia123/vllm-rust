@@ -517,8 +517,16 @@ impl CudaGraphRunner {
 
         self.sync_device()?;
 
+        // RELAXED capture mode: GLOBAL aborts the capture the moment any
+        // op inside it touches a buffer that still has outstanding work on
+        // a stream other than the captured one. With cudarc's auto event
+        // tracking that happens on the very first kernel: every CudaSlice
+        // touched by warmup carries an event-edge to the warmup stream
+        // state. RELAXED allows dependencies on uncaptured work to be
+        // resolved at submission time, which is exactly what we want for
+        // the cold-start replay.
         let begin_result = unsafe {
-            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
         };
         if begin_result != CUresult::CUDA_SUCCESS {
             tracing::warn!(

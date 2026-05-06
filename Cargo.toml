@@ -6,10 +6,17 @@ publish = false
 
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor"]
 resolver = "2"
 
+# Top-level convenience feature so `cargo clippy --all-targets --features cuda`
+# (the pre-commit hook) keeps working with the patched candle. Activates the
+# CUDA feature on each workspace member; candle's `cuda` feature comes
+# transitively through them — referencing `candle-core/cuda` directly here
+# would conflict with `[patch.crates-io]` ("cannot specify features for
+# packages outside of workspace").
 [features]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "vllm-core/cuda", "vllm-server/cuda"]
+cuda = ["vllm-core/cuda", "vllm-server/cuda"]
 
 [dev-dependencies]
 vllm-core = { path = "crates/core", features = ["test-utils"] }
@@ -56,6 +63,20 @@ base64 = "0.22"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "mp3", "isomp4", "aac"] }
 phf = { version = "0.11", features = ["macros"] }
 bitflags = "2"
+
+# Use the vendored candle fork (vendor/candle) instead of the crates.io
+# release. The fork carries one delta on top of the v0.9.1 tag — switching
+# `CudaDevice::new` from `default_stream()` to `new_stream()` so cudarc
+# reports a non-NULL CUstream to the rest of the engine. CUDA Graph capture
+# (`cuStreamBeginCapture_v2`) is unconditionally unsupported on the legacy
+# null stream; without this patch the capture path returns error 900 and
+# falls back to eager. Every other candle subcrate we touch (candle-nn,
+# candle-flash-attn) re-exports candle-core internally — patching just
+# `candle-core` is enough to redirect the whole stack to the fork.
+[patch.crates-io]
+candle-core = { path = "vendor/candle/candle-core" }
+candle-nn = { path = "vendor/candle/candle-nn" }
+candle-flash-attn = { path = "vendor/candle/candle-flash-attn" }
 
 [[test]]
 name = "reference_comparison"
