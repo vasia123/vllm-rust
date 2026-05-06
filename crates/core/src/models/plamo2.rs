@@ -127,30 +127,10 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 
 // ─── SwiGLU MLP ─────────────────────────────────────────────────────────────
 
-struct Plamo2Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Plamo2Mlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_up_proj.gate"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_up_proj.up"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs)?)?;
-        let up = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(gate * up)?)
-    }
-}
+// PLaMo-2 stores SwiGLU MLP weights under a fused parent prefix as two
+// split tensors: `gate_up_proj.gate` / `gate_up_proj.up` / `down_proj`.
+// Forward semantics match canonical SwiGLU.
+type Plamo2Mlp = crate::layers::SwiGluMlp;
 
 // ─── Mamba2 Mixer ───────────────────────────────────────────────────────────
 //
@@ -549,7 +529,14 @@ impl Plamo2DecoderLayer {
             Plamo2MixerType::Attention(Plamo2AttentionMixer::new(cfg, p2_cfg, vb.pp("mixer"))?)
         };
 
-        let mlp = Plamo2Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
+        let mlp = Plamo2Mlp::new_with_proj_names(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            vb.pp("mlp"),
+            "gate_up_proj.gate",
+            "gate_up_proj.up",
+            "down_proj",
+        )?;
         let pre_mixer_norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_mixer_norm"))?;
         let post_mixer_norm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_mixer_norm"))?;

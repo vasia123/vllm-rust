@@ -244,31 +244,10 @@ impl GlmOcrVisionAttention {
 
 // ─── Vision MLP ──────────────────────────────────────────────────────────────
 
-struct GlmOcrVisionMLP {
-    gate_up_proj: Linear,
-    down_proj: Linear,
-    intermediate_size: usize,
-}
-
-impl GlmOcrVisionMLP {
-    fn new(dim: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        // bias=True for GlmOcr (overridden from Glm4v default of False).
-        let gate_up_proj = linear_b(dim, 2 * intermediate_size, true, vb.pp("gate_up_proj"))?;
-        let down_proj = linear_b(intermediate_size, dim, true, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            intermediate_size,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(x)?;
-        let gate = candle_nn::ops::silu(&gate_up.narrow(1, 0, self.intermediate_size)?)?;
-        let up = gate_up.narrow(1, self.intermediate_size, self.intermediate_size)?;
-        self.down_proj.forward(&(gate * up)?)
-    }
-}
+// GlmOcr vision MLP is fused-gate-up SwiGLU with bias. The original
+// bespoke struct narrowed on dim=1 (2D `[L, dim]` tensors); the shared
+// `FusedSwiGluMlp` narrows on `D::Minus1`, which is equivalent for 2D.
+type GlmOcrVisionMLP = crate::layers::FusedSwiGluMlp;
 
 // ─── Vision Block ────────────────────────────────────────────────────────────
 
@@ -284,7 +263,12 @@ impl GlmOcrVisionBlock {
         let norm1 = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm1"))?;
         let attn = GlmOcrVisionAttention::new(cfg, vb.pp("attn"))?;
         let norm2 = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm2"))?;
-        let mlp = GlmOcrVisionMLP::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
+        let mlp = GlmOcrVisionMLP::new_with_bias(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            true,
+            vb.pp("mlp"),
+        )?;
         Ok(Self {
             norm1,
             attn,

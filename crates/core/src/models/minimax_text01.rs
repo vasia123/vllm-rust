@@ -307,33 +307,9 @@ impl MiniMaxText01Config {
     }
 }
 
-// ─── SwiGLU MLP ─────────────────────────────────────────────────────────────
-
-struct MiniMaxText01Mlp {
-    gate_up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl MiniMaxText01Mlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        // Merged gate+up: hidden_size -> 2*intermediate_size
-        let gate_up_proj =
-            linear_no_bias(hidden_size, 2 * intermediate_size, vb.pp("gate_up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs)?;
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = candle_nn::ops::silu(&chunks[0])?;
-        let hidden = gate.mul(&chunks[1])?;
-        self.down_proj.forward(&hidden)
-    }
-}
+// MiniMax-Text01's dense MLP is the canonical fused-gate-up SwiGLU
+// pattern without bias.
+type MiniMaxText01Mlp = crate::layers::FusedSwiGluMlp;
 
 // ─── MoE Layer ──────────────────────────────────────────────────────────────
 

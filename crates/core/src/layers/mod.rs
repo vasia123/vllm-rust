@@ -49,7 +49,7 @@ pub use attention::{
     apply_per_head_norm, batched_paged_attention_decode, paged_attention, repeat_kv,
 };
 pub use mask::causal_mask;
-pub use mlp::{fused_swiglu, GluActivation, MlpConfig, SwiGluMlp};
+pub use mlp::{fused_swiglu, FusedSwiGluMlp, GluActivation, MlpConfig, SwiGluMlp};
 pub use normalization::{rms_norm, rms_norm_gemma, rms_norm_unweighted, RmsNorm, RmsNormVariant};
 pub use rotary::{
     get_mrope_interleaved_id_list, MRoPEInterleaved, RotaryEmbedding, XDRotaryEmbedding,

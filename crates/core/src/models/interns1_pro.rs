@@ -313,34 +313,10 @@ impl FoPE {
 
 // ─── Dense MLP ───────────────────────────────────────────────────────────────
 
-struct DenseMlp {
-    gate_up_proj: Linear,
-    down_proj: Linear,
-    half: usize,
-}
-
-impl DenseMlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        // gate_up_proj packs [gate_proj | up_proj] into one matrix.
-        let gate_up_proj =
-            candle_nn::linear_no_bias(hidden_size, 2 * intermediate_size, vb.pp("gate_up_proj"))?;
-        let down_proj =
-            candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            half: intermediate_size,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs)?;
-        let gate = gate_up.narrow(candle_core::D::Minus1, 0, self.half)?;
-        let up = gate_up.narrow(candle_core::D::Minus1, self.half, self.half)?;
-        self.down_proj
-            .forward(&(candle_nn::ops::silu(&gate)? * up)?)
-    }
-}
+// InternS1-Pro's dense MLP is the canonical fused-gate-up SwiGLU
+// pattern without bias. The MoE-expert path remains bespoke (per-expert
+// weight loading is handled separately).
+type DenseMlp = crate::layers::FusedSwiGluMlp;
 
 // ─── MoE ─────────────────────────────────────────────────────────────────────
 

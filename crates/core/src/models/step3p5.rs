@@ -21,7 +21,7 @@ use crate::layers::{apply_per_head_norm, paged_attention, RotaryEmbedding};
 use crate::moe::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 
 pub use super::tp_layers::TpContext;
-use super::tp_layers::{TpEmbedding, TpLinear, TpSwiGluMlp};
+use super::tp_layers::{TpEmbedding, TpFusedSwiGluMlp, TpLinear, TpSwiGluMlp};
 
 // ─── Step3p5 Config (parsed from ModelConfig.extra) ─────────────────────────
 
@@ -193,27 +193,7 @@ impl Step3p5Config {
     }
 }
 
-// ─── Clamped SwiGLU Activation ──────────────────────────────────────────────
-
-/// Clamped SwiGLU: min(silu(gate), limit) * clamp(up, -limit, limit).
-///
-/// When no limit is set, falls back to standard SwiGLU: silu(gate) * up.
-fn swiglu_with_limit(gate_up: &Tensor, limit: Option<f64>) -> Result<Tensor> {
-    let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-    let gate = &chunks[0];
-    let up = &chunks[1];
-
-    let gate_act = candle_nn::ops::silu(gate)?;
-
-    match limit {
-        Some(l) => {
-            let gate_clamped = gate_act.clamp(-l, l)?;
-            let up_clamped = up.clamp(-l, l)?;
-            gate_clamped.mul(&up_clamped)
-        }
-        None => gate_act.mul(up),
-    }
-}
+// Clipped SwiGLU semantics live in `TpFusedSwiGluMlp` (limit knob).
 
 // ─── Attention ──────────────────────────────────────────────────────────────
 
@@ -537,54 +517,10 @@ impl Step3p5Attention {
     }
 }
 
-// ─── Step3p5 MLP (gate_up merged, optional clamping) ────────────────────────
-
-struct Step3p5MLP {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-    limit: Option<f64>,
-}
-
-impl Step3p5MLP {
-    fn new_with_tp(
-        hidden_size: usize,
-        intermediate_size: usize,
-        limit: Option<f64>,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        // Merged gate+up projection: hidden_size -> 2*intermediate_size
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            false,
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            false,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            limit,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs, tp_ctx)?;
-        let intermediate = swiglu_with_limit(&gate_up, self.limit)?;
-        self.down_proj.forward(&intermediate, tp_ctx)
-    }
-}
+// Step3p5's dense MLP is the fused-gate-up SwiGLU pattern with an
+// optional clamp `limit` on the activation. Use the unified
+// `TpFusedSwiGluMlp::new_with_bias_and_limit` from `tp_layers`.
+type Step3p5MLP = TpFusedSwiGluMlp;
 
 // ─── MoE Expert (SwiGLU) ───────────────────────────────────────────────────
 
@@ -693,9 +629,10 @@ impl Step3p5MoEBlock {
 
         // Shared expert (always active, processes all tokens)
         let shared_limit = step_cfg.swiglu_limit_shared(layer_idx);
-        let share_expert = Step3p5MLP::new_with_tp(
+        let share_expert = Step3p5MLP::new_with_bias_and_limit(
             hidden_size,
             step_cfg.share_expert_dim,
+            false,
             shared_limit,
             vb.pp("share_expert"),
             pg,
@@ -1178,29 +1115,8 @@ mod tests {
         assert!(!step_cfg.use_rope(1));
     }
 
-    // ─── Activation Tests ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_swiglu_without_limit() {
-        let device = Device::Cpu;
-        // gate=1.0, up=2.0 → silu(1.0) * 2.0
-        let gate_up = Tensor::new(&[[1.0_f32, 2.0]], &device).unwrap();
-        let result = swiglu_with_limit(&gate_up, None).unwrap();
-        let values: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
-        let expected = 1.0 / (1.0 + (-1.0_f32).exp()) * 2.0; // silu(1) * 2
-        assert!((values[0] - expected).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_swiglu_with_limit() {
-        let device = Device::Cpu;
-        // gate=100.0 (silu→~100), up=100.0, limit=7.0
-        // → min(silu(100), 7) * clamp(100, -7, 7) = 7.0 * 7.0 = 49.0
-        let gate_up = Tensor::new(&[[100.0_f32, 100.0]], &device).unwrap();
-        let result = swiglu_with_limit(&gate_up, Some(7.0)).unwrap();
-        let values: Vec<f32> = result.flatten_all().unwrap().to_vec1().unwrap();
-        assert!((values[0] - 49.0).abs() < 1e-3, "got {}", values[0]);
-    }
+    // Activation tests moved into `tp_layers::tests::tp_fused_swiglu_mlp_*`
+    // alongside the unified TpFusedSwiGluMlp implementation.
 
     // ─── Construction Tests ─────────────────────────────────────────────────────
 
@@ -1404,7 +1320,8 @@ mod tests {
         let pg = LocalProcessGroup::new();
         let tp_ctx = TpContext::single_gpu();
 
-        let mlp = Step3p5MLP::new_with_tp(64, 128, Some(7.0), vb.pp("mlp"), &pg).unwrap();
+        let mlp = Step3p5MLP::new_with_bias_and_limit(64, 128, false, Some(7.0), vb.pp("mlp"), &pg)
+            .unwrap();
 
         let input = Tensor::zeros((2, 64), DType::F32, &device).expect("input");
         let output = mlp.forward(&input, &tp_ctx);

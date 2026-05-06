@@ -97,17 +97,64 @@ impl SwiGluMlp {
         vb: VarBuilder,
         cfg: MlpConfig,
     ) -> Result<Self> {
+        Self::new_with_cfg_and_proj_names(
+            hidden_size,
+            intermediate_size,
+            vb,
+            cfg,
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        )
+    }
+
+    /// Construct a SwiGLU MLP with custom weight-name aliases.
+    ///
+    /// Used by PLaMo-2 / PLaMo-3 where the weights are stored under a
+    /// fused parent prefix as two split tensors:
+    /// `gate_up_proj.gate` / `gate_up_proj.up` / `down_proj`. The
+    /// projection layout is otherwise identical to the canonical Llama
+    /// triple — only the VarBuilder lookup differs.
+    pub fn new_with_proj_names(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        gate_name: &str,
+        up_name: &str,
+        down_name: &str,
+    ) -> Result<Self> {
+        Self::new_with_cfg_and_proj_names(
+            hidden_size,
+            intermediate_size,
+            vb,
+            MlpConfig::default(),
+            gate_name,
+            up_name,
+            down_name,
+        )
+    }
+
+    /// Most-general constructor: full `MlpConfig` plus weight-name aliases.
+    pub fn new_with_cfg_and_proj_names(
+        hidden_size: usize,
+        intermediate_size: usize,
+        vb: VarBuilder,
+        cfg: MlpConfig,
+        gate_name: &str,
+        up_name: &str,
+        down_name: &str,
+    ) -> Result<Self> {
         let (gate_proj, up_proj, down_proj) = if cfg.has_bias {
             (
-                linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+                linear(hidden_size, intermediate_size, vb.pp(gate_name))?,
+                linear(hidden_size, intermediate_size, vb.pp(up_name))?,
+                linear(intermediate_size, hidden_size, vb.pp(down_name))?,
             )
         } else {
             (
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+                linear_no_bias(hidden_size, intermediate_size, vb.pp(gate_name))?,
+                linear_no_bias(hidden_size, intermediate_size, vb.pp(up_name))?,
+                linear_no_bias(intermediate_size, hidden_size, vb.pp(down_name))?,
             )
         };
         Ok(Self {
@@ -154,6 +201,73 @@ impl Module for SwiGluMlp {
         let gate_act = self.activation.apply(&gate)?;
         let activation_result = (gate_act * up)?;
         activation_result.apply(&self.down_proj)
+    }
+}
+
+// ============================================================================
+// FusedSwiGluMlp — single-GPU fused gate_up SwiGLU
+// ============================================================================
+
+/// Fused-gate-up SwiGLU MLP without tensor parallelism.
+///
+/// Mirrors the Phi-3 / vLLM layout where `gate_proj` and `up_proj` are
+/// stored as a single `gate_up_proj` weight `[hidden, 2*intermediate]`.
+/// After projection, the output is split into `(gate, up)`; the
+/// activation is `silu(gate) * up`, then `down_proj`.
+///
+/// This is the non-TP analogue of [`crate::models::tp_layers::TpFusedSwiGluMlp`].
+/// Use this variant for models that wrap their own `Linear` projections
+/// (e.g. dots1, chameleon, minimax_text01, interns1_pro, glm_ocr vision).
+pub struct FusedSwiGluMlp {
+    gate_up_proj: Linear,
+    down_proj: Linear,
+    intermediate_size: usize,
+}
+
+impl FusedSwiGluMlp {
+    /// Construct a fused-gate-up SwiGLU MLP **without** bias.
+    pub fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_bias(hidden_size, intermediate_size, false, vb)
+    }
+
+    /// Construct a fused-gate-up SwiGLU MLP with optional bias on
+    /// both `gate_up_proj` and `down_proj`. Bias = true matches
+    /// Chameleon's MLP layout.
+    pub fn new_with_bias(
+        hidden_size: usize,
+        intermediate_size: usize,
+        bias: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let gate_up_proj = if bias {
+            linear(hidden_size, 2 * intermediate_size, vb.pp("gate_up_proj"))?
+        } else {
+            linear_no_bias(hidden_size, 2 * intermediate_size, vb.pp("gate_up_proj"))?
+        };
+        let down_proj = if bias {
+            linear(intermediate_size, hidden_size, vb.pp("down_proj"))?
+        } else {
+            linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?
+        };
+        Ok(Self {
+            gate_up_proj,
+            down_proj,
+            intermediate_size,
+        })
+    }
+}
+
+impl Module for FusedSwiGluMlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let fused = self.gate_up_proj.forward(xs)?;
+        let gate = fused.narrow(candle_core::D::Minus1, 0, self.intermediate_size)?;
+        let up = fused.narrow(
+            candle_core::D::Minus1,
+            self.intermediate_size,
+            self.intermediate_size,
+        )?;
+        let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
+        self.down_proj.forward(&hidden)
     }
 }
 

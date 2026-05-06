@@ -31,30 +31,11 @@ use super::tp_layers::TpContext;
 
 // ─── SwiGLU MLP ─────────────────────────────────────────────────────────────
 
-struct Plamo3Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Plamo3Mlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_up_proj.gate"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_up_proj.up"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(xs)?)?;
-        let up = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(gate * up)?)
-    }
-}
+// PLaMo-3 stores SwiGLU MLP weights under a fused parent prefix as two
+// split tensors: `gate_up_proj.gate` / `gate_up_proj.up` / `down_proj`.
+// Forward semantics are identical to the canonical SwiGLU — only the
+// VarBuilder paths differ.
+type Plamo3Mlp = crate::layers::SwiGluMlp;
 
 // ─── Attention ───────────────────────────────────────────────────────────────
 
@@ -128,7 +109,14 @@ struct Plamo3DecoderLayer {
 impl Plamo3DecoderLayer {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let mixer = Plamo3Attention::new(cfg, vb.pp("mixer"))?;
-        let mlp = Plamo3Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?;
+        let mlp = Plamo3Mlp::new_with_proj_names(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            vb.pp("mlp"),
+            "gate_up_proj.gate",
+            "gate_up_proj.up",
+            "down_proj",
+        )?;
         let pre_mixer_norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("pre_mixer_norm"))?;
         let post_mixer_norm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_mixer_norm"))?;

@@ -227,37 +227,10 @@ impl ChameleonAttention {
 
 // ─── MLP ────────────────────────────────────────────────────────────────────
 
-/// SwiGLU MLP: gate_up_proj → silu(gate) * up → down_proj
-struct ChameleonMLP {
-    gate_up_proj: Linear,
-    down_proj: Linear,
-    intermediate_size: usize,
-}
-
-impl ChameleonMLP {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_up_proj = candle_nn::linear(
-            cfg.hidden_size,
-            cfg.intermediate_size * 2,
-            vb.pp("gate_up_proj"),
-        )?;
-        let down_proj =
-            candle_nn::linear(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            intermediate_size: cfg.intermediate_size,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(x)?;
-        let gate = gate_up.narrow(2, 0, self.intermediate_size)?;
-        let up = gate_up.narrow(2, self.intermediate_size, self.intermediate_size)?;
-        let x = (candle_nn::Activation::Silu.forward(&gate)? * up)?;
-        self.down_proj.forward(&x)
-    }
-}
+// Chameleon's MLP is the fused-gate-up SwiGLU pattern WITH bias on
+// both `gate_up_proj` and `down_proj`. Use the shared
+// `crate::layers::FusedSwiGluMlp::new_with_bias`.
+type ChameleonMLP = crate::layers::FusedSwiGluMlp;
 
 // ─── Decoder Layer ──────────────────────────────────────────────────────────
 
@@ -271,7 +244,12 @@ struct ChameleonDecoderLayer {
 impl ChameleonDecoderLayer {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let self_attn = ChameleonAttention::new(cfg, vb.pp("self_attn"))?;
-        let mlp = ChameleonMLP::new(cfg, vb.pp("mlp"))?;
+        let mlp = ChameleonMLP::new_with_bias(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            true,
+            vb.pp("mlp"),
+        )?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(

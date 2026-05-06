@@ -420,6 +420,10 @@ pub struct TpFusedSwiGluMlp {
     down_proj: TpLinear,
     /// Local intermediate size = `intermediate_size / world_size`.
     local_intermediate: usize,
+    /// Optional clamp threshold for clipped SwiGLU
+    /// (`min(silu(gate), L) * clamp(up, -L, L)`). Used by Step3.5 and
+    /// any future architecture with a stability cap on the activation.
+    limit: Option<f64>,
 }
 
 impl TpFusedSwiGluMlp {
@@ -449,6 +453,21 @@ impl TpFusedSwiGluMlp {
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
+        Self::new_with_bias_and_limit(hidden_size, intermediate_size, bias, None, vb, pg)
+    }
+
+    /// Create a fused-gate-up SwiGLU MLP with optional bias and an
+    /// optional clamp `limit`. When `limit = Some(L)`, the activation
+    /// becomes `min(silu(gate), L) * clamp(up, -L, L)` (Step3.5 style).
+    /// When `limit = None`, falls through to standard SwiGLU.
+    pub fn new_with_bias_and_limit(
+        hidden_size: usize,
+        intermediate_size: usize,
+        bias: bool,
+        limit: Option<f64>,
+        vb: VarBuilder,
+        pg: &dyn ProcessGroup,
+    ) -> Result<Self> {
         let gate_up_proj = TpLinear::column_parallel(
             hidden_size,
             2 * intermediate_size,
@@ -472,10 +491,14 @@ impl TpFusedSwiGluMlp {
             gate_up_proj,
             down_proj,
             local_intermediate,
+            limit,
         })
     }
 
     /// Forward pass: fused projection → split → SwiGLU → down.
+    ///
+    /// When `limit` is `Some(L)`, applies clipped SwiGLU: gate and up
+    /// are both clamped to `[-L, L]` before the elementwise product.
     pub fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
         let fused = self.gate_up_proj.forward(xs, tp_ctx)?;
         let gate = fused.narrow(candle_core::D::Minus1, 0, self.local_intermediate)?;
@@ -484,7 +507,15 @@ impl TpFusedSwiGluMlp {
             self.local_intermediate,
             self.local_intermediate,
         )?;
-        let hidden = candle_nn::ops::silu(&gate)?.mul(&up)?;
+        let gate_act = candle_nn::ops::silu(&gate)?;
+        let hidden = match self.limit {
+            Some(l) => {
+                let g = gate_act.clamp(-l, l)?;
+                let u = up.clamp(-l, l)?;
+                g.mul(&u)?
+            }
+            None => gate_act.mul(&up)?,
+        };
         self.down_proj.forward(&hidden, tp_ctx)
     }
 }

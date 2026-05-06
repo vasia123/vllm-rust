@@ -109,30 +109,9 @@ impl Dots1Config {
 
 // ---- MLP (gate_up merged, SiLU) -------------------------------------------
 
-struct Dots1MLP {
-    gate_up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Dots1MLP {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_up_proj =
-            linear_no_bias(hidden_size, 2 * intermediate_size, vb.pp("gate_up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs)?;
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = candle_nn::ops::silu(&chunks[0])?;
-        let hidden = gate.mul(&chunks[1])?;
-        self.down_proj.forward(&hidden)
-    }
-}
+// Dots1's dense MLP is the canonical fused-gate-up SwiGLU pattern
+// without bias. Use the shared `crate::layers::FusedSwiGluMlp`.
+type Dots1MLP = crate::layers::FusedSwiGluMlp;
 
 // ---- Attention (merged QKV, Q/K norm, RoPE) --------------------------------
 //
