@@ -521,12 +521,18 @@ impl CudaGraphRunner {
             cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
         };
         if begin_result != CUresult::CUDA_SUCCESS {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                cuda_result = begin_result as i32,
+                batch_size,
+                "cuStreamBeginCapture_v2 failed"
+            );
             return Ok(false);
         }
 
         let capture_output = match capture_fn(&input_ids) {
             Ok(out) => out,
-            Err(_) => {
+            Err(e) => {
                 // Abort the capture cleanly — even if the forward errored
                 // we still need to consume the stream's capture state.
                 let mut graph: CUgraph = std::ptr::null_mut();
@@ -536,6 +542,14 @@ impl CudaGraphRunner {
                         candle_core::cuda::cudarc::driver::sys::cuGraphDestroy(graph);
                     }
                 }
+                tracing::warn!(
+                    target: "vllm_core::cuda_graph",
+                    error = %e,
+                    batch_size,
+                    "graph capture aborted: forward pass errored inside cuStreamBeginCapture; \
+                     a kernel is doing host-blocking work or a non-captureable allocation. \
+                     Eager path remains live for this batch."
+                );
                 return Ok(false);
             }
         };
@@ -548,12 +562,28 @@ impl CudaGraphRunner {
         let mut graph: CUgraph = std::ptr::null_mut();
         let end_result = unsafe { cuStreamEndCapture(stream, &mut graph) };
         if end_result != CUresult::CUDA_SUCCESS || graph.is_null() {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                cuda_result = end_result as i32,
+                graph_null = graph.is_null(),
+                batch_size,
+                "cuStreamEndCapture failed — most often means the captured stream \
+                 hit a non-captureable operation (cuMemAlloc, sync device→host copy, \
+                 etc.) and the driver invalidated the capture state. \
+                 CUDA error 900 = CUDA_ERROR_STREAM_CAPTURE_INVALIDATED."
+            );
             return Ok(false);
         }
 
         let mut graph_exec: CUgraphExec = std::ptr::null_mut();
         let inst_result = unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) };
         if inst_result != CUresult::CUDA_SUCCESS {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                cuda_result = inst_result as i32,
+                batch_size,
+                "cuGraphInstantiateWithFlags failed"
+            );
             unsafe {
                 candle_core::cuda::cudarc::driver::sys::cuGraphDestroy(graph);
             }
@@ -589,6 +619,13 @@ impl CudaGraphRunner {
     /// `get_padded_size` / `execute` calls dispatch to captured graphs.
     pub fn mark_warmed_up(&mut self) {
         self.warmed_up = true;
+        #[cfg(feature = "cuda-kernels")]
+        tracing::info!(
+            target: "vllm_core::cuda_graph",
+            "mark_warmed_up: graphs_count={}, size_mapping_count={}",
+            self.graphs.len(),
+            self.size_mapping.len()
+        );
     }
 
     /// Execute with CUDA graph if available, otherwise fall back to eager.
@@ -613,8 +650,31 @@ impl CudaGraphRunner {
         let batch_size = input_ids.dims()[0];
 
         // Check if we have a graph for this batch size
-        if let Some(padded_size) = self.get_padded_size(batch_size) {
+        let padded_size = self.get_padded_size(batch_size);
+        static FIRST_DECISION: std::sync::Once = std::sync::Once::new();
+        FIRST_DECISION.call_once(|| {
+            tracing::info!(
+                target: "vllm_core::cuda_graph",
+                "execute() entered (first call): batch_size={}, padded_size={:?}, \
+                 graphs_count={}, is_enabled={}, warmed_up={}",
+                batch_size,
+                padded_size,
+                self.graphs.len(),
+                self.is_enabled(),
+                self.warmed_up,
+            );
+        });
+        if let Some(padded_size) = padded_size {
             if let Some(captured) = self.graphs.get(&padded_size) {
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| {
+                    tracing::info!(
+                        target: "vllm_core::cuda_graph",
+                        "CUDA graph replay live (first replay: batch_size={}, padded={})",
+                        batch_size,
+                        padded_size
+                    );
+                });
                 // Prepare input: pad if necessary
                 let padded_input = if batch_size < padded_size {
                     // Create padded input by concatenating with zeros
@@ -703,17 +763,26 @@ impl CudaGraphRunner {
     fn get_cuda_stream(
         &self,
     ) -> Result<candle_core::cuda::cudarc::driver::sys::CUstream, CudaGraphRunnerError> {
-        // Create a dummy tensor to access the CUDA device
-        let dummy = Tensor::zeros(1, DType::F32, &self.device)
-            .map_err(|e| CudaGraphRunnerError::DeviceError(e.to_string()))?;
-
-        let (storage, _) = dummy.storage_and_layout();
-        match &*storage {
-            candle_core::Storage::Cuda(_cuda_storage) => {
-                // Get the stream from the device
-                // cudarc CudaDevice uses stream 0 by default
-                Ok(std::ptr::null_mut()) // Default stream (stream 0)
-            }
+        // candle 0.9 / cudarc 0.16 dispatch every kernel through the
+        // CudaContext's *default* stream, and `default_stream()` returns
+        // a CudaStream whose `cu_stream` is `std::ptr::null_mut()` — the
+        // legacy null stream.  CUDA stream capture is unconditionally
+        // unsupported on that stream:
+        //
+        //   `cuStreamBeginCapture_v2` returns
+        //   `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` (900).
+        //
+        // Picking a freshly created `cuStreamCreate` stream here would
+        // capture *that* stream's queue (which is empty), not the queue
+        // candle is feeding. So unless candle is taught to use a
+        // non-default stream, every `try_capture_decode_step` call will
+        // hit error 900, fall through to `Ok(false)`, and the engine
+        // will run eager forever.  This is a known upstream limitation;
+        // `mark_warmed_up` keeps `warmed_up = true` so callers see a
+        // consistent "tried, fell back" path rather than an unbounded
+        // retry loop.
+        match &self.device {
+            candle_core::Device::Cuda(cuda_device) => Ok(cuda_device.cuda_stream().cu_stream()),
             _ => Err(CudaGraphRunnerError::DeviceError(
                 "Device is not CUDA".to_string(),
             )),

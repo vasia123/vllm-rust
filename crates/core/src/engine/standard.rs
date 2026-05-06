@@ -136,12 +136,15 @@ impl<M: ModelForward> StandardExecution<M> {
     /// the real `model.forward_decode_batch`, and registers the captured
     /// size with the dispatcher on success. If no runner is attached,
     /// falls back to plain JIT warmup so cold-shape kernels still compile.
+    /// Returns `true` iff a CUDA graph was actually captured for this
+    /// batch size; `false` means the call ran a plain JIT warmup forward
+    /// (capture was unavailable, skipped, or failed cleanly).
     fn capture_decode_graph(
         &mut self,
         batch_size: usize,
         kv_cache_mgr: &mut KVCacheManager,
         dispatcher: &mut CudaGraphDispatcher,
-    ) -> Result<(), WarmupError> {
+    ) -> Result<bool, WarmupError> {
         let descriptor = super::cuda_graph::BatchDescriptor::for_decode(batch_size);
 
         // Without an attached runner there's nothing to capture — fall
@@ -150,7 +153,7 @@ impl<M: ModelForward> StandardExecution<M> {
         if self.graph_runner.is_none() {
             self.run_dummy_decode(batch_size, kv_cache_mgr)?;
             dispatcher.register_valid_key(descriptor);
-            return Ok(());
+            return Ok(false);
         }
 
         // Build dummy sequences + slot for the decode token. Mirrors
@@ -196,14 +199,14 @@ impl<M: ModelForward> StandardExecution<M> {
         match captured {
             Ok(true) => {
                 dispatcher.register_valid_key(descriptor);
-                Ok(())
+                Ok(true)
             }
             Ok(false) => {
                 // Capture skipped or failed cleanly — fall back to JIT
                 // warmup so the eager path is at least primed for this
                 // batch size.
                 self.run_dummy_decode(batch_size, kv_cache_mgr)?;
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(WarmupError::CacheAllocation(format!(
                 "graph capture for batch {batch_size}: {e}"
@@ -510,10 +513,21 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             // Phase 2: CUDA graph registration
             if config.enable_graph_capture && dispatcher.is_enabled() {
                 match self.capture_decode_graph(batch_size, kv_cache_mgr, dispatcher) {
-                    Ok(()) => {
+                    Ok(true) => {
                         stats.graphs_captured += 1;
                         if config.show_progress {
                             info!(batch_size, "CUDA graph registered");
+                        }
+                    }
+                    Ok(false) => {
+                        stats.graphs_failed += 1;
+                        if config.show_progress {
+                            info!(
+                                batch_size,
+                                "CUDA graph capture skipped (JIT-only fallback) — \
+                                 a kernel inside the forward pass is not capturable; \
+                                 this size will run eager"
+                            );
                         }
                     }
                     Err(e) => {
@@ -532,6 +546,16 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
         if let Some(runner_arc) = self.graph_runner.as_mut() {
             if let Some(runner) = Arc::get_mut(runner_arc) {
                 runner.mark_warmed_up();
+                tracing::info!(
+                    target: "vllm_core::cuda_graph",
+                    "graph runner marked warmed_up — replay path now active"
+                );
+            } else {
+                tracing::warn!(
+                    target: "vllm_core::cuda_graph",
+                    "graph runner Arc has > 1 strong refs — mark_warmed_up SKIPPED. \
+                     Replay will never fire; eager fallback in effect."
+                );
             }
         }
 

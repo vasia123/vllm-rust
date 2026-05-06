@@ -88,28 +88,22 @@ use context::OwnedExecutionState;
 // ─── Engine start functions ───────────────────────────────────────────────
 
 /// Start the inference engine with standard execution.
+///
+/// Runs the configured warmup phase synchronously before spawning the
+/// engine loop. This populates `StandardExecution::graph_runner` (when
+/// `cuda_graph_config.enabled` is true) and JIT-compiles every kernel
+/// at the configured decode batch sizes — without it, every decode call
+/// silently falls back to the eager dispatch path in
+/// `helpers::execute_decode_step`. Warmup stats are dropped on the floor
+/// here; callers that want them should use `start_engine_with_warmup`.
 pub fn start_engine<M: ModelForward>(
     model: M,
     tokenizer: TokenizerWrapper,
     kv_cache_mgr: KVCacheManager,
     config: EngineConfig,
 ) -> EngineHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(256);
-
-    let state = OwnedExecutionState::new(&config);
-    let strategy =
-        StandardExecution::new(model).with_sliding_window(config.sliding_window, config.block_size);
-
-    tokio::spawn(strategy::run_engine_loop(
-        strategy,
-        state,
-        kv_cache_mgr,
-        config,
-        tokenizer,
-        cmd_rx,
-    ));
-
-    EngineHandle { cmd_tx }
+    let (handle, _stats) = start_engine_with_warmup(model, tokenizer, kv_cache_mgr, config);
+    handle
 }
 
 /// Start the inference engine with speculative decoding using a draft model.
