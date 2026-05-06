@@ -71,23 +71,53 @@ quantified:
 1. `start_engine` was wired into `start_engine_with_warmup` (it had
    been silently bypassing it). JIT precompiles batch sizes
    1, 2, 4, 8, 16, 32 at boot, smoothing first-token latency.
-2. CUDA stream capture itself remains blocked one level lower:
-   `cuStreamBeginCapture_v2` returns `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`
-   (code 900) on every batch because candle 0.9 + cudarc 0.16 dispatch
-   every kernel through the CudaContext's *default* stream, and
-   `default_stream()` returns a stream whose underlying handle is the
-   legacy null stream — on which CUDA stream capture is unconditionally
-   forbidden. Capturing a freshly created non-default stream would
-   record an empty queue.
+2. CUDA stream capture itself remains blocked one level lower (initially
+   error 900 — `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` — because candle
+   0.9 + cudarc 0.16 dispatch every kernel through the CudaContext's
+   *default* stream, whose underlying handle is the legacy null stream).
 3. Honest diagnostics now distinguish "graph captured" from "JIT
    fallback" in the warmup log, and `try_capture_decode_step` emits the
    exact CUDA driver error code on every failure path.
 
-Closing the gap therefore needs upstream-architectural work in candle
-(use a non-default stream) or a bypass that hand-rolls graph node
-insertion, neither of which fits in this branch. The eager path with
-the new GEMV variants and uninit allocs already gets us to ~733× of
-baseline on warm hardware.
+## Stage 11 — vendored candle fork: error 900 → error 905
+
+`scripts/setup-vendor-candle.sh` clones candle 0.9.1 into `vendor/candle/`
+and applies a one-line surgical patch (`CudaDevice::new` switches from
+`context.default_stream()` to `context.new_stream().w()?`). Workspace
+`[patch.crates-io]` redirects `candle-core`, `candle-nn`, and
+`candle-flash-attn` to the vendored copies. Combined with switching
+`cuStreamBeginCapture_v2` mode from GLOBAL to RELAXED:
+
+- **Before fork:** every batch fails with CUDA error 900
+  (`STREAM_CAPTURE_UNSUPPORTED`). Capture never starts.
+- **After fork:** every batch progresses past `cuStreamBeginCapture_v2`
+  and fails later with CUDA error 905 (`STREAM_CAPTURE_ISOLATION`,
+  *"dependency created on uncaptured work in another stream"*).
+
+Same eager fallback path runs in both cases — steady-state remains
+~42 tok/s with no regression — but the failure mode has shifted from
+*"can't even start"* to *"started, then aborted on a tensor
+allocation"*, which is the actual upstream-blocked operation.
+
+The new error is surfaced by candle's per-tensor allocations
+(`Tensor::zeros`, intermediate `.contiguous()` results, KV cache slot
+mapping rebuilds) which go through plain synchronous `cuMemAlloc`. CUDA
+stream capture forbids any allocation primitive other than
+`cuMemAllocAsync` from a captured memory pool — the moment a
+captured stream sees a `cuMemAlloc` it logs an event-edge to the
+allocator's internal stream and aborts the capture sequence.
+
+Closing the gap therefore requires either:
+- Teaching candle's hot path to use a memory pool
+  (`cuMemAllocAsync`-only inside the captured stream), or
+- Pre-allocating every intermediate tensor once into the
+  `DecodeBatchShared` bundle that Stage 7 already plumbs through, and
+  reusing those buffers for every decode forward.
+
+The fork is the minimum viable infrastructure for either follow-up —
+without it CUDA capture is unreachable. The eager path with the new
+GEMV variants and uninit allocs already delivers ~733× of baseline on
+warm hardware.
 
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
