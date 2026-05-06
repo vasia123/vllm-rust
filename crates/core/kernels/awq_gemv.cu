@@ -116,3 +116,114 @@ extern "C" __global__ void awq_gemv_int4_bf16(
         __syncthreads();  // ready for next m
     }
 }
+
+// ─── Split-K variant for higher SM occupancy ────────────────────────────────
+//
+// The serial kernel above puts a single warp on each block (one thread per
+// output column, K reduced sequentially). For Qwen3-class shapes (N = 2560)
+// that leaves ~10% of SM warp slots active on Ada. The split-K variant fans
+// each output column across `K_THREADS = 4` threads, so the same N tile uses
+// a 4-warp block — still one block per N tile, but 4× more parallel work
+// per block, raising occupancy to ~40% on RTX 4060 Laptop.
+//
+// Layout assumes:
+//   - K  divisible by (8 * K_THREADS)         (e.g. K = 2560 → K/4 = 640, ok)
+//   - K  divisible by group_size              (always for AWQ)
+//   - K_THREADS divides packed_k              (for clean k-chunk boundaries)
+//   - N  divisible by N_TILE                  (32)
+// The dispatcher checks these and falls back to `awq_gemv_int4_bf16` if not.
+//
+// Within one warp (32 lanes) we pack 8 output columns × 4 K-chunks each.
+// Lane (4*c + ck) holds the partial sum for column c, K-chunk ck. After two
+// `__shfl_xor_sync` rounds the 4 partial sums of each column collapse into
+// lane (4*c + 0), which writes the BF16 output. FP32 accumulation throughout.
+
+#define SPLIT_K_THREADS 4
+#define SPLIT_BLOCK_THREADS (N_TILE * SPLIT_K_THREADS)  // 128
+
+extern "C" __global__ void awq_gemv_int4_split_k_bf16(
+    __nv_bfloat16* __restrict__ output,         // [M, N]
+    const __nv_bfloat16* __restrict__ input,    // [M, K]
+    const unsigned int* __restrict__ qweight,   // [K/8, N]
+    const __nv_bfloat16* __restrict__ scales,   // [G, N]
+    const unsigned int* __restrict__ qzeros,    // [G, N/8]
+    const __nv_bfloat16* __restrict__ bias,     // [N], optional
+    int M,
+    int N,
+    int K,
+    int group_size,
+    int has_zp,
+    int has_bias
+) {
+    const int tid     = threadIdx.x;
+    const int col_idx = tid / SPLIT_K_THREADS;     // 0..31 → output column within block
+    const int k_chunk = tid % SPLIT_K_THREADS;     // 0..3  → K-range within column
+    const int n       = blockIdx.x * N_TILE + col_idx;
+
+    extern __shared__ __nv_bfloat16 input_sh[];
+
+    const int packed_k = K / 8;
+    const int packed_n = N / 8;
+
+    // packed_k must be divisible by SPLIT_K_THREADS (host-side dispatcher
+    // enforces this; otherwise the serial kernel is used).
+    const int kp_per_chunk = packed_k / SPLIT_K_THREADS;
+    const int kp_start     = k_chunk * kp_per_chunk;
+    const int kp_end       = kp_start + kp_per_chunk;
+
+    for (int m = 0; m < M; ++m) {
+        // Cooperative load of input[m, :K].
+        for (int k = tid; k < K; k += SPLIT_BLOCK_THREADS) {
+            input_sh[k] = input[m * K + k];
+        }
+        __syncthreads();
+
+        float acc = 0.0f;
+        if (n < N) {
+            int   cached_group = -1;
+            float cached_scale = 0.0f;
+            float cached_zp    = 8.0f;
+
+            for (int kp = kp_start; kp < kp_end; ++kp) {
+                const int k_base   = kp * 8;
+                const int group_id = k_base / group_size;
+
+                if (group_id != cached_group) {
+                    cached_scale = __bfloat162float(scales[group_id * N + n]);
+                    if (has_zp) {
+                        const int zp_pack_col = n >> 3;
+                        const int zp_bit      = (n & 7) << 2;
+                        const unsigned int zw = qzeros[group_id * packed_n + zp_pack_col];
+                        cached_zp = (float)((zw >> zp_bit) & 0xFu);
+                    }
+                    cached_group = group_id;
+                }
+
+                const unsigned int w = qweight[kp * N + n];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int   nib  = (int)((w >> (i * 4)) & 0xFu);
+                    const float wval = ((float)nib - cached_zp) * cached_scale;
+                    acc += __bfloat162float(input_sh[k_base + i]) * wval;
+                }
+            }
+        }
+
+        // Reduce 4 partial sums per column across lanes (4*c..4*c+3) within
+        // the same warp. SPLIT_K_THREADS = 4 → two XOR rounds suffice.
+        // The full warp participates (mask = 0xFFFFFFFF) — inactive lanes
+        // (n ≥ N) carry acc = 0 from above, so they do not corrupt sums.
+        unsigned mask = 0xFFFFFFFFu;
+        acc += __shfl_xor_sync(mask, acc, 1);
+        acc += __shfl_xor_sync(mask, acc, 2);
+
+        if (k_chunk == 0 && n < N) {
+            float out_val = acc;
+            if (has_bias) {
+                out_val += __bfloat162float(bias[n]);
+            }
+            output[m * N + n] = __float2bfloat16(out_val);
+        }
+        __syncthreads();
+    }
+}

@@ -293,6 +293,17 @@ impl MarlinGemmOp {
     fn cuda_fwd_awq_gemv(&self, storage: &CudaStorage) -> Result<(CudaStorage, Shape)> {
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
 
+        const N_TILE: u32 = 32;
+        const SERIAL_BLOCK_THREADS: u32 = 32;
+        const SPLIT_K_THREADS: u32 = 4;
+        const SPLIT_BLOCK_THREADS: u32 = N_TILE * SPLIT_K_THREADS; // 128
+
+        // Pick the highest-occupancy variant the shape allows. Split-K
+        // requires K/8 (packed_k) to be divisible by SPLIT_K_THREADS; for
+        // every Qwen3 shape (K = 2560, 18944, …) this holds.
+        let packed_k = self.k / 8;
+        let use_split_k = packed_k.is_multiple_of(SPLIT_K_THREADS as usize) && packed_k >= 8;
+
         // One-shot confirmation that the decode path is actually live.
         // Helps diagnose whether wall-clock degradation is in the kernel
         // itself or somewhere upstream.
@@ -300,13 +311,14 @@ impl MarlinGemmOp {
         FIRST.call_once(|| {
             tracing::info!(
                 target: "vllm_core::awq_gemv",
-                "awq_gemv decode kernel active (M={}, N={}, K={}, num_groups={})",
-                self.m, self.n, self.k, self.num_groups
+                "awq_gemv decode kernel active (M={}, N={}, K={}, num_groups={}, variant={})",
+                self.m,
+                self.n,
+                self.k,
+                self.num_groups,
+                if use_split_k { "split_k" } else { "serial" }
             );
         });
-
-        const N_TILE: u32 = 32;
-        const BLOCK_THREADS: u32 = 32;
 
         let dev = &storage.device;
 
@@ -318,7 +330,12 @@ impl MarlinGemmOp {
         let elem_count = self.m * self.n;
         let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
 
-        let func = dev.get_or_load_custom_func("awq_gemv_int4_bf16", "awq_gemv", AWQ_GEMV_PTX)?;
+        let kernel_name = if use_split_k {
+            "awq_gemv_int4_split_k_bf16"
+        } else {
+            "awq_gemv_int4_bf16"
+        };
+        let func = dev.get_or_load_custom_func(kernel_name, "awq_gemv", AWQ_GEMV_PTX)?;
 
         // Activations.
         let input = match &storage.slice {
@@ -404,10 +421,15 @@ impl MarlinGemmOp {
         let grid_x: u32 = (self.n as u32) / N_TILE;
         // One BF16 input row cached in shared memory.
         let smem_bytes: u32 = (self.k as u32) * 2;
+        let block_threads = if use_split_k {
+            SPLIT_BLOCK_THREADS
+        } else {
+            SERIAL_BLOCK_THREADS
+        };
 
         let cfg = LaunchConfig {
             grid_dim: (grid_x, 1, 1),
-            block_dim: (BLOCK_THREADS, 1, 1),
+            block_dim: (block_threads, 1, 1),
             shared_mem_bytes: smem_bytes,
         };
 
