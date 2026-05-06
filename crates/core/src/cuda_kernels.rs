@@ -1730,39 +1730,47 @@ impl CustomOp1 for RopeOp {
             "rotary_embedding_gptj_bf16"
         };
 
-        // Get positions storage
+        // Get positions storage. The kernel reads each entry as `int`
+        // (4 bytes); for non-negative position indices ≤ 2^31 the bit
+        // pattern of u32 and i32 is identical, so the U32 path hands the
+        // device pointer to the kernel directly — avoiding a synchronous
+        // device→host→device round-trip on every RoPE call (which also
+        // blocked CUDA-graph capture).
+        //
+        // I64 positions still need a one-pass conversion; we materialise
+        // an i32 buffer on host. This path is currently unreachable from
+        // `apply_varlen` (which always builds U32) but kept as a defensive
+        // fallback. A one-shot warn tags any future regression.
         let (pos_storage, _pos_layout) = self.positions.storage_and_layout();
         let pos_storage = match &*pos_storage {
             Storage::Cuda(s) => s,
             _ => candle_core::bail!("rope: positions must be on CUDA"),
         };
-        // Match arms use the variant as a dtype witness; the data is read
-        // back via `to_vec1` and re-uploaded to keep a single i32 contract on
-        // the device side. (Direct device-side cast is a separate perf task.)
-        let pos_slice = match &pos_storage.slice {
-            CudaStorageSlice::I64(_) => {
-                let pos_vec: Vec<i32> = self
-                    .positions
-                    .to_vec1::<i64>()?
-                    .iter()
-                    .map(|&v| v as i32)
-                    .collect();
-                dev.memcpy_stod(&pos_vec)?
-            }
-            CudaStorageSlice::U32(_) => {
-                let pos_vec: Vec<i32> = self
-                    .positions
-                    .to_vec1::<u32>()?
-                    .iter()
-                    .map(|&v| v as i32)
-                    .collect();
-                dev.memcpy_stod(&pos_vec)?
-            }
-            _ => candle_core::bail!(
-                "rope: positions must be i64 or u32, got {:?}",
-                self.positions.dtype()
-            ),
-        };
+        let pos_i32_owned: Option<candle_core::cuda::cudarc::driver::CudaSlice<i32>> =
+            match &pos_storage.slice {
+                CudaStorageSlice::U32(_) => None,
+                CudaStorageSlice::I64(_) => {
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    FIRST.call_once(|| {
+                        tracing::warn!(
+                            target: "vllm_core::rope",
+                            "RoPE positions arrived as I64 — host-pull conversion path active. \
+                             Caller should pass U32 to avoid the per-call host sync."
+                        );
+                    });
+                    let pos_vec: Vec<i32> = self
+                        .positions
+                        .to_vec1::<i64>()?
+                        .iter()
+                        .map(|&v| v as i32)
+                        .collect();
+                    Some(dev.memcpy_stod(&pos_vec)?)
+                }
+                _ => candle_core::bail!(
+                    "rope: positions must be i64 or u32, got {:?}",
+                    self.positions.dtype()
+                ),
+            };
 
         // Get cos_sin_cache storage
         let (cache_storage, _cache_layout) = self.cos_sin_cache.storage_and_layout();
@@ -1784,7 +1792,16 @@ impl CustomOp1 for RopeOp {
                 let func = dev.get_or_load_custom_func(kernel_name, "rope", ROPE_PTX)?;
 
                 let mut builder = func.builder();
-                builder.arg(&pos_slice); // positions
+                // Positions arg: U32 source goes directly (kernel reads as `int`,
+                // bit pattern matches for non-negative indices); I64 source uses
+                // the host-converted I32 slice.
+                if let CudaStorageSlice::U32(s) = &pos_storage.slice {
+                    builder.arg(s);
+                } else if let Some(s) = pos_i32_owned.as_ref() {
+                    builder.arg(s);
+                } else {
+                    candle_core::bail!("rope: positions dtype unsupported (must be U32 or I64)");
+                }
                 builder.arg(&output_slice); // query (modified in-place)
                 builder.arg(&0u64); // key = nullptr
                 builder.arg(cache_slice); // cos_sin_cache
