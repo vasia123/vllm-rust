@@ -54,6 +54,7 @@ Server: `--num-blocks 96 --max-requests 4 --max-model-len 1024
 | Stages 1–6 (initial baseline)                          | ~5 min  | ~17 000   | ~0.05        | not measured   |
 | + Stage 7 (decode shared tensors) wired on Qwen3-AWQ¹  | ~5 min  | ~17 000   | ~0.06        | ~460 ms / 36   |
 | + Stage 8 (CUDA `awq_to_gptq_qweight_int4` kernel)     | **21 s** | ~17 000  | ~0.06        | ~460 ms / 36   |
+| + Stage 9 (AwqMarlin live + AWQ GEMV kernel for M ≤ 16) | ~21 s  | ~600     | **~11.6**    | ~10 ms / 36    |
 
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
@@ -113,6 +114,49 @@ vLLM hides this with two mechanisms we don't yet have on the AWQ path:
 Both are next-stage fixes; they are out of scope for the present
 landed work and are tracked separately.
 
+## Stage 9 — what changed (2026-05-06)
+
+Two latent gating bugs blocked the entire Marlin/GEMV path on Qwen3-AWQ.
+Both were undiagnosed until we wired one-shot `tracing::info!` markers
+inside `AwqMarlinLinear::load_weights`, `MarlinLinear::forward_marlin`,
+`forward_fallback`, and the new `cuda_fwd_awq_gemv`, then ran the server.
+
+1. **`AwqWeightLoader::load_linear` always built `AwqLinear` directly**
+   (`crates/core/src/quantization/weight_loader.rs:403-510`), bypassing
+   `AwqConfig::create_linear` where Stage 1 had wired the Marlin route.
+   Fix: mirror the Marlin gate inside the weight-loader entry path so
+   AWQ checkpoints construct `AwqMarlinLinear` whenever
+   `use_marlin && can_use_marlin_for_shape` clears.
+
+2. **`MarlinLinear::process_weights` repacked qweight to a Marlin
+   tile-MMA layout via a kernel we do not ship.** The PTX entry
+   `repack_gptq_to_marlin_int4` is missing from `marlin_gemm.ptx`
+   (`grep .entry`); all four live INT4/INT8 GEMM kernels plus the new
+   `awq_gemv_int4_bf16` consume raw `[K/8, N]` GPTQ-style qweight and
+   un-permuted `[num_groups, N]` scales. Until a real tile-MMA kernel
+   ships, `process_weights` is a documented no-op.
+
+3. **HF AWQ scales arrive in F16; the Marlin and GEMV kernels both
+   need BF16.** `AwqMarlinLinear::load_weights` now converts at load
+   time so the per-call cast is free.
+
+4. **Decode-path GEMV kernel** (`crates/core/kernels/awq_gemv.cu`,
+   `MarlinGemmOp::cuda_fwd_awq_gemv`): one warp per block, one thread
+   per output column, FP32 accumulation, BF16 output, scale/zp cached
+   per group. Routed for `M ≤ 16` AWQ-INT4 with zero points and
+   without `g_idx`.
+
+Net effect: **0.06 → 11.6 tok/s** on the same hardware and command line
+(`--enforce-eager`, `--num-blocks 96`, `--max-requests 4`,
+`--max-model-len 1024`). 193× single-stream throughput improvement.
+
+Per-layer profile on the new path: ~10 ms / 36 layers
+(7 quantized linear forwards each), down from ~460 ms / 36.
+Effective memory bandwidth on the GEMV kernel is ~12 GB/s of the
+~256 GB/s peak — leaving substantial headroom that Stage 10 (CUDA-graph
+capture, output buffer pooling, GPU positions for RoPE) is expected
+to close to ≥ 50 tok/s.
+
 ## Stage attribution (cumulative on this branch)
 
 - **Stage 1**  AWQ→Marlin layout repack at load via `AwqMarlinLinear`,
@@ -131,6 +175,14 @@ landed work and are tracked separately.
   `QuantizedQwen3ForCausalLM` (AWQ runtime path).
 - **Stage 8**  GPU `awq_to_gptq_qweight_int4` kernel — startup
   ~5 min → ~21 s.
+- **Stage 9**  Three coordinated changes that activate every Marlin-path
+  optimisation Stages 1, 7, 8 had silently been gated out of:
+  (9-A) `AwqWeightLoader` routes through `AwqMarlinLinear`;
+  (9-B) `MarlinLinear::process_weights` becomes a no-op (no tile-MMA
+  kernel is shipped, so the old repack would have crashed at startup);
+  (9-C) new `awq_gemv_int4_bf16` kernel takes over for `M ≤ 16` and
+  scale/zp dtype is normalised at load time.
+  Single-stream decode: 0.06 → 11.6 tok/s.
 
 Python vLLM was not present in the test environment (no apples-to-apples
 comparison was made on this run). The vllm-rust numbers above are real
