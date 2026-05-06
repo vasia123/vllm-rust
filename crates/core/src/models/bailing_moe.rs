@@ -27,7 +27,7 @@ use crate::layers::attention::{
 use crate::layers::RotaryEmbedding;
 use crate::moe::{MoERouter, RouterConfig, ScoringFunc, TopKRouter};
 
-use super::tp_layers::{TpContext, TpEmbedding, TpLinear, TpSwiGluMlp};
+use super::tp_layers::{TpContext, TpEmbedding, TpFusedSwiGluMlp, TpLinear, TpSwiGluMlp};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -249,50 +249,9 @@ impl BailingAttention {
 
 // ─── MLP (SwiGLU with merged gate_up) ───────────────────────────────────────
 
-struct BailingMLP {
-    gate_up_proj: TpLinear,
-    down_proj: TpLinear,
-}
-
-impl BailingMLP {
-    fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        use_bias: bool,
-        vb: VarBuilder,
-        pg: &dyn ProcessGroup,
-    ) -> Result<Self> {
-        let gate_up_proj = TpLinear::column_parallel(
-            hidden_size,
-            2 * intermediate_size,
-            use_bias,
-            false,
-            vb.pp("gate_up_proj"),
-            pg,
-        )?;
-        let down_proj = TpLinear::row_parallel(
-            intermediate_size,
-            hidden_size,
-            use_bias,
-            true,
-            vb.pp("down_proj"),
-            pg,
-        )?;
-
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor, tp_ctx: &TpContext) -> Result<Tensor> {
-        let gate_up = self.gate_up_proj.forward(xs, tp_ctx)?;
-        let chunks = gate_up.chunk(2, gate_up.rank() - 1)?;
-        let gate = candle_nn::ops::silu(&chunks[0])?;
-        let hidden = gate.mul(&chunks[1])?;
-        self.down_proj.forward(&hidden, tp_ctx)
-    }
-}
+// Bailing-MoE shared expert MLP is the fused-gate-up SwiGLU pattern
+// with optional bias (`use_bias` config flag).
+type BailingMLP = TpFusedSwiGluMlp;
 
 // ─── MoE Expert ──────────────────────────────────────────────────────────────
 
@@ -410,7 +369,7 @@ impl BailingMoEBlock {
                 .moe_shared_expert_intermediate_size
                 .unwrap_or(bm_cfg.moe_intermediate_size)
                 * bm_cfg.num_shared_experts;
-            Some(BailingMLP::new(
+            Some(BailingMLP::new_with_bias(
                 hidden_size,
                 shared_intermediate,
                 bm_cfg.use_bias,
