@@ -1105,6 +1105,109 @@ mod tests {
     use super::*;
     use candle_core::Device;
 
+    // ─── DecodeBatchShared builder ───────────────────────────────────────
+
+    fn fake_metadata(
+        num_seqs: usize,
+        offsets: &[usize],
+        block_lists: &[Vec<usize>],
+        slot_lists: &[Vec<usize>],
+    ) -> Vec<crate::engine::DecodeSequenceMetadata> {
+        assert_eq!(num_seqs, offsets.len());
+        assert_eq!(num_seqs, block_lists.len());
+        assert_eq!(num_seqs, slot_lists.len());
+
+        let mut sequences = Vec::with_capacity(num_seqs);
+        for i in 0..num_seqs {
+            sequences.push(crate::engine::DecodeSequenceMetadata {
+                request_id: i as u64,
+                seqlen_offset: offsets[i],
+                block_ids: block_lists[i].clone(),
+                slot_mapping: slot_lists[i].clone(),
+            });
+        }
+        sequences
+    }
+
+    #[test]
+    fn build_decode_batch_shared_single_seq() {
+        let device = Device::Cpu;
+        let seqs = fake_metadata(1, &[5], &[vec![0]], &[vec![5]]);
+        let shared = build_decode_batch_shared(&seqs, &device).unwrap();
+
+        assert_eq!(shared.positions.as_slice(), &[5]);
+        assert_eq!(shared.all_slot_mapping.as_slice(), &[5]);
+        assert_eq!(shared.max_blocks_per_seq, 1);
+        assert_eq!(shared.max_seq_len, 6); // seqlen_offset + 1
+        assert_eq!(shared.block_tables.dims(), &[1, 1]);
+        assert_eq!(shared.seq_lens.dims(), &[1]);
+
+        let bt: Vec<u32> = shared
+            .block_tables
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let sl: Vec<u32> = shared.seq_lens.to_vec1().unwrap();
+        assert_eq!(bt, vec![0]);
+        assert_eq!(sl, vec![6]);
+    }
+
+    #[test]
+    fn build_decode_batch_shared_multiple_sequences_pad_block_table() {
+        // Two sequences with different block-list lengths — block_tables
+        // gets padded along axis 1 to max_blocks_per_seq.
+        let device = Device::Cpu;
+        let seqs = fake_metadata(
+            2,
+            &[15, 7],
+            &[vec![3, 9, 12], vec![5]],
+            &[vec![15], vec![7]],
+        );
+        let shared = build_decode_batch_shared(&seqs, &device).unwrap();
+
+        assert_eq!(shared.positions.as_slice(), &[15, 7]);
+        assert_eq!(shared.all_slot_mapping.as_slice(), &[15, 7]);
+        assert_eq!(shared.max_blocks_per_seq, 3);
+        assert_eq!(shared.max_seq_len, 16);
+
+        let bt: Vec<u32> = shared
+            .block_tables
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        // Row 0: [3, 9, 12]; row 1: [5, 0, 0] (zero-padded).
+        assert_eq!(bt, vec![3, 9, 12, 5, 0, 0]);
+
+        let sl: Vec<u32> = shared.seq_lens.to_vec1().unwrap();
+        assert_eq!(sl, vec![16, 8]); // seqlen_offset + 1
+    }
+
+    #[test]
+    fn build_decode_batch_shared_empty_errors() {
+        let device = Device::Cpu;
+        let res = build_decode_batch_shared(&[], &device);
+        assert!(res.is_err(), "empty sequences must error");
+    }
+
+    #[test]
+    fn decode_batch_shared_clone_is_cheap() {
+        // Clone should be Arc/Tensor refcount bumps, not deep copies.
+        // Exercising the path here also lets the borrow checker confirm
+        // DecodeBatchShared: Clone is well-formed.
+        let device = Device::Cpu;
+        let seqs = fake_metadata(1, &[2], &[vec![1]], &[vec![2]]);
+        let shared = build_decode_batch_shared(&seqs, &device).unwrap();
+        let clone1 = shared.clone();
+        let clone2 = shared.clone();
+        assert!(std::sync::Arc::ptr_eq(&shared.positions, &clone1.positions));
+        assert!(std::sync::Arc::ptr_eq(
+            &shared.all_slot_mapping,
+            &clone2.all_slot_mapping
+        ));
+    }
+
     #[test]
     fn config_defaults() {
         let cfg = AttentionConfig::gqa(8, 4, 64, 512);

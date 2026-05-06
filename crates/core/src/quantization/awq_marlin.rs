@@ -477,4 +477,48 @@ mod tests {
         let flat: Vec<u32> = result.flatten_all().unwrap().to_vec1().unwrap();
         assert!(flat.iter().all(|&v| v == 0));
     }
+
+    /// Numeric equivalence between the GPU `awq_to_gptq_qweight_cuda`
+    /// kernel (Stage 8) and the CPU reference implementation. Gated to
+    /// the gpu-test-medium tier since it needs a real CUDA device.
+    #[cfg(all(feature = "marlin", feature = "gpu-test-medium"))]
+    #[test]
+    fn test_awq_to_gptq_qweight_gpu_matches_cpu() {
+        // Use a non-trivial shape that exercises both axes:
+        // K=64 (8 packed_k), N=128 (16 packed_n). Random-ish nibble
+        // pattern so we don't accidentally pass on a degenerate case.
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("no CUDA device available — skipping");
+            return;
+        };
+        let k = 64usize;
+        let n = 128usize;
+        let packed_n = n / 8;
+        let mut words: Vec<u32> = Vec::with_capacity(k * packed_n);
+        let mut rng_state: u32 = 0x9E37_79B9;
+        for _ in 0..(k * packed_n) {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            words.push(rng_state);
+        }
+
+        let awq_cpu = Tensor::from_vec(words.clone(), (k, packed_n), &Device::Cpu).unwrap();
+        let awq_gpu = Tensor::from_vec(words, (k, packed_n), &cuda).unwrap();
+
+        // CPU reference (force CPU path by passing CPU tensor) vs GPU.
+        let gptq_cpu = awq_to_gptq_qweight(&awq_cpu, k, n).unwrap();
+        let gptq_gpu = awq_to_gptq_qweight(&awq_gpu, k, n).unwrap();
+
+        let cpu_vec: Vec<u32> = gptq_cpu.flatten_all().unwrap().to_vec1().unwrap();
+        let gpu_vec: Vec<u32> = gptq_gpu
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            cpu_vec, gpu_vec,
+            "GPU awq_to_gptq_qweight kernel must be bit-exact with CPU reference"
+        );
+    }
 }
