@@ -140,6 +140,8 @@ extern "C" __global__ void awq_gemv_int4_bf16(
 
 #define SPLIT_K_THREADS 4
 #define SPLIT_BLOCK_THREADS (N_TILE * SPLIT_K_THREADS)  // 128
+#define SPLIT8_K_THREADS 8
+#define SPLIT8_BLOCK_THREADS (N_TILE * SPLIT8_K_THREADS) // 256
 
 extern "C" __global__ void awq_gemv_int4_split_k_bf16(
     __nv_bfloat16* __restrict__ output,         // [M, N]
@@ -216,6 +218,101 @@ extern "C" __global__ void awq_gemv_int4_split_k_bf16(
         unsigned mask = 0xFFFFFFFFu;
         acc += __shfl_xor_sync(mask, acc, 1);
         acc += __shfl_xor_sync(mask, acc, 2);
+
+        if (k_chunk == 0 && n < N) {
+            float out_val = acc;
+            if (has_bias) {
+                out_val += __bfloat162float(bias[n]);
+            }
+            output[m * N + n] = __float2bfloat16(out_val);
+        }
+        __syncthreads();
+    }
+}
+
+// ─── Split-K (×8) variant — wider K split for higher SM occupancy ───────────
+//
+// Same shape as the ×4 variant but K is fanned across 8 threads instead of 4.
+// 256-thread block (8 warps × 32 lanes), N_TILE = 32 columns. Within one warp
+// (32 lanes) we pack 4 columns × 8 K-chunks. Three `__shfl_xor_sync` rounds
+// (mask 1, 2, 4) collapse the 8 partial sums into lane (8*c + 0).
+//
+// Layout assumes (host-side gate):
+//   - K  divisible by (8 * SPLIT8_K_THREADS) — packed_k % 8 == 0
+//
+// With BLOCK_THREADS = 256 = 8 warps, peak active warps per SM rises to ~26
+// out of 48 (Ada) at Qwen3 N = 2560 — roughly twice the ×4 variant.
+
+extern "C" __global__ void awq_gemv_int4_split_k8_bf16(
+    __nv_bfloat16* __restrict__ output,         // [M, N]
+    const __nv_bfloat16* __restrict__ input,    // [M, K]
+    const unsigned int* __restrict__ qweight,   // [K/8, N]
+    const __nv_bfloat16* __restrict__ scales,   // [G, N]
+    const unsigned int* __restrict__ qzeros,    // [G, N/8]
+    const __nv_bfloat16* __restrict__ bias,     // [N], optional
+    int M,
+    int N,
+    int K,
+    int group_size,
+    int has_zp,
+    int has_bias
+) {
+    const int tid     = threadIdx.x;
+    const int col_idx = tid / SPLIT8_K_THREADS;     // 0..31 → output column
+    const int k_chunk = tid % SPLIT8_K_THREADS;     // 0..7  → K-range
+    const int n       = blockIdx.x * N_TILE + col_idx;
+
+    extern __shared__ __nv_bfloat16 input_sh[];
+
+    const int packed_k = K / 8;
+    const int packed_n = N / 8;
+
+    const int kp_per_chunk = packed_k / SPLIT8_K_THREADS;
+    const int kp_start     = k_chunk * kp_per_chunk;
+    const int kp_end       = kp_start + kp_per_chunk;
+
+    for (int m = 0; m < M; ++m) {
+        for (int k = tid; k < K; k += SPLIT8_BLOCK_THREADS) {
+            input_sh[k] = input[m * K + k];
+        }
+        __syncthreads();
+
+        float acc = 0.0f;
+        if (n < N) {
+            int   cached_group = -1;
+            float cached_scale = 0.0f;
+            float cached_zp    = 8.0f;
+
+            for (int kp = kp_start; kp < kp_end; ++kp) {
+                const int k_base   = kp * 8;
+                const int group_id = k_base / group_size;
+
+                if (group_id != cached_group) {
+                    cached_scale = __bfloat162float(scales[group_id * N + n]);
+                    if (has_zp) {
+                        const int zp_pack_col = n >> 3;
+                        const int zp_bit      = (n & 7) << 2;
+                        const unsigned int zw = qzeros[group_id * packed_n + zp_pack_col];
+                        cached_zp = (float)((zw >> zp_bit) & 0xFu);
+                    }
+                    cached_group = group_id;
+                }
+
+                const unsigned int w = qweight[kp * N + n];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int   nib  = (int)((w >> (i * 4)) & 0xFu);
+                    const float wval = ((float)nib - cached_zp) * cached_scale;
+                    acc += __bfloat162float(input_sh[k_base + i]) * wval;
+                }
+            }
+        }
+
+        // 3-stage warp reduce across 8 lanes per column.
+        unsigned mask = 0xFFFFFFFFu;
+        acc += __shfl_xor_sync(mask, acc, 1);
+        acc += __shfl_xor_sync(mask, acc, 2);
+        acc += __shfl_xor_sync(mask, acc, 4);
 
         if (k_chunk == 0 && n < N) {
             float out_val = acc;

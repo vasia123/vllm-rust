@@ -297,12 +297,16 @@ impl MarlinGemmOp {
         const SERIAL_BLOCK_THREADS: u32 = 32;
         const SPLIT_K_THREADS: u32 = 4;
         const SPLIT_BLOCK_THREADS: u32 = N_TILE * SPLIT_K_THREADS; // 128
+        const SPLIT8_K_THREADS: u32 = 8;
+        const SPLIT8_BLOCK_THREADS: u32 = N_TILE * SPLIT8_K_THREADS; // 256
 
-        // Pick the highest-occupancy variant the shape allows. Split-K
-        // requires K/8 (packed_k) to be divisible by SPLIT_K_THREADS; for
-        // every Qwen3 shape (K = 2560, 18944, …) this holds.
+        // Pick the highest-occupancy variant the shape allows. Each split-K
+        // variant requires `packed_k = K/8` to be divisible by its
+        // K_THREADS factor — for every Qwen3 layer (K ∈ {2560, 18944, 4096})
+        // both 4 and 8 divide packed_k cleanly, so the ×8 variant is taken.
         let packed_k = self.k / 8;
-        let use_split_k = packed_k.is_multiple_of(SPLIT_K_THREADS as usize) && packed_k >= 8;
+        let use_split_k8 = packed_k.is_multiple_of(SPLIT8_K_THREADS as usize) && packed_k >= 16;
+        let use_split_k4 = packed_k.is_multiple_of(SPLIT_K_THREADS as usize) && packed_k >= 8;
 
         // One-shot confirmation that the decode path is actually live.
         // Helps diagnose whether wall-clock degradation is in the kernel
@@ -316,7 +320,13 @@ impl MarlinGemmOp {
                 self.n,
                 self.k,
                 self.num_groups,
-                if use_split_k { "split_k" } else { "serial" }
+                if use_split_k8 {
+                    "split_k8"
+                } else if use_split_k4 {
+                    "split_k4"
+                } else {
+                    "serial"
+                }
             );
         });
 
@@ -330,7 +340,9 @@ impl MarlinGemmOp {
         let elem_count = self.m * self.n;
         let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
 
-        let kernel_name = if use_split_k {
+        let kernel_name = if use_split_k8 {
+            "awq_gemv_int4_split_k8_bf16"
+        } else if use_split_k4 {
             "awq_gemv_int4_split_k_bf16"
         } else {
             "awq_gemv_int4_bf16"
@@ -421,7 +433,9 @@ impl MarlinGemmOp {
         let grid_x: u32 = (self.n as u32) / N_TILE;
         // One BF16 input row cached in shared memory.
         let smem_bytes: u32 = (self.k as u32) * 2;
-        let block_threads = if use_split_k {
+        let block_threads = if use_split_k8 {
+            SPLIT8_BLOCK_THREADS
+        } else if use_split_k4 {
             SPLIT_BLOCK_THREADS
         } else {
             SERIAL_BLOCK_THREADS
