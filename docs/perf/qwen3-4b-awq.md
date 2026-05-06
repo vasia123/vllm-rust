@@ -159,6 +159,55 @@ default allocator out for `cuMemAllocAsync` from a captured pool.
 Python vLLM was not installed on the test box, so no head-to-head
 comparison was made on this run.
 
+## Stage 13 — capture diagnosis: V3 (cross-stream event isolation)
+
+After Stages 11–12 capture still aborted with
+`CUDA_ERROR_STREAM_CAPTURE_ISOLATION` (905). Stage 13-A added one-shot
+diagnostic logging in `try_capture_decode_step` to classify the root
+cause among four hypotheses (V1 — no memory pools; V2 — alloc path
+bypass; V3 — cross-stream event tracking; V4 — driver-level oddity).
+The probes cover: querying
+`CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED` directly via
+`cuDeviceGetAttribute`; running an alloc-only mini-capture
+(`Tensor::zeros` between `cuStreamBeginCapture_v2` and
+`cuStreamEndCapture`); and snapshotting `cuStreamGetCaptureInfo_v2`
+status after the forward returns.
+
+Run on RTX 4060 Laptop, server boot without `--enforce-eager`:
+
+```
+stage="13-A"   stream_ptr_null=false  memory_pools_supported=1  attr_query_ok=true
+stage="13-A.2" alloc_ok=true  status_after_alloc="ACTIVE"  end_result=0
+               -> Alloc-only probe SURVIVED capture. cuMemAllocAsync is active.
+forward          DriverError(CUDA_ERROR_STREAM_CAPTURE_ISOLATION,
+                 "dependency created on uncaptured work in another stream")
+                 (×6 — every warmup batch size 1, 2, 4, 8, 16)
+```
+
+**Verdict — V3.** V1 falsified: the device supports memory pools.
+V2 falsified: a single `Tensor::zeros` allocated *inside* the capture
+window does not invalidate it, so cudarc's allocator is already going
+through `cuMemAllocAsync`. The error text "dependency created on
+uncaptured work in another stream" matches cudarc's automatic event
+tracking — every cross-resource ordering edge cudarc records reaches
+back to the warmup-time event chain on resources allocated before the
+capture began (model weights, KV-cache pages, internal scratch
+tensors). Even RELAXED capture mode rejects that.
+
+There is no public switch to disable cudarc's event tracking, and the
+forward path touches hundreds of cudarc-managed `CudaSlice`s per layer.
+A surgical fix would require either bypassing cudarc's safe API for the
+capture path (re-implement allocation/launch via raw FFI) or upstream
+cudarc work to make event tracking capture-aware. Both are out of
+scope for this push.
+
+Per pre-approved fallback policy, capture is closed as **infra-ready
+but not activated for AWQ on cudarc 0.16**: the diagnostic logging
+remains, the `try_capture_decode_step` path is intact and will benefit
+automatically if/when cudarc gains capture-aware event tracking. The
+44 tok/s steady baseline holds; remaining headroom (≥50 tok/s) will
+come from kernel-level optimizations (Stage 13-C).
+
 ¹ The first attempt at Stage 7 placed the override on
 `Qwen3ForCausalLM`; the runtime path for AWQ models is actually
 `QuantizedQwen3ForCausalLM` (registry's `build_quant`), so the override

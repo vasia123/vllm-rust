@@ -498,6 +498,12 @@ impl CudaGraphRunner {
 
         let stream = self.get_cuda_stream()?;
 
+        // Stage 13-A diagnostic: at first call, dump CUDA capability state
+        // so we can classify the capture failure (V1 — no memory pools,
+        // V2 — wrong stream/alloc path, V3 — cross-stream events).
+        log_capture_diagnostics_once(&self.device, stream);
+        run_alloc_only_capture_probe_once(&self.device, stream, self.dtype);
+
         // Pre-allocated input buffer; identity-stable address that the
         // captured graph reads from on every replay.
         let input_ids = Tensor::zeros((batch_size, 1), DType::U32, &self.device).map_err(|e| {
@@ -561,6 +567,12 @@ impl CudaGraphRunner {
                 return Ok(false);
             }
         };
+
+        // Stage 13-A: localize where capture state died. If status is
+        // INVALIDATED here, the forward itself broke capture (kernel-internal
+        // alloc, host pull, or cross-stream event). If still ACTIVE, the
+        // failure happens later during memcpy_inplace or cuStreamEndCapture.
+        log_capture_status_once_after_forward(stream);
 
         // Record the device→device copy into the stable output buffer as
         // part of the graph; on replay this gives the caller a fixed read
@@ -807,6 +819,223 @@ impl CudaGraphRunner {
         }
         Ok(())
     }
+}
+
+/// Stage 13-A diagnostic. Dumps CUDA capture pre-conditions exactly once
+/// per process so we can classify why `cuStreamBeginCapture_v2`/in-window ops
+/// fail on this specific GPU + driver:
+///
+/// - `memory_pools_supported` (CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, id 115):
+///   if 0, cudarc 0.16.6 falls back to synchronous `cuMemAlloc` which is
+///   capture-incompatible → expect error 905 (CAPTURE_ISOLATION) on the
+///   first allocation inside the capture window.
+/// - `stream_ptr_null`: should be false after the Stage 11 candle patch
+///   (vendored `new_stream()`). If true, the patch did not take effect.
+#[cfg(feature = "cuda-kernels")]
+fn log_capture_diagnostics_once(
+    device: &Device,
+    stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+) {
+    use candle_core::cuda::cudarc::driver::sys::{
+        cuDeviceGetAttribute, CUdevice_attribute, CUresult,
+    };
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let cuda_device = match device {
+            Device::Cuda(d) => d,
+            _ => return,
+        };
+        let cu_device = cuda_device.cuda_stream().context().cu_device();
+        let mut memory_pools_supported: i32 = -1;
+        let attr_result = unsafe {
+            cuDeviceGetAttribute(
+                &mut memory_pools_supported,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
+                cu_device,
+            )
+        };
+        let attr_ok = attr_result == CUresult::CUDA_SUCCESS;
+        let stream_ptr_null = stream.is_null();
+
+        tracing::warn!(
+            target: "vllm_core::cuda_graph",
+            stage = "13-A",
+            stream_ptr_null,
+            memory_pools_supported = if attr_ok { memory_pools_supported } else { -1 },
+            attr_query_ok = attr_ok,
+            "CUDA graph capture diagnostic: stream/alloc preconditions"
+        );
+
+        if !attr_ok {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                cuda_result = attr_result as i32,
+                "cuDeviceGetAttribute(MEMORY_POOLS_SUPPORTED) failed — async-alloc unknown"
+            );
+        } else if memory_pools_supported == 0 {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                "Verdict candidate V1: device does NOT support memory pools — \
+                 cudarc 0.16 will issue synchronous cuMemAlloc, capture will hit 905. \
+                 Remediation: force cuMemAllocAsync via vendored cudarc patch."
+            );
+        } else {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                "Memory pools supported — async-alloc should be active. \
+                 If capture still fails with 905, blocker is V2 (alloc path bypass) \
+                 or V3 (cross-stream events). Check next warmup attempt logs."
+            );
+        }
+    });
+}
+
+/// Stage 13-A.2 probe: does a TRIVIAL allocation inside a capture window
+/// already invalidate? Allocates one BF16 tensor between BeginCapture and
+/// EndCapture. If this fails, root cause is the alloc path itself (V1 or V2).
+/// Run-once per process; logs result + any failure code.
+#[cfg(feature = "cuda-kernels")]
+fn run_alloc_only_capture_probe_once(
+    device: &Device,
+    stream: candle_core::cuda::cudarc::driver::sys::CUstream,
+    dtype: DType,
+) {
+    use candle_core::cuda::cudarc::driver::sys::{
+        cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, cuStreamGetCaptureInfo_v2,
+        CUgraph, CUresult, CUstreamCaptureMode, CUstreamCaptureStatus,
+    };
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // Best-effort sync; ignore errors here — purely diagnostic.
+        unsafe {
+            let _ = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let begin_result = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        };
+        if begin_result != CUresult::CUDA_SUCCESS {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                stage = "13-A.2",
+                cuda_result = begin_result as i32,
+                "alloc-only probe: cuStreamBeginCapture_v2 failed at probe entry"
+            );
+            return;
+        }
+
+        // Single trivial allocation inside the capture window.
+        let alloc_result = Tensor::zeros((1024_usize,), dtype, device);
+        let alloc_ok = alloc_result.is_ok();
+        let alloc_err = alloc_result.as_ref().err().map(|e| e.to_string());
+
+        // Status snapshot before EndCapture: did the alloc invalidate the stream?
+        let mut status = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let mut id: u64 = 0;
+        let mut graph_probe: CUgraph = std::ptr::null_mut();
+        let mut deps_ptr: *const candle_core::cuda::cudarc::driver::sys::CUgraphNode =
+            std::ptr::null();
+        let mut deps_count: usize = 0;
+        let info_result = unsafe {
+            cuStreamGetCaptureInfo_v2(
+                stream,
+                &mut status,
+                &mut id as *mut u64,
+                &mut graph_probe,
+                &mut deps_ptr,
+                &mut deps_count,
+            )
+        };
+
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end_result = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        if !graph.is_null() {
+            unsafe {
+                cuGraphDestroy(graph);
+            }
+        }
+
+        let status_str = match status {
+            CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE => "NONE",
+            CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE => "ACTIVE",
+            CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED => "INVALIDATED",
+        };
+
+        tracing::warn!(
+            target: "vllm_core::cuda_graph",
+            stage = "13-A.2",
+            alloc_ok,
+            alloc_err = alloc_err.as_deref().unwrap_or(""),
+            info_result = info_result as i32,
+            status_after_alloc = status_str,
+            end_result = end_result as i32,
+            "alloc-only capture probe: did a single Tensor::zeros invalidate capture?"
+        );
+
+        if status == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                "Verdict candidate V1/V2: a single Tensor::zeros INSIDE capture \
+                 invalidated the stream. The alloc path is not capture-safe \
+                 (sync cuMemAlloc, htod path, or cross-stream event)."
+            );
+        } else if status == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE {
+            tracing::warn!(
+                target: "vllm_core::cuda_graph",
+                "Alloc-only probe SURVIVED capture. cuMemAllocAsync is active \
+                 (or alloc was elided). The forward-time 905 must come from \
+                 something OTHER than a single Tensor::zeros — likely \
+                 a host-blocking op (Tensor::from_vec / .to_vec) or cross-stream \
+                 event. Verdict candidate: V2 or V3."
+            );
+        }
+    });
+}
+
+/// Stage 13-A.2 status check: log whether stream is still being captured
+/// after `capture_fn` returns. Run-once.
+#[cfg(feature = "cuda-kernels")]
+fn log_capture_status_once_after_forward(stream: candle_core::cuda::cudarc::driver::sys::CUstream) {
+    use candle_core::cuda::cudarc::driver::sys::{
+        cuStreamGetCaptureInfo_v2, CUgraph, CUgraphNode, CUstreamCaptureStatus,
+    };
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut status = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let mut id: u64 = 0;
+        let mut graph_probe: CUgraph = std::ptr::null_mut();
+        let mut deps_ptr: *const CUgraphNode = std::ptr::null();
+        let mut deps_count: usize = 0;
+        let info_result = unsafe {
+            cuStreamGetCaptureInfo_v2(
+                stream,
+                &mut status,
+                &mut id as *mut u64,
+                &mut graph_probe,
+                &mut deps_ptr,
+                &mut deps_count,
+            )
+        };
+        let status_str = match status {
+            CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE => "NONE",
+            CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE => "ACTIVE",
+            CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED => "INVALIDATED",
+        };
+        tracing::warn!(
+            target: "vllm_core::cuda_graph",
+            stage = "13-A.2",
+            info_result = info_result as i32,
+            status_after_forward = status_str,
+            "capture status snapshot after forward — INVALIDATED means forward broke it; \
+             ACTIVE means failure is in memcpy_inplace or EndCapture."
+        );
+    });
 }
 
 /// Statistics about CUDA graph runner state.
