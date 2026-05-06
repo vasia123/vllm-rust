@@ -26,6 +26,7 @@ mod encoder_decoder;
 mod handle;
 mod helpers;
 mod model_forward;
+pub mod output_pool;
 pub mod pipeline;
 pub mod spec_decode;
 mod speculative;

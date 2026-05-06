@@ -10,9 +10,11 @@
 //! - Custom INT4 packing optimized for tensor core MMA operations
 
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, Layout, Result, Shape, Storage,
-    Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, InplaceOp2, Layout, Result,
+    Shape, Storage, Tensor,
 };
+
+use crate::engine::output_pool::OutputPool;
 
 use super::marlin::{MarlinScalarType, GPTQ_MARLIN_TILE};
 
@@ -1085,6 +1087,271 @@ pub fn fp8_ampere_gemm(
         result.reshape(out_shape)
     } else {
         Ok(result)
+    }
+}
+
+/// In-place sibling of [`MarlinGemmOp`] used by the pooled fast path.
+///
+/// `Tensor::inplace_op2(&input, &MarlinGemmInplaceOp { ... })` writes the
+/// result of `input @ dequant(qweight).T + bias` into the receiver tensor's
+/// storage and returns nothing.  The receiver is a buffer reserved from
+/// [`OutputPool`] — it lives across forward passes, so the per-call
+/// `cuMemAlloc` that `cuda_fwd_awq_gemv` performs disappears.
+///
+/// The kernel launch logic mirrors [`MarlinGemmOp::cuda_fwd_awq_gemv`]
+/// exactly (same dispatch table, same launch config); only the output
+/// pointer changes.  Keeping the two paths textually parallel makes any
+/// future kernel update need to apply once and we copy across.
+struct MarlinGemmInplaceOp<'a> {
+    qweight: &'a Tensor,
+    scales: &'a Tensor,
+    qzeros: &'a Tensor,
+    bias: Option<&'a Tensor>,
+    m: usize,
+    n: usize,
+    k: usize,
+    num_groups: usize,
+}
+
+impl<'a> InplaceOp2 for MarlinGemmInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "marlin_gemm_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("marlin_gemm_inplace requires CUDA")
+    }
+
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        in_storage: &CudaStorage,
+        _in_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        const N_TILE: u32 = 32;
+        const SERIAL_BLOCK_THREADS: u32 = 32;
+        const SPLIT_K_THREADS: u32 = 4;
+        const SPLIT_BLOCK_THREADS: u32 = N_TILE * SPLIT_K_THREADS;
+        const SPLIT8_K_THREADS: u32 = 8;
+        const SPLIT8_BLOCK_THREADS: u32 = N_TILE * SPLIT8_K_THREADS;
+        const SPLIT_KT_THREADS: u32 = 8;
+        const SPLIT_KT_BLOCK_THREADS: u32 = N_TILE * SPLIT_KT_THREADS;
+
+        let packed_k = self.k / 8;
+        let use_split_kt =
+            packed_k.is_multiple_of((SPLIT_KT_THREADS * 4) as usize) && packed_k >= 32;
+        let use_split_k8 = packed_k.is_multiple_of(SPLIT8_K_THREADS as usize) && packed_k >= 16;
+        let use_split_k4 = packed_k.is_multiple_of(SPLIT_K_THREADS as usize) && packed_k >= 8;
+
+        if self.num_groups == 0 || !self.k.is_multiple_of(self.num_groups) {
+            candle_core::bail!(
+                "marlin_gemm_inplace: K ({}) must be divisible by num_groups ({})",
+                self.k,
+                self.num_groups
+            );
+        }
+        let group_size = (self.k / self.num_groups) as i32;
+        if !(group_size as usize).is_multiple_of(8) {
+            candle_core::bail!(
+                "marlin_gemm_inplace: group_size ({group_size}) must be a multiple of 8"
+            );
+        }
+        if !self.n.is_multiple_of(N_TILE as usize) {
+            candle_core::bail!(
+                "marlin_gemm_inplace: N ({}) must be a multiple of {}",
+                self.n,
+                N_TILE
+            );
+        }
+        if !self.k.is_multiple_of(8) {
+            candle_core::bail!(
+                "marlin_gemm_inplace: K ({}) must be a multiple of 8",
+                self.k
+            );
+        }
+
+        let dev = &out_storage.device;
+
+        let kernel_name = if use_split_kt {
+            "awq_gemv_int4_kt_bf16"
+        } else if use_split_k8 {
+            "awq_gemv_int4_split_k8_bf16"
+        } else if use_split_k4 {
+            "awq_gemv_int4_split_k_bf16"
+        } else {
+            "awq_gemv_int4_bf16"
+        };
+        let func = dev.get_or_load_custom_func(kernel_name, "awq_gemv", AWQ_GEMV_PTX)?;
+
+        let output = match &out_storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("marlin_gemm_inplace: output must be BF16"),
+        };
+        let input = match &in_storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("marlin_gemm_inplace: input must be BF16"),
+        };
+
+        let (qweight_guard, _) = self.qweight.storage_and_layout();
+        let (scales_guard, _) = self.scales.storage_and_layout();
+        let (qzeros_guard, _) = self.qzeros.storage_and_layout();
+        let bias_guard = self.bias.map(|t| t.storage_and_layout());
+
+        let qweight = match &*qweight_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("marlin_gemm_inplace: qweight must be U32"),
+            },
+            _ => candle_core::bail!("marlin_gemm_inplace: qweight must be on CUDA"),
+        };
+        let scales = match &*scales_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::BF16(s) => s,
+                _ => candle_core::bail!("marlin_gemm_inplace: scales must be BF16"),
+            },
+            _ => candle_core::bail!("marlin_gemm_inplace: scales must be on CUDA"),
+        };
+        let qzeros = match &*qzeros_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("marlin_gemm_inplace: qzeros must be U32"),
+            },
+            _ => candle_core::bail!("marlin_gemm_inplace: qzeros must be on CUDA"),
+        };
+        let bias_slice = match bias_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::BF16(s) => Some(s),
+                    _ => candle_core::bail!("marlin_gemm_inplace: bias must be BF16"),
+                },
+                _ => candle_core::bail!("marlin_gemm_inplace: bias must be on CUDA"),
+            },
+            None => None,
+        };
+
+        let m_i32 = self.m as i32;
+        let n_i32 = self.n as i32;
+        let k_i32 = self.k as i32;
+        let has_zp_i32: i32 = 1;
+        let has_bias_i32: i32 = i32::from(self.bias.is_some());
+
+        let grid_x: u32 = (self.n as u32) / N_TILE;
+        let smem_bytes: u32 = (self.k as u32) * 2;
+        let block_threads = if use_split_kt {
+            SPLIT_KT_BLOCK_THREADS
+        } else if use_split_k8 {
+            SPLIT8_BLOCK_THREADS
+        } else if use_split_k4 {
+            SPLIT_BLOCK_THREADS
+        } else {
+            SERIAL_BLOCK_THREADS
+        };
+
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (block_threads, 1, 1),
+            shared_mem_bytes: smem_bytes,
+        };
+
+        let null_ptr: u64 = 0;
+
+        let mut builder = func.builder();
+        builder.arg(output);
+        builder.arg(input);
+        builder.arg(qweight);
+        builder.arg(scales);
+        builder.arg(qzeros);
+        match bias_slice {
+            Some(s) => {
+                builder.arg(s);
+            }
+            None => {
+                builder.arg(&null_ptr);
+            }
+        }
+        builder.arg(&m_i32);
+        builder.arg(&n_i32);
+        builder.arg(&k_i32);
+        builder.arg(&group_size);
+        builder.arg(&has_zp_i32);
+        builder.arg(&has_bias_i32);
+
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("marlin_gemm_inplace launch: {e}")))?;
+
+        drop(qweight_guard);
+        drop(scales_guard);
+        drop(qzeros_guard);
+        drop(bias_guard);
+
+        Ok(())
+    }
+}
+
+/// Pool-backed AWQ INT4 GEMV: reserves the output tensor from the
+/// process-global [`OutputPool`] and runs the kernel through the
+/// [`InplaceOp2`] path, eliminating the per-call `cuMemAlloc`.
+///
+/// The dispatch logic mirrors [`marlin_gemm`] but only handles the AWQ
+/// `MarlinScalarType::Uint4` case with `qzeros` present and no `g_idx`,
+/// because (a) that's the live decode hot path on Qwen3-AWQ, and (b)
+/// the legacy tile kernel that backs the other variants is dormant on
+/// this branch.  Other dtypes fall through to the heap-allocating
+/// [`marlin_gemm`].
+pub fn marlin_gemm_pooled(
+    input: &Tensor,
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    bias: Option<&Tensor>,
+    size_k: usize,
+    size_n: usize,
+) -> Result<Tensor> {
+    let input = input.contiguous()?;
+    let dims = input.dims();
+    let (m, k) = match dims.len() {
+        2 => (dims[0], dims[1]),
+        n if n > 2 => {
+            let batch_size: usize = dims[..n - 1].iter().product();
+            (batch_size, dims[n - 1])
+        }
+        _ => candle_core::bail!("marlin_gemm_pooled: input must have ≥ 2 dimensions"),
+    };
+    if k != size_k {
+        candle_core::bail!("marlin_gemm_pooled: input K ({k}) does not match size_k ({size_k})");
+    }
+    let num_groups = scales.dims()[0];
+
+    // Reserve the output buffer from the global pool.  The pool keeps
+    // the underlying CudaSlice alive across forward passes; the next
+    // call returns the same storage if the cursor has been reset by
+    // the engine loop, growing the pool only when the same shape is
+    // requested twice in one forward (q/k/v of identical N, gate/up,
+    // etc.).
+    let output_2d = OutputPool::global().reserve(&[m, size_n], DType::BF16, input.device())?;
+
+    let op = MarlinGemmInplaceOp {
+        qweight,
+        scales,
+        qzeros,
+        bias,
+        m,
+        n: size_n,
+        k: size_k,
+        num_groups,
+    };
+
+    output_2d.inplace_op2(&input, &op)?;
+
+    if dims.len() > 2 {
+        let mut out_shape: Vec<usize> = dims[..dims.len() - 1].to_vec();
+        out_shape.push(size_n);
+        output_2d.reshape(out_shape)
+    } else {
+        Ok(output_2d)
     }
 }
 

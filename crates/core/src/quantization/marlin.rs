@@ -595,6 +595,30 @@ impl MarlinLinear {
 
         let is_k_full = !self.config.desc_act || self.g_idx_sort_indices.is_none();
 
+        // Pool-backed fast path for AWQ INT4-ZP — by far the most common
+        // configuration on this branch (every Qwen3-AWQ linear hits it).
+        // The pooled kernel reserves the output tensor from a process-
+        // global buffer pool instead of `cuMemAlloc`-ing a fresh slice on
+        // every call; with 252 GEMV launches per decode token, the
+        // syscall amortisation is the dominant non-kernel cost the Stage
+        // 12 work targets.  Other Marlin scalar types fall through to
+        // the heap-allocating dispatcher below — they are dormant on
+        // this branch but kept callable for future reuse.
+        if matches!(self.config.scalar_type, MarlinScalarType::Uint4)
+            && self.qzeros.elem_count() > 0
+            && self.g_idx.is_none()
+        {
+            return marlin_cuda::marlin_gemm_pooled(
+                x,
+                &self.qweight,
+                &self.scales,
+                &self.qzeros,
+                self.bias.as_ref(),
+                self.in_features,
+                self.out_features,
+            );
+        }
+
         marlin_cuda::marlin_gemm(
             x,
             &self.qweight,

@@ -754,6 +754,13 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             ForwardContext::eager()
         };
 
+        // Rewind the global GEMV output-buffer pool. Each shape's
+        // round-robin cursor restarts at 0 so subsequent `reserve()` calls
+        // walk the same allocation order this forward as last forward —
+        // the pool stops growing once a steady decode workload has been
+        // observed.
+        crate::engine::output_pool::OutputPool::global().reset_cursors();
+
         // Build decode-batch shared tensors once per forward. Models that
         // route through `forward_decode_batch_with_ctx` and propagate
         // `ctx.decode_shared` to their attention layers will reuse this
