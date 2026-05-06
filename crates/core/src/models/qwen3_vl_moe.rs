@@ -295,7 +295,7 @@ impl Qwen3VLMoeAttention {
         let k = apply_per_head_norm(&k, &self.k_norm)?;
 
         #[cfg(feature = "cuda-kernels")]
-        {
+        if q.device().is_cuda() {
             let q = q.squeeze(2)?;
             let k = k.squeeze(2)?;
             let v = v.squeeze(2)?;
@@ -349,38 +349,37 @@ impl Qwen3VLMoeAttention {
                 cache_engine.block_size(),
             )?;
 
-            self.o_proj.forward(&attn_output)?.unsqueeze(1)
+            return self.o_proj.forward(&attn_output)?.unsqueeze(1);
         }
 
-        #[cfg(not(feature = "cuda-kernels"))]
-        {
-            let mut outputs = Vec::with_capacity(batch_size);
-            for (i, seq) in sequences.iter().enumerate() {
-                let q_i = q.narrow(0, i, 1)?;
-                let k_i = k.narrow(0, i, 1)?;
-                let v_i = v.narrow(0, i, 1)?;
+        // Naive per-sequence fallback — always available. Reached on CPU even
+        // when `cuda-kernels` is enabled, and on every device otherwise.
+        let mut outputs = Vec::with_capacity(batch_size);
+        for (i, seq) in sequences.iter().enumerate() {
+            let q_i = q.narrow(0, i, 1)?;
+            let k_i = k.narrow(0, i, 1)?;
+            let v_i = v.narrow(0, i, 1)?;
 
-                let (q_i, k_i) = self.mrope.apply_scalar(&q_i, &k_i, seq.seqlen_offset)?;
+            let (q_i, k_i) = self.mrope.apply_scalar(&q_i, &k_i, seq.seqlen_offset)?;
 
-                let attn_out = paged_attention(
-                    &q_i,
-                    &k_i,
-                    &v_i,
-                    None,
-                    seq.seqlen_offset,
-                    cache_engine,
-                    &seq.block_ids,
-                    &seq.slot_mapping,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?;
-                outputs.push(attn_out);
-            }
-
-            let attn_output = Tensor::cat(&outputs, 0)?;
-            self.o_proj.forward(&attn_output)
+            let attn_out = paged_attention(
+                &q_i,
+                &k_i,
+                &v_i,
+                None,
+                seq.seqlen_offset,
+                cache_engine,
+                &seq.block_ids,
+                &seq.slot_mapping,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )?;
+            outputs.push(attn_out);
         }
+
+        let attn_output = Tensor::cat(&outputs, 0)?;
+        self.o_proj.forward(&attn_output)
     }
 }
 

@@ -129,6 +129,15 @@ impl AttentionBias {
     };
 }
 
+// Compile-time invariants on the named bias presets. If a future edit
+// changes the meaning of NONE/QKV_ONLY/ALL inadvertently, the build fails.
+const _: () = {
+    assert!(!AttentionBias::NONE.q);
+    assert!(AttentionBias::QKV_ONLY.q && AttentionBias::QKV_ONLY.k && AttentionBias::QKV_ONLY.v);
+    assert!(!AttentionBias::QKV_ONLY.o);
+    assert!(AttentionBias::ALL.o);
+};
+
 /// VarBuilder names for the QKV/O projections.
 ///
 /// Different model families use different conventions:
@@ -588,11 +597,13 @@ impl AttentionBlock {
             self.apply_qk_norm(&q, &k)?
         };
 
-        // Fast batched CUDA decode path: only when no softcap / sliding-window /
-        // custom scale and no post-RoPE QK norm (the kernel applies RoPE
-        // internally and we cannot inject a norm step in between).
+        // Fast batched CUDA decode path: only when on a CUDA device, no softcap
+        // / sliding-window / custom scale and no post-RoPE QK norm (the kernel
+        // applies RoPE internally and we cannot inject a norm step in between).
+        // The device check matters when `cuda-kernels` is compiled in but the
+        // model is being exercised on CPU (e.g. `*_decode_batch` tests).
         #[cfg(feature = "cuda-kernels")]
-        if !self.needs_manual && !self.qk_norm_after_rope {
+        if q.device().is_cuda() && !self.needs_manual && !self.qk_norm_after_rope {
             return self.cuda_decode_batch(&q, &k, &v, sequences, cache_engine, tp_ctx);
         }
 
@@ -1054,13 +1065,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bias_helpers() {
-        assert_eq!(AttentionBias::NONE.q, false);
-        assert!(
-            AttentionBias::QKV_ONLY.q && AttentionBias::QKV_ONLY.k && AttentionBias::QKV_ONLY.v
-        );
-        assert!(!AttentionBias::QKV_ONLY.o);
-        assert!(AttentionBias::ALL.o);
-    }
+    // Invariants on the AttentionBias presets are checked at compile time
+    // via the `const _: () = { ... };` block near their definition.
 }
