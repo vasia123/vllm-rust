@@ -129,6 +129,18 @@ impl CudaGraphConfig {
             ..Default::default()
         }
     }
+
+    /// Pick a sensible default for the given device: full-mode CUDA graphs
+    /// when running on CUDA, plain disabled config otherwise. Use this from
+    /// CLI / engine builders so production GPU runs get graph capture
+    /// without the user having to opt in by hand.
+    pub fn auto_for_device(device: &candle_core::Device) -> Self {
+        if device.is_cuda() {
+            Self::enabled()
+        } else {
+            Self::default()
+        }
+    }
 }
 
 /// Entry for a cached CUDA graph.

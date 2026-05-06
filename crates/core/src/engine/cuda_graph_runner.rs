@@ -461,6 +461,136 @@ impl CudaGraphRunner {
         Ok(0)
     }
 
+    /// Capture a CUDA graph for a single decode batch size.
+    ///
+    /// Calls `capture_fn` twice: once outside the capture stream as a JIT
+    /// warmup (so any per-shape kernel compilation happens before recording),
+    /// and once inside `cuStreamBeginCapture_v2` / `cuStreamEndCapture` to
+    /// record the forward pass.  The output of the recorded run is copied
+    /// into a pre-allocated buffer so subsequent replays can read results
+    /// from a stable address.
+    ///
+    /// `capture_fn` receives the runner-owned input buffer (shape `[batch_size, 1]`,
+    /// `DType::U32`) — callers that need additional metadata (sequences,
+    /// kv-cache manager, etc.) should close over them in the closure.
+    ///
+    /// Returns `Ok(true)` on a successful capture, `Ok(false)` if any of
+    /// the CUDA capture/instantiate steps fail (caller should fall back to
+    /// eager); errors propagate only from buffer allocation, the warmup
+    /// forward, or the in-place output copy.
+    #[cfg(feature = "cuda-kernels")]
+    pub fn try_capture_decode_step<F>(
+        &mut self,
+        batch_size: usize,
+        mut capture_fn: F,
+    ) -> Result<bool, CudaGraphRunnerError>
+    where
+        F: FnMut(&Tensor) -> candle_core::Result<Tensor>,
+    {
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphInstantiateWithFlags, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph,
+            CUgraphExec, CUresult, CUstreamCaptureMode,
+        };
+
+        if !self.is_enabled() {
+            return Ok(false);
+        }
+
+        let stream = self.get_cuda_stream()?;
+
+        // Pre-allocated input buffer; identity-stable address that the
+        // captured graph reads from on every replay.
+        let input_ids = Tensor::zeros((batch_size, 1), DType::U32, &self.device).map_err(|e| {
+            CudaGraphRunnerError::BufferAllocation(format!("Failed to allocate input buffer: {e}"))
+        })?;
+
+        // First call is JIT warmup (allocates internal buffers, compiles
+        // any per-shape kernels) — running it inside capture would record
+        // the allocation, which is illegal.
+        let warmup_output = capture_fn(&input_ids)
+            .map_err(|e| CudaGraphRunnerError::WarmupFailed(format!("Warmup forward: {e}")))?;
+
+        let output_shape = warmup_output.dims().to_vec();
+        let output = Tensor::zeros(&output_shape[..], self.dtype, &self.device).map_err(|e| {
+            CudaGraphRunnerError::BufferAllocation(format!("Failed to allocate output buffer: {e}"))
+        })?;
+
+        self.sync_device()?;
+
+        let begin_result = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+        };
+        if begin_result != CUresult::CUDA_SUCCESS {
+            return Ok(false);
+        }
+
+        let capture_output = match capture_fn(&input_ids) {
+            Ok(out) => out,
+            Err(_) => {
+                // Abort the capture cleanly — even if the forward errored
+                // we still need to consume the stream's capture state.
+                let mut graph: CUgraph = std::ptr::null_mut();
+                unsafe {
+                    cuStreamEndCapture(stream, &mut graph);
+                    if !graph.is_null() {
+                        candle_core::cuda::cudarc::driver::sys::cuGraphDestroy(graph);
+                    }
+                }
+                return Ok(false);
+            }
+        };
+
+        // Record the device→device copy into the stable output buffer as
+        // part of the graph; on replay this gives the caller a fixed read
+        // address and lets us narrow() it back to the requested shape.
+        cuda_memcpy_inplace(&output, &capture_output)?;
+
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end_result = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        if end_result != CUresult::CUDA_SUCCESS || graph.is_null() {
+            return Ok(false);
+        }
+
+        let mut graph_exec: CUgraphExec = std::ptr::null_mut();
+        let inst_result = unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) };
+        if inst_result != CUresult::CUDA_SUCCESS {
+            unsafe {
+                candle_core::cuda::cudarc::driver::sys::cuGraphDestroy(graph);
+            }
+            return Ok(false);
+        }
+
+        self.graphs.insert(
+            batch_size,
+            CapturedGraph {
+                graph,
+                graph_exec,
+                buffers: CaptureBuffers { input_ids, output },
+            },
+        );
+
+        Ok(true)
+    }
+
+    #[cfg(not(feature = "cuda-kernels"))]
+    pub fn try_capture_decode_step<F>(
+        &mut self,
+        _batch_size: usize,
+        _capture_fn: F,
+    ) -> Result<bool, CudaGraphRunnerError>
+    where
+        F: FnMut(&Tensor) -> candle_core::Result<Tensor>,
+    {
+        Ok(false)
+    }
+
+    /// Mark warmup as complete.  Call once after all
+    /// `try_capture_decode_step` calls have run so subsequent
+    /// `get_padded_size` / `execute` calls dispatch to captured graphs.
+    pub fn mark_warmed_up(&mut self) {
+        self.warmed_up = true;
+    }
+
     /// Execute with CUDA graph if available, otherwise fall back to eager.
     ///
     /// # Arguments

@@ -129,25 +129,86 @@ impl<M: ModelForward> StandardExecution<M> {
         Ok(())
     }
 
-    /// Capture a CUDA graph for the given batch size.
-    #[allow(unused_variables)] // dispatcher used when cuda-kernels enabled
+    /// Capture a CUDA graph for the given decode batch size.
+    ///
+    /// If a `CudaGraphRunner` is attached, this builds dummy sequences plus
+    /// KV slots, calls `try_capture_decode_step` with a closure that runs
+    /// the real `model.forward_decode_batch`, and registers the captured
+    /// size with the dispatcher on success. If no runner is attached,
+    /// falls back to plain JIT warmup so cold-shape kernels still compile.
     fn capture_decode_graph(
         &mut self,
         batch_size: usize,
         kv_cache_mgr: &mut KVCacheManager,
         dispatcher: &mut CudaGraphDispatcher,
     ) -> Result<(), WarmupError> {
-        // Register the batch size as valid for CUDA graph dispatch
         let descriptor = super::cuda_graph::BatchDescriptor::for_decode(batch_size);
-        dispatcher.register_valid_key(descriptor);
 
-        // If graph runner exists, capture is already done via runner.warmup()
-        // If not, we just do JIT warmup
+        // Without an attached runner there's nothing to capture — fall
+        // back to JIT warmup and register the descriptor so the
+        // dispatcher's mode logic stays consistent.
         if self.graph_runner.is_none() {
             self.run_dummy_decode(batch_size, kv_cache_mgr)?;
+            dispatcher.register_valid_key(descriptor);
+            return Ok(());
         }
 
-        Ok(())
+        // Build dummy sequences + slot for the decode token. Mirrors
+        // run_dummy_decode but keeps the metadata around so the capture
+        // closure can read it on every call.
+        let mut dummy_seqs = self.create_dummy_sequences(batch_size, kv_cache_mgr)?;
+        for seq in &mut dummy_seqs {
+            kv_cache_mgr
+                .allocate_for_request(&mut seq.block_table, 1)
+                .map_err(|e| WarmupError::CacheAllocation(e.to_string()))?;
+            seq.slot_mapping = seq.block_table.slot_mapping(seq.seqlen_offset, 1);
+        }
+        let sequences: Vec<DecodeSequenceMetadata> = dummy_seqs
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| DecodeSequenceMetadata {
+                request_id: i as u64,
+                seqlen_offset: seq.seqlen_offset,
+                block_ids: seq.block_ids.clone(),
+                slot_mapping: seq.slot_mapping.clone(),
+            })
+            .collect();
+
+        // Borrow self's fields disjointly: the runner needs &mut, the
+        // model needs only &, and kv_cache_mgr is already &mut from the
+        // caller. The runner is wrapped in `Arc`; capture only succeeds
+        // when nothing else holds a clone yet (which is guaranteed during
+        // single-threaded warmup).
+        let model = &self.model;
+        let runner_arc = self.graph_runner.as_mut().unwrap();
+        let captured = match Arc::get_mut(runner_arc) {
+            Some(runner) => runner.try_capture_decode_step(batch_size, |input| {
+                model.forward_decode_batch(input, &sequences, kv_cache_mgr)
+            }),
+            None => Ok(false),
+        };
+
+        // Always release the dummy sequences, regardless of whether
+        // capture succeeded — captured graphs hold their own
+        // input/output buffers, not these blocks.
+        self.cleanup_dummy_sequences(dummy_seqs, kv_cache_mgr)?;
+
+        match captured {
+            Ok(true) => {
+                dispatcher.register_valid_key(descriptor);
+                Ok(())
+            }
+            Ok(false) => {
+                // Capture skipped or failed cleanly — fall back to JIT
+                // warmup so the eager path is at least primed for this
+                // batch size.
+                self.run_dummy_decode(batch_size, kv_cache_mgr)?;
+                Ok(())
+            }
+            Err(e) => Err(WarmupError::CacheAllocation(format!(
+                "graph capture for batch {batch_size}: {e}"
+            ))),
+        }
     }
 
     /// Initialize the CUDA graph runner for capture and replay.
@@ -463,6 +524,14 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                             .push(format!("graph batch_size={batch_size}: {e}"));
                     }
                 }
+            }
+        }
+
+        // Once every batch size has been processed, mark the runner as
+        // warmed up so dispatch can route to captured graphs.
+        if let Some(runner_arc) = self.graph_runner.as_mut() {
+            if let Some(runner) = Arc::get_mut(runner_arc) {
+                runner.mark_warmed_up();
             }
         }
 
