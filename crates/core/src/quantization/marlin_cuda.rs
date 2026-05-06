@@ -19,6 +19,18 @@ use super::marlin::{MarlinScalarType, GPTQ_MARLIN_TILE};
 // PTX module for Marlin kernels
 const MARLIN_GEMM_PTX: &str = include_str!("../../kernels/marlin_gemm.ptx");
 
+// PTX module for the dedicated AWQ INT4 GEMV kernel used on the decode hot
+// path (M ≤ 16). Lives in its own .cu/.ptx pair so cudarc does not need to
+// re-link the legacy `marlin_gemm` module on every dispatch.
+const AWQ_GEMV_PTX: &str = include_str!("../../kernels/awq_gemv.ptx");
+
+/// Maximum M for which the dedicated GEMV path is active.
+///
+/// At M ≤ 16 the legacy `marlin_gemm_int4_zp_bf16` kernel under-utilises the
+/// SM (it tiles for M = 16 but each tile column is computed by 16 redundant
+/// threads). The GEMV path streams qweight at memory bandwidth instead.
+const AWQ_GEMV_M_THRESHOLD: usize = 16;
+
 /// Marlin GEMM operation for INT4 quantized weights.
 struct MarlinGemmOp {
     qweight: Tensor,
@@ -47,6 +59,18 @@ impl CustomOp1 for MarlinGemmOp {
     }
 
     fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        // Decode hot path: AWQ INT4 with zero points, no activation reorder
+        // (g_idx), and a tiny M typical of single-token / multi-step decode.
+        // Route to the bandwidth-bound GEMV kernel; everything else stays on
+        // the legacy tiled path below to preserve prefill / GPTQ behaviour.
+        if self.m <= AWQ_GEMV_M_THRESHOLD
+            && matches!(self.scalar_type, MarlinScalarType::Uint4)
+            && self.g_idx.is_none()
+            && self.qzeros.is_some()
+        {
+            return self.cuda_fwd_awq_gemv(storage);
+        }
+
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
 
         let dev = &storage.device;
@@ -248,6 +272,175 @@ impl CustomOp1 for MarlinGemmOp {
         drop(bias_guard);
         drop(g_idx_guard);
         drop(si_guard);
+
+        let output_storage = CudaStorage {
+            slice: CudaStorageSlice::BF16(output),
+            device: dev.clone(),
+        };
+        Ok((output_storage, output_shape))
+    }
+}
+
+impl MarlinGemmOp {
+    /// AWQ INT4 GEMV decode-path launcher.
+    ///
+    /// Mirrors the input contract of the legacy `marlin_gemm_int4_zp_bf16`
+    /// kernel (qweight `[K/8, N]`, scales `[G, N]`, qzeros `[G, N/8]`) but
+    /// dispatches the dedicated `awq_gemv_int4_bf16` kernel which is tuned
+    /// for M ≤ 16 and runs at memory bandwidth. Single warp per block, one
+    /// thread per output column, K reduced sequentially per thread with
+    /// FP32 accumulation.
+    fn cuda_fwd_awq_gemv(&self, storage: &CudaStorage) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        // One-shot confirmation that the decode path is actually live.
+        // Helps diagnose whether wall-clock degradation is in the kernel
+        // itself or somewhere upstream.
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                target: "vllm_core::awq_gemv",
+                "awq_gemv decode kernel active (M={}, N={}, K={}, num_groups={})",
+                self.m, self.n, self.k, self.num_groups
+            );
+        });
+
+        const N_TILE: u32 = 32;
+        const BLOCK_THREADS: u32 = 32;
+
+        let dev = &storage.device;
+
+        // Output [M, N] in BF16, freshly allocated per call. Pre-allocation
+        // (an output pool keyed by shape) is a separate item planned for the
+        // CUDA-graph capture stage; the current call cost is dwarfed by the
+        // K-reduction loop in the kernel itself.
+        let output_shape = Shape::from_dims(&[self.m, self.n]);
+        let elem_count = self.m * self.n;
+        let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
+
+        let func = dev.get_or_load_custom_func("awq_gemv_int4_bf16", "awq_gemv", AWQ_GEMV_PTX)?;
+
+        // Activations.
+        let input = match &storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("awq_gemv: input must be BF16"),
+        };
+
+        // Hoist storage guards onto the function scope so all referenced
+        // CUDA slices outlive the kernel builder (cudarc 0.16 enforces
+        // `'arg: 'builder` on PushKernelArg).
+        let (qweight_guard, _) = self.qweight.storage_and_layout();
+        let (scales_guard, _) = self.scales.storage_and_layout();
+        let qzeros_t = self
+            .qzeros
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("awq_gemv: qzeros required".into()))?;
+        let (qzeros_guard, _) = qzeros_t.storage_and_layout();
+        let bias_guard = self.bias.as_ref().map(|t| t.storage_and_layout());
+
+        let qweight = match &*qweight_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("awq_gemv: qweight must be U32"),
+            },
+            _ => candle_core::bail!("awq_gemv: qweight must be on CUDA"),
+        };
+        let scales = match &*scales_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::BF16(s) => s,
+                _ => candle_core::bail!("awq_gemv: scales must be BF16"),
+            },
+            _ => candle_core::bail!("awq_gemv: scales must be on CUDA"),
+        };
+        let qzeros = match &*qzeros_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("awq_gemv: qzeros must be U32"),
+            },
+            _ => candle_core::bail!("awq_gemv: qzeros must be on CUDA"),
+        };
+        let bias_slice = match bias_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::BF16(s) => Some(s),
+                    _ => candle_core::bail!("awq_gemv: bias must be BF16"),
+                },
+                _ => candle_core::bail!("awq_gemv: bias must be on CUDA"),
+            },
+            None => None,
+        };
+
+        // Group size derived from K and num_groups. AWQ checkpoints have
+        // `group_size % 8 == 0` (typically 128); the kernel relies on this
+        // so a single (scale, zp) pair covers all 8 nibbles of one packed
+        // word. We assert here defensively rather than silently producing
+        // wrong outputs.
+        if self.num_groups == 0 || !self.k.is_multiple_of(self.num_groups) {
+            candle_core::bail!(
+                "awq_gemv: K ({}) must be divisible by num_groups ({})",
+                self.k,
+                self.num_groups
+            );
+        }
+        let group_size = (self.k / self.num_groups) as i32;
+        if !(group_size as usize).is_multiple_of(8) {
+            candle_core::bail!("awq_gemv: group_size ({group_size}) must be a multiple of 8");
+        }
+        // The kernel fans out coalesced loads in tiles of N_TILE columns;
+        // mismatched widths would silently access out-of-bounds qzeros.
+        if !self.n.is_multiple_of(N_TILE as usize) {
+            candle_core::bail!("awq_gemv: N ({}) must be a multiple of {}", self.n, N_TILE);
+        }
+        if !self.k.is_multiple_of(8) {
+            candle_core::bail!("awq_gemv: K ({}) must be a multiple of 8", self.k);
+        }
+
+        let m_i32 = self.m as i32;
+        let n_i32 = self.n as i32;
+        let k_i32 = self.k as i32;
+        let has_zp_i32: i32 = 1; // gated above
+        let has_bias_i32: i32 = i32::from(self.bias.is_some());
+
+        let grid_x: u32 = (self.n as u32) / N_TILE;
+        // One BF16 input row cached in shared memory.
+        let smem_bytes: u32 = (self.k as u32) * 2;
+
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (BLOCK_THREADS, 1, 1),
+            shared_mem_bytes: smem_bytes,
+        };
+
+        let null_ptr: u64 = 0;
+
+        let mut builder = func.builder();
+        builder.arg(&output);
+        builder.arg(input);
+        builder.arg(qweight);
+        builder.arg(scales);
+        builder.arg(qzeros);
+        match bias_slice {
+            Some(s) => {
+                builder.arg(s);
+            }
+            None => {
+                builder.arg(&null_ptr);
+            }
+        }
+        builder.arg(&m_i32);
+        builder.arg(&n_i32);
+        builder.arg(&k_i32);
+        builder.arg(&group_size);
+        builder.arg(&has_zp_i32);
+        builder.arg(&has_bias_i32);
+
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("awq_gemv launch: {e}")))?;
+
+        drop(qweight_guard);
+        drop(scales_guard);
+        drop(qzeros_guard);
+        drop(bias_guard);
 
         let output_storage = CudaStorage {
             slice: CudaStorageSlice::BF16(output),
@@ -984,6 +1177,373 @@ mod tests {
                     .unwrap();
                 assert!(values.iter().all(|&v| v == 0));
             }
+        }
+
+        /// Smoke test with handcrafted constants — every output column has
+        /// a known closed-form value, so a kernel-side indexing or
+        /// dequant-formula bug shows up immediately without being masked
+        /// by BF16 rounding on random data.
+        #[test]
+        fn test_awq_gemv_smoke_known_values() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            // Minimal shape: K = 8 (one packed word along K), N = 32 (one
+            // N_TILE block), M = 1, group_size = 8 → num_groups = 1.
+            let m = 1usize;
+            let k = 8usize;
+            let n = 32usize;
+            let group_size = 8usize;
+            let num_groups = k / group_size;
+            let packed_k = k / 8;
+            let packed_n = n / 8;
+
+            // qweight: one row of N=32 U32 words. Each word packs K-axis
+            // nibbles [0,1,2,3,4,5,6,7] (nib i at bit i*4 — sequential GPTQ
+            // ordering, what the kernel reads).
+            let w_word: u32 = (0..8).fold(0u32, |acc, i| acc | (i << (i * 4)));
+            let qweight_words: Vec<u32> = vec![w_word; packed_k * n];
+
+            // qzeros: zero point = 0 for every (group, output_lane) → the
+            // dequant formula reduces to nib * scale.
+            let qzeros_words: Vec<u32> = vec![0u32; num_groups * packed_n];
+
+            // scales = 1.0 everywhere.
+            let scales: Vec<f32> = vec![1.0f32; num_groups * n];
+            // input = 1.0 everywhere.
+            let inputs: Vec<f32> = vec![1.0f32; m * k];
+
+            // Closed form: each output column = sum_k input[k] * (nib_k - 0) * 1
+            //                                 = 0 + 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28.
+            let expected: Vec<f32> = vec![28.0f32; m * n];
+
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device).unwrap();
+            let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
+            let scales_t = Tensor::from_vec(scales, (num_groups, n), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let input = Tensor::from_vec(inputs, (m, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let workspace = Tensor::zeros(64usize, DType::U32, &device).unwrap();
+
+            let output = marlin_gemm(
+                &input,
+                &qweight,
+                &scales_t,
+                Some(&qzeros),
+                None,
+                None,
+                &workspace,
+                None,
+                MarlinScalarType::Uint4,
+                k,
+                n,
+                true,
+                true,
+            )
+            .expect("awq_gemv launch should succeed");
+
+            let got: Vec<f32> = output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            assert_eq!(got.len(), expected.len());
+            for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < 0.5,
+                    "awq_gemv smoke[{i}]: got {g}, expected {e}"
+                );
+            }
+        }
+
+        /// Numerical equivalence: AWQ GEMV decode-path kernel vs a pure CPU
+        /// dequant+matmul reference on identical random inputs. Asserts
+        /// max absolute error within BF16 tolerance.
+        ///
+        /// Skipped unless a CUDA device is available.
+        #[test]
+        fn test_awq_gemv_matches_cpu_reference_m1() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            // Small but non-trivial shape — exercises group boundaries and
+            // multi-block grid (N / N_TILE = 4 blocks).
+            let m = 1usize;
+            let k = 256usize;
+            let n = 128usize;
+            let group_size = 128usize;
+            let num_groups = k / group_size; // 2
+            let packed_k = k / 8;
+            let packed_n = n / 8;
+
+            // Deterministic pseudo-random fill.
+            let mut rng: u32 = 0x9E37_79B9;
+            let mut next = |modulus: u32| -> u32 {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                rng % modulus
+            };
+
+            // Pack int4 nibbles in [0, 15] sequentially along K — matches the
+            // layout the legacy `marlin_gemm_int4_zp_bf16` kernel reads.
+            let mut qweight_words: Vec<u32> = Vec::with_capacity(packed_k * n);
+            for _ in 0..(packed_k * n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qweight_words.push(w);
+            }
+            // Sequential nibbles along N (post-`repack_awq_nibbles` layout).
+            let mut qzeros_words: Vec<u32> = Vec::with_capacity(num_groups * packed_n);
+            for _ in 0..(num_groups * packed_n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qzeros_words.push(w);
+            }
+            // Scales: small magnitudes; BF16-rounded so the CPU reference
+            // sees exactly the same values the GPU kernel reads.
+            let scales_f32: Vec<f32> = (0..(num_groups * n))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-4)
+                .collect();
+            let inputs_f32: Vec<f32> = (0..(m * k))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-3)
+                .collect();
+
+            // Round-trip through BF16 so the CPU reference and the GPU kernel
+            // operate on the same numeric values; then any residual difference
+            // is purely the F32 reduction order (which is identical for the
+            // GEMV path: one thread per column reduces K sequentially).
+            let bf16_round = |v: f32| -> f32 { half::bf16::from_f32(v).to_f32() };
+            let scales: Vec<f32> = scales_f32.iter().map(|&v| bf16_round(v)).collect();
+            let inputs: Vec<f32> = inputs_f32.iter().map(|&v| bf16_round(v)).collect();
+
+            // CPU reference: dequant in F32, compute output[n] = sum_k input[k] * w[k,n].
+            let mut expected = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for ni in 0..n {
+                    let zp_pack_col = ni / 8;
+                    let zp_bit = (ni % 8) * 4;
+                    let mut acc = 0.0f32;
+                    for k_idx in 0..k {
+                        let group_id = k_idx / group_size;
+                        let pack_row = k_idx / 8;
+                        let pack_idx = k_idx % 8;
+                        let w_word = qweight_words[pack_row * n + ni];
+                        let nib = ((w_word >> (pack_idx * 4)) & 0xF) as i32;
+                        let zp_word = qzeros_words[group_id * packed_n + zp_pack_col];
+                        let zp = ((zp_word >> zp_bit) & 0xF) as i32;
+                        let scale = scales[group_id * n + ni];
+                        let w_val = ((nib - zp) as f32) * scale;
+                        acc += inputs[mi * k + k_idx] * w_val;
+                    }
+                    expected[mi * n + ni] = acc;
+                }
+            }
+
+            // Build GPU tensors mirroring the legacy kernel's expected layout.
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device).unwrap();
+            let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
+            let scales_t = Tensor::from_vec(scales.clone(), (num_groups, n), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let input = Tensor::from_vec(inputs.clone(), (m, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let workspace = Tensor::zeros(64usize, DType::U32, &device).unwrap();
+
+            // M=1 ≤ AWQ_GEMV_M_THRESHOLD → routed through the new GEMV kernel.
+            let output = marlin_gemm(
+                &input,
+                &qweight,
+                &scales_t,
+                Some(&qzeros),
+                None,
+                None,
+                &workspace,
+                None,
+                MarlinScalarType::Uint4,
+                k,
+                n,
+                true,
+                true,
+            )
+            .expect("awq_gemv launch should succeed");
+
+            let got: Vec<f32> = output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            assert_eq!(got.len(), expected.len());
+            // Final stage: BF16 quantisation of the output (kernel writes
+            // via `__float2bfloat16`). At our random-data magnitudes the
+            // sum can reach ~20, where the BF16 step size is ~0.08; allow
+            // 1% of max-abs(expected) on top of a 5e-2 absolute floor for
+            // small magnitudes.
+            let max_expected = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let tol = (max_expected * 0.01).max(5e-2);
+            let max_abs = got
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= tol,
+                "awq_gemv vs CPU ref max_abs={max_abs} > tol={tol} (max_expected={max_expected})"
+            );
+        }
+
+        /// Same as the M=1 test but with M=4 (multi-step decode shape) — the
+        /// kernel loops over M reusing its shared input cache. Confirms the
+        /// per-row barrier wiring and the M-loop don't introduce drift.
+        #[test]
+        fn test_awq_gemv_matches_cpu_reference_m4() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            let m = 4usize;
+            let k = 256usize;
+            let n = 64usize;
+            let group_size = 128usize;
+            let num_groups = k / group_size;
+            let packed_k = k / 8;
+            let packed_n = n / 8;
+
+            let mut rng: u32 = 0xCAFE_BABE;
+            let mut next = |modulus: u32| -> u32 {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                rng % modulus
+            };
+
+            let mut qweight_words: Vec<u32> = Vec::with_capacity(packed_k * n);
+            for _ in 0..(packed_k * n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qweight_words.push(w);
+            }
+            let mut qzeros_words: Vec<u32> = Vec::with_capacity(num_groups * packed_n);
+            for _ in 0..(num_groups * packed_n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qzeros_words.push(w);
+            }
+            let scales_f32: Vec<f32> = (0..(num_groups * n))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-4)
+                .collect();
+            let inputs_f32: Vec<f32> = (0..(m * k))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-3)
+                .collect();
+            let bf16_round = |v: f32| -> f32 { half::bf16::from_f32(v).to_f32() };
+            let scales: Vec<f32> = scales_f32.iter().map(|&v| bf16_round(v)).collect();
+            let inputs: Vec<f32> = inputs_f32.iter().map(|&v| bf16_round(v)).collect();
+
+            let mut expected = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for ni in 0..n {
+                    let zp_pack_col = ni / 8;
+                    let zp_bit = (ni % 8) * 4;
+                    let mut acc = 0.0f32;
+                    for k_idx in 0..k {
+                        let group_id = k_idx / group_size;
+                        let pack_row = k_idx / 8;
+                        let pack_idx = k_idx % 8;
+                        let w_word = qweight_words[pack_row * n + ni];
+                        let nib = ((w_word >> (pack_idx * 4)) & 0xF) as i32;
+                        let zp_word = qzeros_words[group_id * packed_n + zp_pack_col];
+                        let zp = ((zp_word >> zp_bit) & 0xF) as i32;
+                        let scale = scales[group_id * n + ni];
+                        let w_val = ((nib - zp) as f32) * scale;
+                        acc += inputs[mi * k + k_idx] * w_val;
+                    }
+                    expected[mi * n + ni] = acc;
+                }
+            }
+
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device).unwrap();
+            let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
+            let scales_t = Tensor::from_vec(scales.clone(), (num_groups, n), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let input = Tensor::from_vec(inputs.clone(), (m, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let workspace = Tensor::zeros(64usize, DType::U32, &device).unwrap();
+
+            let output = marlin_gemm(
+                &input,
+                &qweight,
+                &scales_t,
+                Some(&qzeros),
+                None,
+                None,
+                &workspace,
+                None,
+                MarlinScalarType::Uint4,
+                k,
+                n,
+                true,
+                true,
+            )
+            .expect("awq_gemv launch should succeed");
+
+            let got: Vec<f32> = output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            assert_eq!(got.len(), expected.len());
+            let max_expected = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let tol = (max_expected * 0.01).max(5e-2);
+            let max_abs = got
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= tol,
+                "awq_gemv (m=4) vs CPU ref max_abs={max_abs} > tol={tol} (max_expected={max_expected})"
+            );
         }
 
         #[test]

@@ -101,6 +101,12 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/marlin_gemm.ptx",
         min_sm: 80,
     },
+    // AWQ INT4 GEMV for decode batch=1..16 — uses bf16
+    KernelDef {
+        source: "kernels/awq_gemv.cu",
+        output: "kernels/awq_gemv.ptx",
+        min_sm: 80,
+    },
     // MXFP4 E2M1 × BF16 GEMM with blockwise E8M0 scales — uses bf16
     KernelDef {
         source: "kernels/mxfp4_gemm.cu",
