@@ -21,6 +21,8 @@ pub mod wrapper;
 
 pub use metadata::FlashInferMetadata;
 pub use workspace::{WorkspaceBuffer, DEFAULT_WORKSPACE_SIZE};
+#[cfg(feature = "flashinfer")]
+pub use wrapper::DecodePlan;
 pub use wrapper::{DecodeWrapper, FlashInferConfig, MlaConfig, MlaWrapper, PrefillWrapper};
 
 #[cfg(feature = "flashinfer")]
@@ -180,12 +182,35 @@ impl FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Tensor> {
-        let device = q.device();
+        // Build a fresh plan and run once. Used by callers that haven't
+        // plumbed plan caching through. The cached path lives in
+        // `decode_flashinfer_with_plan`.
+        let plan = self.build_decode_plan_inner(
+            cache_engine,
+            metadata,
+            q.dtype(),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
+        self.decode_flashinfer_with_plan(q, cache_engine, &plan, num_heads, head_dim)
+    }
+
+    /// Build a [`DecodePlan`] without running the kernel. Called once per
+    /// forward batch from `prepare_decode_plan`.
+    #[cfg(feature = "flashinfer")]
+    fn build_decode_plan_inner(
+        &self,
+        cache_engine: &CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        query_dtype: DType,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<wrapper::DecodePlan> {
+        let device = cache_engine.k_cache().device();
         let batch_size = metadata.kv_lengths.len();
 
-        // q shape: [batch_size, num_heads, head_dim] — already correct for FlashInfer
-
-        // Build FlashInfer paged KV metadata
         let fi_metadata = FlashInferMetadata::from_paged_attention(
             metadata.seq_block_ids,
             metadata.kv_lengths,
@@ -193,12 +218,10 @@ impl FlashInferBackend {
             device,
         )?;
 
-        // Convert metadata tensors from i64/u32 to i32 for FFI
         let kv_indptr = fi_metadata.paged_kv_indptr.to_dtype(DType::U32)?;
         let kv_indices = fi_metadata.paged_kv_indices.to_dtype(DType::U32)?;
         let kv_last_page_len = fi_metadata.paged_kv_last_page_len.to_dtype(DType::U32)?;
 
-        // Create wrapper and run (pass cache layout for correct KV access pattern)
         let config = FlashInferConfig::new(
             num_heads as u32,
             num_kv_heads as u32,
@@ -217,20 +240,52 @@ impl FlashInferBackend {
             .as_mut()
             .ok_or_else(|| candle_core::Error::Msg("workspace not initialized".to_string()))?;
 
-        let output = wrapper.run(
-            q,
-            cache_engine.k_cache(),
-            cache_engine.v_cache(),
+        wrapper.build_plan(
             ws,
-            &kv_indptr,
-            &kv_indices,
-            &kv_last_page_len,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            query_dtype,
             batch_size,
-        )?;
+        )
+    }
 
-        // Reshape output from [batch_size, num_heads, head_dim]
-        // to [batch_size, num_heads * head_dim]
-        output.reshape((batch_size, num_heads * head_dim))
+    /// Replay a previously-built decode plan. No host syncs.
+    ///
+    /// `DecodeWrapper::run_with_plan` only reads `kv_layout` and the
+    /// stream pointer from its config — `num_heads/num_kv_heads/head_dim`
+    /// are already baked into `plan`. So it's safe to construct a
+    /// minimal wrapper here just to access `run_with_plan`; nothing in
+    /// it talks to the GPU until the kernel launch, and the kernel
+    /// reads its dimensions from the plan.
+    #[cfg(feature = "flashinfer")]
+    fn decode_flashinfer_with_plan(
+        &self,
+        q: &Tensor,
+        cache_engine: &CacheEngine,
+        plan: &wrapper::DecodePlan,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let device = q.device();
+
+        // Minimal config: only `kv_layout` is read by `run_with_plan`.
+        // The head/dim fields are placeholders that the kernel ignores
+        // because `plan` already carries them.
+        let config = FlashInferConfig::new(
+            num_heads as u32,
+            num_heads as u32,
+            head_dim as u32,
+            self.block_size as u32,
+        )
+        .with_kv_layout(cache_engine.layout());
+        let wrapper = DecodeWrapper::new(config, device)?;
+
+        let output =
+            wrapper.run_with_plan(q, cache_engine.k_cache(), cache_engine.v_cache(), plan)?;
+
+        let bs = output.dim(0)?;
+        output.reshape((bs, num_heads * head_dim))
     }
 
     /// Naive prefill attention implementation (CPU fallback).
@@ -550,6 +605,79 @@ impl AttentionBackend for FlashInferBackend {
         )?;
 
         Ok((output, Some(lse)))
+    }
+
+    fn prepare_decode_plan(
+        &self,
+        cache_engine: &CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        query_dtype: DType,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
+        if !cache_engine.k_cache().device().is_cuda() {
+            return Ok(None);
+        }
+        let plan = self.build_decode_plan_inner(
+            cache_engine,
+            metadata,
+            query_dtype,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
+        Ok(Some(
+            std::sync::Arc::new(plan) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+        ))
+    }
+
+    fn batched_decode_attention_with_plan(
+        &self,
+        q: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        cache_engine: &mut CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        plan: Option<&(dyn std::any::Any + Send + Sync)>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let device = q.device();
+        if !device.is_cuda() {
+            // CPU path doesn't have a plan; route to existing batched_decode.
+            return self.batched_decode_attention(
+                q,
+                k_new,
+                v_new,
+                cache_engine,
+                metadata,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+        }
+
+        cache_engine
+            .write_batch(k_new, v_new, metadata.all_slot_mapping)
+            .map_err(|e| candle_core::Error::Msg(format!("cache write_batch: {e}")))?;
+
+        // Try to downcast the opaque plan to our concrete `DecodePlan`.
+        // If the caller didn't provide one, build a fresh one — same cost
+        // as the eager path, no regression.
+        if let Some(any_plan) = plan {
+            if let Some(decode_plan) = any_plan.downcast_ref::<wrapper::DecodePlan>() {
+                return self.decode_flashinfer_with_plan(
+                    q,
+                    cache_engine,
+                    decode_plan,
+                    num_heads,
+                    head_dim,
+                );
+            }
+        }
+        self.decode_flashinfer(q, cache_engine, metadata, num_heads, num_kv_heads, head_dim)
     }
 
     fn supported_dtypes(&self) -> &[DType] {

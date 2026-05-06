@@ -6,7 +6,7 @@ use crate::config::ModelConfig;
 use crate::distributed::{LocalProcessGroup, ProcessGroup};
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
-use crate::layers::attention::{AttentionBlock, AttentionConfig, QkNormVariant};
+use crate::layers::attention::{AttentionBlock, AttentionConfig, DecodeBatchShared, QkNormVariant};
 use crate::layers::RotaryEmbedding;
 
 // Re-export for public API
@@ -64,15 +64,16 @@ impl Qwen3Attention {
         )
     }
 
-    fn forward_decode_batch(
+    fn forward_decode_batch_with_shared(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
+        shared: Option<&DecodeBatchShared>,
     ) -> Result<Tensor> {
         self.inner
-            .forward_decode_batch(xs, sequences, cache_engine, tp_ctx)
+            .forward_decode_batch_with_shared(xs, sequences, cache_engine, tp_ctx, shared)
     }
 }
 
@@ -143,13 +144,27 @@ impl Qwen3DecoderLayer {
         layer_idx: usize,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
+        self.forward_decode_batch_with_shared(xs, sequences, kv_cache_mgr, layer_idx, tp_ctx, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decode_batch_with_shared(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        layer_idx: usize,
+        tp_ctx: &TpContext,
+        shared: Option<&DecodeBatchShared>,
+    ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward_decode_batch(
+        let xs = self.self_attn.forward_decode_batch_with_shared(
             &xs,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
             tp_ctx,
+            shared,
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
@@ -402,6 +417,39 @@ impl crate::engine::ModelForward for Qwen3ForCausalLM {
         let xs = self.norm.forward(&xs)?;
         let logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
         Ok(logits)
+    }
+
+    /// Override the default `forward_decode_batch_with_ctx` so the
+    /// per-forward shared decode tensors (built once by
+    /// `engine::helpers::execute_batched_decode_with_graph` and stashed
+    /// in `ctx.decode_shared`) get propagated down to every attention
+    /// layer. Without this override the model falls back to the eager
+    /// path which rebuilds `block_tables` / `seq_lens` 36× per token.
+    fn forward_decode_batch_with_ctx(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        ctx: &crate::engine::cuda_graph::ForwardContext,
+    ) -> Result<Tensor> {
+        let shared: Option<&DecodeBatchShared> = ctx
+            .decode_shared
+            .as_ref()
+            .and_then(|arc| arc.downcast_ref::<DecodeBatchShared>());
+
+        let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward_decode_batch_with_shared(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                &self.tp_ctx,
+                shared,
+            )?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     fn device(&self) -> &Device {

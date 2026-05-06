@@ -625,6 +625,11 @@ pub enum CudaGraphError {
 ///
 /// Used to communicate between dispatcher and wrapper about which
 /// mode/graph to use for the current forward pass.
+///
+/// Also carries the per-forward shared decode tensors built once by
+/// `engine::helpers::execute_batched_decode_with_graph` and read by
+/// every attention layer, eliminating the previous 36×
+/// `Tensor::from_vec` host→device uploads per Qwen3-4B token.
 #[derive(Debug, Clone, Default)]
 pub struct ForwardContext {
     /// Current runtime mode
@@ -635,6 +640,17 @@ pub struct ForwardContext {
     pub should_capture: bool,
     /// Whether we can replay on this forward
     pub can_replay: bool,
+    /// Pre-built decode tensors shared across all attention layers of
+    /// this forward batch. `None` for prefill, single-sequence forward,
+    /// CPU runs, and tests; models that opt in via
+    /// `forward_decode_batch_with_ctx` should propagate this down to
+    /// their `AttentionBlock::forward_decode_batch_with_shared` call.
+    ///
+    /// Stored as `Arc<dyn Any + Send + Sync>` to keep
+    /// `engine::cuda_graph` independent of `layers::attention` (which
+    /// already imports `engine::DecodeSequenceMetadata`); attention
+    /// downcasts to `&DecodeBatchShared` at the call site.
+    pub decode_shared: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl ForwardContext {
@@ -645,7 +661,18 @@ impl ForwardContext {
             descriptor: Some(result.descriptor),
             should_capture: result.mode != RuntimeMode::None && !result.graph_available,
             can_replay: result.graph_available,
+            decode_shared: None,
         }
+    }
+
+    /// Attach a pre-built shared decode tensor bundle (typed
+    /// `Arc<DecodeBatchShared>` from `layers::attention`).
+    pub fn with_decode_shared(
+        mut self,
+        shared: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.decode_shared = Some(shared);
+        self
     }
 
     /// Create context for eager execution.
@@ -655,6 +682,7 @@ impl ForwardContext {
             descriptor: None,
             should_capture: false,
             can_replay: false,
+            decode_shared: None,
         }
     }
 }

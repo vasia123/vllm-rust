@@ -741,7 +741,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         }
     } else {
         // No adapters — use standard path with CUDA graph support
-        let forward_ctx = if let Some(disp) = dispatcher {
+        let mut forward_ctx = if let Some(disp) = dispatcher {
             let descriptor = BatchDescriptor::for_decode(batch_size);
             match disp.read() {
                 Ok(disp_guard) => {
@@ -753,6 +753,22 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         } else {
             ForwardContext::eager()
         };
+
+        // Build decode-batch shared tensors once per forward. Models that
+        // route through `forward_decode_batch_with_ctx` and propagate
+        // `ctx.decode_shared` to their attention layers will reuse this
+        // bundle 36× per Qwen3 token instead of rebuilding it per layer.
+        match crate::layers::attention::build_decode_batch_shared(&sequences, model.device()) {
+            Ok(shared) => {
+                forward_ctx = forward_ctx.with_decode_shared(std::sync::Arc::new(shared));
+            }
+            Err(e) => {
+                // Non-fatal: fall back to per-layer build at the
+                // attention site. Log so unexpected build failures
+                // don't go silent.
+                tracing::debug!(error = %e, "build_decode_batch_shared failed; per-layer build will run");
+            }
+        }
 
         let input = match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
             Ok(t) => t,

@@ -136,6 +136,69 @@ pub trait AttentionBackend: Send + Sync {
         Ok((out_3d, None))
     }
 
+    /// Pre-build a backend-specific decode plan that can be replayed across
+    /// every attention layer of the same forward pass.
+    ///
+    /// Backends that benefit from caching (FlashInfer's `BatchDecodePlan`,
+    /// which otherwise rebuilds and host-syncs `kv_indptr` ×36 per token on
+    /// Qwen3-4B) override this and return `Some(plan)`. Other backends
+    /// return `None` and `batched_decode_attention_with_plan` falls back
+    /// to the per-layer eager path.
+    ///
+    /// The plan is opaque to the caller; pass it back unchanged via the
+    /// `plan: Option<&dyn Any>` argument of
+    /// `batched_decode_attention_with_plan`.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_decode_plan(
+        &self,
+        cache_engine: &CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        query_dtype: candle_core::DType,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
+        let _ = (
+            cache_engine,
+            metadata,
+            query_dtype,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+        Ok(None)
+    }
+
+    /// Replay a pre-built decode plan returned by `prepare_decode_plan`.
+    /// Default implementation ignores the plan and falls through to the
+    /// regular `batched_decode_attention`, so callers can pass a cached
+    /// plan unconditionally without checking which backend they have.
+    #[allow(clippy::too_many_arguments)]
+    fn batched_decode_attention_with_plan(
+        &self,
+        q: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        cache_engine: &mut CacheEngine,
+        metadata: &BatchedDecodeMetadata,
+        plan: Option<&(dyn std::any::Any + Send + Sync)>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let _ = plan;
+        self.batched_decode_attention(
+            q,
+            k_new,
+            v_new,
+            cache_engine,
+            metadata,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )
+    }
+
     /// Check if this backend supports the given configuration.
     fn supports_config(&self, num_heads: usize, num_kv_heads: usize, head_dim: usize) -> bool {
         // Default: support all configurations

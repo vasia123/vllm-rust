@@ -220,6 +220,54 @@ impl PrefillWrapper {
     }
 }
 
+/// Pre-built FlashInfer decode plan that bundles a `BatchDecodePlan`
+/// together with the GPU tensors it reads at run time.
+///
+/// Constructing this is the only host-blocking step on the decode path
+/// (`kv_indptr` is pulled to the host so FlashInfer can compute work
+/// estimates on the CPU). Once built, [`DecodeWrapper::run_with_plan`]
+/// can replay the kernel for every attention layer of the same forward
+/// pass without any further host syncs — turning the previous
+/// 36-host-syncs-per-token cost (one per attention layer for Qwen3) into
+/// a single host sync per forward batch.
+#[cfg(feature = "flashinfer")]
+pub struct DecodePlan {
+    plan: flashinfer_rs::ffi::BatchDecodePlan,
+    /// GPU tensor `[batch_size + 1]` — cumulative block counts; read by
+    /// `plan.run()` on every replay.
+    kv_indptr: Tensor,
+    /// GPU tensor `[total_blocks]` — flattened block IDs.
+    kv_indices: Tensor,
+    /// GPU tensor `[batch_size]` — valid tokens in last page.
+    kv_last_page_len: Tensor,
+    batch_size: usize,
+    /// Page-locked scratch the plan writes its metadata into. Must stay
+    /// alive as long as `plan` may still be replayed; using a `Box<[u8]>`
+    /// pins the address (no realloc moves) for the kernel to read.
+    _page_locked_buf: Box<[u8]>,
+}
+
+#[cfg(feature = "flashinfer")]
+impl DecodePlan {
+    /// Number of sequences this plan was built for.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+}
+
+// SAFETY: `BatchDecodePlan` from flashinfer-rs holds opaque CUDA handles
+// (no thread-local state, no raw pointers into mutable shared memory).
+// We construct it in one thread (warmup / engine forward setup), then
+// either keep it pinned to the same thread or hand it to the engine via
+// `Arc<dyn Any + Send + Sync>` storage that's locked per forward batch.
+// The wrapped `Tensor`s are `Send + Sync` already; the `Box<[u8]>`
+// page-locked buffer never moves once boxed. Manual unsafe impls
+// because cudarc's FFI types don't carry the auto-marker.
+#[cfg(feature = "flashinfer")]
+unsafe impl Send for DecodePlan {}
+#[cfg(feature = "flashinfer")]
+unsafe impl Sync for DecodePlan {}
+
 /// Wrapper for FlashInfer batch decode attention via direct FFI calls.
 ///
 /// Handles decode attention where we have a single query token per sequence
@@ -246,35 +294,28 @@ impl DecodeWrapper {
         })
     }
 
-    /// Run batch decode attention via FlashInfer FFI.
+    /// Build a [`DecodePlan`] that can be replayed across every attention
+    /// layer of one forward pass.
     ///
-    /// # Arguments
-    /// * `q` - Query tensor [batch_size, num_qo_heads, head_dim]
-    /// * `k_cache` - Key cache [num_pages, page_size, num_kv_heads, head_dim]
-    /// * `v_cache` - Value cache [num_pages, page_size, num_kv_heads, head_dim]
-    /// * `workspace` - Workspace buffer for FlashInfer temporaries
-    /// * `kv_indptr` - Cumulative block counts [batch_size + 1], i32 GPU tensor
-    /// * `kv_indices` - Flattened block IDs [total_blocks], i32 GPU tensor
-    /// * `kv_last_page_len` - Valid tokens in last page [batch_size], i32 GPU tensor
-    /// * `batch_size` - Number of sequences
+    /// This is the **only** host-blocking step on the decode path — it
+    /// pulls `kv_indptr` to the CPU so FlashInfer can compute work
+    /// estimates, then writes plan metadata into a page-locked buffer and
+    /// stages it on the device via `cudaMemcpyAsync`. Subsequent
+    /// [`Self::run_with_plan`] calls replay the kernel without touching
+    /// the host.
     ///
-    /// # Returns
-    /// Output tensor [batch_size, num_qo_heads, head_dim]
-    #[allow(clippy::too_many_arguments)]
-    pub fn run(
+    /// `workspace` is borrowed mutably during plan creation (the plan
+    /// writes its split-K / partition info layout there); the workspace
+    /// must remain valid for as long as the returned plan is replayed.
+    pub fn build_plan(
         &self,
-        q: &Tensor,
-        k_cache: &Tensor,
-        v_cache: &Tensor,
         workspace: &mut WorkspaceBuffer,
-        kv_indptr: &Tensor,
-        kv_indices: &Tensor,
-        kv_last_page_len: &Tensor,
+        kv_indptr: Tensor,
+        kv_indices: Tensor,
+        kv_last_page_len: Tensor,
+        query_dtype: candle_core::DType,
         batch_size: usize,
-    ) -> Result<Tensor> {
-        let q = tensor_bridge::ensure_contiguous(q)?;
-
-        // Ensure workspace is large enough
+    ) -> Result<DecodePlan> {
         let required_size = estimate_decode_workspace(
             batch_size,
             self.config.num_qo_heads as usize,
@@ -282,41 +323,26 @@ impl DecodeWrapper {
         );
         workspace.ensure_size(required_size)?;
 
-        // Get raw DEVICE pointers
-        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
-        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
-        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
-        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(kv_indptr)? as *const i32;
-        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(kv_indices)? as *const i32;
-        let kv_last_page_len_ptr =
-            tensor_bridge::tensor_to_device_ptr(kv_last_page_len)? as *const i32;
-        let workspace_ptr = workspace.as_ptr()?;
-        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
-
-        // Copy kv_indptr to HOST for plan creation.
-        // FlashInfer's DecodePlan reads indptr on the CPU for work estimation
-        // (the C++ parameter is named `indptr_h` — the `_h` suffix = host).
+        // FlashInfer's DecodePlan reads indptr on the CPU for work
+        // estimation (the C++ parameter is named `indptr_h` — `_h` for
+        // host). This is the single host-sync per forward batch.
         let kv_indptr_host_u32: Vec<u32> = kv_indptr.to_vec1::<u32>()?;
         let kv_indptr_host: Vec<i32> = kv_indptr_host_u32.iter().map(|&x| x as i32).collect();
 
-        // Allocate output
-        let output = Tensor::zeros_like(&q)?;
-        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
-
-        let dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
-
-        // Split workspace: first half for float, second half for int
+        let workspace_ptr = workspace.as_ptr()?;
         let ws_size = workspace.size();
         let float_ws_size = ws_size / 2;
         let int_ws_size = ws_size - float_ws_size;
         let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
         let int_ws_ptr = unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
 
-        // DecodePlan writes plan metadata to page-locked host memory, then
-        // copies it to device via cudaMemcpyAsync. Must match int workspace size.
-        let mut page_locked_buf: Vec<u8> = vec![0u8; int_ws_size];
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+        let dtype = tensor_bridge::candle_to_ffi_dtype(query_dtype)?;
 
-        // Create FFI plan (uses HOST kv_indptr for CPU-side work estimation)
+        // Pinned scratch for plan metadata. `Box<[u8]>` keeps the address
+        // stable for the lifetime of the plan (no Vec realloc moves).
+        let mut page_locked_buf: Box<[u8]> = vec![0u8; int_ws_size].into_boxed_slice();
+
         let plan = unsafe {
             flashinfer_rs::ffi::BatchDecodePlan::new(
                 float_ws_ptr,
@@ -341,26 +367,86 @@ impl DecodeWrapper {
             .map_err(|e| candle_core::Error::Msg(format!("FlashInfer decode plan failed: {e}")))?
         };
 
-        // Run the kernel (uses DEVICE pointers for GPU execution)
+        Ok(DecodePlan {
+            plan,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            batch_size,
+            _page_locked_buf: page_locked_buf,
+        })
+    }
+
+    /// Replay a pre-built decode plan. No host syncs — only device
+    /// pointer extraction (which Candle does without crossing PCIe) and
+    /// the kernel launch.
+    pub fn run_with_plan(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        plan: &DecodePlan,
+    ) -> Result<Tensor> {
+        let q = tensor_bridge::ensure_contiguous(q)?;
+
+        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
+        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
+        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(&plan.kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(&plan.kv_indices)? as *const i32;
+        let kv_last_page_len_ptr =
+            tensor_bridge::tensor_to_device_ptr(&plan.kv_last_page_len)? as *const i32;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+
+        let output = Tensor::zeros_like(&q)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
+
         unsafe {
-            plan.run(
-                q_ptr,
-                k_cache_ptr,
-                v_cache_ptr,
-                kv_indptr_ptr,
-                kv_indices_ptr,
-                kv_last_page_len_ptr,
-                output_ptr,
-                std::ptr::null_mut(), // lse
-                self.config.ffi_kv_layout(),
-                stream_ptr,
-            )
-            .map_err(|e| {
-                candle_core::Error::Msg(format!("FlashInfer decode forward failed: {e}"))
-            })?;
+            plan.plan
+                .run(
+                    q_ptr,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    kv_indptr_ptr,
+                    kv_indices_ptr,
+                    kv_last_page_len_ptr,
+                    output_ptr,
+                    std::ptr::null_mut(), // lse
+                    self.config.ffi_kv_layout(),
+                    stream_ptr,
+                )
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("FlashInfer decode forward failed: {e}"))
+                })?;
         }
 
         Ok(output)
+    }
+
+    /// Convenience wrapper: build a one-shot plan and run it.
+    /// Equivalent to the previous `run` API; kept for tests and any
+    /// callers that don't yet plumb a cached plan through.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        workspace: &mut WorkspaceBuffer,
+        kv_indptr: &Tensor,
+        kv_indices: &Tensor,
+        kv_last_page_len: &Tensor,
+        batch_size: usize,
+    ) -> Result<Tensor> {
+        let plan = self.build_plan(
+            workspace,
+            kv_indptr.clone(),
+            kv_indices.clone(),
+            kv_last_page_len.clone(),
+            q.dtype(),
+            batch_size,
+        )?;
+        self.run_with_plan(q, k_cache, v_cache, &plan)
     }
 
     /// Run batch decode attention, also returning log-sum-exp softmax statistics.

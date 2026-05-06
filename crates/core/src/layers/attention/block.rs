@@ -96,6 +96,90 @@ pub enum QkNormVariant {
     PerHeadLayerNorm,
 }
 
+/// Per-forward shared state for batched decode attention.
+///
+/// All quantities here depend only on the active `[DecodeSequenceMetadata]`
+/// (positions, block IDs, KV lengths, slot mapping) — not on which
+/// transformer layer is currently running. So they can be built **once** at
+/// the start of a forward batch and reused across every attention layer,
+/// avoiding the previous per-layer pattern of building scratch `Vec<u32>`s
+/// and uploading them with `Tensor::from_vec` 36 times per token on
+/// Qwen3-4B.
+///
+/// Construct via [`build_decode_batch_shared`], hand to
+/// [`AttentionBlock::forward_decode_batch_with_shared`] (or via
+/// `ForwardContext::decode_shared` when a model routes through it).
+#[derive(Debug, Clone)]
+pub struct DecodeBatchShared {
+    /// Per-sequence query positions (`seqlen_offset`), host-side. Used by
+    /// `RotaryEmbedding::apply_varlen` which already expects host slice.
+    pub positions: std::sync::Arc<Vec<usize>>,
+    /// Flattened per-step slot mapping for all sequences (host-side).
+    /// Used by `cache_engine.write_batch`.
+    pub all_slot_mapping: std::sync::Arc<Vec<usize>>,
+    /// `[batch_size, max_blocks_per_seq]` U32 block IDs on the same
+    /// device as the model.
+    pub block_tables: Tensor,
+    /// `[batch_size]` U32 sequence lengths (current decode position + 1).
+    pub seq_lens: Tensor,
+    /// Padding extent of `block_tables` along axis 1.
+    pub max_blocks_per_seq: usize,
+    /// `max(seq_lens)` — used as the kernel's upper bound.
+    pub max_seq_len: usize,
+}
+
+/// Build the per-forward shared decode state on `device`.
+///
+/// One pass through `sequences`: collects positions, slot mapping,
+/// block IDs (padded), seq_lens. Two `Tensor::from_vec` host→device
+/// uploads (block_tables, seq_lens) — same as one attention layer used
+/// to do, but now amortised across all 36 layers of a Qwen3 forward.
+pub fn build_decode_batch_shared(
+    sequences: &[DecodeSequenceMetadata],
+    device: &Device,
+) -> Result<DecodeBatchShared> {
+    let batch_size = sequences.len();
+    if batch_size == 0 {
+        candle_core::bail!("build_decode_batch_shared: empty sequences");
+    }
+
+    let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
+
+    let all_slot_mapping: Vec<usize> = sequences
+        .iter()
+        .flat_map(|s| s.slot_mapping.iter().copied())
+        .collect();
+
+    let max_blocks_per_seq = sequences
+        .iter()
+        .map(|s| s.block_ids.len())
+        .max()
+        .unwrap_or(1);
+    let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
+    for (i, seq) in sequences.iter().enumerate() {
+        for (j, &block_id) in seq.block_ids.iter().enumerate() {
+            bt_data[i * max_blocks_per_seq + j] = block_id as u32;
+        }
+    }
+    let block_tables = Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), device)?;
+
+    let seq_lens_data: Vec<u32> = sequences
+        .iter()
+        .map(|s| (s.seqlen_offset + 1) as u32)
+        .collect();
+    let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
+    let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), device)?;
+
+    Ok(DecodeBatchShared {
+        positions: std::sync::Arc::new(positions),
+        all_slot_mapping: std::sync::Arc::new(all_slot_mapping),
+        block_tables,
+        seq_lens,
+        max_blocks_per_seq,
+        max_seq_len,
+    })
+}
+
 /// Bias presence on the four projections.
 ///
 /// Most models have bias=false everywhere (Llama family). Some (Qwen2)
@@ -586,6 +670,25 @@ impl AttentionBlock {
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
     ) -> Result<Tensor> {
+        self.forward_decode_batch_with_shared(xs, sequences, cache_engine, tp_ctx, None)
+    }
+
+    /// Like [`forward_decode_batch`], but accepts a [`DecodeBatchShared`] that
+    /// pre-builds the per-sequence host vectors and GPU tensors that are
+    /// constant across every attention layer of one forward pass.
+    ///
+    /// On Qwen3-4B this is the difference between 36 host→device uploads
+    /// per token (block_tables, seq_lens, plus the implicit syncs from
+    /// each `Tensor::from_vec` call inside `cuda_decode_batch`) and a
+    /// single upload reused by every layer.
+    pub fn forward_decode_batch_with_shared(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        cache_engine: &mut CacheEngine,
+        tp_ctx: &TpContext,
+        shared: Option<&DecodeBatchShared>,
+    ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
         let (q, k, v) = self.project_qkv(xs, batch_size, 1, tp_ctx)?;
@@ -604,8 +707,9 @@ impl AttentionBlock {
         // model is being exercised on CPU (e.g. `*_decode_batch` tests).
         #[cfg(feature = "cuda-kernels")]
         if q.device().is_cuda() && !self.needs_manual && !self.qk_norm_after_rope {
-            return self.cuda_decode_batch(&q, &k, &v, sequences, cache_engine, tp_ctx);
+            return self.cuda_decode_batch(&q, &k, &v, sequences, cache_engine, tp_ctx, shared);
         }
+        let _ = shared;
 
         // Per-sequence loop fallback (CPU and manual paths). RoPE position
         // depends on sequence offset, and the slot_mapping / block_ids are
@@ -815,6 +919,7 @@ impl AttentionBlock {
     /// unset — the kernel computes attention with the standard `1/sqrt(head_dim)`
     /// scale and a plain causal mask.
     #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
     fn cuda_decode_batch(
         &self,
         q: &Tensor,
@@ -823,6 +928,7 @@ impl AttentionBlock {
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
         tp_ctx: &TpContext,
+        shared: Option<&DecodeBatchShared>,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
@@ -831,40 +937,80 @@ impl AttentionBlock {
         let k = k.squeeze(2)?;
         let v = v.squeeze(2)?;
 
-        let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
+        // RoPE positions — identical across attention layers within one
+        // forward, so reuse from `shared` when available; otherwise build
+        // a per-layer scratch vector (the old slow path).
+        let positions_owned: Vec<usize>;
+        let positions: &[usize] = match shared {
+            Some(s) => &s.positions,
+            None => {
+                positions_owned = sequences.iter().map(|s| s.seqlen_offset).collect();
+                &positions_owned
+            }
+        };
         let (q, k) = if self.bypass_rope {
             (q, k)
         } else {
-            self.rotary_emb.apply_varlen(&q, &k, &positions)?
+            self.rotary_emb.apply_varlen(&q, &k, positions)?
         };
 
-        let all_slot_mapping: Vec<usize> = sequences
-            .iter()
-            .flat_map(|s| s.slot_mapping.iter().copied())
-            .collect();
+        // KV write — slot_mapping is also constant across layers; reuse.
+        let slot_mapping_owned: Vec<usize>;
+        let all_slot_mapping: &[usize] = match shared {
+            Some(s) => &s.all_slot_mapping,
+            None => {
+                slot_mapping_owned = sequences
+                    .iter()
+                    .flat_map(|s| s.slot_mapping.iter().copied())
+                    .collect();
+                &slot_mapping_owned
+            }
+        };
         cache_engine
-            .write_batch(&k, &v, &all_slot_mapping)
+            .write_batch(&k, &v, all_slot_mapping)
             .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
 
-        let max_blocks_per_seq = sequences
-            .iter()
-            .map(|s| s.block_ids.len())
-            .max()
-            .unwrap_or(1);
-        let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-        for (i, seq) in sequences.iter().enumerate() {
-            for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-            }
-        }
-        let block_tables = Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
+        // block_tables / seq_lens — same shape and contents for every
+        // attention layer of one forward, so the GPU upload happens once
+        // per token (in `engine/helpers.rs`) instead of 36× via
+        // `Tensor::from_vec` here. We clone the cached `Tensor`s on the
+        // shared path; that's just an `Arc` refcount bump — no GPU work.
+        let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len): (
+            Tensor,
+            Tensor,
+            usize,
+            usize,
+        ) = match shared {
+            Some(s) => (
+                s.block_tables.clone(),
+                s.seq_lens.clone(),
+                s.max_blocks_per_seq,
+                s.max_seq_len,
+            ),
+            None => {
+                let max_blocks_per_seq = sequences
+                    .iter()
+                    .map(|s| s.block_ids.len())
+                    .max()
+                    .unwrap_or(1);
+                let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
+                for (i, seq) in sequences.iter().enumerate() {
+                    for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                        bt_data[i * max_blocks_per_seq + j] = block_id as u32;
+                    }
+                }
+                let bt = Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
 
-        let seq_lens_data: Vec<u32> = sequences
-            .iter()
-            .map(|s| (s.seqlen_offset + 1) as u32)
-            .collect();
-        let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-        let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+                let seq_lens_data: Vec<u32> = sequences
+                    .iter()
+                    .map(|s| (s.seqlen_offset + 1) as u32)
+                    .collect();
+                let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
+                let sl = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+
+                (bt, sl, max_blocks_per_seq, max_seq_len)
+            }
+        };
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let attn_output = crate::cuda_kernels::paged_attention_cuda(
