@@ -1,6 +1,8 @@
+#[cfg(feature = "cuda-fused-activations")]
+use candle_core::CustomOp2;
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, CustomOp2, DType, Layout, Result,
-    Shape, Storage, Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, Layout, Result, Shape, Storage,
+    Tensor,
 };
 
 /// Clone a CudaStorageSlice by pattern-matching each variant.
@@ -36,9 +38,104 @@ pub fn fp8_kernels_available() -> bool {
     cuda_target_sm() >= 89
 }
 
-const HEAD_DIM: usize = 128;
-const BLOCK_SIZE: usize = 16;
 const NUM_WARPS: usize = 4;
+
+/// Validate the V2 paged-attention contract `max(seq_lens) <= max_seq_len`.
+///
+/// `max_seq_len` controls how many partition slots the V2 path allocates and
+/// how many `tmp_out` partitions Stage-1 actually writes. The Stage-2 reduce
+/// kernel iterates over `ceil(seq_len / PARTITION_SIZE)` partitions per
+/// sequence — if any `seq_lens[i] > max_seq_len`, reduce reads beyond the
+/// initialised range and silently produces wrong outputs. The check is gated
+/// behind `debug_assertions` so release builds avoid the device→host sync.
+fn debug_assert_seq_lens_within_bound(seq_lens: &Tensor, max_seq_len: usize) -> Result<()> {
+    if cfg!(debug_assertions) {
+        let lens: Vec<u32> = seq_lens.to_vec1()?;
+        if let Some(&actual_max) = lens.iter().max() {
+            if (actual_max as usize) > max_seq_len {
+                candle_core::bail!(
+                    "paged_attention_v2: contract violation — seq_lens.max()={} exceeds max_seq_len={}",
+                    actual_max,
+                    max_seq_len
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Storage dtype for PagedAttention kernels.
+///
+/// Implementations name the kernel symbols and provide CudaStorageSlice
+/// projections for their concrete float type. Adding a new dtype (e.g. fp8
+/// activations) is one impl block — no kernel-launch code changes.
+trait PagedAttnDtype:
+    candle_core::cuda::cudarc::driver::DeviceRepr
+    + candle_core::cuda::cudarc::driver::ValidAsZeroBits
+    + Default
+    + Copy
+    + 'static
+{
+    const KERNEL_V1: &'static str;
+    const KERNEL_V1_ALIBI: &'static str;
+    const KERNEL_V2: &'static str;
+    const KERNEL_V2_ALIBI: &'static str;
+    const KERNEL_V2_REDUCE: &'static str;
+    const NAME: &'static str;
+
+    fn slice_from(
+        s: &CudaStorageSlice,
+    ) -> Option<&candle_core::cuda::cudarc::driver::CudaSlice<Self>>;
+    fn into_storage_slice(
+        s: candle_core::cuda::cudarc::driver::CudaSlice<Self>,
+    ) -> CudaStorageSlice;
+}
+
+impl PagedAttnDtype for half::bf16 {
+    const KERNEL_V1: &'static str = "paged_attention_v1_bf16";
+    const KERNEL_V1_ALIBI: &'static str = "paged_attention_v1_bf16_alibi";
+    const KERNEL_V2: &'static str = "paged_attention_v2_bf16";
+    const KERNEL_V2_ALIBI: &'static str = "paged_attention_v2_bf16_alibi";
+    const KERNEL_V2_REDUCE: &'static str = "paged_attention_v2_reduce_bf16";
+    const NAME: &'static str = "bf16";
+
+    fn slice_from(
+        s: &CudaStorageSlice,
+    ) -> Option<&candle_core::cuda::cudarc::driver::CudaSlice<Self>> {
+        match s {
+            CudaStorageSlice::BF16(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn into_storage_slice(
+        s: candle_core::cuda::cudarc::driver::CudaSlice<Self>,
+    ) -> CudaStorageSlice {
+        CudaStorageSlice::BF16(s)
+    }
+}
+
+impl PagedAttnDtype for half::f16 {
+    const KERNEL_V1: &'static str = "paged_attention_v1_f16";
+    const KERNEL_V1_ALIBI: &'static str = "paged_attention_v1_f16_alibi";
+    const KERNEL_V2: &'static str = "paged_attention_v2_f16";
+    const KERNEL_V2_ALIBI: &'static str = "paged_attention_v2_f16_alibi";
+    const KERNEL_V2_REDUCE: &'static str = "paged_attention_v2_reduce_f16";
+    const NAME: &'static str = "f16";
+
+    fn slice_from(
+        s: &CudaStorageSlice,
+    ) -> Option<&candle_core::cuda::cudarc::driver::CudaSlice<Self>> {
+        match s {
+            CudaStorageSlice::F16(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn into_storage_slice(
+        s: candle_core::cuda::cudarc::driver::CudaSlice<Self>,
+    ) -> CudaStorageSlice {
+        CudaStorageSlice::F16(s)
+    }
+}
 
 struct PagedAttnOp {
     k_cache: Tensor,
@@ -64,36 +161,53 @@ impl CustomOp1 for PagedAttnOp {
     }
 
     fn cuda_fwd(&self, q_storage: &CudaStorage, q_layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use half::bf16;
-
-        let dev = &q_storage.device;
-        let num_seqs = q_layout.dims()[0];
-
         if q_layout.start_offset() != 0 {
             candle_core::bail!("paged_attention: Q must be contiguous from offset 0");
         }
+        let num_seqs = q_layout.dims()[0];
+        match &q_storage.slice {
+            CudaStorageSlice::BF16(_) => self.run_v1::<half::bf16>(q_storage, num_seqs),
+            CudaStorageSlice::F16(_) => self.run_v1::<half::f16>(q_storage, num_seqs),
+            _ => candle_core::bail!("paged_attention expects bf16 or f16 Q tensor"),
+        }
+    }
+}
 
-        let q_slice = match &q_storage.slice {
-            CudaStorageSlice::BF16(s) => s,
-            _ => candle_core::bail!("paged_attention expects bf16 Q tensor"),
-        };
+impl PagedAttnOp {
+    fn run_v1<T: PagedAttnDtype>(
+        &self,
+        q_storage: &CudaStorage,
+        num_seqs: usize,
+    ) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &q_storage.device;
+        let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "paged_attention: Q dtype mismatch with selected kernel ({})",
+                T::NAME
+            ))
+        })?;
 
         let (k_guard, _) = self.k_cache.storage_and_layout();
         let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention expects bf16 K cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention: K cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("paged_attention: K cache must be on CUDA"),
         };
 
         let (v_guard, _) = self.v_cache.storage_and_layout();
         let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention expects bf16 V cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention: V cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("paged_attention: V cache must be on CUDA"),
         };
 
@@ -117,10 +231,9 @@ impl CustomOp1 for PagedAttnOp {
 
         let head_dim = self.head_dim;
         let elem_count = num_seqs * self.num_heads * head_dim;
-        let output_slice = dev.alloc_zeros::<bf16>(elem_count)?;
+        let output_slice = dev.alloc_zeros::<T>(elem_count)?;
 
-        let func =
-            dev.get_or_load_custom_func("paged_attention_v1_bf16", "paged_attention", PTX)?;
+        let func = dev.get_or_load_custom_func(T::KERNEL_V1, "paged_attention", PTX)?;
 
         // Shared memory: q_smem[head_dim] + reduce_smem[NUM_WARPS] + logits[max_seq_len]
         let shared_mem_bytes =
@@ -162,7 +275,7 @@ impl CustomOp1 for PagedAttnOp {
         drop(sl_guard);
 
         let output_storage = CudaStorage {
-            slice: CudaStorageSlice::BF16(output_slice),
+            slice: T::into_storage_slice(output_slice),
             device: dev.clone(),
         };
         let output_shape = Shape::from_dims(&[num_seqs, self.num_heads, head_dim]);
@@ -249,6 +362,12 @@ struct PagedAttnV2Op {
     num_heads: usize,
     num_kv_heads: usize,
     max_blocks_per_seq: usize,
+    /// Caller's stated upper bound on `seq_lens[i]`. The kernel itself only
+    /// reads `max_num_partitions` (derived from this), but we keep the field
+    /// to validate the contract `max(seq_lens) <= max_seq_len` at the public
+    /// API entry — violating it would make the reduce kernel read
+    /// uninitialised partitions.
+    #[allow(dead_code)]
     max_seq_len: usize,
     head_dim: usize,
     block_size: usize,
@@ -265,36 +384,53 @@ impl CustomOp1 for PagedAttnV2Op {
     }
 
     fn cuda_fwd(&self, q_storage: &CudaStorage, q_layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use half::bf16;
-
-        let dev = &q_storage.device;
-        let num_seqs = q_layout.dims()[0];
-
         if q_layout.start_offset() != 0 {
             candle_core::bail!("paged_attention_v2: Q must be contiguous from offset 0");
         }
+        let num_seqs = q_layout.dims()[0];
+        match &q_storage.slice {
+            CudaStorageSlice::BF16(_) => self.run_v2::<half::bf16>(q_storage, num_seqs),
+            CudaStorageSlice::F16(_) => self.run_v2::<half::f16>(q_storage, num_seqs),
+            _ => candle_core::bail!("paged_attention_v2 expects bf16 or f16 Q tensor"),
+        }
+    }
+}
 
-        let q_slice = match &q_storage.slice {
-            CudaStorageSlice::BF16(s) => s,
-            _ => candle_core::bail!("paged_attention_v2 expects bf16 Q tensor"),
-        };
+impl PagedAttnV2Op {
+    fn run_v2<T: PagedAttnDtype>(
+        &self,
+        q_storage: &CudaStorage,
+        num_seqs: usize,
+    ) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &q_storage.device;
+        let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "paged_attention_v2: Q dtype mismatch ({})",
+                T::NAME
+            ))
+        })?;
 
         let (k_guard, _) = self.k_cache.storage_and_layout();
         let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention_v2 expects bf16 K cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v2: K cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("paged_attention_v2: K cache must be on CUDA"),
         };
 
         let (v_guard, _) = self.v_cache.storage_and_layout();
         let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention_v2 expects bf16 V cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v2: V cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("paged_attention_v2: V cache must be on CUDA"),
         };
 
@@ -328,11 +464,10 @@ impl CustomOp1 for PagedAttnV2Op {
 
         // Final output
         let out_size = num_seqs * self.num_heads * head_dim;
-        let output_slice = dev.alloc_zeros::<bf16>(out_size)?;
+        let output_slice = dev.alloc_zeros::<T>(out_size)?;
 
         // Stage 1: partitioned attention kernel
-        let v2_func =
-            dev.get_or_load_custom_func("paged_attention_v2_bf16", "paged_attention", PTX)?;
+        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2, "paged_attention", PTX)?;
 
         // Shared memory: q[head_dim] + reduce[NUM_WARPS] + logits[PARTITION_SIZE]
         let shared_mem_bytes =
@@ -380,7 +515,7 @@ impl CustomOp1 for PagedAttnV2Op {
 
         // Stage 2: reduce kernel
         let reduce_func =
-            dev.get_or_load_custom_func("paged_attention_v2_reduce_bf16", "paged_attention", PTX)?;
+            dev.get_or_load_custom_func(T::KERNEL_V2_REDUCE, "paged_attention", PTX)?;
 
         // Reduce shared memory: max_logits[max_num_partitions] + exp_sums[max_num_partitions] + warp_reduce[NUM_WARPS]
         let reduce_shared_bytes =
@@ -414,7 +549,7 @@ impl CustomOp1 for PagedAttnV2Op {
         drop(sl_guard);
 
         let output_storage = CudaStorage {
-            slice: CudaStorageSlice::BF16(output_slice),
+            slice: T::into_storage_slice(output_slice),
             device: dev.clone(),
         };
         let output_shape = Shape::from_dims(&[num_seqs, self.num_heads, head_dim]);
@@ -453,13 +588,16 @@ pub fn paged_attention_v2_cuda(
 ) -> Result<Tensor> {
     let q = q.contiguous()?;
     let num_seqs = q.dim(0)?;
-    let max_num_partitions = (max_seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+    let max_num_partitions = max_seq_len.div_ceil(PARTITION_SIZE);
+
+    let seq_lens_c = seq_lens.contiguous()?;
+    debug_assert_seq_lens_within_bound(&seq_lens_c, max_seq_len)?;
 
     let op = PagedAttnV2Op {
         k_cache: k_cache.clone(),
         v_cache: v_cache.clone(),
         block_tables: block_tables.contiguous()?,
-        seq_lens: seq_lens.contiguous()?,
+        seq_lens: seq_lens_c,
         scale,
         num_heads,
         num_kv_heads,
@@ -563,36 +701,53 @@ impl CustomOp1 for PagedAttnAlibiOp {
     }
 
     fn cuda_fwd(&self, q_storage: &CudaStorage, q_layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use half::bf16;
-
-        let dev = &q_storage.device;
-        let num_seqs = q_layout.dims()[0];
-
         if q_layout.start_offset() != 0 {
             candle_core::bail!("paged_attention: Q must be contiguous from offset 0");
         }
+        let num_seqs = q_layout.dims()[0];
+        match &q_storage.slice {
+            CudaStorageSlice::BF16(_) => self.run_v1_alibi::<half::bf16>(q_storage, num_seqs),
+            CudaStorageSlice::F16(_) => self.run_v1_alibi::<half::f16>(q_storage, num_seqs),
+            _ => candle_core::bail!("paged_attention_v1_alibi expects bf16 or f16 Q tensor"),
+        }
+    }
+}
 
-        let q_slice = match &q_storage.slice {
-            CudaStorageSlice::BF16(s) => s,
-            _ => candle_core::bail!("paged_attention expects bf16 Q tensor"),
-        };
+impl PagedAttnAlibiOp {
+    fn run_v1_alibi<T: PagedAttnDtype>(
+        &self,
+        q_storage: &CudaStorage,
+        num_seqs: usize,
+    ) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &q_storage.device;
+        let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "paged_attention_v1_alibi: Q dtype mismatch ({})",
+                T::NAME
+            ))
+        })?;
 
         let (k_guard, _) = self.k_cache.storage_and_layout();
         let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention expects bf16 K cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v1_alibi: K cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("paged_attention: K cache must be on CUDA"),
         };
 
         let (v_guard, _) = self.v_cache.storage_and_layout();
         let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention expects bf16 V cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v1_alibi: V cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("paged_attention: V cache must be on CUDA"),
         };
 
@@ -625,10 +780,9 @@ impl CustomOp1 for PagedAttnAlibiOp {
 
         let head_dim = self.head_dim;
         let elem_count = num_seqs * self.num_heads * head_dim;
-        let output_slice = dev.alloc_zeros::<bf16>(elem_count)?;
+        let output_slice = dev.alloc_zeros::<T>(elem_count)?;
 
-        let func =
-            dev.get_or_load_custom_func("paged_attention_v1_bf16_alibi", "paged_attention", PTX)?;
+        let func = dev.get_or_load_custom_func(T::KERNEL_V1_ALIBI, "paged_attention", PTX)?;
 
         let shared_mem_bytes =
             ((head_dim + NUM_WARPS + self.max_seq_len) * std::mem::size_of::<f32>()) as u32;
@@ -671,7 +825,7 @@ impl CustomOp1 for PagedAttnAlibiOp {
         drop(sl_guard);
 
         let output_storage = CudaStorage {
-            slice: CudaStorageSlice::BF16(output_slice),
+            slice: T::into_storage_slice(output_slice),
             device: dev.clone(),
         };
         let output_shape = Shape::from_dims(&[num_seqs, self.num_heads, head_dim]);
@@ -747,6 +901,8 @@ struct PagedAttnV2AlibiOp {
     num_heads: usize,
     num_kv_heads: usize,
     max_blocks_per_seq: usize,
+    /// Same contract as in `PagedAttnV2Op::max_seq_len`.
+    #[allow(dead_code)]
     max_seq_len: usize,
     head_dim: usize,
     block_size: usize,
@@ -763,36 +919,53 @@ impl CustomOp1 for PagedAttnV2AlibiOp {
     }
 
     fn cuda_fwd(&self, q_storage: &CudaStorage, q_layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
-        use half::bf16;
-
-        let dev = &q_storage.device;
-        let num_seqs = q_layout.dims()[0];
-
         if q_layout.start_offset() != 0 {
             candle_core::bail!("paged_attention_v2_alibi: Q must be contiguous from offset 0");
         }
+        let num_seqs = q_layout.dims()[0];
+        match &q_storage.slice {
+            CudaStorageSlice::BF16(_) => self.run_v2_alibi::<half::bf16>(q_storage, num_seqs),
+            CudaStorageSlice::F16(_) => self.run_v2_alibi::<half::f16>(q_storage, num_seqs),
+            _ => candle_core::bail!("paged_attention_v2_alibi expects bf16 or f16 Q tensor"),
+        }
+    }
+}
 
-        let q_slice = match &q_storage.slice {
-            CudaStorageSlice::BF16(s) => s,
-            _ => candle_core::bail!("paged_attention_v2_alibi expects bf16 Q"),
-        };
+impl PagedAttnV2AlibiOp {
+    fn run_v2_alibi<T: PagedAttnDtype>(
+        &self,
+        q_storage: &CudaStorage,
+        num_seqs: usize,
+    ) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &q_storage.device;
+        let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "paged_attention_v2_alibi: Q dtype mismatch ({})",
+                T::NAME
+            ))
+        })?;
 
         let (k_guard, _) = self.k_cache.storage_and_layout();
         let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention_v2_alibi expects bf16 K cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v2_alibi: K cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("K cache must be on CUDA"),
         };
 
         let (v_guard, _) = self.v_cache.storage_and_layout();
         let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("paged_attention_v2_alibi expects bf16 V cache"),
-            },
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v2_alibi: V cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
             _ => candle_core::bail!("V cache must be on CUDA"),
         };
 
@@ -833,11 +1006,10 @@ impl CustomOp1 for PagedAttnV2AlibiOp {
         let max_logits_slice = dev.alloc_zeros::<f32>(meta_size)?;
 
         let out_size = num_seqs * self.num_heads * head_dim;
-        let output_slice = dev.alloc_zeros::<bf16>(out_size)?;
+        let output_slice = dev.alloc_zeros::<T>(out_size)?;
 
         // Stage 1: partitioned attention with ALiBi
-        let v2_func =
-            dev.get_or_load_custom_func("paged_attention_v2_bf16_alibi", "paged_attention", PTX)?;
+        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2_ALIBI, "paged_attention", PTX)?;
 
         let shared_mem_bytes =
             ((head_dim + NUM_WARPS + PARTITION_SIZE) * std::mem::size_of::<f32>()) as u32;
@@ -883,9 +1055,9 @@ impl CustomOp1 for PagedAttnV2AlibiOp {
                 .map_err(|e| candle_core::Error::Msg(format!("paged_attention_v2_alibi: {e}")))?;
         }
 
-        // Stage 2: reduce (same kernel as non-ALiBi — reduction is ALiBi-agnostic)
+        // Stage 2: reduce (same kernel family as non-ALiBi — reduction is ALiBi-agnostic).
         let reduce_func =
-            dev.get_or_load_custom_func("paged_attention_v2_reduce_bf16", "paged_attention", PTX)?;
+            dev.get_or_load_custom_func(T::KERNEL_V2_REDUCE, "paged_attention", PTX)?;
 
         let reduce_shared_bytes =
             ((2 * max_num_partitions + NUM_WARPS) * std::mem::size_of::<f32>()) as u32;
@@ -920,7 +1092,7 @@ impl CustomOp1 for PagedAttnV2AlibiOp {
         drop(sl_guard);
 
         let output_storage = CudaStorage {
-            slice: CudaStorageSlice::BF16(output_slice),
+            slice: T::into_storage_slice(output_slice),
             device: dev.clone(),
         };
         let output_shape = Shape::from_dims(&[num_seqs, self.num_heads, head_dim]);
@@ -948,17 +1120,20 @@ pub fn paged_attention_auto_alibi(
     if max_seq_len > V2_SEQ_LEN_THRESHOLD {
         let q = q.contiguous()?;
         let num_seqs = q.dim(0)?;
-        let max_num_partitions = (max_seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+        let max_num_partitions = max_seq_len.div_ceil(PARTITION_SIZE);
 
         let alibi_slopes = alibi_slopes
             .to_dtype(candle_core::DType::F32)?
             .contiguous()?;
 
+        let seq_lens_c = seq_lens.contiguous()?;
+        debug_assert_seq_lens_within_bound(&seq_lens_c, max_seq_len)?;
+
         let op = PagedAttnV2AlibiOp {
             k_cache: k_cache.clone(),
             v_cache: v_cache.clone(),
             block_tables: block_tables.contiguous()?,
-            seq_lens: seq_lens.contiguous()?,
+            seq_lens: seq_lens_c,
             alibi_slopes,
             scale,
             num_heads,
@@ -1563,28 +1738,27 @@ impl CustomOp1 for RopeOp {
             Storage::Cuda(s) => s,
             _ => candle_core::bail!("rope: positions must be on CUDA"),
         };
+        // Match arms use the variant as a dtype witness; the data is read
+        // back via `to_vec1` and re-uploaded to keep a single i32 contract on
+        // the device side. (Direct device-side cast is a separate perf task.)
         let pos_slice = match &pos_storage.slice {
-            CudaStorageSlice::I64(s) => {
-                // Convert i64 positions to i32
+            CudaStorageSlice::I64(_) => {
                 let pos_vec: Vec<i32> = self
                     .positions
                     .to_vec1::<i64>()?
                     .iter()
                     .map(|&v| v as i32)
                     .collect();
-                let pos_i32 = dev.memcpy_stod(&pos_vec)?;
-                pos_i32
+                dev.memcpy_stod(&pos_vec)?
             }
-            CudaStorageSlice::U32(s) => {
-                // Reinterpret u32 as i32 (both 4 bytes, positions are small positive)
+            CudaStorageSlice::U32(_) => {
                 let pos_vec: Vec<i32> = self
                     .positions
                     .to_vec1::<u32>()?
                     .iter()
                     .map(|&v| v as i32)
                     .collect();
-                let pos_i32 = dev.memcpy_stod(&pos_vec)?;
-                pos_i32
+                dev.memcpy_stod(&pos_vec)?
             }
             _ => candle_core::bail!(
                 "rope: positions must be i64 or u32, got {:?}",
@@ -2369,5 +2543,197 @@ mod tests {
 
         let result = fused_swiglu(&gate, &up);
         assert!(result.is_err());
+    }
+
+    /// Paged-attention F16 vs BF16 parity: identical inputs cast to either
+    /// dtype must produce outputs that match within F16 mantissa tolerance.
+    /// Covers V1 (short seq), V2 (long seq, partitioned), and the auto path.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attention_f16_bf16_parity() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+
+        let num_seqs = 1usize;
+        let num_heads = 4usize;
+        let num_kv_heads = 4usize;
+        let head_dim = 128usize;
+        let block_size = 16usize;
+        let seq_len = 16usize; // one full block, fits V1
+        let max_blocks_per_seq = 1usize;
+
+        // Random-ish but deterministic input data.
+        let q_f32: Vec<f32> = (0..num_seqs * num_heads * head_dim)
+            .map(|i| (i as f32 * 0.0123).sin() * 0.5)
+            .collect();
+        let k_f32: Vec<f32> = (0..max_blocks_per_seq * block_size * num_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.0271).cos() * 0.5)
+            .collect();
+        let v_f32: Vec<f32> = (0..max_blocks_per_seq * block_size * num_kv_heads * head_dim)
+            .map(|i| (i as f32 * 0.0411).sin() * 0.5)
+            .collect();
+
+        let q = Tensor::from_vec(q_f32, (num_seqs, num_heads, head_dim), &dev).unwrap();
+        let k_cache = Tensor::from_vec(
+            k_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            &dev,
+        )
+        .unwrap();
+        let v_cache = Tensor::from_vec(
+            v_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            &dev,
+        )
+        .unwrap();
+        let block_tables =
+            Tensor::from_vec(vec![0u32], (num_seqs, max_blocks_per_seq), &dev).unwrap();
+        let seq_lens = Tensor::from_vec(vec![seq_len as u32], num_seqs, &dev).unwrap();
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // BF16 path
+        let q_bf16 = q.to_dtype(DType::BF16).unwrap();
+        let k_bf16 = k_cache.to_dtype(DType::BF16).unwrap();
+        let v_bf16 = v_cache.to_dtype(DType::BF16).unwrap();
+        let out_bf16 = paged_attention_cuda(
+            &q_bf16,
+            &k_bf16,
+            &v_bf16,
+            &block_tables,
+            &seq_lens,
+            scale,
+            num_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            seq_len,
+            head_dim,
+            block_size,
+        )
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+
+        // F16 path
+        let q_f16 = q.to_dtype(DType::F16).unwrap();
+        let k_f16 = k_cache.to_dtype(DType::F16).unwrap();
+        let v_f16 = v_cache.to_dtype(DType::F16).unwrap();
+        let out_f16 = paged_attention_cuda(
+            &q_f16,
+            &k_f16,
+            &v_f16,
+            &block_tables,
+            &seq_lens,
+            scale,
+            num_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            seq_len,
+            head_dim,
+            block_size,
+        )
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+
+        let bf16_vec: Vec<f32> = out_bf16.flatten_all().unwrap().to_vec1().unwrap();
+        let f16_vec: Vec<f32> = out_f16.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(bf16_vec.len(), f16_vec.len());
+
+        // F16 has 10 mantissa bits, BF16 has 7 — different rounding paths.
+        // Tolerance: 5e-2 absolute, matches values <0.5 in our synthetic input.
+        let max_diff = bf16_vec
+            .iter()
+            .zip(f16_vec.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 5e-2,
+            "paged_attention v1 f16/bf16 max diff {max_diff} exceeds 5e-2"
+        );
+    }
+
+    /// V2 split-K parity: long sequence forces multi-partition reduce path.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attention_v2_f16_bf16_parity() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+
+        let num_seqs = 1usize;
+        let num_heads = 4usize;
+        let num_kv_heads = 4usize;
+        let head_dim = 128usize;
+        let block_size = 16usize;
+        // > V2_SEQ_LEN_THRESHOLD (512) and > PARTITION_SIZE (512) → exercises reduce.
+        let seq_len = 1024usize;
+        let max_blocks_per_seq = seq_len / block_size; // 64 blocks
+
+        let q_f32: Vec<f32> = (0..num_seqs * num_heads * head_dim)
+            .map(|i| (i as f32 * 0.0123).sin() * 0.5)
+            .collect();
+        let kv_elements = max_blocks_per_seq * block_size * num_kv_heads * head_dim;
+        let k_f32: Vec<f32> = (0..kv_elements)
+            .map(|i| (i as f32 * 0.0271).cos() * 0.5)
+            .collect();
+        let v_f32: Vec<f32> = (0..kv_elements)
+            .map(|i| (i as f32 * 0.0411).sin() * 0.5)
+            .collect();
+
+        let q = Tensor::from_vec(q_f32, (num_seqs, num_heads, head_dim), &dev).unwrap();
+        let k_cache = Tensor::from_vec(
+            k_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            &dev,
+        )
+        .unwrap();
+        let v_cache = Tensor::from_vec(
+            v_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            &dev,
+        )
+        .unwrap();
+        let bt: Vec<u32> = (0..max_blocks_per_seq as u32).collect();
+        let block_tables = Tensor::from_vec(bt, (num_seqs, max_blocks_per_seq), &dev).unwrap();
+        let seq_lens = Tensor::from_vec(vec![seq_len as u32], num_seqs, &dev).unwrap();
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let run = |dtype: DType| {
+            paged_attention_auto(
+                &q.to_dtype(dtype).unwrap(),
+                &k_cache.to_dtype(dtype).unwrap(),
+                &v_cache.to_dtype(dtype).unwrap(),
+                &block_tables,
+                &seq_lens,
+                scale,
+                num_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                seq_len,
+                head_dim,
+                block_size,
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+        };
+
+        let bf16_vec = run(DType::BF16);
+        let f16_vec = run(DType::F16);
+        assert_eq!(bf16_vec.len(), f16_vec.len());
+
+        let max_diff = bf16_vec
+            .iter()
+            .zip(f16_vec.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // V2 sums across partitions accumulate more rounding drift than V1.
+        assert!(
+            max_diff < 1e-1,
+            "paged_attention v2 f16/bf16 max diff {max_diff} exceeds 1e-1"
+        );
     }
 }

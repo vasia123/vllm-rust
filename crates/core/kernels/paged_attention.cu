@@ -6,8 +6,28 @@
 // Dynamic shared memory: sizeof(float) * (head_dim + NUM_WARPS + max_seq_len)
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <float.h>
+
+// Type-erased fp16/bf16 conversion helpers. The kernels operate in F32 internally
+// (Q/K/V are upcast to float for arithmetic) and only the load/store boundary
+// depends on the storage dtype.
+template <typename T> __device__ __forceinline__ float to_f32(T x);
+template <> __device__ __forceinline__ float to_f32<__nv_bfloat16>(__nv_bfloat16 x) {
+    return __bfloat162float(x);
+}
+template <> __device__ __forceinline__ float to_f32<__half>(__half x) {
+    return __half2float(x);
+}
+
+template <typename T> __device__ __forceinline__ T from_f32(float x);
+template <> __device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(float x) {
+    return __float2bfloat16(x);
+}
+template <> __device__ __forceinline__ __half from_f32<__half>(float x) {
+    return __float2half(x);
+}
 
 // NUM_THREADS must be >= head_dim for correctness when head_dim <= 128,
 // and threads loop for head_dim > 128.
@@ -96,11 +116,12 @@ __device__ float block_reduce_max(float val, float* reduce_smem) {
 //   float q_smem[head_dim]             -- query vector
 //   float reduce_smem[NUM_WARPS]       -- reduction workspace
 //   float logits[max_context_len]      -- QK logits (variable)
+template <typename T>
 __device__ void paged_attention_v1_impl(
-    __nv_bfloat16* __restrict__ out,           // [num_seqs, num_heads, head_dim]
-    const __nv_bfloat16* __restrict__ q,       // [num_seqs, num_heads, head_dim]
-    const __nv_bfloat16* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
-    const __nv_bfloat16* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
+    T* __restrict__ out,                       // [num_seqs, num_heads, head_dim]
+    const T* __restrict__ q,                   // [num_seqs, num_heads, head_dim]
+    const T* __restrict__ k_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
+    const T* __restrict__ v_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
     const int* __restrict__ block_tables,      // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ seq_lens,          // [num_seqs]
     const float scale,
@@ -141,7 +162,7 @@ __device__ void paged_attention_v1_impl(
     // Load query vector into shared memory (threads loop if head_dim > NUM_THREADS)
     for (int d = tid; d < head_dim; d += NUM_THREADS) {
         const int q_offset = seq_idx * num_heads * head_dim + head_idx * head_dim + d;
-        q_smem[d] = __bfloat162float(q[q_offset]);
+        q_smem[d] = to_f32<T>(q[q_offset]);
     }
     __syncthreads();
 
@@ -164,7 +185,7 @@ __device__ void paged_attention_v1_impl(
                                    + token * cache_stride_token
                                    + kv_head_idx * head_dim
                                    + d;
-                const float k_val = __bfloat162float(k_cache[k_offset]);
+                const float k_val = to_f32<T>(k_cache[k_offset]);
                 qk += q_smem[d] * k_val;
             }
 
@@ -222,7 +243,7 @@ __device__ void paged_attention_v1_impl(
                                    + token * cache_stride_token
                                    + kv_head_idx * head_dim
                                    + d;
-                const float v_val = __bfloat162float(v_cache[v_offset]);
+                const float v_val = to_f32<T>(v_cache[v_offset]);
                 const float weight = logits[block_idx * block_size + token];
                 acc += weight * v_val;
             }
@@ -230,7 +251,7 @@ __device__ void paged_attention_v1_impl(
 
         // Write output
         const int out_offset = seq_idx * num_heads * head_dim + head_idx * head_dim + d;
-        out[out_offset] = __float2bfloat16(acc);
+        out[out_offset] = from_f32<T>(acc);
     }
 }
 
@@ -249,7 +270,7 @@ extern "C" __global__ void paged_attention_v1_bf16(
     const int head_dim,
     const int block_size
 ) {
-    paged_attention_v1_impl(
+    paged_attention_v1_impl<__nv_bfloat16>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size,
@@ -273,7 +294,53 @@ extern "C" __global__ void paged_attention_v1_bf16_alibi(
     const int block_size,
     const float* __restrict__ alibi_slopes     // [num_heads]
 ) {
-    paged_attention_v1_impl(
+    paged_attention_v1_impl<__nv_bfloat16>(
+        out, q, k_cache, v_cache, block_tables, seq_lens,
+        scale, num_heads, num_kv_heads, max_blocks_per_seq,
+        head_dim, block_size,
+        alibi_slopes
+    );
+}
+
+// F16 entry points — thin wrappers over the templated impl with __half.
+extern "C" __global__ void paged_attention_v1_f16(
+    __half* __restrict__ out,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const float scale,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks_per_seq,
+    const int head_dim,
+    const int block_size
+) {
+    paged_attention_v1_impl<__half>(
+        out, q, k_cache, v_cache, block_tables, seq_lens,
+        scale, num_heads, num_kv_heads, max_blocks_per_seq,
+        head_dim, block_size,
+        nullptr
+    );
+}
+
+extern "C" __global__ void paged_attention_v1_f16_alibi(
+    __half* __restrict__ out,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const float scale,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks_per_seq,
+    const int head_dim,
+    const int block_size,
+    const float* __restrict__ alibi_slopes
+) {
+    paged_attention_v1_impl<__half>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size,
@@ -300,13 +367,14 @@ extern "C" __global__ void paged_attention_v1_bf16_alibi(
 #define PARTITION_SIZE 512
 
 // V2 main kernel: compute attention for one partition of the sequence.
+template <typename T>
 __device__ void paged_attention_v2_impl(
     float* __restrict__ tmp_out,               // [num_seqs, num_heads, max_num_partitions, head_dim]
     float* __restrict__ exp_sums,              // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits_out,        // [num_seqs, num_heads, max_num_partitions]
-    const __nv_bfloat16* __restrict__ q,       // [num_seqs, num_heads, head_dim]
-    const __nv_bfloat16* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
-    const __nv_bfloat16* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
+    const T* __restrict__ q,                   // [num_seqs, num_heads, head_dim]
+    const T* __restrict__ k_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
+    const T* __restrict__ v_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
     const int* __restrict__ block_tables,      // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ seq_lens,          // [num_seqs]
     const float scale,
@@ -356,7 +424,7 @@ __device__ void paged_attention_v2_impl(
     // Load query into shared memory
     for (int d = tid; d < head_dim; d += NUM_THREADS) {
         const int q_offset = seq_idx * num_heads * head_dim + head_idx * head_dim + d;
-        q_smem[d] = __bfloat162float(q[q_offset]);
+        q_smem[d] = to_f32<T>(q[q_offset]);
     }
     __syncthreads();
 
@@ -383,7 +451,7 @@ __device__ void paged_attention_v2_impl(
                 const int k_offset = physical_block * cache_stride_block
                                    + token_in_block * cache_stride_token
                                    + kv_head_idx * head_dim + d;
-                qk += q_smem[d] * __bfloat162float(k_cache[k_offset]);
+                qk += q_smem[d] * to_f32<T>(k_cache[k_offset]);
             }
 
             qk = block_reduce_sum(qk, reduce_smem);
@@ -453,7 +521,7 @@ __device__ void paged_attention_v2_impl(
                                    + token_in_block * cache_stride_token
                                    + kv_head_idx * head_dim + d;
                 const int local_idx = abs_token - partition_start_token;
-                acc += logits[local_idx] * __bfloat162float(v_cache[v_offset]);
+                acc += logits[local_idx] * to_f32<T>(v_cache[v_offset]);
             }
         }
 
@@ -470,8 +538,9 @@ __device__ void paged_attention_v2_impl(
 // Uses the identity:
 //   softmax(concat(A,B)) = rescale(softmax(A), softmax(B))
 // via the log-sum-exp trick for numerical stability.
-extern "C" __global__ void paged_attention_v2_reduce_bf16(
-    __nv_bfloat16* __restrict__ out,        // [num_seqs, num_heads, head_dim]
+template <typename T>
+__device__ void paged_attention_v2_reduce_impl(
+    T* __restrict__ out,                    // [num_seqs, num_heads, head_dim]
     const float* __restrict__ tmp_out,      // [num_seqs, num_heads, max_num_partitions, head_dim]
     const float* __restrict__ exp_sums,     // [num_seqs, num_heads, max_num_partitions]
     const float* __restrict__ max_logits,   // [num_seqs, num_heads, max_num_partitions]
@@ -489,13 +558,13 @@ extern "C" __global__ void paged_attention_v2_reduce_bf16(
 
     const int num_partitions = (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
 
-    // Fast path: single partition → just copy (convert f32 → bf16)
+    // Fast path: single partition → just copy (convert f32 → output dtype)
     if (num_partitions == 1) {
         const int tmp_offset = seq_idx * num_heads * max_num_partitions * head_dim
                              + head_idx * max_num_partitions * head_dim;
         const int out_offset = seq_idx * num_heads * head_dim + head_idx * head_dim;
         for (int d = tid; d < head_dim; d += NUM_THREADS) {
-            out[out_offset + d] = __float2bfloat16(tmp_out[tmp_offset + d]);
+            out[out_offset + d] = from_f32<T>(tmp_out[tmp_offset + d]);
         }
         return;
     }
@@ -602,8 +671,42 @@ extern "C" __global__ void paged_attention_v2_reduce_bf16(
             //                = tmp_out[p][d] * shared_exp_sums[p] / global_exp_sum
             acc += tmp_out[tmp_base + p * head_dim + d] * shared_exp_sums[p];
         }
-        out[out_offset + d] = __float2bfloat16(acc * inv_global_exp_sum);
+        out[out_offset + d] = from_f32<T>(acc * inv_global_exp_sum);
     }
+}
+
+// Thin bf16 wrapper around the templated reduce.
+extern "C" __global__ void paged_attention_v2_reduce_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const float* __restrict__ tmp_out,
+    const float* __restrict__ exp_sums,
+    const float* __restrict__ max_logits,
+    const int* __restrict__ seq_lens,
+    const int num_heads,
+    const int head_dim,
+    const int max_num_partitions
+) {
+    paged_attention_v2_reduce_impl<__nv_bfloat16>(
+        out, tmp_out, exp_sums, max_logits, seq_lens,
+        num_heads, head_dim, max_num_partitions
+    );
+}
+
+// F16 reduce wrapper.
+extern "C" __global__ void paged_attention_v2_reduce_f16(
+    __half* __restrict__ out,
+    const float* __restrict__ tmp_out,
+    const float* __restrict__ exp_sums,
+    const float* __restrict__ max_logits,
+    const int* __restrict__ seq_lens,
+    const int num_heads,
+    const int head_dim,
+    const int max_num_partitions
+) {
+    paged_attention_v2_reduce_impl<__half>(
+        out, tmp_out, exp_sums, max_logits, seq_lens,
+        num_heads, head_dim, max_num_partitions
+    );
 }
 
 // V2 entry point: standard (no ALiBi).
@@ -624,7 +727,7 @@ extern "C" __global__ void paged_attention_v2_bf16(
     const int block_size,
     const int max_num_partitions
 ) {
-    paged_attention_v2_impl(
+    paged_attention_v2_impl<__nv_bfloat16>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
@@ -652,7 +755,61 @@ extern "C" __global__ void paged_attention_v2_bf16_alibi(
     const int max_num_partitions,
     const float* __restrict__ alibi_slopes     // [num_heads]
 ) {
-    paged_attention_v2_impl(
+    paged_attention_v2_impl<__nv_bfloat16>(
+        tmp_out, exp_sums, max_logits,
+        q, k_cache, v_cache, block_tables, seq_lens,
+        scale, num_heads, num_kv_heads, max_blocks_per_seq,
+        head_dim, block_size, max_num_partitions,
+        alibi_slopes
+    );
+}
+
+// V2 F16 entry points.
+extern "C" __global__ void paged_attention_v2_f16(
+    float* __restrict__ tmp_out,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const float scale,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks_per_seq,
+    const int head_dim,
+    const int block_size,
+    const int max_num_partitions
+) {
+    paged_attention_v2_impl<__half>(
+        tmp_out, exp_sums, max_logits,
+        q, k_cache, v_cache, block_tables, seq_lens,
+        scale, num_heads, num_kv_heads, max_blocks_per_seq,
+        head_dim, block_size, max_num_partitions,
+        nullptr
+    );
+}
+
+extern "C" __global__ void paged_attention_v2_f16_alibi(
+    float* __restrict__ tmp_out,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const float scale,
+    const int num_heads,
+    const int num_kv_heads,
+    const int max_blocks_per_seq,
+    const int head_dim,
+    const int block_size,
+    const int max_num_partitions,
+    const float* __restrict__ alibi_slopes
+) {
+    paged_attention_v2_impl<__half>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
