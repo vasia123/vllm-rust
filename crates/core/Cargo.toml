@@ -14,6 +14,28 @@ cuda-fused-activations = ["cuda-kernels"]
 cuda-layernorm = ["cuda-kernels"]
 cuda-moe = ["cuda-kernels"]
 marlin = ["cuda-kernels"]
+# Aggregate feature describing the *intended* production GPU build set.
+# When all listed features compile cleanly, pulling this in turns on every
+# kernel-level optimisation in vllm-core (Marlin INT4, fused norms, fused
+# activations, MoE kernels, FlashInfer attention).  AWQ checkpoints route
+# through Marlin; RMSNorm/RoPE through fused CUDA; attention through
+# FlashInfer paged kernels.
+#
+# NOTE (2026-05): `marlin`, `flashinfer`, `cuda-layernorm`,
+# `cuda-fused-activations`, and `cuda-moe` currently fail to build against
+# the bumped cudarc / candle stack (LaunchArgs::arg API change and FFI
+# guard-lifetime issues).  Until those are repaired, recommend building
+# with just `cuda-kernels` — the AWQ fast path still routes through
+# `gptq_cuda::gptq_gemm` (which only requires `cuda-kernels`) and gives
+# a large speed-up over `AwqLinear`'s CPU dequant.
+cuda-default = [
+    "cuda-kernels",
+    "cuda-layernorm",
+    "cuda-fused-activations",
+    "cuda-moe",
+    "marlin",
+    "flashinfer",
+]
 image-loading = ["dep:image", "dep:base64"]
 audio = ["dep:symphonia"]
 # Phase 1 of the architecture refactor (registry-based dispatch). Off by

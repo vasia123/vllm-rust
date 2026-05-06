@@ -6,6 +6,11 @@ edition.workspace = true
 [features]
 cuda = ["vllm-core/cuda", "candle-core/cuda"]
 cuda-kernels = ["cuda", "vllm-core/cuda-kernels"]
+# Production GPU build: pulls in every kernel-level optimisation
+# (Marlin, fused norms, fused activations, MoE kernels, FlashInfer).
+# Recommended command for actual inference:
+#   cargo run --release -p vllm-server --features cuda-full -- serve ...
+cuda-full = ["cuda", "vllm-core/cuda-default"]
 
 [dependencies]
 vllm-core = { path = "../core", features = ["audio"] }
