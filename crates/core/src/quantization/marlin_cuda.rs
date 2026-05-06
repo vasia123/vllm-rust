@@ -59,12 +59,14 @@ impl CustomOp1 for MarlinGemmOp {
     }
 
     fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        // Decode hot path: AWQ INT4 with zero points, no activation reorder
-        // (g_idx), and a tiny M typical of single-token / multi-step decode.
-        // Route to the bandwidth-bound GEMV kernel; everything else stays on
-        // the legacy tiled path below to preserve prefill / GPTQ behaviour.
-        if self.m <= AWQ_GEMV_M_THRESHOLD
-            && matches!(self.scalar_type, MarlinScalarType::Uint4)
+        // AWQ INT4 with zero points (no activation reorder): qweight is
+        // stored transposed as `[N, K/8]` after `AwqMarlinLinear::load_weights`
+        // so the legacy `[K/8, N]`-row-major tile kernel below cannot read
+        // it. Route every M (decode and prefill) through the dedicated
+        // `awq_gemv_int4_*` family. The M ≤ 16 dispatch inside
+        // `cuda_fwd_awq_gemv` continues to pick the highest-occupancy
+        // variant the shape permits.
+        if matches!(self.scalar_type, MarlinScalarType::Uint4)
             && self.g_idx.is_none()
             && self.qzeros.is_some()
         {
@@ -299,12 +301,23 @@ impl MarlinGemmOp {
         const SPLIT_BLOCK_THREADS: u32 = N_TILE * SPLIT_K_THREADS; // 128
         const SPLIT8_K_THREADS: u32 = 8;
         const SPLIT8_BLOCK_THREADS: u32 = N_TILE * SPLIT8_K_THREADS; // 256
+        const SPLIT_KT_THREADS: u32 = 8;
+        const SPLIT_KT_BLOCK_THREADS: u32 = N_TILE * SPLIT_KT_THREADS; // 256
 
-        // Pick the highest-occupancy variant the shape allows. Each split-K
-        // variant requires `packed_k = K/8` to be divisible by its
-        // K_THREADS factor — for every Qwen3 layer (K ∈ {2560, 18944, 4096})
-        // both 4 and 8 divide packed_k cleanly, so the ×8 variant is taken.
+        // Pick the highest-bandwidth variant the shape allows.
+        // `kt` (K-transposed + uint4 LDG) is preferred whenever each
+        // thread's K-chunk holds a multiple of 4 packed words — needed to
+        // step the inner loop in 16-byte vectors. `AwqMarlinLinear` always
+        // stores qweight as `[N, K/8]`, so this variant is the live decode
+        // (and prefill) path on every Qwen3 layer.
+        //
+        // The non-KT variants stay in the dispatch only as a defensive
+        // fallback; if a future caller ships qweight in the row-major
+        // `[K/8, N]` layout (without the load-time transpose), it will be
+        // routed here when `kt` does not apply.
         let packed_k = self.k / 8;
+        let use_split_kt =
+            packed_k.is_multiple_of((SPLIT_KT_THREADS * 4) as usize) && packed_k >= 32;
         let use_split_k8 = packed_k.is_multiple_of(SPLIT8_K_THREADS as usize) && packed_k >= 16;
         let use_split_k4 = packed_k.is_multiple_of(SPLIT_K_THREADS as usize) && packed_k >= 8;
 
@@ -320,7 +333,9 @@ impl MarlinGemmOp {
                 self.n,
                 self.k,
                 self.num_groups,
-                if use_split_k8 {
+                if use_split_kt {
+                    "split_kt (vec4 LDG, transposed qweight)"
+                } else if use_split_k8 {
                     "split_k8"
                 } else if use_split_k4 {
                     "split_k4"
@@ -340,7 +355,9 @@ impl MarlinGemmOp {
         let elem_count = self.m * self.n;
         let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
 
-        let kernel_name = if use_split_k8 {
+        let kernel_name = if use_split_kt {
+            "awq_gemv_int4_kt_bf16"
+        } else if use_split_k8 {
             "awq_gemv_int4_split_k8_bf16"
         } else if use_split_k4 {
             "awq_gemv_int4_split_k_bf16"
@@ -433,7 +450,9 @@ impl MarlinGemmOp {
         let grid_x: u32 = (self.n as u32) / N_TILE;
         // One BF16 input row cached in shared memory.
         let smem_bytes: u32 = (self.k as u32) * 2;
-        let block_threads = if use_split_k8 {
+        let block_threads = if use_split_kt {
+            SPLIT_KT_BLOCK_THREADS
+        } else if use_split_k8 {
             SPLIT8_BLOCK_THREADS
         } else if use_split_k4 {
             SPLIT_BLOCK_THREADS
@@ -1393,8 +1412,18 @@ mod tests {
                 }
             }
 
-            // Build GPU tensors mirroring the legacy kernel's expected layout.
-            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device).unwrap();
+            // Build GPU tensors mirroring the live AWQ-GEMV layout. The
+            // production loader (`AwqMarlinLinear::load_weights`) stores
+            // qweight transposed as `[N, K/8]` so the decode kernels can
+            // issue contiguous-along-K vec4 LDGs; replicate that here so the
+            // dispatcher's `awq_gemv_int4_kt_bf16` arm exercises the same
+            // memory layout it sees on a real model.
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device)
+                .unwrap()
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap();
             let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
             let scales_t = Tensor::from_vec(scales.clone(), (num_groups, n), &Device::Cpu)
                 .unwrap()
@@ -1527,7 +1556,13 @@ mod tests {
                 }
             }
 
-            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device).unwrap();
+            // Transpose to `[N, K/8]` to match the production AWQ layout.
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device)
+                .unwrap()
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap();
             let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
             let scales_t = Tensor::from_vec(scales.clone(), (num_groups, n), &Device::Cpu)
                 .unwrap()

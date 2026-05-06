@@ -324,8 +324,22 @@ impl QuantizedLinear for AwqMarlinLinear {
         let mut repacked: HashMap<String, Tensor> = HashMap::with_capacity(weights.len());
 
         if let Some(qw) = weights.get("qweight") {
+            // Step 1: AWQ interleaved nibbles → GPTQ sequential `[K/8, N]`.
             let gptq_qw = awq_to_gptq_qweight(qw, self.in_features, self.out_features)?;
-            repacked.insert("qweight".to_string(), gptq_qw);
+
+            // Step 2: transpose to `[N, K/8]` so the K-axis sits in the
+            // contiguous dimension. This unlocks vec4 (uint4) global loads
+            // along K in the AWQ GEMV kernel — single packed_k step now
+            // reads 4 u32s = 32 nibbles per LDG, quartering the number of
+            // memory transactions per output column at the same coalesced
+            // bandwidth budget.
+            //
+            // `t()?.contiguous()?` materialises the transposed layout once
+            // at load time (a single GPU strided-copy); every subsequent
+            // forward reads it directly. The decode kernel
+            // `awq_gemv_int4_kt_bf16` consumes this layout.
+            let qweight_kt = gptq_qw.t()?.contiguous()?;
+            repacked.insert("qweight".to_string(), qweight_kt);
         }
         if let Some(qz) = weights.get("qzeros") {
             // qzeros share the same shape between AWQ and GPTQ
