@@ -897,11 +897,16 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         }
     }
 
-    // CPU path: transfer logits and sample per-sequence
-    let logits_cpu: Vec<f32> = match last_logits.to_vec2::<f32>() {
+    // CPU path: transfer logits and sample per-sequence.
+    // Cast to F32 first — quantized models (AWQ, GPTQ, FP8, ...) can return
+    // BF16/F16 logits depending on activation dtype; sampler contract is F32.
+    let logits_cpu: Vec<f32> = match last_logits
+        .to_dtype(candle_core::DType::F32)
+        .and_then(|t| t.to_vec2::<f32>())
+    {
         Ok(v) => v.into_iter().flatten().collect(),
         Err(e) => {
-            let msg = format!("last-logits to_vec2::<f32>: {e}");
+            let msg = format!("last-logits to F32 vec2: {e}");
             tracing::error!(error = %e, "batched decode logits->cpu transfer failed");
             failed.extend(failed_batch(msg, &batch_ids));
             return failed;

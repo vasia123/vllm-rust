@@ -295,12 +295,15 @@ mod cuda_ops {
 
 /// Greedy sampling (argmax) on GPU via CUDA kernel.
 ///
-/// Takes logits tensor `[num_seqs, vocab_size]` and returns
-/// token IDs `[num_seqs]` as U32.
+/// Takes logits tensor `[num_seqs, vocab_size]` of any float dtype and returns
+/// token IDs `[num_seqs]` as U32. Logits are cast to F32 internally; the cast is
+/// a no-op when the tensor is already F32.
 ///
 /// On CUDA: only transfers `num_seqs * 4` bytes back (one u32 per sequence)
 /// instead of `num_seqs * vocab_size * dtype_size` bytes.
 pub fn gpu_argmax(logits: &Tensor) -> Result<Tensor> {
+    let logits = logits.to_dtype(DType::F32)?;
+
     #[cfg(feature = "cuda-kernels")]
     if logits.device().is_cuda() {
         let logits = logits.contiguous()?;
@@ -308,14 +311,16 @@ pub fn gpu_argmax(logits: &Tensor) -> Result<Tensor> {
     }
 
     // CPU fallback via Candle ops
-    let logits_f32 = logits.to_dtype(DType::F32)?;
-    logits_f32.argmax(1)?.to_dtype(DType::U32)
+    logits.argmax(1)?.to_dtype(DType::U32)
 }
 
 /// GPU-accelerated softmax for probability conversion.
 ///
-/// Converts logits to F32 probabilities on GPU.
+/// Accepts logits of any float dtype and converts to F32 probabilities.
+/// The cast to F32 is a no-op when the input is already F32.
 pub fn gpu_softmax(logits: &Tensor) -> Result<Tensor> {
+    let logits = logits.to_dtype(DType::F32)?;
+
     #[cfg(feature = "cuda-kernels")]
     if logits.device().is_cuda() {
         let logits = logits.contiguous()?;
@@ -323,9 +328,8 @@ pub fn gpu_softmax(logits: &Tensor) -> Result<Tensor> {
     }
 
     // CPU fallback
-    let logits_f32 = logits.to_dtype(DType::F32)?;
-    let max = logits_f32.max_keepdim(1)?;
-    let shifted = logits_f32.broadcast_sub(&max)?;
+    let max = logits.max_keepdim(1)?;
+    let shifted = logits.broadcast_sub(&max)?;
     let exp = shifted.exp()?;
     let sum = exp.sum_keepdim(1)?;
     exp.broadcast_div(&sum)
@@ -467,9 +471,16 @@ pub struct GpuSamplingConfig {
 /// Only transfers back `[num_seqs]` token IDs instead of `[num_seqs, vocab_size]` logits.
 ///
 /// Falls back to CPU for sequences needing constraints, logit processors, or logprobs.
+///
+/// Accepts logits of any float dtype (BF16/F16/F32). Internally cast to F32 once
+/// so that downstream kernels and CPU paths see a uniform dtype contract.
 pub fn gpu_sample_batch(logits: &Tensor, configs: &[GpuSamplingConfig]) -> Result<Vec<u32>> {
     let (num_seqs, _vocab_size) = logits.dims2()?;
     assert_eq!(num_seqs, configs.len());
+
+    // Establish the sampler-path dtype contract: all downstream ops see F32 logits.
+    // No-op when the input tensor is already F32.
+    let logits = &logits.to_dtype(DType::F32)?;
 
     // Check if all greedy — fast path
     let all_greedy = configs.iter().all(|c| c.inv_temperature == 0.0);
@@ -1041,5 +1052,113 @@ mod tests {
         let result = gpu_argmax(&t).unwrap();
         let ids: Vec<u32> = result.to_vec1().unwrap();
         assert_eq!(ids[0], 12345);
+    }
+
+    // Sampler dtype contract: BF16/F16/F32 logits are all accepted; the wrappers
+    // cast to F32 internally. Regression coverage for the AWQ/GPTQ path where
+    // the model returns logits in the activation dtype rather than F32.
+
+    #[test]
+    fn test_gpu_argmax_bf16_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![1.0f32, 5.0, 3.0, 2.0, 0.5, 4.0, 2.0, 1.0],
+            (2, 4),
+            &device,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let ids: Vec<u32> = gpu_argmax(&logits).unwrap().to_vec1().unwrap();
+        assert_eq!(ids, vec![1, 1]);
+    }
+
+    #[test]
+    fn test_gpu_argmax_f16_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![1.0f32, 5.0, 3.0, 2.0, 0.5, 4.0, 2.0, 1.0],
+            (2, 4),
+            &device,
+        )
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+        let ids: Vec<u32> = gpu_argmax(&logits).unwrap().to_vec1().unwrap();
+        assert_eq!(ids, vec![1, 1]);
+    }
+
+    #[test]
+    fn test_gpu_softmax_bf16_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let probs = gpu_softmax(&logits).unwrap();
+        assert_eq!(probs.dtype(), DType::F32);
+        let data: Vec<f32> = probs.flatten_all().unwrap().to_vec1().unwrap();
+        let sum1: f32 = data[0..3].iter().sum();
+        let sum2: f32 = data[3..6].iter().sum();
+        // BF16 has only 7 mantissa bits — looser tolerance than F32 path.
+        assert!((sum1 - 1.0).abs() < 1e-2, "Row 1 sum: {sum1}");
+        assert!((sum2 - 1.0).abs() < 1e-2, "Row 2 sum: {sum2}");
+    }
+
+    #[test]
+    fn test_gpu_sample_batch_bf16_greedy() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![
+                1.0f32, 5.0, 3.0, // seq 0: argmax = 1
+                -100.0, -100.0, 100.0, // seq 1: argmax = 2
+            ],
+            (2, 3),
+            &device,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+
+        let configs = vec![
+            GpuSamplingConfig {
+                inv_temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                rand_val: 0.5,
+            },
+            GpuSamplingConfig {
+                inv_temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                rand_val: 0.5,
+            },
+        ];
+
+        let ids = gpu_sample_batch(&logits, &configs).unwrap();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_gpu_sample_batch_f16_stochastic() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(
+            vec![-100.0f32, -100.0, 100.0, -100.0], // dominant @ idx 2
+            (1, 4),
+            &device,
+        )
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+
+        let configs = vec![GpuSamplingConfig {
+            inv_temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            rand_val: 0.5,
+        }];
+
+        let ids = gpu_sample_batch(&logits, &configs).unwrap();
+        assert_eq!(ids[0], 2);
     }
 }
