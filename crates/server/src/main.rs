@@ -1628,7 +1628,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 "--gpu-memory-utilization must be between 0.0 and 1.0, got {utilization}"
             );
         }
-        let kv_budget = estimate_kv_cache_budget(utilization, &files.config, dtype)?;
+        let kv_budget =
+            estimate_kv_cache_budget(utilization, &files.config, &files.quantization, dtype)?;
         let computed_blocks = CacheConfig::from_memory_budget(
             kv_budget,
             files.config.num_hidden_layers,
@@ -2029,18 +2030,20 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
 /// Estimate available GPU memory for KV cache given memory utilization target.
 ///
-/// Queries total VRAM, estimates model size from config, and returns the
-/// memory budget available for KV cache allocation.
+/// Queries total VRAM, estimates model size from config (taking quantization
+/// into account so AWQ INT4 weights aren't mis-priced as BF16), and returns
+/// the memory budget available for KV cache allocation.
 fn estimate_kv_cache_budget(
     utilization: f32,
     config: &vllm_core::config::ModelConfig,
+    quantization: &vllm_core::quantization::DetectedQuantConfig,
     dtype: DType,
 ) -> anyhow::Result<usize> {
     #[cfg(feature = "cuda")]
     {
         let (_free, total_vram) = vllm_core::kv_cache::config::gpu_memory_info()?;
 
-        // Rough model size estimate:
+        // Rough parameter count estimate:
         // params ≈ vocab * hidden + layers * (4 * hidden^2 + 3 * hidden * intermediate)
         let h = config.hidden_size;
         let v = config.vocab_size;
@@ -2048,23 +2051,34 @@ fn estimate_kv_cache_budget(
         let i = config.intermediate_size;
         let estimated_params = v * h + l * (4 * h * h + 3 * h * i);
 
-        let kv_budget = vllm_core::kv_cache::config::estimate_kv_budget_bytes(
+        // Per-parameter footprint depends on the quantization scheme — for
+        // weight-only INT4 (AWQ, GPTQ, Marlin, AwqMarlin, ...) this is ~0.55
+        // bytes, not 2.0 bytes.  Using the BF16 baseline here previously
+        // caused `Insufficient GPU memory` bail-outs on small GPUs even
+        // though the quantized model fit comfortably.
+        let bytes_per_param = vllm_core::kv_cache::config::bytes_per_param_for_quant(
+            quantization.method,
+            quantization.bits,
+            dtype,
+        );
+        let model_bytes = (estimated_params as f64 * bytes_per_param as f64) as usize;
+
+        let kv_budget = vllm_core::kv_cache::config::estimate_kv_budget_bytes_with_model_size(
             total_vram,
             utilization,
-            estimated_params,
-            dtype,
+            model_bytes,
         );
 
         if kv_budget == 0 {
-            let bytes_per_param = if matches!(dtype, DType::F32) { 4 } else { 2 };
-            let model_bytes = estimated_params * bytes_per_param;
             anyhow::bail!(
                 "Insufficient GPU memory: {:.0} MiB usable ({:.0}% of {:.0} MiB), \
-                 estimated model size {:.0} MiB",
+                 estimated model size {:.0} MiB ({:?}, ~{:.2} bytes/param)",
                 (total_vram as f64 * utilization as f64) / (1024.0 * 1024.0),
                 utilization * 100.0,
                 total_vram as f64 / (1024.0 * 1024.0),
                 model_bytes as f64 / (1024.0 * 1024.0),
+                quantization.method,
+                bytes_per_param,
             );
         }
 
@@ -2073,7 +2087,7 @@ fn estimate_kv_cache_budget(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (utilization, config, dtype);
+        let _ = (utilization, config, quantization, dtype);
         anyhow::bail!("--gpu-memory-utilization requires the 'cuda' feature")
     }
 }

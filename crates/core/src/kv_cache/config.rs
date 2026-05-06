@@ -17,26 +17,92 @@ pub fn gpu_memory_info() -> anyhow::Result<(usize, usize)> {
 ///
 /// Returns the number of bytes available for KV cache after accounting for
 /// estimated model parameters and a 10% overhead for activations.
+///
+/// `dtype` is the *compute* dtype — used for the unquantized baseline. For
+/// weight-quantized models (AWQ/GPTQ INT4, FP8, etc.) prefer
+/// [`estimate_kv_budget_bytes_with_model_size`] and pass the actual
+/// quantized weight footprint.
 pub fn estimate_kv_budget_bytes(
     total_vram: usize,
     utilization: f32,
     num_params_estimate: usize,
     dtype: DType,
 ) -> usize {
-    let available = (total_vram as f64 * utilization as f64) as usize;
-
     let bytes_per_param = match dtype {
         DType::BF16 | DType::F16 => 2,
         DType::F32 => 4,
         _ => 2,
     };
     let model_bytes = num_params_estimate * bytes_per_param;
+    estimate_kv_budget_bytes_with_model_size(total_vram, utilization, model_bytes)
+}
 
-    // Reserve 10% of available for activations and fragmentation
+/// Like [`estimate_kv_budget_bytes`] but takes the model's actual on-GPU
+/// footprint directly, in bytes. Use this when the weights are quantized
+/// (INT4, FP8, ...) so the caller can compute the real footprint instead
+/// of the BF16-equivalent we'd otherwise assume.
+pub fn estimate_kv_budget_bytes_with_model_size(
+    total_vram: usize,
+    utilization: f32,
+    model_bytes: usize,
+) -> usize {
+    let available = (total_vram as f64 * utilization as f64) as usize;
+
+    // Reserve 10% of available for activations and fragmentation.
     let overhead = available / 10;
     available
         .saturating_sub(model_bytes)
         .saturating_sub(overhead)
+}
+
+/// Effective bytes-per-parameter for a quantized model's on-GPU weights,
+/// including a small allowance for scales/zero-points.
+///
+/// Mirrors the cost model the loader uses: for INT4 weight-only quant
+/// (AWQ / GPTQ / Marlin / AwqMarlin / MoeWNA16 / CpuWna16 / Inc) we count
+/// 4 bits per weight plus ~10% overhead for F16 scales and packed
+/// zeros — empirically ≈ 0.55 byte/param. INT8 / FP8 schemes get
+/// 1 byte/param + 5% overhead. Everything else falls back to the
+/// `dtype`-derived size used by [`estimate_kv_budget_bytes`].
+pub fn bytes_per_param_for_quant(
+    method: super::super::quantization::QuantizationMethod,
+    bits: Option<u32>,
+    compute_dtype: DType,
+) -> f32 {
+    use super::super::quantization::QuantizationMethod as Q;
+    let dtype_bytes = match compute_dtype {
+        DType::BF16 | DType::F16 => 2.0,
+        DType::F32 => 4.0,
+        _ => 2.0,
+    };
+    match method {
+        Q::None | Q::Gguf => dtype_bytes,
+        // Weight-only INT4 schemes (4 bits + scales + zeros ≈ 0.55 byte).
+        Q::Awq
+        | Q::AwqMarlin
+        | Q::Gptq
+        | Q::Marlin
+        | Q::MoeWNA16
+        | Q::CpuWna16
+        | Q::Inc
+        | Q::SqueezeLlm
+        | Q::BitsAndBytes
+        | Q::Mxfp4
+        | Q::FpQuant => match bits {
+            Some(b) if b > 0 => (b as f32 / 8.0) * 1.10 + 0.05,
+            _ => 0.55,
+        },
+        // Weight-only INT8 / FP8 schemes (~1 byte/param + 5% overhead).
+        Q::Fp8
+        | Q::FbgemmFp8
+        | Q::PtpcFp8
+        | Q::ModelOpt
+        | Q::ModelOptFull
+        | Q::Torchao
+        | Q::ExpertsInt8
+        | Q::CompressedTensors
+        | Q::Quark => 1.05,
+    }
 }
 
 /// Memory layout of the paged KV cache tensor.
