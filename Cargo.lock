@@ -4497,6 +4497,7 @@ dependencies = [
  "hf-hub",
  "image",
  "libloading",
+ "libm",
  "minijinja",
  "minijinja-contrib",
  "nom",

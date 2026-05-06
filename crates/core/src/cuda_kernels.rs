@@ -1191,8 +1191,6 @@ impl CustomOp2 for FusedSwiGluOp {
         up_layout: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
         // CPU fallback implementation using standard operations
-        use candle_core::cpu_backend::unary_map;
-
         let gate_shape = gate_layout.shape();
         let up_shape = up_layout.shape();
 
@@ -1489,7 +1487,7 @@ impl CustomOp1 for RmsNormOp {
         input_storage: &CudaStorage,
         input_layout: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::LaunchConfig;
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use half::{bf16, f16};
 
         let dev = &input_storage.device;
@@ -1984,7 +1982,7 @@ impl CustomOp1 for GeluAndMulOp {
         input_storage: &CudaStorage,
         input_layout: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::LaunchConfig;
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use half::{bf16, f16};
 
         let dev = &input_storage.device;

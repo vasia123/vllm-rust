@@ -78,6 +78,7 @@ regex-automata = "0.4"
 nom = "7"
 uuid.workspace = true
 sha2 = "0.10"
+libm = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

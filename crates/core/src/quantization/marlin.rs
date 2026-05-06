@@ -585,7 +585,14 @@ impl MarlinLinear {
             x,
             &self.qweight,
             &self.scales,
-            self.qzeros.as_ref().filter(|z| z.elem_count() > 0),
+            // qzeros lives as a 0-element placeholder for symmetric (GPTQ)
+            // configs and only carries data for asymmetric (AWQ) ones — pass
+            // `Some(&tensor)` only when there's actual data behind it.
+            if self.qzeros.elem_count() > 0 {
+                Some(&self.qzeros)
+            } else {
+                None
+            },
             self.g_idx.as_ref(),
             self.g_idx_sort_indices.as_ref(),
             &self.workspace,

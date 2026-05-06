@@ -133,6 +133,61 @@ impl CustomOp1 for MarlinGemmOp {
         let has_zp_i32: i32 = if self.qzeros.is_some() { 1 } else { 0 };
         let has_g_idx_i32: i32 = if self.g_idx.is_some() { 1 } else { 0 };
 
+        // cudarc 0.16 enforces `'arg: 'builder` on PushKernelArg, so every
+        // value we pass to `builder.arg(...)` must outlive the builder.
+        // Hoist guards and the null sentinel onto the outer scope before
+        // creating the builder, then resolve optional tensors to slices
+        // through references that share the function-scope lifetime.
+        let null_ptr: u64 = 0;
+        let qzeros_guard = self.qzeros.as_ref().map(|t| t.storage_and_layout());
+        let bias_guard = self.bias.as_ref().map(|t| t.storage_and_layout());
+        let g_idx_guard = self.g_idx.as_ref().map(|t| t.storage_and_layout());
+        let si_guard = self
+            .g_idx_sort_indices
+            .as_ref()
+            .map(|t| t.storage_and_layout());
+
+        let qzeros_slice = match qzeros_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::U32(s) => Some(s),
+                    _ => candle_core::bail!("marlin_gemm: qzeros must be U32"),
+                },
+                _ => candle_core::bail!("marlin_gemm: qzeros must be on CUDA"),
+            },
+            None => None,
+        };
+        let bias_slice = match bias_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::BF16(s) => Some(s),
+                    _ => candle_core::bail!("marlin_gemm: bias must be BF16"),
+                },
+                _ => candle_core::bail!("marlin_gemm: bias must be on CUDA"),
+            },
+            None => None,
+        };
+        let g_idx_slice = match g_idx_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::U32(s) => Some(s),
+                    _ => candle_core::bail!("marlin_gemm: g_idx must be U32"),
+                },
+                _ => candle_core::bail!("marlin_gemm: g_idx must be on CUDA"),
+            },
+            None => None,
+        };
+        let si_slice = match si_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::U32(s) => Some(s),
+                    _ => candle_core::bail!("marlin_gemm: g_idx_sort_indices must be U32"),
+                },
+                _ => candle_core::bail!("marlin_gemm: g_idx_sort_indices must be on CUDA"),
+            },
+            None => None,
+        };
+
         // Build kernel args
         let mut builder = func.builder();
         builder.arg(&output);
@@ -150,53 +205,37 @@ impl CustomOp1 for MarlinGemmOp {
         builder.arg(&has_zp_i32);
         builder.arg(&has_g_idx_i32);
 
-        // Add optional tensors (pass null pointers if not present)
-        if let Some(ref zp) = self.qzeros {
-            let (zp_guard, _) = zp.storage_and_layout();
-            if let Storage::Cuda(cs) = &*zp_guard {
-                if let CudaStorageSlice::U32(s) = &cs.slice {
-                    builder.arg(s);
-                }
+        match qzeros_slice {
+            Some(s) => {
+                builder.arg(s);
             }
-        } else {
-            let null_ptr: u64 = 0;
-            builder.arg(&null_ptr);
+            None => {
+                builder.arg(&null_ptr);
+            }
         }
-
-        if let Some(ref bias) = self.bias {
-            let (bias_guard, _) = bias.storage_and_layout();
-            if let Storage::Cuda(cs) = &*bias_guard {
-                if let CudaStorageSlice::BF16(s) = &cs.slice {
-                    builder.arg(s);
-                }
+        match bias_slice {
+            Some(s) => {
+                builder.arg(s);
             }
-        } else {
-            let null_ptr: u64 = 0;
-            builder.arg(&null_ptr);
+            None => {
+                builder.arg(&null_ptr);
+            }
         }
-
-        if let Some(ref g_idx) = self.g_idx {
-            let (g_idx_guard, _) = g_idx.storage_and_layout();
-            if let Storage::Cuda(cs) = &*g_idx_guard {
-                if let CudaStorageSlice::U32(s) = &cs.slice {
-                    builder.arg(s);
-                }
+        match g_idx_slice {
+            Some(s) => {
+                builder.arg(s);
             }
-        } else {
-            let null_ptr: u64 = 0;
-            builder.arg(&null_ptr);
+            None => {
+                builder.arg(&null_ptr);
+            }
         }
-
-        if let Some(ref sort_indices) = self.g_idx_sort_indices {
-            let (si_guard, _) = sort_indices.storage_and_layout();
-            if let Storage::Cuda(cs) = &*si_guard {
-                if let CudaStorageSlice::U32(s) = &cs.slice {
-                    builder.arg(s);
-                }
+        match si_slice {
+            Some(s) => {
+                builder.arg(s);
             }
-        } else {
-            let null_ptr: u64 = 0;
-            builder.arg(&null_ptr);
+            None => {
+                builder.arg(&null_ptr);
+            }
         }
 
         unsafe { builder.launch(cfg) }
@@ -205,6 +244,10 @@ impl CustomOp1 for MarlinGemmOp {
         drop(qweight_guard);
         drop(scales_guard);
         drop(workspace_guard);
+        drop(qzeros_guard);
+        drop(bias_guard);
+        drop(g_idx_guard);
+        drop(si_guard);
 
         let output_storage = CudaStorage {
             slice: CudaStorageSlice::BF16(output),
@@ -371,6 +414,25 @@ impl CustomOp1 for RepackOp {
             0
         };
 
+        // Hoist guards/null sentinel into the function scope so that every
+        // pointer passed to the builder outlives it (cudarc 0.16 enforces
+        // `'arg: 'builder` on PushKernelArg).
+        let null_ptr: u64 = 0;
+        let si_guard = self
+            .g_idx_sort_indices
+            .as_ref()
+            .map(|t| t.storage_and_layout());
+        let si_slice = match si_guard.as_ref() {
+            Some((g, _)) => match &**g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::U32(s) => Some(s),
+                    _ => candle_core::bail!("repack_gptq_to_marlin: sort_indices must be U32"),
+                },
+                _ => candle_core::bail!("repack_gptq_to_marlin: sort_indices must be on CUDA"),
+            },
+            None => None,
+        };
+
         let mut builder = func.builder();
         builder.arg(&output);
         builder.arg(qweight);
@@ -378,24 +440,18 @@ impl CustomOp1 for RepackOp {
         builder.arg(&size_n_i32);
         builder.arg(&has_sort_indices_i32);
 
-        if let Some(ref sort_indices) = self.g_idx_sort_indices {
-            let (si_guard, _) = sort_indices.storage_and_layout();
-            if let Storage::Cuda(cs) = &*si_guard {
-                if let CudaStorageSlice::U32(s) = &cs.slice {
-                    builder.arg(s);
-                } else {
-                    candle_core::bail!("sort_indices must be U32");
-                }
-            } else {
-                candle_core::bail!("sort_indices must be on CUDA");
+        match si_slice {
+            Some(s) => {
+                builder.arg(s);
             }
-        } else {
-            let null_ptr: u64 = 0;
-            builder.arg(&null_ptr);
+            None => {
+                builder.arg(&null_ptr);
+            }
         }
 
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("repack_gptq_to_marlin launch: {e}")))?;
+        drop(si_guard);
 
         let output_storage = CudaStorage {
             slice: CudaStorageSlice::U32(output),
