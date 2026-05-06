@@ -347,13 +347,16 @@ impl MarlinGemmOp {
 
         let dev = &storage.device;
 
-        // Output [M, N] in BF16, freshly allocated per call. Pre-allocation
-        // (an output pool keyed by shape) is a separate item planned for the
-        // CUDA-graph capture stage; the current call cost is dwarfed by the
-        // K-reduction loop in the kernel itself.
+        // Output [M, N] in BF16. The kernel writes every element of the
+        // [M, N] output exactly once (one assignment per (m, n) by the
+        // chunk-0 thread of the column), so the buffer can be left
+        // uninitialised — saving the per-call zero-init memset on the
+        // 252 GEMV launches per token. SAFETY: the kernel guarantees no
+        // element is ever read before write, and all elements are written
+        // before the launch returns.
         let output_shape = Shape::from_dims(&[self.m, self.n]);
         let elem_count = self.m * self.n;
-        let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
+        let output = unsafe { dev.alloc::<half::bf16>(elem_count) }?;
 
         let kernel_name = if use_split_kt {
             "awq_gemv_int4_kt_bf16"
