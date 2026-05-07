@@ -2838,4 +2838,329 @@ mod tests {
             "paged_attention v2 f16/bf16 max diff {max_diff} exceeds 1e-1"
         );
     }
+
+    // ─── Boundary parity matrix for V1 ↔ V2 (Step 2 of Phase 2 hardening) ───
+    //
+    // These tests exercise paths that the existing parity tests do not cover:
+    //
+    //  - seq_len at partition boundaries (seq_len ≈ k·partition_size ± 1) so
+    //    the multi-partition log-sum-exp reduce is exercised on edge counts;
+    //  - partition_size sweep (64, 128, 256, 512) at fixed seq_len so the new
+    //    runtime-arg dispatch is verified against itself;
+    //  - head_dim sweep (64, 96, 128, 256, 80) so both the warp K-pass
+    //    (head_dim divisible by 32, ≤ 512) and the legacy block-reduce
+    //    fallback (head_dim=80 → not divisible by 32) are walked;
+    //  - GQA num_queries_per_kv ∈ {1, 4, 8} so MHA, Qwen3-style 4× sharing,
+    //    and Llama-70B-style 8× sharing all run;
+    //  - ALiBi enabled / disabled so the alibi_slope addition path is tested.
+    //
+    // The tolerance is tighter than the BF16↔F16 dtype-mismatch test above
+    // (5e-3 absolute) since we are comparing two implementations of the same
+    // math at the same dtype: V1 against V2-with-multi-partition-reduce.
+
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_v1_v2_parity_case_bf16(
+        dev: &Device,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+        partition_size: usize,
+        alibi_slopes: Option<&[f32]>,
+    ) -> f32 {
+        use crate::cuda_kernels::{
+            paged_attention_auto_alibi, paged_attention_cuda, paged_attention_cuda_alibi,
+            paged_attention_v2_cuda_with_partition_size,
+        };
+
+        // Deterministic synthetic inputs.
+        let num_seqs = 1usize;
+        let max_blocks_per_seq = seq_len.div_ceil(block_size);
+        let q_f32: Vec<f32> = (0..num_seqs * num_q_heads * head_dim)
+            .map(|i| (i as f32 * 0.0123 + (head_dim as f32) * 0.001).sin() * 0.5)
+            .collect();
+        let kv_elements = max_blocks_per_seq * block_size * num_kv_heads * head_dim;
+        let k_f32: Vec<f32> = (0..kv_elements)
+            .map(|i| (i as f32 * 0.0271 + (seq_len as f32) * 0.001).cos() * 0.5)
+            .collect();
+        let v_f32: Vec<f32> = (0..kv_elements)
+            .map(|i| (i as f32 * 0.0411 + (head_dim as f32) * 0.002).sin() * 0.5)
+            .collect();
+
+        let q = Tensor::from_vec(q_f32, (num_seqs, num_q_heads, head_dim), dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let k_cache = Tensor::from_vec(
+            k_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let v_cache = Tensor::from_vec(
+            v_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+
+        let bt: Vec<u32> = (0..max_blocks_per_seq as u32).collect();
+        let block_tables = Tensor::from_vec(bt, (num_seqs, max_blocks_per_seq), dev).unwrap();
+        let seq_lens = Tensor::from_vec(vec![seq_len as u32], num_seqs, dev).unwrap();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let alibi_tensor = alibi_slopes.map(|s| {
+            assert_eq!(
+                s.len(),
+                num_q_heads,
+                "alibi_slopes length must equal num_q_heads"
+            );
+            Tensor::from_vec(s.to_vec(), num_q_heads, dev).unwrap()
+        });
+
+        let v1 = match alibi_tensor.as_ref() {
+            None => paged_attention_cuda(
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &seq_lens,
+                scale,
+                num_q_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                seq_len,
+                head_dim,
+                block_size,
+            ),
+            Some(a) => paged_attention_cuda_alibi(
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &seq_lens,
+                scale,
+                num_q_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                seq_len,
+                head_dim,
+                block_size,
+                a,
+            ),
+        }
+        .unwrap();
+
+        // Suppress unused warning for partition_size in the ALiBi branch.
+        let _ = partition_size;
+
+        let v2 = match alibi_tensor.as_ref() {
+            None => paged_attention_v2_cuda_with_partition_size(
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &seq_lens,
+                scale,
+                num_q_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                seq_len,
+                head_dim,
+                block_size,
+                partition_size,
+            ),
+            // ALiBi V2 currently uses the default partition_size (the public
+            // `paged_attention_auto_alibi` does not expose the override).
+            // For seq_len > V2_SEQ_LEN_THRESHOLD this routes through the V2
+            // ALiBi kernel, which is the path the parity test cares about.
+            // A `_with_partition_size` overload for ALiBi can be added later
+            // if/when the adaptive selector wants to tune ALiBi separately.
+            Some(a) => paged_attention_auto_alibi(
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &seq_lens,
+                scale,
+                num_q_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                seq_len,
+                head_dim,
+                block_size,
+                a,
+            ),
+        }
+        .unwrap();
+
+        let v1_f: Vec<f32> = v1
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let v2_f: Vec<f32> = v2
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(v1_f.len(), v2_f.len());
+        v1_f.iter()
+            .zip(v2_f.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// V1↔V2 parity, seq_len × partition_size sweep with Qwen3-shape fixed
+    /// (num_q_heads=32, num_kv_heads=8, head_dim=128, block_size=16).
+    ///
+    /// Walks every combination of seq_len ∈ {boundaries near 64, 128, 256,
+    /// 512, 1024, 2048, 4096} and partition_size ∈ {64, 128, 256, 512}.
+    /// Specifically pins the V2 parameter-size dispatch we just refactored.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_seq_len_x_partition_size_matrix() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let num_q_heads = 32;
+        let num_kv_heads = 8; // Qwen3-style GQA, group=4
+        let head_dim = 128;
+        let block_size = 16;
+
+        // Boundary-rich seq_len set: covers 1× / multi-partition transitions
+        // for every partition_size we sweep.
+        let seq_lens: &[usize] = &[
+            65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 2049, 4097,
+        ];
+        let partition_sizes: &[usize] = &[64, 128, 256, 512];
+
+        for &seq_len in seq_lens {
+            for &part in partition_sizes {
+                let max_diff = run_paged_attn_v1_v2_parity_case_bf16(
+                    &dev,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                    part,
+                    None,
+                );
+                assert!(
+                    max_diff < 5e-3,
+                    "V1↔V2 parity FAIL seq_len={seq_len} partition_size={part} \
+                     max_diff={max_diff} (threshold 5e-3)"
+                );
+            }
+        }
+    }
+
+    /// V1↔V2 parity across head_dim variants. Walks both warp K-pass
+    /// (head_dim ∈ {64, 96, 128, 256}, divisible by 32) and the legacy
+    /// block-reduce fallback (head_dim=80, not divisible by 32 → falls into
+    /// the `else` branch we kept around exactly for cases like this).
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_head_dim_sweep() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let num_q_heads = 4;
+        let num_kv_heads = 4; // MHA; varying GQA orthogonal to head_dim test
+        let block_size = 16;
+        let seq_len = 512;
+        let partition_size = 128;
+
+        for &head_dim in &[64usize, 80, 96, 128, 256] {
+            let max_diff = run_paged_attn_v1_v2_parity_case_bf16(
+                &dev,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                seq_len,
+                partition_size,
+                None,
+            );
+            assert!(
+                max_diff < 5e-3,
+                "V1↔V2 parity FAIL head_dim={head_dim} max_diff={max_diff} (threshold 5e-3); \
+                 head_dim=80 exercises the legacy block-reduce fallback path"
+            );
+        }
+    }
+
+    /// V1↔V2 parity across GQA sharing factors (num_queries_per_kv).
+    /// 1 = MHA, 4 = Qwen3-4B-AWQ, 8 = Llama-3-70B style.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_gqa_sweep() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let head_dim = 128;
+        let block_size = 16;
+        let seq_len = 512;
+        let partition_size = 128;
+        let num_q_heads = 8;
+        for &num_q_per_kv in &[1usize, 4, 8] {
+            assert!(num_q_heads % num_q_per_kv == 0);
+            let num_kv_heads = num_q_heads / num_q_per_kv;
+            let max_diff = run_paged_attn_v1_v2_parity_case_bf16(
+                &dev,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                seq_len,
+                partition_size,
+                None,
+            );
+            assert!(
+                max_diff < 5e-3,
+                "V1↔V2 parity FAIL num_q_per_kv={num_q_per_kv} max_diff={max_diff}"
+            );
+        }
+    }
+
+    /// V1_alibi ↔ V2_alibi parity with deliberately-non-trivial slopes.
+    /// Catches regressions in the ALiBi-bias term inside both kernels;
+    /// the existing parity test does not exercise ALiBi at all.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_alibi_parity() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let num_q_heads = 4;
+        let num_kv_heads = 4;
+        let head_dim = 128;
+        let block_size = 16;
+        let seq_len = 512;
+        let partition_size = 128;
+
+        // BLOOM-style halved-decay slopes; varied per-head so each warp
+        // sees a different bias and any cross-head bug shows up.
+        let slopes: Vec<f32> = (0..num_q_heads)
+            .map(|h| 0.5_f32.powi(h as i32 + 1))
+            .collect();
+
+        let max_diff = run_paged_attn_v1_v2_parity_case_bf16(
+            &dev,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            seq_len,
+            partition_size,
+            Some(&slopes),
+        );
+        assert!(
+            max_diff < 5e-3,
+            "V1↔V2 ALiBi parity max_diff={max_diff} (threshold 5e-3)"
+        );
+    }
 }
