@@ -432,50 +432,117 @@ __device__ void paged_attention_v2_impl(
     __syncthreads();
 
     // ---- Phase 1: Compute QK dot products for this partition ----
-    // Convert partition token range to cache block range
+    //
+    // Strategy: each warp owns its own subset of tokens (stride NUM_WARPS), so
+    // the per-token QK reduction collapses into a warp-shuffle (no
+    // __syncthreads).  The whole K-pass runs with ONE __syncthreads at the
+    // very end (to broadcast the global qk_max), instead of one per token in
+    // the legacy block-reduce design.
+    //
+    // Requires head_dim divisible by 32 (warp size).  All current LLM head
+    // dimensions (64, 96, 128, 192, 256) satisfy this.  If a future caller
+    // breaks that, drop into the legacy block-reduce path below.
     const int start_block_idx = partition_start_token / block_size;
     const int end_block_idx = (partition_end_token + block_size - 1) / block_size;
 
     float qk_max = -FLT_MAX;
 
-    for (int blk = start_block_idx; blk < end_block_idx; blk++) {
-        const int physical_block = block_tables[seq_idx * max_blocks_per_seq + blk];
+    if (head_dim % 32 == 0 && head_dim >= 32) {
+        const int warp_id = tid / 32;
+        const int lane_id = tid % 32;
+        const int dims_per_thread = head_dim / 32;
+        const int dim_base = lane_id * dims_per_thread;
 
-        // Tokens within this cache block that fall in our partition
-        const int block_start_token = blk * block_size;
-        const int token_lo = max(block_start_token, partition_start_token);
-        const int token_hi = min(block_start_token + block_size, partition_end_token);
+        // Loop tokens by warp stride.  Each warp handles
+        // local_idx ∈ {warp_id, warp_id+NUM_WARPS, warp_id+2*NUM_WARPS, ...}.
+        for (int local_idx = warp_id; local_idx < partition_num_tokens;
+             local_idx += NUM_WARPS) {
+            const int abs_token = partition_start_token + local_idx;
+            const int blk = abs_token / block_size;
+            const int token_in_block = abs_token - blk * block_size;
+            const int physical_block = block_tables[seq_idx * max_blocks_per_seq + blk];
 
-        for (int abs_token = token_lo; abs_token < token_hi; abs_token++) {
-            const int token_in_block = abs_token - block_start_token;
+            const int k_base = physical_block * cache_stride_block
+                             + token_in_block * cache_stride_token
+                             + kv_head_idx * head_dim;
 
             float qk = 0.0f;
-            for (int d = tid; d < head_dim; d += NUM_THREADS) {
-                const int k_offset = physical_block * cache_stride_block
-                                   + token_in_block * cache_stride_token
-                                   + kv_head_idx * head_dim + d;
-                qk += q_smem[d] * to_f32<T>(k_cache[k_offset]);
+            #pragma unroll
+            for (int dd = 0; dd < 16; dd++) {
+                if (dd >= dims_per_thread) break;  // compile-time-friendly bound
+                const int d = dim_base + dd;
+                qk += q_smem[d] * to_f32<T>(k_cache[k_base + d]);
             }
 
-            qk = block_reduce_sum(qk, reduce_smem);
+            // Warp-level reduce; result lands in lane 0.
+            qk = warp_reduce_sum(qk);
 
-            if (tid == 0) {
-                const int local_idx = abs_token - partition_start_token;
+            if (lane_id == 0) {
                 float scaled_qk = qk * scale;
                 scaled_qk += alibi_slope * (float)(abs_token - query_pos);
                 logits[local_idx] = scaled_qk;
                 qk_max = fmaxf(qk_max, scaled_qk);
             }
-            __syncthreads();
         }
-    }
 
-    // Broadcast qk_max
-    if (tid == 0) {
-        reduce_smem[0] = qk_max;
+        // Each warp's qk_max lives in lane 0 register.  Reduce across warps
+        // via shared memory.  This is the only __syncthreads in the K-pass.
+        if (lane_id == 0) {
+            reduce_smem[warp_id] = qk_max;
+        }
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float v = (lane_id < NUM_WARPS) ? reduce_smem[lane_id] : -FLT_MAX;
+            #pragma unroll
+            for (int offset = NUM_WARPS / 2; offset > 0; offset >>= 1) {
+                v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset));
+            }
+            if (lane_id == 0) {
+                reduce_smem[0] = v;
+            }
+        }
+        __syncthreads();
+        qk_max = reduce_smem[0];
+    } else {
+        // Legacy fallback for head dims not divisible by 32.
+        for (int blk = start_block_idx; blk < end_block_idx; blk++) {
+            const int physical_block = block_tables[seq_idx * max_blocks_per_seq + blk];
+            const int block_start_token = blk * block_size;
+            const int token_lo = max(block_start_token, partition_start_token);
+            const int token_hi = min(block_start_token + block_size, partition_end_token);
+
+            for (int abs_token = token_lo; abs_token < token_hi; abs_token++) {
+                const int token_in_block = abs_token - block_start_token;
+
+                float qk = 0.0f;
+                for (int d = tid; d < head_dim; d += NUM_THREADS) {
+                    const int k_offset = physical_block * cache_stride_block
+                                       + token_in_block * cache_stride_token
+                                       + kv_head_idx * head_dim + d;
+                    qk += q_smem[d] * to_f32<T>(k_cache[k_offset]);
+                }
+
+                qk = block_reduce_sum(qk, reduce_smem);
+
+                if (tid == 0) {
+                    const int local_idx = abs_token - partition_start_token;
+                    float scaled_qk = qk * scale;
+                    scaled_qk += alibi_slope * (float)(abs_token - query_pos);
+                    logits[local_idx] = scaled_qk;
+                    qk_max = fmaxf(qk_max, scaled_qk);
+                }
+                __syncthreads();
+            }
+        }
+
+        // Broadcast qk_max via shared memory.
+        if (tid == 0) {
+            reduce_smem[0] = qk_max;
+        }
+        __syncthreads();
+        qk_max = reduce_smem[0];
     }
-    __syncthreads();
-    qk_max = reduce_smem[0];
 
     // ---- Phase 2: Softmax (local to partition) ----
     float local_exp_sum = 0.0f;

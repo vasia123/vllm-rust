@@ -224,3 +224,84 @@ ceiling. Further wins from Phase 2.B candidates:
 Decision: Phase 2.A target was ≥38 tok/s (+10%). Got 42.7 (+26%).
 **Continue with Phase 2.B**: pick the one with best ROI / lowest
 risk to push toward 50 tok/s.
+
+## Phase 2.B.1 — warp-level QK reduce in V2 K-pass
+
+The V2 K-pass under PARTITION_SIZE=128 still issued ~256
+`__syncthreads` per partition: each token's QK dot product ran
+through `block_reduce_sum`, which costs two block-wide syncs
+(`reduce_smem` write fence + result-broadcast fence). At 128
+tokens per partition × 4 partitions = 512 calls × ~256 syncs each
+= ~131k syncs per token through the K-pass alone. Each sync
+serialises four warps and stalls execution.
+
+Audit of `paged_attention_v2.cu` and the vLLM reference confirmed
+the per-token block-reduce is what dominates kernel runtime at
+batch=1; the V-pass is already coalesced (128 threads × 1 dim
+each, kv_cache layout `[block, token, kv_head, dim]` makes
+adjacent threads read adjacent addresses).
+
+### Design
+
+Partition the work along WARPS rather than threads:
+
+- 4 warps in the block. Each warp owns its own subset of tokens
+  with stride NUM_WARPS (warp 0 → tokens 0,4,8,…; warp 1 → 1,5,9;
+  etc.).
+- Within a warp: 32 lanes × 4 dims/lane (head_dim=128/32). Each
+  lane computes a partial QK over its 4 dims; `warp_reduce_sum`
+  via `__shfl_xor_sync` produces the full QK with no shared
+  memory and no `__syncthreads`.
+- Lane 0 of each warp writes the logit and updates a per-warp
+  `qk_max` register.
+- After the loop: a single `__syncthreads` broadcasts the global
+  `qk_max` across warps via `reduce_smem`.
+
+K-pass syncs: 256 → 1 per partition.
+
+Constraint: head_dim divisible by 32. All current LLM head dims
+(64, 96, 128, 192, 256) satisfy this. A legacy block-reduce path
+remains in the kernel as a fallback for any future caller with
+exotic head_dim.
+
+### Results
+
+VLLM_PROFILE_DECODE=1 median sample over ~10 samples × 100
+layer-calls in steady state:
+
+| Component   | Phase 2.A        | Phase 2.B.1       | Δ        |
+| ----------- | ---------------- | ----------------- | -------- |
+| in_norm     | 26 µs (3.3%)     | 26 µs (3.6%)      | flat     |
+| qkv         | 97 µs (12.3%)    | 96 µs (13.3%)     | flat     |
+| qk_norm     | 36 µs (4.6%)     | 34 µs (4.7%)      | flat     |
+| rope        | 62 µs (7.9%)     | 60 µs (8.3%)      | flat     |
+| cache_w     | 31 µs (3.9%)     | 30 µs (4.2%)      | flat     |
+| **paged_attn** | **137 µs (17.4%)** | **82 µs (11.4%)** | **−40%** |
+| o_proj      | 71 µs (9.0%)     | 68 µs (9.4%)      | flat     |
+| post_norm   | 28 µs (3.6%)     | 25 µs (3.5%)      | flat     |
+| mlp         | 299 µs (38%)     | 296 µs (41%)      | flat     |
+| **sum**     | 785 µs           | **717 µs**        | **−9%**  |
+
+Cumulative paged_attn since baseline: 280 → 137 → 82 µs = **−71%**.
+mlp is now 41% of per-layer time; further attention work has
+diminishing returns versus going after the MLP block.
+
+End-to-end bench (`concurrency=1 max_tokens=256 prompt_len=256
+temperature=0 runs=5`):
+
+| Build                                | tok/s steady |
+| ------------------------------------ | ------------ |
+| baseline (post Stage 12 disable)     | 33.9         |
+| Phase 2.A (PARTITION_SIZE=128)       | 42.7         |
+| **Phase 2.B.1 (warp-level K-pass)**  | **46.5**     |
+
+**+9% over 2.A, +37% from baseline.** 46.5/50 ≈ 93% of the Stage
+13-C target.
+
+Verification:
+- `cargo test --features cuda-default -p vllm-core --lib`: 4489 pass.
+- V1↔V2 parity tests under `cuda-default` and `cuda-default
+  gpu-test-medium` pass (BF16 + F16 dtypes).
+- `scripts/test_qwen3_awq_correctness.sh`: 5/5 PASS.
+- `cargo clippy --features cuda -p vllm-core --lib -- -D warnings`:
+  clean.
