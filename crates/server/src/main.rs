@@ -1815,9 +1815,11 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 &draft_files.quantization,
             )?;
 
+            let draft_num_blocks =
+                compute_draft_kv_blocks(num_blocks, block_size, &draft_files.config, dtype)?;
             let draft_cache_config = CacheConfig {
-                block_size: 16,
-                num_blocks,
+                block_size,
+                num_blocks: draft_num_blocks,
                 num_layers: draft_files.config.num_hidden_layers,
                 num_kv_heads: draft_files.config.num_key_value_heads,
                 head_dim: draft_files.config.head_dim,
@@ -2126,6 +2128,91 @@ fn estimate_kv_cache_budget(
     {
         let _ = (utilization, config, quantization, dtype);
         anyhow::bail!("--gpu-memory-utilization requires the 'cuda' feature")
+    }
+}
+
+/// Stage 13-I.4 — size the draft KV cache from VRAM still free *after*
+/// target weights, target KV pool, and draft weights have already been
+/// allocated. Reuses the target's `block_size` so an engine sequence
+/// position maps to the same logical block index across both caches.
+///
+/// Caps at `target_num_blocks` because the draft never needs more
+/// sequence capacity than the target — every accepted draft token is
+/// also stored in the target cache, so any extra draft block above that
+/// would just sit idle.
+///
+/// Floor at 64 blocks: less than that, and a single moderately-sized
+/// request (≥ 1 K tokens) preempts itself before any speculation can
+/// pay off.
+fn compute_draft_kv_blocks(
+    target_num_blocks: usize,
+    target_block_size: usize,
+    draft_config: &vllm_core::config::ModelConfig,
+    dtype: DType,
+) -> anyhow::Result<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        let per_block_bytes = target_block_size
+            * draft_config.num_hidden_layers
+            * draft_config.num_key_value_heads
+            * draft_config.head_dim
+            * 2 // K + V tensors per layer
+            * dtype.size_in_bytes();
+
+        let (free_vram, _total) = vllm_core::kv_cache::config::gpu_memory_info()?;
+
+        // Tiny scratch reserve for the draft pass: target has already
+        // pre-allocated the heavy AWQ-Marlin / cuBLAS workspace as part
+        // of its own 1.5 GiB scratch reserve, and the draft pass reuses
+        // the same pool. Draft activations themselves are small (a 0.6 B
+        // model running batch=1×K decode steps). 256 MiB covers any
+        // additional cudnn/candle scratch that gets touched first time
+        // through the smaller model. Without this lower reserve the
+        // draft cache lands at the 64-block floor on an 8 GiB card.
+        const SCRATCH_RESERVE_BYTES: usize = 256 * 1024 * 1024;
+        let kv_budget = free_vram.saturating_sub(SCRATCH_RESERVE_BYTES);
+
+        let auto_blocks = if per_block_bytes > 0 {
+            kv_budget / per_block_bytes
+        } else {
+            0
+        };
+        let blocks = auto_blocks.min(target_num_blocks).max(64);
+
+        eprintln!(
+            "Sizing draft KV from free VRAM: {:.0} MiB free - {:.0} MiB scratch \
+             = {:.0} MiB / {} bytes/block ({}L × {}H × {}D × 2 × {}b dtype × {}-tok block) \
+             → {} blocks (capped at target {} blocks)",
+            free_vram as f64 / (1024.0 * 1024.0),
+            SCRATCH_RESERVE_BYTES as f64 / (1024.0 * 1024.0),
+            kv_budget as f64 / (1024.0 * 1024.0),
+            per_block_bytes,
+            draft_config.num_hidden_layers,
+            draft_config.num_key_value_heads,
+            draft_config.head_dim,
+            dtype.size_in_bytes() * 8,
+            target_block_size,
+            blocks,
+            target_num_blocks,
+        );
+
+        if blocks < 64 {
+            anyhow::bail!(
+                "Insufficient free VRAM for draft KV cache: {} bytes per block × \
+                 64 blocks minimum > {} MiB available after scratch reserve. \
+                 Lower --gpu-memory-utilization for the target so draft has room.",
+                per_block_bytes,
+                kv_budget / (1024 * 1024),
+            );
+        }
+
+        Ok(blocks)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (target_num_blocks, target_block_size, draft_config, dtype);
+        anyhow::bail!("draft KV sizing requires the 'cuda' feature")
     }
 }
 
@@ -2464,9 +2551,14 @@ async fn run_generate(
                 &draft_files.quantization,
             )?;
 
+            // 13-I.4 — see helper docstring for sizing rationale. The
+            // run_generate path uses a fixed block_size of 16 (matches
+            // the cache_config above this site, kept in sync).
+            let draft_num_blocks =
+                compute_draft_kv_blocks(num_blocks, 16, &draft_files.config, dtype)?;
             let draft_cache_config = CacheConfig {
                 block_size: 16,
-                num_blocks,
+                num_blocks: draft_num_blocks,
                 num_layers: draft_files.config.num_hidden_layers,
                 num_kv_heads: draft_files.config.num_key_value_heads,
                 head_dim: draft_files.config.head_dim,

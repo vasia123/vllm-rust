@@ -1030,3 +1030,62 @@ Acceptance gate (per Stage 13-I plan): one of these must clear
 `scripts/bench_decode.py` to win the default-on slot. Otherwise we
 keep speculative as a manual flag and move on to Stage 13-J.
 
+## Stage 13-I.3 — measurement + verdict
+
+Bench setup: Qwen3-4B-AWQ target on RTX 4060 Laptop sm_89, prompt 256 w,
+max_tokens 256, temp 0.7, runs 2 (best-of), `scripts/bench_decode.py`
+with `--admin-url` for per-batch acceptance-rate.
+
+| variant | c=1 tok/s | c=4 tok/s (req / agg) | accept | tok/draft |
+|---|--:|--:|--:|--:|
+| baseline (no draft, multi_step=4) | **43.3** | **15.4 / 61.2** | n/a | n/a |
+| Orion-zhen/Qwen3-0.6B-AWQ K=4 | 6.9 | 0.0 / 7.1 | 13.2 % | 1.53 |
+| Qwen/Qwen3-0.6B BF16 K=4 | 7.1 | (timeout) | 17.3 % | 1.69 |
+| N-Gram (zero VRAM, n=2..4 K=4) | 20.2 | 7.1 / 27.2 | 9.3 % | 1.37 |
+
+**All three candidates fail the gate.** Per-req c=1 regressed 2.1× (best
+case, N-Gram) to 6.3× (worst case, AWQ-0.6B); c=4 aggregate regressed
+2.2× to 8.6×.
+
+### Root cause
+
+The baseline already runs `--multi-step-count 4` (default), which
+emits 4 tokens per engine step. Speculative decode in the current
+implementation **disables** multi-step batching (`engine/main.rs:1837`
+omits the `multi_step_count` builder call on the draft branch) and
+replaces it with a K=4 draft-then-verify loop.
+
+That swap is only beneficial if average accepted tokens per round
+≥ multi-step's 4. Acceptance rates landed at 9–17 %, giving
+~1.4–1.7 emitted tokens per round — a **2.4–2.9× per-step token-rate
+drop** before any draft cost is paid. Compounded with sequential
+draft forwards (4× draft.forward() per round, ~30 ms each for BF16-0.6B
+on this GPU), the net per-step latency rose 6–10×.
+
+Speculative decode wins are unlocked **either** by:
+- **Higher acceptance** — needs a draft model trained for distillation
+  on this target (we'd need a Qwen3-0.6B-distilled-from-4B variant; the
+  community AWQ quants are quality-degraded, BF16 stock is too generic).
+- **Cheaper draft proposal** — Eagle / Medusa / MTP run draft heads in
+  parallel with target verify (no sequential 4× draft cost). Eagle-1
+  Llama / DeepSeek paths already exist in this repo
+  (`models/eagle_llama.rs` and friends), but no Eagle head ships with
+  Qwen3-4B-AWQ on HF. MTP would require a Qwen3-MTP head.
+- **Spec + multi-step composing** — currently they're mutually
+  exclusive; making them compose (run multi-step per verify round)
+  would salvage the 4× lookahead even when acceptance is mediocre.
+
+### Decision
+
+**Do not default-on speculative decode** for Qwen3-4B-AWQ on this GPU.
+The CLI flags (`--draft-model`, `--ngram-prompt-lookup-max`) remain
+available for users with workloads where draft acceptance is naturally
+high (long structured output, lots of copy-paste from prompt) — but
+the global default keeps the multi_step=4 baseline.
+
+Stage 13-I architectural cleanup still ships (block_size inheritance,
+`compute_draft_kv_blocks` helper) — those remove a latent OOM bug for
+users who *do* turn speculative on with a non-tiny draft.
+
+Next: Stage 13-J (kt_mloop M=12, 16) per plan.
+
