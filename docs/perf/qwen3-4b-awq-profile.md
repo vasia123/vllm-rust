@@ -769,3 +769,78 @@ real shared scratch buffer so the dequant+matmul path stops
 allocating per-call — is tracked under Stage 13-F (the same INT4
 GEMM rewrite that closes the c=4 cliff would supersede the scratch
 issue).
+
+---
+
+## Stage 13-H — drop candle 0.9.1 fork (DEFERRED)
+
+### Attempt
+
+Bumped `candle-core` / `candle-nn` / `candle-flash-attn` from the
+vendored 0.9.1+stream-patch fork to crates.io 0.10.2 to get rid of
+the `vendor/candle/` dir and the per-bump maintenance overhead. The
+plan was: switch deps, fix API drift, drop vendor + setup script +
+CI/Docker steps.
+
+### What broke and how it was fixed
+
+Compile-time API drift (12 errors total):
+
+- `CudaDevice::memcpy_stod` → `CudaDevice::clone_htod` (rename,
+  same signature). 9 call-sites in `cuda_kernels.rs`,
+  `moe/fused/kernel_wrapper.rs`, `sampling/gpu.rs`.
+- `CudaDevice::memcpy_dtov` → `CudaDevice::clone_dtoh`. 1 call-site.
+- `SimpleBackend` trait now requires `get_unchecked(name, dtype,
+  dev)`. Implemented in `quantization/gguf/mod.rs::GgufVarBuilderBackend`.
+- `DType` / `CudaStorageSlice` gained variants (I16, I32, F8E4M3,
+  F8E5M2 and 4 more). Added wildcard arms in `cuda_kernels.rs`,
+  `distributed/nccl.rs` (× 2), `flashinfer/tensor_bridge.rs`.
+
+Runtime issue (silent corruption):
+
+- HuggingFace AWQ `qweight` / `qzeros` arrive in the safetensors
+  decoder as I32 in candle 0.10 (was U32 in 0.9). The VarBuilder's
+  `get_with_hints_dtype(.., U32)` chains *two* numerical casts
+  (file → backend default = BF16, then BF16 → U32), saturating the
+  packed nibbles. Some U32↔I32 cast pairs additionally hit a
+  missing CUDA kernel
+  (`CUDA_ERROR_NOT_FOUND, "named symbol not found"`).
+- Workaround: route integer requests through a CPU-rooted
+  `VarBuilder` with target dtype, so the safetensors decoder
+  reads I32-on-disk straight into an I32 (or U32) host buffer
+  with no cast kernel involved, then push to GPU. Verified via
+  `scripts/test_qwen3_awq_correctness.sh`: 7/7 PASS on candle 0.10.
+
+### Why it was reverted
+
+Decode throughput halved on the same hardware:
+
+| Config | num_blocks | TTFT @ 256 | c=1 tok/s | c=4 agg |
+|:--|--:|--:|--:|--:|
+| Vendored 0.9.1 fork (HEAD) | 1029 | 252 ms | 42.9 | 56.9 |
+| crates.io 0.10.2 | 588 | 721 ms | 23.4 | 27.5 |
+
+Auto-tune dropped from 1029 → 588 blocks because the on-GPU
+footprint after model load went up under candle 0.10 (~700 MiB
+more reserved by the activation/kernel state). Decode tps dropped
+~45 % even at the same `--num-blocks 512`. Numerical correctness
+held, but the perf cost is a hard regression on the workload
+Stage 13-D / 13-G optimised for. Investigation deferred — likely
+either candle 0.10's kernel cache initialisation, a different
+default cudarc stream policy, or the CPU-fallback path in
+`vb_get_as` adding per-load latency.
+
+### Decisions
+
+- Revert: `candle-core` / `candle-nn` / `candle-flash-attn` stay
+  on the vendored 0.9.1 + non-default-stream patch. CI vendor step
+  + Dockerfile vendor copy stay in place. Pin commit
+  `cd96fa80` is unchanged.
+- The shape of the candle 0.10 patch is now known and tractable
+  if/when we need to bump (e.g. for the MXFP4/FP8 tensor cores
+  shipped in 0.10's kernel set). Tracked as **Stage 13-H follow-up**
+  — the bump is straightforward, the perf regression is what needs
+  diagnosis next.
+- Bench coverage policy paid off again: the regression was caught
+  immediately by the Stage 13-D bench harness, before any
+  user-facing build saw it.
