@@ -1228,10 +1228,81 @@ Stage 13 closes here with cumulative wins from `git log`:
 - 13-G: VRAM-aware auto-tune
 - 13-I: speculative decode → not adopted; cleanup landed
 - 13-J: kt_mloop M=12 / M=16 → +11 % (c=4 agg) / +8 % (c=8 agg)
+- 13-K-bis attempt: prefill plan caching → reverted (see below)
 
 End-state: c=1 = 41.9 tps (97 % of vLLM 47), c=4 = 16.0 / 64.2 tps,
 c=8 = 8.1 / 65.5 tps (vs vLLM ~351 aggregate at c=8 — 5.5× gap remains;
 closing it requires either Marlin tile-MMA tensor-core kernel
 [Stage 13-L, deferred 2-4 weeks] or the prefill plan caching above
 combined with 13-L).
+
+---
+
+## Stage 13-K-bis attempt — prefill plan caching (reverted)
+
+Tried to mirror the decode plan-caching pattern (`DecodePlan` +
+`decode_flashinfer_with_plan`) for prefill: a single static
+`Mutex<Option<(CacheKey, PrefillPlan)>>` slot keyed on
+`(block_ids hash, seq_len, kv layout, dtype, head dims)`. Cache key
+matches across all 36 attention layers of one prefill, so the
+`BatchPrefillPlan::new()` host work happens once instead of 36 times.
+
+### What broke
+
+End-to-end correctness on `test_qwen3_awq_correctness.sh`:
+- Cases 1–4 (short single prefill, 9-token prompt): **PASS** —
+  cache trace showed 1 MISS + 35 HITS per request.
+- Cases 5 (sustained 8 + 1 batch), 6 (3K-token prompt long-context),
+  7 (concurrent 2-request): **FAIL** with
+  `CUDA_ERROR_ILLEGAL_ADDRESS` — illegal memory access during
+  `BatchPrefillPlan::run`.
+
+### Root-cause hypothesis
+
+The decode plan-caching path that's already in the codebase is
+*per-call* — the engine builds `DecodePlan` once at the start of
+each forward batch and threads it through every layer's attention
+call. The plan is dropped at the end of that one forward.
+
+A static-singleton cache for prefill survives **across forwards**.
+Between any two prefills, the engine performs decode forwards (each
+of which uses the same FlashInfer workspace pool that the cached
+prefill plan internally points into). Workspace bytes get rewritten
+by intervening decode plans. When the next prefill comes in, if its
+key happens to match the cached one (same seq_len, same block_ids
+hash), the cache hit replays a `BatchPrefillPlan` whose internal
+metadata pointers refer to workspace bytes that are now garbage.
+Hence the illegal memory access on the longer paths where
+prefill ↔ decode interleaving happens.
+
+The decode-plan path doesn't hit this because (a) it's rebuilt
+per-forward, and (b) decode metadata always changes between calls
+(KV growth flips `kv_last_page_len` every token).
+
+### What would actually work
+
+Two viable shapes; both are bigger than this loop iteration:
+
+1. **Per-forward plan, threaded through.** Engine builds the
+   `PrefillPlan` once before the prefill forward starts, hands it to
+   the model via metadata, model passes to each attention layer.
+   Plan dies at the end of the forward — no cross-forward staleness.
+   Cost: extends `AttentionBackend` trait, `paged_attention`
+   signature, and changes ~76 model files that call
+   `paged_attention`. Mirrors what was already done for decode.
+2. **Per-key plan with a bind-time-snapshot of workspace.** Each
+   cached plan owns a *private* slice of workspace memory that
+   nothing else writes to. Eliminates the cross-forward corruption
+   but doubles workspace footprint and requires a small allocator on
+   top of the existing `WorkspaceBuffer`.
+
+Approach (1) is the matched analogue to the decode path; (2) is
+cheaper to plumb but uses more VRAM. Both are 1–2 day milestones.
+
+### Status
+
+Reverted to baseline (commit unchanged). Audit (Stage 13-K.1) and
+this negative-result entry stay as the deliverables for the K
+milestone. Stage 13 closes here; the win path is captured for
+whoever picks up Stage 14-A.
 
