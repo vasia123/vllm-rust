@@ -524,6 +524,50 @@ extern "C" __global__ void awq_gemv_int4_kt_mloop_m8_bf16(
                      N, K, group_size, has_zp, has_bias);
 }
 
+// Stage 13-J.2 — M=12 / M=16 specialisations.
+//
+// Shared-memory budget at K=4096: M=12 → 96 KiB, M=16 → 128 KiB. The
+// 100 KiB dynamic-shmem opt-in (Stage 13-J.1) lets M=12 fit at K=4096
+// without trimming K. M=16 at K=4096 exceeds the 100 KiB cap, so the
+// dispatcher gates m16 on `(M_FIXED * K * 2) ≤ 100 KiB` and falls
+// through to dequant+matmul when the layer's K is too big (e.g. mlp.up
+// at K=4096 won't take m16; only K ≤ 3072 layers will).
+//
+// Register pressure: `acc[M_FIXED]` lives in registers, so M=16 occupies
+// 16 × FP32 = 64 bytes per thread. Combined with `wvals[8]` (32 bytes)
+// the per-thread footprint stays well below the 256-register limit on
+// sm_8x. The dispatcher picks whichever M_FIXED template matches the
+// runtime M closest from above (e.g. M=14 → m16, M=10..11 → m12) so the
+// wasted-row count in the inner loop never exceeds 5.
+
+extern "C" __global__ void awq_gemv_int4_kt_mloop_m12_bf16(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned int* __restrict__ qweight_kt,
+    const __nv_bfloat16* __restrict__ scales,
+    const unsigned int* __restrict__ qzeros,
+    const __nv_bfloat16* __restrict__ bias,
+    int M, int N, int K, int group_size, int has_zp, int has_bias
+) {
+    (void)M;  // M_FIXED = 12; runtime M required to be 9..12 by dispatcher.
+    kt_mloop_body<12>(output, input, qweight_kt, scales, qzeros, bias,
+                      N, K, group_size, has_zp, has_bias);
+}
+
+extern "C" __global__ void awq_gemv_int4_kt_mloop_m16_bf16(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned int* __restrict__ qweight_kt,
+    const __nv_bfloat16* __restrict__ scales,
+    const unsigned int* __restrict__ qzeros,
+    const __nv_bfloat16* __restrict__ bias,
+    int M, int N, int K, int group_size, int has_zp, int has_bias
+) {
+    (void)M;  // M_FIXED = 16; runtime M required to be 13..16 by dispatcher.
+    kt_mloop_body<16>(output, input, qweight_kt, scales, qzeros, bias,
+                      N, K, group_size, has_zp, has_bias);
+}
+
 extern "C" __global__ void awq_gemv_int4_kt_bf16(
     __nv_bfloat16* __restrict__ output,         // [M, N]
     const __nv_bfloat16* __restrict__ input,    // [M, K]

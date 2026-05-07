@@ -49,6 +49,30 @@ const AWQ_MARLIN_DEQUANT_PTX: &str = include_str!("../../kernels/awq_marlin_dequ
 /// microbench curve.
 pub const AWQ_GEMV_M_THRESHOLD: usize = 8;
 
+/// 96 KiB dynamic shared memory cap per block on sm_8x. Keep in sync with
+/// `KT_MLOOP_DYN_SHMEM_CAP` and `KT_MLOOP_MAX_DYN_SMEM` inside
+/// `MarlinGemmOp::cuda_fwd_awq_gemv`.
+pub const KT_MLOOP_DYN_SHMEM_CAP_BYTES: usize = 96 * 1024;
+
+/// Returns true when the AWQ-INT4 kt_mloop GEMV path beats the
+/// dequant+matmul fallback for the given (M, K).
+///
+/// - M ∈ {1..8} unconditionally — covered by kt_mloop_m4/m8 (or smaller
+///   variants for M < 4) whose weight reuse + 96 KiB shmem still
+///   amortise HBM reads cheaper than dequant+matmul's BF16 cuBLAS GEMM
+///   round-trip.
+/// - M ∈ {12, 16} only when `M_FIXED * K * 2 B ≤ 96 KiB` — guards
+///   `mlp.down` at K = 9728 (would need 304 KiB at M=16, falls through
+///   to dequant+matmul) without losing the K = 4096 hot path.
+/// - Other M values (5–7, 9–11, 13–15, > 16): GEMV does not have an
+///   exact-match template, so dispatch to dequant+matmul whose
+///   ~1.45 ms fixed overhead beats the legacy kt path at any M ≥ 10.
+///
+/// See Stage 13-J notes in `docs/perf/qwen3-4b-awq-profile.md`.
+pub fn awq_gemv_kt_mloop_template_fits(m: usize, k: usize) -> bool {
+    matches!(m, 4 | 8 | 12 | 16) && (m * k * 2) <= KT_MLOOP_DYN_SHMEM_CAP_BYTES
+}
+
 /// Marlin GEMM operation for INT4 quantized weights.
 struct MarlinGemmOp {
     qweight: Tensor,
@@ -345,14 +369,30 @@ impl MarlinGemmOp {
         // M_MAX-unrolled kernel — the original PoC regressed at M=4
         // exactly because of those NOPs (see Stage 13-F PoC notes).
         // Dispatch each runtime M to the closest variant whose shared
-        // memory budget (M_FIXED × K × 2 bytes) fits the static 47 KiB
-        // per-block cap; otherwise fall through to the legacy kt
-        // m-loop.
-        const KT_MLOOP_SHMEM_CAP: usize = 47 * 1024;
+        // memory budget (M_FIXED × K × 2 bytes) fits the per-block
+        // shmem cap.
+        //
+        // Static cap is 48 KiB per block on sm_8x; dynamic shmem opt-in
+        // (Stage 13-J.1) raises it to 100 KiB on sm_8x via
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, which
+        // unlocks M=8 at K=9728 (mlp.down) and M=12/16 at K=4096 (mlp.up).
+        // The attribute set is one-shot per kernel handle (cached for the
+        // device lifetime) so the cost is paid once.
+        const KT_MLOOP_DYN_SHMEM_CAP: usize = 96 * 1024;
+        // Exact-M match per template: kt_mloop_body templates over
+        // M_FIXED at compile time and stages exactly M_FIXED rows of
+        // input into shmem unconditionally, so routing a smaller M
+        // here would read out-of-bounds. M values that don't hit any
+        // template fall through to the legacy kt path or
+        // dequant+matmul.
         let use_split_kt_mloop_m4 =
-            use_split_kt && self.m == 4 && (4 * self.k * 2) <= KT_MLOOP_SHMEM_CAP;
+            use_split_kt && self.m == 4 && (4 * self.k * 2) <= KT_MLOOP_DYN_SHMEM_CAP;
         let use_split_kt_mloop_m8 =
-            use_split_kt && self.m == 8 && (8 * self.k * 2) <= KT_MLOOP_SHMEM_CAP;
+            use_split_kt && self.m == 8 && (8 * self.k * 2) <= KT_MLOOP_DYN_SHMEM_CAP;
+        let use_split_kt_mloop_m12 =
+            use_split_kt && self.m == 12 && (12 * self.k * 2) <= KT_MLOOP_DYN_SHMEM_CAP;
+        let use_split_kt_mloop_m16 =
+            use_split_kt && self.m == 16 && (16 * self.k * 2) <= KT_MLOOP_DYN_SHMEM_CAP;
 
         // One-shot confirmation that the decode path is actually live.
         // Helps diagnose whether wall-clock degradation is in the kernel
@@ -366,7 +406,11 @@ impl MarlinGemmOp {
                 self.n,
                 self.k,
                 self.num_groups,
-                if use_split_kt_mloop_m8 {
+                if use_split_kt_mloop_m16 {
+                    "kt_mloop_m16 (template-specialised, weight reuse over M=16)"
+                } else if use_split_kt_mloop_m12 {
+                    "kt_mloop_m12 (template-specialised, weight reuse over M=12)"
+                } else if use_split_kt_mloop_m8 {
                     "kt_mloop_m8 (template-specialised, weight reuse over M=8)"
                 } else if use_split_kt_mloop_m4 {
                     "kt_mloop_m4 (template-specialised, weight reuse over M=4)"
@@ -395,7 +439,11 @@ impl MarlinGemmOp {
         let elem_count = self.m * self.n;
         let output = unsafe { dev.alloc::<half::bf16>(elem_count) }?;
 
-        let kernel_name = if use_split_kt_mloop_m8 {
+        let kernel_name = if use_split_kt_mloop_m16 {
+            "awq_gemv_int4_kt_mloop_m16_bf16"
+        } else if use_split_kt_mloop_m12 {
+            "awq_gemv_int4_kt_mloop_m12_bf16"
+        } else if use_split_kt_mloop_m8 {
             "awq_gemv_int4_kt_mloop_m8_bf16"
         } else if use_split_kt_mloop_m4 {
             "awq_gemv_int4_kt_mloop_m4_bf16"
@@ -409,6 +457,36 @@ impl MarlinGemmOp {
             "awq_gemv_int4_bf16"
         };
         let func = dev.get_or_load_custom_func(kernel_name, "awq_gemv", AWQ_GEMV_PTX)?;
+
+        // 13-J.1 — opt the kt_mloop kernels into the 100 KiB dynamic
+        // shmem regime on sm_8x. The static per-block cap is 48 KiB,
+        // which is enough for M=4 at K=4096 (32 KiB) but caps M=8 at
+        // K ≤ 3072. Setting `MAX_DYNAMIC_SHARED_SIZE_BYTES` is sticky
+        // on the kernel handle, and cudarc 0.16 caches the handle, so
+        // the cost is paid once per process. `cuFuncSetAttribute` is
+        // idempotent — setting the same value again is cheap.
+        // sm_89 per-block dynamic shmem cap is 99 KiB; we pick 96 KiB
+        // for headroom (the bench at 98 KiB rejects with
+        // CUDA_ERROR_INVALID_VALUE on some driver versions).
+        const KT_MLOOP_MAX_DYN_SMEM: i32 = 96 * 1024;
+        if use_split_kt_mloop_m4
+            || use_split_kt_mloop_m8
+            || use_split_kt_mloop_m12
+            || use_split_kt_mloop_m16
+        {
+            use candle_core::cuda::cudarc::driver::sys::CUfunction_attribute_enum;
+            func.set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                KT_MLOOP_MAX_DYN_SMEM,
+            )
+            .map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "awq_gemv: cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES={} \
+                     failed for {}: {e}",
+                    KT_MLOOP_MAX_DYN_SMEM, kernel_name
+                ))
+            })?;
+        }
 
         // Activations.
         let input = match &storage.slice {
@@ -496,7 +574,11 @@ impl MarlinGemmOp {
         // time (K × 2 bytes). The kt_mloop variants cache all M_FIXED
         // rows up-front (M_FIXED × K × 2). Dispatch already gated this
         // on the static 47 KiB cap.
-        let smem_bytes: u32 = if use_split_kt_mloop_m8 {
+        let smem_bytes: u32 = if use_split_kt_mloop_m16 {
+            (16 * self.k as u32) * 2
+        } else if use_split_kt_mloop_m12 {
+            (12 * self.k as u32) * 2
+        } else if use_split_kt_mloop_m8 {
             (8 * self.k as u32) * 2
         } else if use_split_kt_mloop_m4 {
             (4 * self.k as u32) * 2
@@ -803,10 +885,17 @@ pub fn marlin_gemm(
     // axis, so above this threshold its per-token cost dominates the
     // prefill profile (Stage 13-D.3 measured 232 µs/(layer, token) at
     // M = 1940 vs ~80 µs/layer-call in decode).
+    // Stage 13-J — keep M ∈ {12, 16} on the GEMV path when the kt_mloop
+    // template fits, otherwise route to dequant+matmul. M ∈ 5..=7,
+    // 9..=11, 13..=15 have no exact template and would land on the
+    // legacy kt kernel whose linear-in-M cost (138 µs/M) exceeds the
+    // dequant+matmul ~1.45 ms anywhere above M=10.
+    let route_to_dequant = m > AWQ_GEMV_M_THRESHOLD && !awq_gemv_kt_mloop_template_fits(m, size_k);
+
     if matches!(scalar_type, MarlinScalarType::Uint4)
         && qzeros.is_some()
         && g_idx.is_none()
-        && m > AWQ_GEMV_M_THRESHOLD
+        && route_to_dequant
     {
         // Candle's matmul does not broadcast a 2D weight over a higher-rank
         // input (e.g. 3D batched activations [B, M, K] @ [K, N]); flatten
@@ -2147,6 +2236,157 @@ mod tests {
                 max_abs <= tol,
                 "awq_gemv (m=4) vs CPU ref max_abs={max_abs} > tol={tol} (max_expected={max_expected})"
             );
+        }
+
+        /// Same numeric reference as the m=1/4 tests, parameterised so
+        /// the m=8/12/16 kt_mloop_body specialisations all share the
+        /// CPU oracle. K=256 keeps the dynamic-shmem footprint
+        /// (M_FIXED × K × 2 B) well under the 96 KiB cap so all three
+        /// `M_FIXED` values dispatch to their template, not to the
+        /// fallback. A failure here means the new template specialisation
+        /// disagrees with the bit-exact reference — drift in either the
+        /// shmem layout, the FP32 reduce order, or the BF16 round-trip.
+        fn run_kt_mloop_match_cpu_reference(m: usize) {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            let k = 256usize;
+            let n = 64usize;
+            let group_size = 128usize;
+            let num_groups = k / group_size;
+            let packed_k = k / 8;
+            let packed_n = n / 8;
+
+            let mut rng: u32 = 0xCAFE_BABE ^ (m as u32);
+            let mut next = |modulus: u32| -> u32 {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                rng % modulus
+            };
+
+            let mut qweight_words: Vec<u32> = Vec::with_capacity(packed_k * n);
+            for _ in 0..(packed_k * n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qweight_words.push(w);
+            }
+            let mut qzeros_words: Vec<u32> = Vec::with_capacity(num_groups * packed_n);
+            for _ in 0..(num_groups * packed_n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qzeros_words.push(w);
+            }
+            let scales_f32: Vec<f32> = (0..(num_groups * n))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-4)
+                .collect();
+            let inputs_f32: Vec<f32> = (0..(m * k))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-3)
+                .collect();
+            let bf16_round = |v: f32| -> f32 { half::bf16::from_f32(v).to_f32() };
+            let scales: Vec<f32> = scales_f32.iter().map(|&v| bf16_round(v)).collect();
+            let inputs: Vec<f32> = inputs_f32.iter().map(|&v| bf16_round(v)).collect();
+
+            let mut expected = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for ni in 0..n {
+                    let zp_pack_col = ni / 8;
+                    let zp_bit = (ni % 8) * 4;
+                    let mut acc = 0.0f32;
+                    for k_idx in 0..k {
+                        let group_id = k_idx / group_size;
+                        let pack_row = k_idx / 8;
+                        let pack_idx = k_idx % 8;
+                        let w_word = qweight_words[pack_row * n + ni];
+                        let nib = ((w_word >> (pack_idx * 4)) & 0xF) as i32;
+                        let zp_word = qzeros_words[group_id * packed_n + zp_pack_col];
+                        let zp = ((zp_word >> zp_bit) & 0xF) as i32;
+                        let scale = scales[group_id * n + ni];
+                        let w_val = ((nib - zp) as f32) * scale;
+                        acc += inputs[mi * k + k_idx] * w_val;
+                    }
+                    expected[mi * n + ni] = acc;
+                }
+            }
+
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device)
+                .unwrap()
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
+            let scales_t = Tensor::from_vec(scales.clone(), (num_groups, n), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let input = Tensor::from_vec(inputs.clone(), (m, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let workspace = Tensor::zeros(64usize, DType::U32, &device).unwrap();
+
+            let output = marlin_gemm(
+                &input,
+                &qweight,
+                &scales_t,
+                Some(&qzeros),
+                None,
+                None,
+                &workspace,
+                None,
+                MarlinScalarType::Uint4,
+                k,
+                n,
+                true,
+                true,
+            )
+            .expect("awq_gemv launch should succeed");
+
+            let got: Vec<f32> = output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            assert_eq!(got.len(), expected.len());
+            let max_expected = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let tol = (max_expected * 0.01).max(5e-2);
+            let max_abs = got
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= tol,
+                "awq_gemv (m={m}) vs CPU ref max_abs={max_abs} > tol={tol} \
+                 (max_expected={max_expected})"
+            );
+        }
+
+        #[test]
+        fn test_awq_gemv_matches_cpu_reference_m8() {
+            run_kt_mloop_match_cpu_reference(8);
+        }
+
+        #[test]
+        fn test_awq_gemv_matches_cpu_reference_m12() {
+            run_kt_mloop_match_cpu_reference(12);
+        }
+
+        #[test]
+        fn test_awq_gemv_matches_cpu_reference_m16() {
+            run_kt_mloop_match_cpu_reference(16);
         }
 
         /// M=32 (> AWQ_GEMV_M_THRESHOLD) routes through the prefill

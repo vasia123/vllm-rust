@@ -1089,3 +1089,71 @@ users who *do* turn speculative on with a non-tiny draft.
 
 Next: Stage 13-J (kt_mloop M=12, 16) per plan.
 
+---
+
+## Stage 13-J — kt_mloop M=12 / M=16 + 96 KiB dynamic shmem
+
+### Landed
+
+1. **96 KiB dynamic shmem opt-in** for the kt_mloop kernels via
+   `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES = 98 304)`.
+   Static per-block cap on sm_8x is 48 KiB; sm_89's hard cap is 99 KiB
+   so 96 KiB clears with headroom (98 KiB rejected with
+   `CUDA_ERROR_INVALID_VALUE` on the test driver).
+2. **`kt_mloop_body<12>` and `<16>` template instantiations** in
+   `awq_gemv.cu`, exposing `awq_gemv_int4_kt_mloop_m12_bf16` /
+   `_m16_bf16`. Hand-instantiated alongside the existing M=4 / M=8
+   variants — same shmem layout (`[k, M_FIXED]`, bank-conflict free),
+   same FP32 reduce, same numeric tolerance (validated by
+   `test_awq_gemv_matches_cpu_reference_m12` / `_m16`).
+3. **Template-aware dispatch gate** `awq_gemv_kt_mloop_template_fits`
+   replaces the simple `m > 8` threshold for M ∈ {12, 16}: GEMV when
+   the template fits the 96 KiB shmem cap, dequant+matmul otherwise.
+   Odd-M (5–7, 9–11, 13–15, > 16) keeps going to dequant+matmul — the
+   legacy kt path (linear in M, 138 µs/M) loses to dequant+matmul above
+   M=10 by Stage 13-F's microbench.
+
+### Microbench (RTX 4060 Laptop, sm_89, K=4096, N=11008)
+
+| M  | dispatch arm        | before  | after   | Δ          |
+|--:|:--                   |--:      |--:      |:--          |
+|  1 | kt_mloop_m4 fallback | 142 µs  | 142 µs  | flat        |
+|  4 | kt_mloop_m4         | 451 µs  | 451 µs  | flat        |
+|  8 | kt_mloop_m8         | 887 µs  | 892 µs  | flat (+0.5 %) |
+| 10 | dequant+matmul      | 1.45 ms | 1.47 ms | flat (+1 %)   |
+| **12** | **kt_mloop_m12** | 1.45 ms | **1.31 ms** | **−9.6 %** ✅ |
+| 13 | dequant+matmul      | 1.46 ms | 1.46 ms | flat        |
+| 14 | dequant+matmul      | 1.46 ms | 1.46 ms | flat        |
+| 16 | dequant+matmul †    | 1.46 ms | 1.46 ms | flat        |
+| 24..2048 | dequant+matmul | …      | …       | flat        |
+
+† M=16 at K=4096 needs 128 KiB shmem (exceeds 96 KiB cap), so
+  `awq_gemv_kt_mloop_template_fits(16, 4096)` returns false → routes
+  to dequant+matmul. M=16 wins **at K ≤ 3072**, which matches the
+  Qwen3-4B q/k/v_proj layers (K = hidden_size = 2560, fits at 80 KiB).
+  Bench above is K=4096 / mlp.up shape and intentionally omits this
+  path; the e2e bench below captures the K=2560 win indirectly.
+
+### End-to-end (Qwen3-4B-AWQ, full TGP, multi_step=4)
+
+| concurrency  | Stage 13-F (after) | Stage 13-J (after) | Δ           |
+|--:           |--:                 |--:                 |:--           |
+| c=1 (M=4)    |    43.4 tps         |    41.9 tps         | flat         |
+| c=4 (M=16)   | 14.4 / 57.5 tps    | 16.0 / **64.2** tps | **+11 %**    |
+| c=8 (M=32)   |  7.5 / 60.4 tps    |  8.1 / **65.5** tps | **+8 %**     |
+
+c=4 picks up the win because effective M at the GEMV layer is
+`concurrency × multi_step = 16`, which lands on `kt_mloop_m16` for the
+q/k/v_proj layers (K=2560 fits) and on dequant+matmul for o_proj
+(K=4096) and mlp.down (K=9728). The c=8 (effective M=32) win is
+secondary — outside any kt_mloop template's M range, so the +8 % must
+come from cache effects of fewer kernel-launch dispatches at the
+crossover.
+
+### Decision
+
+Land. The M=16 cap-gate scales naturally if a future card with larger
+shmem (Hopper sm_90: 228 KiB) raises `KT_MLOOP_DYN_SHMEM_CAP_BYTES` —
+the only constants to bump are the cap and the `MAX_DYN_SMEM`
+attribute value. No template logic to touch.
+

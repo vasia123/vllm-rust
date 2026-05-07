@@ -94,16 +94,22 @@ fn bench_dispatch_sweep(c: &mut Criterion) {
     let mut group = c.benchmark_group("awq_marlin_dispatch");
     group.sample_size(10);
 
-    // M sweep covers both dispatch arms:
-    //   - 1, 4, 8 — gemv path (M ≤ AWQ_GEMV_M_THRESHOLD)
-    //   - 12, 16  — formerly gemv (Stage 13-D.4 had threshold=16, gemv
-    //               cost 138 µs/M = 1.65 / 2.20 ms), now dequant+matmul
-    //               (~1.45 ms fixed, see Stage 13-F)
-    //   - 24, 32 — already on dequant+matmul under both thresholds
+    // M sweep covers all dispatch arms:
+    //   - 1, 4, 8 — gemv path; kt_mloop_m4 / m8 templates with weight reuse
+    //   - 10, 13, 14 — fallback to legacy kt at K=4096 (no exact-match
+    //               template) — guards against routing regressions where a
+    //               future change accidentally sends odd-M to a wrong template
+    //   - 12, 16  — Stage 13-J kt_mloop_m12 / m16 templates (96 KiB
+    //               dynamic shmem opt-in); was dequant+matmul (~1.45 ms)
+    //               under Stage 13-F. Win lands here.
+    //   - 24, 32 — dequant+matmul (kt_mloop's M_FIXED tops out at 16 due
+    //               to shmem cap; nothing routes through GEMV for M > 16)
     //   - 64..2048 — saturating cuBLAS GEMM, growth in K accumulator only
     // The crossover region (M=8..16) is the part most likely to regress
     // on a future kernel rewrite, so we sample it densely.
-    for &m in &[1usize, 4, 8, 12, 16, 24, 32, 64, 256, 512, 1024, 2048] {
+    for &m in &[
+        1usize, 4, 8, 10, 12, 13, 14, 16, 24, 32, 64, 256, 512, 1024, 2048,
+    ] {
         let (input, qweight, scales, qzeros, workspace) = make_inputs(m, K, N, GROUP_SIZE, &device);
         // Warm the kernel cache and the GEMM autotuner so the first
         // sample isn't 10× the rest.
