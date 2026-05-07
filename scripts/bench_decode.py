@@ -16,6 +16,11 @@ Usage:
 
 Compare two backends on the same machine by running twice with different
 --base-url and --label.
+
+When --admin-url is provided, the script also diffs the admin metrics
+endpoint (`/admin/metrics`) before/after each concurrency level to surface
+speculative-decode acceptance rate and token-bonus multiplier alongside
+tok/s. This is the regression guard for Stage 13-I (spec-decode default-on).
 """
 from __future__ import annotations
 
@@ -62,6 +67,42 @@ class BatchStats:
 
     def median_ttft_ms(self) -> float:
         return statistics.median(r.ttft_ms for r in self.runs) if self.runs else 0.0
+
+
+@dataclass
+class SpecSnapshot:
+    """Lifetime monotonic counters from /admin/metrics."""
+
+    num_drafts: int
+    num_draft_tokens: int
+    num_accepted_tokens: int
+
+    def diff(self, before: "SpecSnapshot") -> tuple[int, int, int]:
+        return (
+            self.num_drafts - before.num_drafts,
+            self.num_draft_tokens - before.num_draft_tokens,
+            self.num_accepted_tokens - before.num_accepted_tokens,
+        )
+
+
+async def fetch_spec_snapshot(
+    client: httpx.AsyncClient, admin_url: str
+) -> SpecSnapshot | None:
+    """Fetch a snapshot of speculative counters; None when spec is off."""
+    try:
+        resp = await client.get(f"{admin_url}/metrics")
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    body = resp.json()
+    spec = body.get("spec_decode")
+    if not spec:
+        return None
+    return SpecSnapshot(
+        num_drafts=int(spec["num_drafts"]),
+        num_draft_tokens=int(spec["num_draft_tokens"]),
+        num_accepted_tokens=int(spec["num_accepted_tokens"]),
+    )
 
 
 async def stream_one(
@@ -135,15 +176,26 @@ async def run_concurrent(
     temperature: float,
     concurrency: int,
     api_key: str | None,
-) -> BatchStats:
+    admin_url: str | None = None,
+) -> tuple[BatchStats, tuple[int, int, int] | None]:
+    """Returns batch stats plus an optional (drafts, draft_toks, accepted)
+    delta when an admin URL is provided and spec decode is active."""
     timeout = httpx.Timeout(600.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        before = (
+            await fetch_spec_snapshot(client, admin_url) if admin_url else None
+        )
         coros = [
             stream_one(client, base_url, model, prompt, max_tokens, temperature, api_key)
             for _ in range(concurrency)
         ]
         runs = await asyncio.gather(*coros)
-    return BatchStats(concurrency=concurrency, runs=list(runs))
+        spec_delta: tuple[int, int, int] | None = None
+        if admin_url and before is not None:
+            after = await fetch_spec_snapshot(client, admin_url)
+            if after is not None:
+                spec_delta = after.diff(before)
+    return BatchStats(concurrency=concurrency, runs=list(runs)), spec_delta
 
 
 def make_prompt(prompt_len: int) -> str:
@@ -168,6 +220,12 @@ def main() -> int:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--runs", type=int, default=3, help="repeats per concurrency")
     p.add_argument("--api-key", default=None)
+    p.add_argument(
+        "--admin-url",
+        default=None,
+        help="e.g. http://localhost:8000/admin — when set, prints "
+        "speculative-decode acceptance rate alongside tok/s",
+    )
     args = p.parse_args()
 
     prompt = make_prompt(args.prompt_len)
@@ -176,17 +234,23 @@ def main() -> int:
     print(f"\n=== {label}  model={args.model} ===")
     print(f"prompt≈{args.prompt_len}w  max_tokens={args.max_tokens}  "
           f"temperature={args.temperature}  runs={args.runs}\n")
-    print(f"{'concurrency':>11}  {'med ttft ms':>12}  {'med tps/req':>12}  "
-          f"{'aggregate tps':>14}  {'best agg tps':>14}")
-    print("-" * 75)
+    header = (
+        f"{'concurrency':>11}  {'med ttft ms':>12}  {'med tps/req':>12}  "
+        f"{'aggregate tps':>14}  {'best agg tps':>14}"
+    )
+    if args.admin_url:
+        header += f"  {'accept rate':>11}  {'tok/draft':>9}"
+    print(header)
+    print("-" * len(header))
 
     for c in args.concurrency:
         best_aggregate = 0.0
         last_stats: BatchStats | None = None
+        last_spec_delta: tuple[int, int, int] | None = None
         # Throw away the first run as warmup if more than one is requested.
         warmup = args.runs > 1
         for run_idx in range(args.runs):
-            stats = asyncio.run(
+            stats, spec_delta = asyncio.run(
                 run_concurrent(
                     args.base_url,
                     args.model,
@@ -195,6 +259,7 @@ def main() -> int:
                     args.temperature,
                     c,
                     args.api_key,
+                    args.admin_url,
                 )
             )
             if warmup and run_idx == 0:
@@ -203,14 +268,26 @@ def main() -> int:
             if agg > best_aggregate:
                 best_aggregate = agg
                 last_stats = stats
+                last_spec_delta = spec_delta
         if last_stats is None:
             continue
-        print(
+        line = (
             f"{c:>11}  {last_stats.median_ttft_ms():>12.1f}  "
             f"{last_stats.median_tps():>12.1f}  "
             f"{last_stats.aggregate_tps():>14.1f}  "
             f"{best_aggregate:>14.1f}"
         )
+        if args.admin_url:
+            if last_spec_delta and last_spec_delta[1] > 0:
+                drafts, dtoks, accepted = last_spec_delta
+                rate = accepted / dtoks
+                # Tokens emitted per draft round, including the always-
+                # committed bonus token (1 + accepted/drafts).
+                tok_per_draft = 1.0 + accepted / drafts if drafts else 0.0
+                line += f"  {rate:>10.1%}  {tok_per_draft:>9.2f}"
+            else:
+                line += f"  {'n/a':>11}  {'n/a':>9}"
+        print(line)
 
     print()
     return 0

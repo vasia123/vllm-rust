@@ -29,6 +29,11 @@ pub struct AdminMetrics {
     /// Prefix cache statistics: (cached_blocks, evictable_blocks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_stats: Option<PrefixCacheStats>,
+    /// Speculative decoding statistics — present only when spec decode is
+    /// active. Counters are lifetime monotonic; bench harnesses diff
+    /// snapshots taken before / after a workload window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_decode: Option<SpecDecodeStatsView>,
 }
 
 /// Prefix cache statistics.
@@ -36,6 +41,29 @@ pub struct AdminMetrics {
 pub struct PrefixCacheStats {
     pub cached_blocks: usize,
     pub evictable_blocks: usize,
+}
+
+/// JSON-friendly view of `vllm_core::engine::types::SpecDecodingStats`.
+///
+/// All counters are lifetime monotonic. `acceptance_rate` and
+/// `mean_accepted_per_draft` are derived (kept here so external callers
+/// don't have to re-implement the formulas).
+#[derive(Debug, Clone, Serialize)]
+pub struct SpecDecodeStatsView {
+    /// Total draft sequences proposed (one per accepted decode step).
+    pub num_drafts: u64,
+    /// Total draft tokens proposed across all sequences.
+    pub num_draft_tokens: u64,
+    /// Total draft tokens accepted by the verifier.
+    pub num_accepted_tokens: u64,
+    /// Per-position acceptance counts (length = `num_speculative_tokens`).
+    pub num_accepted_tokens_per_pos: Vec<u64>,
+    /// `num_accepted_tokens / num_draft_tokens` (0.0 when no drafts yet).
+    pub acceptance_rate: f64,
+    /// Mean tokens emitted per verification round, including the always-
+    /// committed bonus token: `1 + num_accepted / num_drafts`. This is
+    /// the per-step output rate multiplier vs non-spec decode.
+    pub mean_accepted_per_draft: f64,
 }
 
 /// Runtime configuration (read-only for now).
