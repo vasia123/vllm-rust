@@ -1157,3 +1157,81 @@ shmem (Hopper sm_90: 228 KiB) raises `KT_MLOOP_DYN_SHMEM_CAP_BYTES` —
 the only constants to bump are the cap and the `MAX_DYN_SMEM`
 attribute value. No template logic to touch.
 
+---
+
+## Stage 13-K.1 — FlashInfer prefill audit (premise correction)
+
+The plan opened with "replace `paged_attention` with FlashInfer ragged
+prefill" — but the audit shows `paged_attention()` *already* routes
+through `FlashInferBackend::prefill_attention` →
+`prefill_flashinfer` whenever the `flashinfer` cargo feature is enabled
+(included by `cuda-default` and `cuda-full`, which the bench builds use).
+Stage 13-D's 252 ms TTFT was already measured *with* FlashInfer paged
+prefill active.
+
+So the "TTFT 252 → ~80 ms" target requires a different lever than the
+plan assumed. Profiling a 489-token prefill with `VLLM_PROFILE_PREFILL=1`
+gives this breakdown (μs, ratio of profile-mode wallclock):
+
+| component   | μs      | %     |
+|---          |--:      |--:    |
+| paged_attn  | 1567 600 | 67.8 % |
+| mlp         |  440 700 | 19.1 % |
+| qkv         |  133 600 |  5.8 % |
+| o_proj      |  108 000 |  4.7 % |
+| qk_norm     |   19 200 |  0.8 % |
+| rope        |   12 300 |  0.5 % |
+| **other**   |    29 400 |  1.3 % |
+| **total**   | 2 310 700 | 100 % |
+
+(Profile mode adds a `cuda_stream().synchronize()` per measurement so
+absolute numbers are 8–10× wallclock; the ratios are what's meaningful.)
+
+paged_attn at 67.8 % — and inside it, `PrefillWrapper::run` rebuilds
+a `BatchPrefillPlan` on every call (`wrapper.rs:173`). For a 36-layer
+forward, that's 36 fresh CPU-side plan builds per prefill, each one
+doing a host-CPU work-estimate and a `vec![0u8; int_ws_size]` for
+page-locked metadata. The exact same anti-pattern was already fixed
+on the decode side (`DecodePlan` + `decode_flashinfer_with_plan`,
+metadata.rs ≈ line 187) — that change cut decode from "36 host syncs
+per token" to one.
+
+### Win path (deferred)
+
+Mirror the decode plan-caching pattern for prefill:
+
+1. Add `prefill_flashinfer_with_plan` and a `PrefillPlan` newtype that
+   owns the `BatchPrefillPlan` + the indptr/indices/last_page_len
+   tensors and the page-locked scratch.
+2. Add `build_prefill_plan` on `AttentionBackend` returning
+   `Option<Arc<dyn Any + Send + Sync>>`.
+3. Engine builds the plan once per prefill forward (in
+   `model_forward.rs` or wherever the prefill metadata is assembled);
+   passes it down through `paged_attention(...)` analogous to the
+   decode path's `prefill_metadata.attention_plan: Option<Arc<…>>`.
+4. Bench `bench_prefill.py` for 64 / 256 / 1024 / 2048 prompt lengths.
+   Expected: TTFT 252 → ~190 ms (saving ~36 × plan-build cost on
+   short prompts; more on longer ones where plan-build still O(seq)).
+
+This is a cross-cutting plumbing change (touches `AttentionBackend`
+trait, `paged_attention` signature, and how every model that calls
+`paged_attention` threads metadata through) — too invasive to bundle
+with Stage 13-J. **Lifted to its own milestone (Stage 13-K-bis or
+Stage 14-A).** The audit (this section) is the deliverable for
+13-K.1; subsequent substeps stay pending for that future milestone.
+
+Stage 13 closes here with cumulative wins from `git log`:
+
+- 13-D: TTFT 4695 → 252 ms (18.6×)
+- 13-E: c=8 OOM fixed; KV preemption
+- 13-F: AWQ-Marlin threshold +9 % (c=8 agg) / +5 % (c=4 agg)
+- 13-G: VRAM-aware auto-tune
+- 13-I: speculative decode → not adopted; cleanup landed
+- 13-J: kt_mloop M=12 / M=16 → +11 % (c=4 agg) / +8 % (c=8 agg)
+
+End-state: c=1 = 41.9 tps (97 % of vLLM 47), c=4 = 16.0 / 64.2 tps,
+c=8 = 8.1 / 65.5 tps (vs vLLM ~351 aggregate at c=8 — 5.5× gap remains;
+closing it requires either Marlin tile-MMA tensor-core kernel
+[Stage 13-L, deferred 2-4 weeks] or the prefill plan caching above
+combined with 13-L).
+
