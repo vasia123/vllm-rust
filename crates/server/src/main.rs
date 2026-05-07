@@ -1621,6 +1621,24 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eprintln!("Using GPU blocks override: {num_blocks}");
     }
 
+    // 13-E.4 NOTE — auto-tuning `num_blocks` from available VRAM was
+    // prototyped here. With Qwen3-4B-AWQ on an 8 GiB card the auto-tune
+    // produced 1760 blocks at `gpu_memory_utilization=0.85` (vs the
+    // legacy default 512) and unblocked the c=8 OOM scenario, but a
+    // **27× TTFT regression** appeared on the c=1 path (252 ms → 6800 ms
+    // at prompt_len=256). Decode tok/s and the JIT-warmup batch=32 OOM
+    // (non-fatal, fires regardless of cache size) are unaffected — the
+    // regression is specific to prefill at large `num_blocks`.
+    //
+    // Hypothesis: either the AWQ-Marlin dequant+matmul scratch buffer
+    // or the block-pool's free-list iteration scales linearly in
+    // `num_blocks` in a way the current implementation does not
+    // amortise. Diagnosis is out of 13-E scope and tracked as Stage
+    // 13-G; until then `num_blocks` stays at the explicit user value
+    // (CLI / config), and operators wanting more concurrent capacity
+    // pass `--gpu-memory-utilization` explicitly (the existing path
+    // below already handles that case correctly when the user opts in).
+
     // Compute num_blocks from GPU memory utilization if specified
     if let Some(utilization) = gpu_memory_utilization {
         if !(0.0..=1.0).contains(&utilization) {

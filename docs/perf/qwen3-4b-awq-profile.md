@@ -638,3 +638,72 @@ Both are stage-sized work and tracked as **Stage 13-F**.
 The remaining 13-E.x substeps (13-E.3 KV preemption, 13-E.4 num_blocks
 auto-tune) close the OOM-on-c=8 ceiling and increase concurrent
 capacity — independent of the per-request scaling limit.
+
+---
+
+## Stage 13-E — concurrent-batching closure (2026-05-07)
+
+### 13-E.1 — instrumentation verdict
+
+`engine::helpers::step_profile` (env `VLLM_PROFILE_STEP=1`) added —
+per-stage timing of `execute_batched_decode_with_graph`, bucketed by
+batch_size. Steady-state on Qwen3-4B-AWQ:
+
+| stage | c=1 | c=4 | scaling |
+|:--|--:|--:|--:|
+| forward | 21.18 ms | 66.92 ms | 3.16 × |
+| sampling | 2.33 ms | 3.00 ms | 1.29 × |
+| **total** | 23.53 ms | 70.20 ms | 2.98 × |
+
+**Sampling already batches** via `gpu_sample_batch_with_diffs`. The
+13-E.2 hypothesis ("sampling is the c=4 bottleneck") was wrong;
+13-E.2 retired.
+
+The c=4 throughput cliff is in `forward`, specifically in the AWQ
+INT4 linears (mlp 3.3 ×, qkv 2.8 ×, o_proj 2.7 × scaling — `gemv` kernel
+re-reads weight columns per M, no shared-memory reuse across the M
+axis). The fix needs a real INT4 GEMM that tiles over M. Tracked as
+**Stage 13-F** future work.
+
+### 13-E.3 — KV preemption with recompute (DONE)
+
+`Scheduler::move_to_waiting(id)` + `StepResult.preempted` channel +
+recompute mutation in `execute_batched_decode_with_graph` on
+`allocate_for_request` failure: free blocks, fold
+`generated_token_ids` back into `prompt_token_ids`, mark `Preempted`,
+let the next `compute_schedule` re-admit.
+
+Stress test (c=8, prompt=1024, max_tokens=1024) — the previously-OOM
+workload — now completes all 8 streams, 4 recompute preemptions logged
+at WARN, aggregate 51.9 tok/s. Pre-13-E.3 the same workload killed
+half the streams with `kv cache out of blocks` errors.
+
+### 13-E.4 — `num_blocks` auto-tune (DEFERRED → 13-G)
+
+Tried setting `gpu_memory_utilization=0.85` as the default when the
+user didn't pass `--num-blocks` or `--gpu-memory-utilization`. On
+Qwen3-4B-AWQ / RTX 4060 the auto-tune produced 1760 blocks (vs 512
+legacy default) — and triggered a **27 × TTFT regression on c=1**
+(252 ms → 6800 ms at prompt_len=256), while decode tok/s held flat.
+The regression appears from the very first request, is independent
+of the non-fatal JIT-warmup OOM at batch=32, and is specific to
+prefill-at-large-cache.
+
+Hypothesis: either the AWQ-Marlin dequant+matmul scratch allocation
+path or the block-pool's free-list iteration is *O(num_blocks)* in
+a way the current code does not amortise.
+
+The auto-tune is reverted in this stage; `num_blocks` stays at the
+explicit user value, and operators wanting more concurrency pass
+`--gpu-memory-utilization` explicitly. Diagnosis tracked as
+**Stage 13-G**.
+
+### Where Stage 13-E leaves us
+
+- c=8 no longer crashes — preemption-on-OOM lands every request.
+- c=1 single-stream perf unchanged (42.5 tok/s, 252 ms TTFT).
+- c=4 per-request still capped by 13-F gemv-not-batched-over-M;
+  no 13-E lever closes it without architectural work.
+- Bench coverage policy (Stage 13-D.0) caught the 13-E.4 TTFT
+  regression on the very first benchmark run — the rule paid for
+  itself a third time.
