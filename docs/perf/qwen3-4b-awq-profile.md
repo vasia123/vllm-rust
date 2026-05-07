@@ -905,3 +905,57 @@ not GEMV-at-M=4. Closing the c=4 gap probably needs the same
 template-specialised variant chain *plus* something at M=16
 (currently routed to legacy kt, which hits the same per-m-loop
 weight re-read pattern). Both fall under Stage 13-F.
+
+---
+
+## Stage 13-F (real fix, single-line) — `AWQ_GEMV_M_THRESHOLD` 16 → 8
+
+### M-sweep microbench on full TGP
+
+| M | path | time |
+|--:|:--|--:|
+| 1 | gemv | 140 µs |
+| 4 | gemv | 552 µs (138 µs/M) |
+| 16 | gemv | **2.20 ms** (138 µs/M — flat per-M cost) |
+| 32 | dequant + GEMM | 1.44 ms |
+| 64 | dequant + GEMM | 1.45 ms |
+
+The gemv kernel scales **strictly linearly** in M (the per-M cost is
+138 µs regardless of where on the curve we sit), confirming the
+"weight column re-read M× from HBM" diagnosis from the Stage 13-F
+PoC. The dequant+matmul path's overhead is fixed at ~1.45 ms for
+M ≤ 512 (cuBLAS BF16 GEMM is overhead-bound, not throughput-bound,
+in this regime). The two cross at M ≈ 10.
+
+### Fix
+
+Lower `AWQ_GEMV_M_THRESHOLD` from 16 to 8 so M ∈ [9, 16] now routes
+through dequant+matmul. M ≤ 8 stays on the gemv path (where it's
+strictly faster).
+
+Microbench at M=16 after the fix: 2.20 ms → **1.46 ms** (33 %
+faster), correctness held by `test_awq_gemv_matches_cpu_reference_*`
++ `test_awq_marlin_dequant_matmul_matches_cpu_reference_m32`.
+
+### End-to-end (Qwen3-4B-AWQ, RTX 4060 Laptop, full TGP, multi_step=4)
+
+| concurrency | before c1 | after c1 | before c4 (req / agg) | after c4 | before c8 (req / agg) | after c8 |
+|:--|--:|--:|:--|:--|:--|:--|
+| tok/s | 43.2 | **43.4** | 13.7 / 55.0 | **14.4 / 57.5** | 6.9 / 55.4 | **7.5 / 60.4** |
+| Δ | +0.5 % | | **+5 % / +4.5 %** | | **+9 % / +9 %** | |
+
+Single-line change, no new kernel, no new dispatch logic — just
+moves the existing threshold to where the microbench says the
+crossover sits. The earlier "real Stage 13-F" plan (template-
+specialised kernel variants, dynamic 100 KiB shmem) remains valid
+for future M ≤ 8 wins; this commit captures the easy win on the
+M ∈ [9, 16] half of the curve.
+
+### Why this didn't ship in 13-D.4
+
+13-D.4 set the threshold at 16 because the awq_marlin_path_bench
+hadn't been run in the M = 9..15 region — only M ∈ {1, 4, 16, 32,
+…} was sampled. M=16's gemv cost was assumed similar to M=4
+(both still "small batch") but linear scaling in M makes M=16 a
+2.2 ms outlier. The full M-sweep above was only run during 13-F
+PoC investigation, which made the right threshold visible.

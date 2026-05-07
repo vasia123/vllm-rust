@@ -33,13 +33,21 @@ const AWQ_MARLIN_DEQUANT_PTX: &str = include_str!("../../kernels/awq_marlin_dequ
 
 /// Maximum M for which the dedicated GEMV path is active.
 ///
-/// At M ≤ 16 the AWQ GEMV kernel runs at memory bandwidth — each output
+/// At M ≤ 8 the AWQ GEMV kernel runs at memory bandwidth — each output
 /// column is one warp-level dot product over K, exactly the right shape
-/// for batch≤16 decode. Above this threshold the gemv would re-read every
-/// INT4 weight column M times from HBM (no shared-memory tiling across the
-/// M axis); the prefill path routes through `awq_marlin_dequant_matmul`
-/// instead, which dequants once and runs a real BF16 cuBLAS GEMM.
-pub const AWQ_GEMV_M_THRESHOLD: usize = 16;
+/// for batch≤8 decode. Above this threshold the gemv re-reads every
+/// INT4 weight column M times from HBM (no shared-memory tiling across
+/// the M axis), so per-M cost stays a flat ~138 µs and at M=16 the gemv
+/// path takes 2.20 ms — vs. the dequant+matmul path's ~1.45 ms fixed
+/// overhead which is independent of M up to ~M=512 (cuBLAS BF16 GEMM
+/// throughput-bound). Crossover sits at M ≈ 10 on RTX 4060 Laptop;
+/// rounding down to a power of two and accounting for the engine's
+/// `--multi-step-count` (= concurrency × multi_step at the GEMV layer),
+/// 8 is a safe threshold that keeps both single-stream decode and
+/// c≤4 × ms=4 batched decode on the faster of the two kernels. See
+/// Stage 13-F notes in `docs/perf/qwen3-4b-awq-profile.md` for the full
+/// microbench curve.
+pub const AWQ_GEMV_M_THRESHOLD: usize = 8;
 
 /// Marlin GEMM operation for INT4 quantized weights.
 struct MarlinGemmOp {
