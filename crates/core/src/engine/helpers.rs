@@ -718,6 +718,7 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
 ) -> Vec<(RequestId, String)> {
+    let mut preempted: Vec<RequestId> = Vec::new();
     execute_batched_decode_with_graph(
         decode_request_ids,
         model,
@@ -725,6 +726,7 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
         requests,
         None,
         None,
+        &mut preempted,
     )
 }
 
@@ -811,6 +813,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     requests: &mut HashMap<RequestId, ActiveRequest>,
     dispatcher: Option<&Arc<std::sync::RwLock<CudaGraphDispatcher>>>,
     graph_runner: Option<&Arc<CudaGraphRunner>>,
+    // `preempted_out`: IDs to push when KV-cache allocation fails at
+    // decode-step time. The caller (engine async loop) drains this and
+    // calls `Scheduler::move_to_waiting(id)` so the request gets
+    // re-admitted on the next compute_schedule pass instead of being
+    // errored out.
+    preempted_out: &mut Vec<RequestId>,
 ) -> Vec<(RequestId, String)> {
     let mut failed: Vec<(RequestId, String)> = Vec::new();
     let mut batch_ids: Vec<RequestId> = Vec::with_capacity(decode_request_ids.len());
@@ -832,7 +840,19 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     };
     let step_dev_ref = step_dev.as_ref();
 
-    // Step 1: Allocate blocks for each sequence
+    // Step 1: Allocate blocks for each sequence.
+    //
+    // Allocation can fail at decode-step time if the scheduler's free-block
+    // estimate drifted from the live cache state (e.g. the prefill in this
+    // same step consumed more blocks than estimated, or chunked prefill
+    // landed at a boundary we didn't account for). Instead of failing the
+    // request fatally we preempt it: free its existing KV blocks, fold any
+    // generated tokens back into the prompt, and reset for recompute. The
+    // engine's async loop calls `Scheduler::move_to_waiting(id)` so the
+    // request gets re-admitted on the next `compute_schedule` pass once
+    // free blocks become available again. See ADR / docs/perf for the
+    // recompute-vs-swap trade-off (we use recompute by default; sampler
+    // RNG state is preserved so the resumed stream stays coherent).
     let bucket_in = step_profile::bucket(decode_request_ids.len());
     step_profile::time_plain(step_dev_ref, &step_profile::ALLOC, bucket_in, || {
         for &req_id in decode_request_ids {
@@ -840,10 +860,40 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 failed.push((req_id, "request no longer active".to_string()));
                 continue;
             };
-            if let Err(e) = kv_cache_mgr.allocate_for_request(&mut req.state.block_table, 1) {
-                failed.push((req_id, format!("kv cache allocate_for_request: {e}")));
-            } else {
-                batch_ids.push(req_id);
+            match kv_cache_mgr.allocate_for_request(&mut req.state.block_table, 1) {
+                Ok(()) => batch_ids.push(req_id),
+                Err(e) => {
+                    tracing::warn!(
+                        request_id = req_id,
+                        error = %e,
+                        "kv cache exhausted at decode step — preempting request for recompute"
+                    );
+                    // Free whatever blocks the request currently holds.
+                    if let Err(free_err) = kv_cache_mgr.free_request(&mut req.state.block_table) {
+                        // Failing to free blocks is unrecoverable — the cache
+                        // accounting is now out of sync with reality. Surface
+                        // as a fatal error instead of leaking blocks silently.
+                        failed.push((req_id, format!("kv cache preempt-free failed: {free_err}")));
+                        continue;
+                    }
+                    // Fold generated tokens back into the prompt so that the
+                    // re-prefill produces the correct seqlen and recovers the
+                    // already-streamed context. The next compute_schedule
+                    // sees a Preempted/Waiting request whose prompt length
+                    // = original_prompt + tokens_generated_so_far, which is
+                    // what scheduler::compute_schedule's prefill admission
+                    // path expects.
+                    let state = &mut req.state;
+                    state
+                        .prompt_token_ids
+                        .append(&mut state.generated_token_ids);
+                    state.seqlen_offset = 0;
+                    state.num_computed_tokens = 0;
+                    state.token_logprobs.clear();
+                    state.top_logprobs.clear();
+                    state.status = RequestStatus::Preempted;
+                    preempted_out.push(req_id);
+                }
             }
         }
     });

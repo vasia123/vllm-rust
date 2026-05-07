@@ -52,6 +52,13 @@ pub(crate) struct OwnedExecutionState {
     /// Request IDs that errored during strategy execution and need deferred
     /// `scheduler.remove_request()` after the blocking task returns.
     pub errored_ids: Vec<RequestId>,
+    /// Request IDs that were preempted because the KV cache allocator
+    /// rejected a step-time allocation. The engine drains these in the
+    /// async loop and calls `Scheduler::move_to_waiting(id)` so the
+    /// request gets re-admitted on the next compute_schedule pass.
+    /// Different from `errored_ids` — the request is not failed, just
+    /// pushed back behind the queue and recompute-restarted.
+    pub preempted_ids: Vec<RequestId>,
 }
 
 impl OwnedExecutionState {
@@ -65,6 +72,7 @@ impl OwnedExecutionState {
             next_id: 0,
             cuda_graph_dispatcher,
             errored_ids: Vec::new(),
+            preempted_ids: Vec::new(),
         }
     }
 

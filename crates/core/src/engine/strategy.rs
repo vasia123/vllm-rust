@@ -20,9 +20,14 @@ use super::warmup::{WarmupConfig, WarmupStats};
 ///
 /// Returned by `execute_engine_step` so the async loop can perform
 /// deferred `scheduler.remove_request()` calls after reclaiming ownership.
+#[derive(Default)]
 pub(crate) struct StepResult {
     pub completed: Vec<RequestId>,
     pub errored: Vec<RequestId>,
+    /// Requests preempted by the engine because step-time KV allocation
+    /// failed. The async loop calls `Scheduler::move_to_waiting(id)` for
+    /// each so they get re-admitted on the next compute_schedule.
+    pub preempted: Vec<RequestId>,
 }
 
 /// Trait defining execution strategy for different inference modes.
@@ -120,10 +125,12 @@ fn execute_engine_step<S: ExecutionStrategy>(
 
     // Clear any stale errored IDs from a previous step
     state.errored_ids.clear();
+    state.preempted_ids.clear();
 
     let mut step_result = StepResult {
         completed: Vec::new(),
         errored: Vec::new(),
+        preempted: Vec::new(),
     };
 
     // Handle preemptions
@@ -261,8 +268,9 @@ fn execute_engine_step<S: ExecutionStrategy>(
         }
     }
 
-    // Drain errored IDs collected by strategy execution into the result
+    // Drain errored / preempted IDs collected by strategy execution.
     step_result.errored.append(&mut state.errored_ids);
+    step_result.preempted.append(&mut state.preempted_ids);
 
     step_result
 }
@@ -559,12 +567,24 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
                         }
                     }
 
-                    // Deferred scheduler removal: apply completions and errors
+                    // Deferred scheduler updates: completions / errors are
+                    // permanent removals; preemptions move the request back
+                    // to the waiting queue so the next compute_schedule
+                    // re-admits it once free blocks become available.
                     for req_id in step_result.completed {
                         scheduler.remove_request(req_id);
                     }
                     for req_id in step_result.errored {
                         scheduler.remove_request(req_id);
+                    }
+                    let had_preemption = !step_result.preempted.is_empty();
+                    for req_id in step_result.preempted {
+                        scheduler.move_to_waiting(req_id);
+                    }
+                    // Preemption changes the running set ⇒ any optimistic
+                    // pre-schedule we computed for N+1 is stale.
+                    if had_preemption {
+                        pending_decision = None;
                     }
 
                     break;
@@ -607,10 +627,7 @@ mod tests {
     use crate::scheduler::{PrefillSchedule, SchedulerOutput};
 
     fn empty_step_result() -> StepResult {
-        StepResult {
-            completed: Vec::new(),
-            errored: Vec::new(),
-        }
+        StepResult::default()
     }
 
     fn make_decision(
@@ -654,7 +671,7 @@ mod tests {
         let decision = make_decision(vec![1, 2, 3], vec![]);
         let result = StepResult {
             completed: vec![2],
-            errored: Vec::new(),
+            ..StepResult::default()
         };
 
         assert!(!is_optimistic_schedule_valid(&decision, &result, 0));
@@ -665,7 +682,7 @@ mod tests {
         let decision = make_decision(vec![], vec![(5, 128)]);
         let result = StepResult {
             completed: vec![5],
-            errored: Vec::new(),
+            ..StepResult::default()
         };
 
         assert!(!is_optimistic_schedule_valid(&decision, &result, 0));
@@ -675,8 +692,8 @@ mod tests {
     fn validation_rejects_when_scheduled_request_errored() {
         let decision = make_decision(vec![1, 2], vec![]);
         let result = StepResult {
-            completed: Vec::new(),
             errored: vec![1],
+            ..StepResult::default()
         };
 
         assert!(!is_optimistic_schedule_valid(&decision, &result, 0));
@@ -688,7 +705,7 @@ mod tests {
         let decision = make_decision(vec![1, 2], vec![(3, 64)]);
         let result = StepResult {
             completed: vec![99],
-            errored: Vec::new(),
+            ..StepResult::default()
         };
 
         assert!(is_optimistic_schedule_valid(&decision, &result, 0));
@@ -700,7 +717,7 @@ mod tests {
         let decision = make_decision(vec![], vec![]);
         let result = StepResult {
             completed: vec![1, 2, 3],
-            errored: Vec::new(),
+            ..StepResult::default()
         };
 
         assert!(is_optimistic_schedule_valid(&decision, &result, 0));

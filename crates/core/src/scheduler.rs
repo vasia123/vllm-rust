@@ -675,6 +675,25 @@ impl Scheduler {
     ///
     /// Moves preempted requests from running → waiting and newly admitted
     /// requests from waiting → running.
+    /// Move a currently-running request back to the waiting queue. Used
+    /// by the engine when KV-cache allocation fails *after* the schedule
+    /// has been applied (i.e. between `compute_schedule` admitting the
+    /// request and the decode loop trying to grow its block table). The
+    /// request keeps its original priority and arrival_time so it sorts
+    /// back into the same FCFS / priority slot it came from.
+    ///
+    /// Idempotent if `req_id` is not in the running set (the engine may
+    /// preempt a request that already finished concurrently).
+    pub fn move_to_waiting(&mut self, req_id: RequestId) {
+        if !self.running_set.remove(&req_id) {
+            return;
+        }
+        if let Some(meta) = self.request_metadata.get(&req_id) {
+            self.waiting_queue
+                .prepend(req_id, meta.priority, meta.arrival_time);
+        }
+    }
+
     pub fn apply_schedule(&mut self, decision: &ScheduleDecision) {
         // Move preempted requests back to waiting queue
         for &req_id in &decision.output.preempted_requests {

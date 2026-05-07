@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::kv_cache::{BlockTable, KVCacheManager};
-use crate::request::RequestStatus;
+use crate::request::{RequestId, RequestStatus};
 use crate::scheduler::SchedulerOutput;
 use crate::tokenizer::TokenizerWrapper;
 
@@ -388,6 +388,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                     break;
                 }
 
+                let mut step_preempted: Vec<RequestId> = Vec::new();
                 let failed = execute_batched_decode_with_graph(
                     &active_decode_ids,
                     &self.model,
@@ -395,6 +396,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                     &mut state.requests,
                     Some(&state.cuda_graph_dispatcher),
                     self.graph_runner.as_ref(),
+                    &mut step_preempted,
                 );
 
                 for (req_id, err_msg) in failed {
@@ -407,6 +409,16 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                         state.errored_ids.push(id);
                     }
                 }
+
+                // Preempted requests leave the active multi-step set this
+                // step; the engine async loop will re-admit them via
+                // `Scheduler::move_to_waiting` after the blocking task
+                // returns. Keeping them here would have the next
+                // multi-step iteration try to decode a Preempted state.
+                for req_id in &step_preempted {
+                    active_decode_ids.retain(|&id| id != *req_id);
+                }
+                state.preempted_ids.append(&mut step_preempted);
 
                 // Remove sequences that finished mid-step
                 active_decode_ids.retain(|&id| {
