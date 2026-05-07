@@ -402,3 +402,60 @@ Verification:
 - `scripts/test_qwen3_awq_correctness.sh`: 5/5 PASS.
 - `cargo clippy --features cuda -p vllm-core --lib --tests
   -- -D warnings`: clean.
+
+## Side-by-side: vllm-rust (this branch) vs Python vLLM 0.20.1
+
+Both servers ran on the same RTX 4060 Laptop (sm_89, 8 GiB VRAM,
+WSL2), same model `Qwen/Qwen3-4B-AWQ`, same `--max-model-len 6000`,
+same eager mode (`--enforce-eager` for both — disables CUDA-graph
+capture which is V3-blocked for us anyway).  Bench harness:
+`scripts/bench_decode.py` with `--prompt-len 256 --max-tokens 256
+--temperature 0`, runs 5 (c=1) / 3 (c=4) / 2 (c=8).
+
+| Backend       | c | TTFT (ms) | tok/s/req (med) | aggregate tok/s |
+| ------------- | - | --------- | ---------------- | --------------- |
+| **vllm-rust** | 1 |    4135.8 |             46.9 |            46.9 |
+| Python vLLM   | 1 |      46.6 |             48.2 |            48.2 |
+| **vllm-rust** | 4 |   16614.1 |             14.7 |            58.8 |
+| Python vLLM   | 4 |      53.7 |             47.8 |           191.3 |
+| Python vLLM   | 8 |      98.0 |             44.0 |           351.6 |
+| (vllm-rust c=8 OOMs the KV cache before completing 8 streams.)         |
+
+### Where we are competitive
+
+**Single-stream decode tok/s** — 46.9 vs 48.2 = **97% of Python vLLM**
+on the metric Stage 13-C optimised.  All five hardening commits
+(refactor, parity matrix, microbench, adaptive selector, e2e tests)
+together with the upstream Phase 2.A + 2.B.1 work close the gap to
+within run-to-run noise.
+
+### Where we are not
+
+1. **TTFT (prefill latency)**: vLLM 47 ms vs vllm-rust 4136 ms ≈ **88×**
+   slower.  Stage 13-C focused entirely on decode; prefill is still
+   dominated by AWQ→Marlin layout repack and CPU-side weight setup
+   work that has not been touched.  For interactive single-stream
+   workloads with short prompts this dominates the user-perceived
+   latency budget.
+
+2. **Concurrent batching scale**: at concurrency=4 vLLM holds
+   per-request throughput essentially flat (47.8 tok/s, 99% of c=1)
+   and lifts aggregate to 191 tok/s (3.97× scaling — near-linear).
+   vllm-rust at c=4 collapses per-request to 14.7 tok/s (-69%) and
+   lifts aggregate only to 58.8 tok/s (1.25× scaling).
+   At c=8 vLLM still scales near-linearly to 351 tok/s; vllm-rust
+   exhausts its KV cache before completing 8 concurrent streams.
+
+   Continuous batching, page-table-aware admission, and the V2
+   attention kernel's GQA-grouped block tiling are the things vLLM
+   does that we don't.  Each one is a substantial piece of work in
+   its own right; none is on the Stage 13-C path.
+
+### Read
+
+For the workload Stage 13-C explicitly targeted — single-stream
+batch-1 decode on Qwen3-4B-AWQ — we are within 3 % of the
+production-grade Python vLLM reference on the same hardware.  The
+two big remaining gaps (prefill latency, batched scaling) are
+orthogonal to decode kernel performance and would each be a Stage
+13-D / 13-E in their own right.

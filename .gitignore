@@ -9,6 +9,11 @@ scripts/__pycache__/
 # Local Python virtualenv for benchmark scripts.
 .venv/
 
+# Local Python virtualenv for the Python-vLLM side-by-side comparison
+# server. Separate from .venv/ so the lightweight client (httpx only)
+# isn't bloated with the ~5 GB of vLLM + torch + flashinfer wheels.
+.venv-vllm/
+
 # Vendored candle fork — populated by `scripts/setup-vendor-candle.sh`.
 # Kept out of the main repo to avoid committing ~1 GB of upstream candle
 # examples; the setup script reproduces the patched branch deterministically
