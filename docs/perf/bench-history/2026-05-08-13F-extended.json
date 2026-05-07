@@ -1,0 +1,74 @@
+[
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "12",
+    "mean_ns": 1462659.0913085938,
+    "std_dev_ns": 33.92386214780422
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "2048",
+    "mean_ns": 4014201.728515625,
+    "std_dev_ns": 127658.91762012469
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "512",
+    "mean_ns": 2629977.01171875,
+    "std_dev_ns": 710.6395529566163
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "1024",
+    "mean_ns": 4137345.0966796875,
+    "std_dev_ns": 1466.5850394226557
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "16",
+    "mean_ns": 1465090.341796875,
+    "std_dev_ns": 3.3256115802679815
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "4",
+    "mean_ns": 548242.3835449219,
+    "std_dev_ns": 5799.038991029105
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "32",
+    "mean_ns": 1442340.5087890625,
+    "std_dev_ns": 83.77972395921783
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "8",
+    "mean_ns": 1100339.654296875,
+    "std_dev_ns": 155.6601666162808
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "24",
+    "mean_ns": 1431434.1381835938,
+    "std_dev_ns": 12085.161306725318
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "256",
+    "mean_ns": 1879445.17578125,
+    "std_dev_ns": 69439.8249318955
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "64",
+    "mean_ns": 1447807.970703125,
+    "std_dev_ns": 15.520441419871917
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "1",
+    "mean_ns": 146785.0244140625,
+    "std_dev_ns": 908.6032113981414
+  }
+]
