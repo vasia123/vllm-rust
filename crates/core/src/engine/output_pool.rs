@@ -86,7 +86,26 @@ impl OutputPool {
             cursor: 0,
         });
 
+        // Bound per-shape growth.  In a single decode forward, the same
+        // shape is requested at most ~108× (q/k/v/o + gate/up/down across
+        // 36 layers, with q/o/down sharing one N).  A conservative cap
+        // of 512 absorbs any reasonable forward, but prevents unbounded
+        // accumulation when a caller forgets to invoke `reset_cursors`
+        // (e.g. prefill historically did not, leaking ~250 entries per
+        // request — see commit log for the post-Stage-12 OOM regression).
+        // When the cap is hit we fall back to a one-shot allocation; the
+        // caller still gets a usable tensor, the pool just doesn't grow.
+        const MAX_PER_SHAPE: usize = 512;
+
         if entry.cursor >= entry.buffers.len() {
+            if entry.buffers.len() >= MAX_PER_SHAPE {
+                // Fall through: allocate without retaining in the pool.
+                // The cursor is still incremented so subsequent `reserve`s
+                // in this forward see consistent growth semantics.
+                drop(inner);
+                let fresh = Tensor::zeros(shape, dtype, device)?;
+                return Ok(fresh);
+            }
             // Grow the pool. `Tensor::zeros` is the only candle entry
             // point that materialises a fresh CudaSlice without
             // intermediate copies.  This pays a one-shot cuMemAlloc per

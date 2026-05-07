@@ -595,29 +595,22 @@ impl MarlinLinear {
 
         let is_k_full = !self.config.desc_act || self.g_idx_sort_indices.is_none();
 
-        // Pool-backed fast path for AWQ INT4-ZP — by far the most common
-        // configuration on this branch (every Qwen3-AWQ linear hits it).
-        // The pooled kernel reserves the output tensor from a process-
-        // global buffer pool instead of `cuMemAlloc`-ing a fresh slice on
-        // every call; with 252 GEMV launches per decode token, the
-        // syscall amortisation is the dominant non-kernel cost the Stage
-        // 12 work targets.  Other Marlin scalar types fall through to
-        // the heap-allocating dispatcher below — they are dormant on
-        // this branch but kept callable for future reuse.
-        if matches!(self.config.scalar_type, MarlinScalarType::Uint4)
-            && self.qzeros.elem_count() > 0
-            && self.g_idx.is_none()
-        {
-            return marlin_cuda::marlin_gemm_pooled(
-                x,
-                &self.qweight,
-                &self.scales,
-                &self.qzeros,
-                self.bias.as_ref(),
-                self.in_features,
-                self.out_features,
-            );
-        }
+        // NOTE — Stage 12 wired a pool-backed AWQ-INT4-ZP fast path here
+        // (`marlin_cuda::marlin_gemm_pooled`).  It was originally motivated
+        // as infrastructure for CUDA Graph capture, but Stage 13-A
+        // classified the capture failure as V3 (cudarc auto-event isolation)
+        // — a blocker the pool can't address.  In sustained-load testing
+        // the pool also introduced an OOM regression: prefill forwards have
+        // varying M (= prompt token count), so each new prompt length adds
+        // ~250 unique-shape buffer slots that never get reclaimed.  Bounded
+        // pool growth and `reset_cursors()` calls on every forward
+        // mitigated but did not eliminate the leak.  The Stage 12 bench
+        // also showed ≤ 1.5 tok/s gain (within run-to-run noise) on the
+        // eager hot path.  Until capture is unblocked or the pool gains a
+        // proper LRU/size cap, the dispatcher routes through the plain
+        // `marlin_gemm` allocator path; the pool implementation
+        // (`marlin_gemm_pooled`, `OutputPool`) stays in tree as dormant
+        // infrastructure for the future.
 
         marlin_cuda::marlin_gemm(
             x,
