@@ -364,10 +364,11 @@ extern "C" __global__ void paged_attention_v1_f16_alibi(
 // Grid: (num_heads, num_seqs, max_num_partitions)
 // Block: (NUM_THREADS, 1, 1)
 
-// PARTITION_SIZE controls split-K granularity for V2.
-// Smaller partitions => more grid blocks => higher SM occupancy at batch=1.
-// Must stay in sync with `PARTITION_SIZE` constant in cuda_kernels.rs.
-#define PARTITION_SIZE 128
+// `partition_size` is supplied at launch time (see paged_attention_v2_cuda
+// in cuda_kernels.rs). Smaller partitions ⇒ more grid blocks ⇒ higher SM
+// occupancy at batch=1; larger partitions ⇒ fewer reduce_smem entries and
+// less tmp_out write traffic at long context. The dispatch in Rust picks
+// the value adaptively from `max_seq_len`.
 
 // V2 main kernel: compute attention for one partition of the sequence.
 template <typename T>
@@ -386,6 +387,7 @@ __device__ void paged_attention_v2_impl(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int partition_size,
     const int max_num_partitions,
     const float* __restrict__ alibi_slopes     // [num_heads] or nullptr
 ) {
@@ -398,9 +400,9 @@ __device__ void paged_attention_v2_impl(
     if (seq_len == 0) return;
 
     // Partition boundaries in token space
-    const int partition_start_token = partition_idx * PARTITION_SIZE;
+    const int partition_start_token = partition_idx * partition_size;
     if (partition_start_token >= seq_len) return;  // No work for this partition
-    const int partition_end_token = min(partition_start_token + PARTITION_SIZE, seq_len);
+    const int partition_end_token = min(partition_start_token + partition_size, seq_len);
     const int partition_num_tokens = partition_end_token - partition_start_token;
 
     // GQA: map query head to KV head
@@ -414,7 +416,7 @@ __device__ void paged_attention_v2_impl(
     // Shared memory layout:
     //   [0, head_dim)                    -- q vector (f32)
     //   [head_dim, head_dim+NUM_WARPS)   -- reduction workspace
-    //   [head_dim+NUM_WARPS, ...)        -- logits[PARTITION_SIZE] (f32)
+    //   [head_dim+NUM_WARPS, ...)        -- logits[partition_size] (f32)
     extern __shared__ float smem[];
     float* q_smem = smem;
     float* reduce_smem = smem + head_dim;
@@ -440,14 +442,17 @@ __device__ void paged_attention_v2_impl(
     // the legacy block-reduce design.
     //
     // Requires head_dim divisible by 32 (warp size).  All current LLM head
-    // dimensions (64, 96, 128, 192, 256) satisfy this.  If a future caller
-    // breaks that, drop into the legacy block-reduce path below.
+    // dimensions (64, 96, 128, 192, 256) satisfy this.  Upper bound 512
+    // comes from the unroll cap in the per-lane dim loop below
+    // (dims_per_thread = head_dim/32, hard-capped at 16).  If a future
+    // caller breaks any of those, the legacy block-reduce path below is
+    // safe for any head_dim.
     const int start_block_idx = partition_start_token / block_size;
     const int end_block_idx = (partition_end_token + block_size - 1) / block_size;
 
     float qk_max = -FLT_MAX;
 
-    if (head_dim % 32 == 0 && head_dim >= 32) {
+    if (head_dim % 32 == 0 && head_dim >= 32 && head_dim <= 512) {
         const int warp_id = tid / 32;
         const int lane_id = tid % 32;
         const int dims_per_thread = head_dim / 32;
@@ -617,6 +622,7 @@ __device__ void paged_attention_v2_reduce_impl(
     const int* __restrict__ seq_lens,       // [num_seqs]
     const int num_heads,
     const int head_dim,
+    const int partition_size,
     const int max_num_partitions
 ) {
     const int head_idx = blockIdx.x;
@@ -626,7 +632,7 @@ __device__ void paged_attention_v2_reduce_impl(
     const int seq_len = seq_lens[seq_idx];
     if (seq_len == 0) return;
 
-    const int num_partitions = (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+    const int num_partitions = (seq_len + partition_size - 1) / partition_size;
 
     // Fast path: single partition → just copy (convert f32 → output dtype)
     if (num_partitions == 1) {
@@ -754,11 +760,12 @@ extern "C" __global__ void paged_attention_v2_reduce_bf16(
     const int* __restrict__ seq_lens,
     const int num_heads,
     const int head_dim,
+    const int partition_size,
     const int max_num_partitions
 ) {
     paged_attention_v2_reduce_impl<__nv_bfloat16>(
         out, tmp_out, exp_sums, max_logits, seq_lens,
-        num_heads, head_dim, max_num_partitions
+        num_heads, head_dim, partition_size, max_num_partitions
     );
 }
 
@@ -771,11 +778,12 @@ extern "C" __global__ void paged_attention_v2_reduce_f16(
     const int* __restrict__ seq_lens,
     const int num_heads,
     const int head_dim,
+    const int partition_size,
     const int max_num_partitions
 ) {
     paged_attention_v2_reduce_impl<__half>(
         out, tmp_out, exp_sums, max_logits, seq_lens,
-        num_heads, head_dim, max_num_partitions
+        num_heads, head_dim, partition_size, max_num_partitions
     );
 }
 
@@ -795,13 +803,14 @@ extern "C" __global__ void paged_attention_v2_bf16(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int partition_size,
     const int max_num_partitions
 ) {
     paged_attention_v2_impl<__nv_bfloat16>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions,
         nullptr  // no ALiBi
     );
 }
@@ -822,6 +831,7 @@ extern "C" __global__ void paged_attention_v2_bf16_alibi(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int partition_size,
     const int max_num_partitions,
     const float* __restrict__ alibi_slopes     // [num_heads]
 ) {
@@ -829,7 +839,7 @@ extern "C" __global__ void paged_attention_v2_bf16_alibi(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions,
         alibi_slopes
     );
 }
@@ -850,13 +860,14 @@ extern "C" __global__ void paged_attention_v2_f16(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int partition_size,
     const int max_num_partitions
 ) {
     paged_attention_v2_impl<__half>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions,
         nullptr
     );
 }
@@ -876,6 +887,7 @@ extern "C" __global__ void paged_attention_v2_f16_alibi(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int partition_size,
     const int max_num_partitions,
     const float* __restrict__ alibi_slopes
 ) {
@@ -883,7 +895,7 @@ extern "C" __global__ void paged_attention_v2_f16_alibi(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions,
         alibi_slopes
     );
 }

@@ -348,13 +348,13 @@ pub fn paged_attention_cuda(
 // PagedAttention V2: Split-K for long sequences
 // ============================================================================
 
-/// Partition size for V2 split-K attention (must match PARTITION_SIZE in paged_attention.cu).
+/// Default V2 partition size used by `paged_attention_auto` for sequences
+/// in the medium-context band.  See `select_partition_size` for the
+/// adaptive policy that picks the actual value used at launch.
 ///
-/// Smaller partitions give more grid blocks per (q_head, seq) pair which
-/// improves SM occupancy at batch=1 decode. With PARTITION_SIZE=128 and
-/// seq_len≈480, the V2 grid is (num_heads, 1, 4) = 128 blocks for Qwen3-4B,
-/// vs 32 blocks under V1 — ~4× more parallelism.
-const PARTITION_SIZE: usize = 128;
+/// Kept as a module constant primarily for tests that want the same
+/// default the production dispatcher uses.
+pub const DEFAULT_V2_PARTITION_SIZE: usize = 128;
 
 /// Threshold: use V2 when max_seq_len exceeds this value.
 ///
@@ -364,6 +364,14 @@ const PARTITION_SIZE: usize = 128;
 /// sequences where the V2 reduce kernel's small launch overhead would
 /// noticeably show up.
 const V2_SEQ_LEN_THRESHOLD: usize = 64;
+
+/// Hard cap on `head_dim` for V2's warp-level K-pass (the
+/// `head_dim % 32 == 0 && head_dim <= 512` branch in
+/// `paged_attention_v2_impl`).  Above this the kernel automatically
+/// falls back to its legacy per-token block-reduce path, which is
+/// correct but ~5× slower.  We document it as a public constant so
+/// callers can warn or pick an alternative attention backend instead.
+pub const PAGED_ATTN_V2_WARP_KPATH_MAX_HEAD_DIM: usize = 512;
 
 /// Stage 1: compute partitioned attention outputs.
 struct PagedAttnV2Op {
@@ -384,6 +392,9 @@ struct PagedAttnV2Op {
     max_seq_len: usize,
     head_dim: usize,
     block_size: usize,
+    /// Tokens per V2 partition (Stage 1 grid Z dim = ⌈seq_len/partition_size⌉).
+    /// Picked at launch by the dispatcher; the kernel reads it as a runtime arg.
+    partition_size: usize,
     max_num_partitions: usize,
 }
 
@@ -482,9 +493,9 @@ impl PagedAttnV2Op {
         // Stage 1: partitioned attention kernel
         let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2, "paged_attention", PTX)?;
 
-        // Shared memory: q[head_dim] + reduce[NUM_WARPS] + logits[PARTITION_SIZE]
+        // Shared memory: q[head_dim] + reduce[NUM_WARPS] + logits[partition_size]
         let shared_mem_bytes =
-            ((head_dim + NUM_WARPS + PARTITION_SIZE) * std::mem::size_of::<f32>()) as u32;
+            ((head_dim + NUM_WARPS + self.partition_size) * std::mem::size_of::<f32>()) as u32;
 
         let v2_cfg = LaunchConfig {
             grid_dim: (
@@ -501,6 +512,7 @@ impl PagedAttnV2Op {
         let max_blocks_i32 = self.max_blocks_per_seq as i32;
         let head_dim_i32 = head_dim as i32;
         let block_size_i32 = self.block_size as i32;
+        let partition_size_i32 = self.partition_size as i32;
         let max_partitions_i32 = max_num_partitions as i32;
 
         {
@@ -519,6 +531,7 @@ impl PagedAttnV2Op {
             builder.arg(&max_blocks_i32);
             builder.arg(&head_dim_i32);
             builder.arg(&block_size_i32);
+            builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
 
             // SAFETY: kernel launch with validated parameters and contiguous buffers
@@ -549,6 +562,7 @@ impl PagedAttnV2Op {
             builder.arg(sl_slice);
             builder.arg(&num_heads_i32);
             builder.arg(&head_dim_i32);
+            builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
 
             // SAFETY: reduce kernel launch with validated partition outputs
@@ -572,12 +586,12 @@ impl PagedAttnV2Op {
 
 /// Fused PagedAttention v2 decode kernel for long sequences.
 ///
-/// Uses split-K partitioning: the sequence is divided into partitions of 512
-/// tokens, each processed by an independent thread block. A reduce kernel
-/// merges partitions using numerically stable log-sum-exp.
-///
-/// Preferred over V1 when `max_seq_len > 512` to avoid shared memory pressure
-/// and improve occupancy.
+/// Uses split-K partitioning: the sequence is divided into partitions of
+/// `DEFAULT_V2_PARTITION_SIZE` tokens, each processed by an independent
+/// thread block. A reduce kernel merges partitions using numerically
+/// stable log-sum-exp.  Use [`paged_attention_v2_cuda_with_partition_size`]
+/// to override the partition size (e.g. from a benchmark-driven adaptive
+/// selector).
 ///
 /// # Arguments
 /// Same as [`paged_attention_cuda`].
@@ -599,9 +613,51 @@ pub fn paged_attention_v2_cuda(
     head_dim: usize,
     block_size: usize,
 ) -> Result<Tensor> {
+    paged_attention_v2_cuda_with_partition_size(
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        max_seq_len,
+        head_dim,
+        block_size,
+        DEFAULT_V2_PARTITION_SIZE,
+    )
+}
+
+/// Same as [`paged_attention_v2_cuda`] but lets the caller pick the V2
+/// partition size.  Used by the adaptive selector and by the parity tests
+/// (which sweep the partition size to verify behaviour at boundaries).
+///
+/// `partition_size` must be > 0.  Anything <= 0 is rejected at the public
+/// boundary.  The kernel itself is correct for any positive value.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_v2_cuda_with_partition_size(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    partition_size: usize,
+) -> Result<Tensor> {
+    if partition_size == 0 {
+        candle_core::bail!("paged_attention_v2: partition_size must be > 0");
+    }
     let q = q.contiguous()?;
     let num_seqs = q.dim(0)?;
-    let max_num_partitions = max_seq_len.div_ceil(PARTITION_SIZE);
+    let max_num_partitions = max_seq_len.div_ceil(partition_size);
 
     let seq_lens_c = seq_lens.contiguous()?;
     debug_assert_seq_lens_within_bound(&seq_lens_c, max_seq_len)?;
@@ -618,6 +674,7 @@ pub fn paged_attention_v2_cuda(
         max_seq_len,
         head_dim,
         block_size,
+        partition_size,
         max_num_partitions,
     };
 
@@ -919,6 +976,8 @@ struct PagedAttnV2AlibiOp {
     max_seq_len: usize,
     head_dim: usize,
     block_size: usize,
+    /// Same role as in [`PagedAttnV2Op::partition_size`].
+    partition_size: usize,
     max_num_partitions: usize,
 }
 
@@ -1025,7 +1084,7 @@ impl PagedAttnV2AlibiOp {
         let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2_ALIBI, "paged_attention", PTX)?;
 
         let shared_mem_bytes =
-            ((head_dim + NUM_WARPS + PARTITION_SIZE) * std::mem::size_of::<f32>()) as u32;
+            ((head_dim + NUM_WARPS + self.partition_size) * std::mem::size_of::<f32>()) as u32;
 
         let v2_cfg = LaunchConfig {
             grid_dim: (
@@ -1042,6 +1101,7 @@ impl PagedAttnV2AlibiOp {
         let max_blocks_i32 = self.max_blocks_per_seq as i32;
         let head_dim_i32 = head_dim as i32;
         let block_size_i32 = self.block_size as i32;
+        let partition_size_i32 = self.partition_size as i32;
         let max_partitions_i32 = max_num_partitions as i32;
 
         {
@@ -1060,6 +1120,7 @@ impl PagedAttnV2AlibiOp {
             builder.arg(&max_blocks_i32);
             builder.arg(&head_dim_i32);
             builder.arg(&block_size_i32);
+            builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
             builder.arg(alibi_slice);
 
@@ -1090,6 +1151,7 @@ impl PagedAttnV2AlibiOp {
             builder.arg(sl_slice);
             builder.arg(&num_heads_i32);
             builder.arg(&head_dim_i32);
+            builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
 
             // SAFETY: reduce kernel launch
@@ -1133,7 +1195,8 @@ pub fn paged_attention_auto_alibi(
     if max_seq_len > V2_SEQ_LEN_THRESHOLD {
         let q = q.contiguous()?;
         let num_seqs = q.dim(0)?;
-        let max_num_partitions = max_seq_len.div_ceil(PARTITION_SIZE);
+        let partition_size = DEFAULT_V2_PARTITION_SIZE;
+        let max_num_partitions = max_seq_len.div_ceil(partition_size);
 
         let alibi_slopes = alibi_slopes
             .to_dtype(candle_core::DType::F32)?
@@ -1155,6 +1218,7 @@ pub fn paged_attention_auto_alibi(
             max_seq_len,
             head_dim,
             block_size,
+            partition_size,
             max_num_partitions,
         };
 
