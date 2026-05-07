@@ -103,3 +103,15 @@ harness = false
 name = "paged_attention_bench"
 harness = false
 required-features = ["cuda-kernels"]
+
+[[bench]]
+name = "scheduler_bench"
+harness = false
+
+[[bench]]
+name = "kv_alloc_bench"
+harness = false
+
+[[bench]]
+name = "sampling_pipeline_bench"
+harness = false
