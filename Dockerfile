@@ -50,6 +50,12 @@ RUN mkdir -p crates/core/src crates/server/src && \
 # Copy frontend dist from the Node stage (needed by RustEmbed at compile time)
 COPY --from=frontend /frontend/dist/ frontend/dist/
 
+# Vendor the pinned candle commit before any `cargo build`. The build
+# graph references `path = "vendor/candle/..."` from Cargo.toml, so the
+# tree must be populated before cargo can resolve the dependency.
+COPY scripts/setup-vendor-candle.sh scripts/setup-vendor-candle.sh
+RUN bash scripts/setup-vendor-candle.sh
+
 # Build dependencies (this layer will be cached)
 RUN cargo build --release -p vllm-server 2>/dev/null || true
 
