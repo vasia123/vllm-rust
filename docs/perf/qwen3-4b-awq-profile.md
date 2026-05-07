@@ -959,3 +959,74 @@ hadn't been run in the M = 9..15 region — only M ∈ {1, 4, 16, 32,
 (both still "small batch") but linear scaling in M makes M=16 a
 2.2 ms outlier. The full M-sweep above was only run during 13-F
 PoC investigation, which made the right threshold visible.
+
+---
+
+## Stage 13-I.1 — speculative-decode draft model selection
+
+### Compatibility audit (Qwen3-4B-AWQ target)
+
+Target config (`Qwen/Qwen3-4B-AWQ`):
+- `vocab_size = 151936`, `bos = 151643`, `eos = 151645`
+- `head_dim = 128`, `num_kv_heads = 8`
+- `rope_theta = 1_000_000`, `max_position = 40 960`
+- `tie_word_embeddings = true`, AWQ gemm 4-bit, group_size 128.
+
+For draft-model speculative decode (`DraftModelDraftProposer`) the
+binding contract is **token-vocab equivalence** — the verifier samples
+in the target's vocab, so the draft must produce token IDs the target
+can score. The `head_dim` / `kv_heads` of draft only have to match the
+*draft's own* KV cache dims (independent `KVCacheManager`), so they're
+informational here.
+
+### Candidates
+
+| candidate | weights | quant | vocab match | est. VRAM |
+|:--|:--|:--|:--:|--:|
+| `Qwen/Qwen3-0.6B` | BF16 | none | ✅ 151 936 | ~1.2 GiB |
+| `Orion-zhen/Qwen3-0.6B-AWQ` | INT4-AWQ | gemm/g128 | ✅ 151 936 | ~0.4 GiB |
+| `mundasuto/Qwen3-0.6B-AWQ` | INT4-AWQ | gemm/g128 | ✅ 151 936 | ~0.4 GiB |
+| N-Gram (no model) | — | — | n/a | 0 |
+
+All three Qwen3-0.6B configs match the target byte-identically on
+vocab, eos/bos, RoPE theta and max position — the same Qwen3 tokenizer
+ships across the family. AWQ community quants exist with the same
+gemm-flavour AWQ format as the target (`bits=4, group_size=128,
+zero_point=true, version="gemm"`), so they go through the exact same
+`from_config_with_quant` → `Qwen3QuantizedForCausalLM` path the target
+uses.
+
+### Memory budget on 8 GiB (RTX 4060 Laptop)
+
+Worst case stack at c=8, full-TGP:
+- target weights:   2.6 GiB
+- target KV (~1.9 GiB at 800 blocks × 16 toks × 36L × 8H × 128D × 4B)
+- draft weights:    0.4 GiB (AWQ) or 1.2 GiB (BF16)
+- draft KV (~1.4 GiB at 800 blocks × 16 toks × 28L × 8H × 128D × 4B)
+- activations + scratch: ~0.7 GiB
+
+That's 7.0 GiB (AWQ draft) or 7.8 GiB (BF16 draft) on an 8188 MiB card.
+**AWQ draft fits comfortably; BF16 draft is on the edge — likely needs
+draft `num_blocks` reduced.**
+
+### Architectural smell flagged for 13-I.4
+
+In `crates/server/src/main.rs:1825-1840` the draft `CacheConfig` hard-
+codes `block_size: 16` and reuses target `num_blocks` verbatim. The
+target's `block_size` is configurable; draft should inherit it (or at
+minimum match), not fix it at 16. Fix is lifted to substep 13-I.4 (the
+"wire defaults" pass) so it lands with the rest of the wire-up changes.
+
+### Decision
+
+Bench order (cheapest first, most-likely-to-succeed last):
+1. **N-Gram** — zero VRAM, zero-config; sets a "bad-draft" floor.
+2. **`Orion-zhen/Qwen3-0.6B-AWQ`** — primary candidate (best memory).
+3. **`Qwen/Qwen3-0.6B` BF16** — fallback if AWQ-0.6B quality is poor
+   (community quant — not rigorously evaluated by the publisher).
+
+Acceptance gate (per Stage 13-I plan): one of these must clear
+≥ +30 % per-req tok/s at c=1 *or* ≥ +50 % aggregate at c=8 on
+`scripts/bench_decode.py` to win the default-on slot. Otherwise we
+keep speculative as a manual flag and move on to Stage 13-J.
+
