@@ -36,6 +36,29 @@ vLLM source: `reference/vllm/`. Consult before implementing any component.
 - Comments: only "why", never "what"
 - Tests: unit tests in-module, integration tests in /tests
 
+## Bench Coverage
+
+Every change that touches a hot path **MUST** ship with a criterion bench
+in `crates/core/benches/` that measures it. A "hot path" is anything in
+the engine step (scheduler, KV alloc, attention, sampling), the
+forward path of any model, or any quantization/MoE/SSM kernel.
+
+- New optimisation → add the bench *first* (records baseline), then
+  the optimisation (records improvement). Without the before/after
+  pair the change cannot be reviewed honestly.
+- Refactor that touches a hot path → confirm the bench is unchanged
+  ≤ 2% by running `scripts/run_benches.sh --filter <bench> --label
+  pre/post` and diffing the JSON snapshots.
+- E2E behaviour (TTFT, batched throughput) → covered via
+  `scripts/bench_decode.py` and `scripts/bench_prefill.py` against a
+  running server. These are the user-visible regression guards.
+- Snapshots land in `docs/perf/bench-history/` as part of the same
+  commit as the perf-relevant change. Reviewers diff them.
+
+A perf change without a bench is not done. A 50% speedup that surfaced
+only via external comparison (e.g. Python vLLM) is a process failure —
+the bench should have caught it months earlier.
+
 ## Architecture Decisions
 
 Document in `/docs/adr/NNNN-title.md` when:
