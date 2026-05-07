@@ -57,6 +57,7 @@ fn build_moe_layer() -> MoELayer {
         num_experts: NUM_EXPERTS,
         top_k: TOP_K,
         renormalize: true,
+        scoring_func: ScoringFunc::Softmax,
         inplace: false,
         is_act_and_mul: true,
     };

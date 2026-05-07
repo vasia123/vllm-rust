@@ -17,7 +17,7 @@ use vllm_core::quantization::{
 
 /// Generate deterministic weight data of the given size, values in [-1, 1].
 fn make_weight_data(n: usize) -> Vec<f32> {
-    (0..n).map(|i| ((i as f32 * 0.017).sin())).collect()
+    (0..n).map(|i| (i as f32 * 0.017).sin()).collect()
 }
 
 /// Create and load an NF4 linear layer with quantized weights.

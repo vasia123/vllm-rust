@@ -18,14 +18,14 @@ use vllm_core::sampling::{log_softmax, sample, SamplerState, SamplingParams};
 /// Build a deterministic logits vector of the given size.
 fn make_logits(vocab_size: usize) -> Vec<f32> {
     (0..vocab_size)
-        .map(|i| ((i as f32 * 0.017).sin() * 5.0))
+        .map(|i| (i as f32 * 0.017).sin() * 5.0)
         .collect()
 }
 
 /// Build a 2-D logits tensor [batch_size, vocab_size] on CPU.
 fn make_logits_tensor(batch_size: usize, vocab_size: usize) -> Tensor {
     let data: Vec<f32> = (0..batch_size * vocab_size)
-        .map(|i| ((i as f32 * 0.013).sin() * 5.0))
+        .map(|i| (i as f32 * 0.013).sin() * 5.0)
         .collect();
     Tensor::from_vec(data, (batch_size, vocab_size), &Device::Cpu)
         .expect("failed to create logits tensor")
@@ -40,7 +40,7 @@ fn make_probs_tensor(batch_size: usize, vocab_size: usize) -> Tensor {
 /// Build a random-values tensor [batch_size] on CPU in [0, 1).
 fn make_rand_vals(batch_size: usize) -> Tensor {
     let data: Vec<f32> = (0..batch_size)
-        .map(|i| ((i as f32 * 0.7 + 0.1) % 1.0))
+        .map(|i| (i as f32 * 0.7 + 0.1) % 1.0)
         .collect();
     Tensor::from_vec(data, batch_size, &Device::Cpu).expect("failed to create rand_vals tensor")
 }
@@ -60,7 +60,7 @@ fn bench_sample_greedy(c: &mut Criterion) {
             &vocab_size,
             |b, _| {
                 let mut state = SamplerState::new(Some(42));
-                b.iter(|| sample(black_box(&logits), &params, &[], &mut state, None));
+                b.iter(|| sample(black_box(&logits), &params, &[], &mut state, None, &[]));
             },
         );
     }
@@ -83,7 +83,7 @@ fn bench_sample_top_k_top_p(c: &mut Criterion) {
             &vocab_size,
             |b, _| {
                 let mut state = SamplerState::new(Some(42));
-                b.iter(|| sample(black_box(&logits), &params, &[], &mut state, None));
+                b.iter(|| sample(black_box(&logits), &params, &[], &mut state, None, &[]));
             },
         );
     }
@@ -121,7 +121,7 @@ fn bench_sample_with_logprobs(c: &mut Criterion) {
             &vocab_size,
             |b, _| {
                 let mut state = SamplerState::new(Some(42));
-                b.iter(|| sample(black_box(&logits), &params, &[], &mut state, Some(5)));
+                b.iter(|| sample(black_box(&logits), &params, &[], &mut state, Some(5), &[]));
             },
         );
     }
