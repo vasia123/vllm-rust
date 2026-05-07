@@ -21,6 +21,157 @@ use super::types::{
 };
 use crate::lora::LoraContext;
 
+// ─── Engine-step profiler ────────────────────────────────────────────────────
+//
+// `VLLM_PROFILE_STEP=1` enables per-stage timing inside
+// `execute_batched_decode_with_graph` and dumps a μs/step breakdown via
+// `tracing::info!` once per `STEP_PROFILE_EVERY` steps, broken down by
+// batch_size so c=1 vs c=4 vs c=8 cohabit a single log without losing
+// resolution. Each timed block ends with a CUDA stream sync so the GPU
+// stages (forward, sampling) carry the actual kernel time, not the
+// launch latency.
+pub(crate) mod step_profile {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const STEP_PROFILE_EVERY: usize = 200;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var("VLLM_PROFILE_STEP").is_ok())
+    }
+
+    // 8 stages × 8 batch-bucket slots = 64 atomics. Bucket index =
+    // batch_size.next_power_of_two().trailing_zeros() clamped to 0..7,
+    // i.e. 1, 2, 4, 8, 16, 32, 64, ≥128.
+    pub const N_BUCKETS: usize = 8;
+
+    pub struct Stage {
+        pub ns: [AtomicU64; N_BUCKETS],
+        pub steps: [AtomicUsize; N_BUCKETS],
+    }
+
+    impl Stage {
+        // `[AtomicU64::new(0); N]` requires Copy (atomics intentionally
+        // don't implement it), and `clippy::declare-interior-mutable-const`
+        // forbids the const-then-array trick. Spell each slot out so the
+        // compiler emits one independent atomic per bucket — which is what
+        // we want anyway, since each bucket is bumped from a different
+        // batch_size cohort.
+        const fn new() -> Self {
+            Self {
+                ns: [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ],
+                steps: [
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                ],
+            }
+        }
+    }
+
+    pub static ALLOC: Stage = Stage::new();
+    pub static METADATA: Stage = Stage::new();
+    pub static SHARED: Stage = Stage::new();
+    pub static INPUT_TENSOR: Stage = Stage::new();
+    pub static FORWARD: Stage = Stage::new();
+    pub static SAMPLING: Stage = Stage::new();
+    pub static DISPATCH: Stage = Stage::new();
+    pub static TOTAL: Stage = Stage::new();
+
+    pub fn bucket(batch_size: usize) -> usize {
+        if batch_size == 0 {
+            return 0;
+        }
+        let idx = batch_size.next_power_of_two().trailing_zeros() as usize;
+        idx.min(N_BUCKETS - 1)
+    }
+
+    /// Untyped variant for closures that return a plain value (no Result).
+    pub fn time_plain<T>(
+        dev: Option<&candle_core::Device>,
+        stage: &Stage,
+        bucket_idx: usize,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        if !enabled() {
+            return f();
+        }
+        let t0 = Instant::now();
+        let out = f();
+        if let Some(candle_core::Device::Cuda(cd)) = dev {
+            let _ = cd.cuda_stream().synchronize();
+        }
+        stage.ns[bucket_idx].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        out
+    }
+
+    pub fn step_done(batch_size: usize, total_ns: u64) {
+        if !enabled() {
+            return;
+        }
+        let b = bucket(batch_size);
+        TOTAL.ns[b].fetch_add(total_ns, Ordering::Relaxed);
+        let n = TOTAL.steps[b].fetch_add(1, Ordering::Relaxed) + 1;
+        if !n.is_multiple_of(STEP_PROFILE_EVERY) {
+            return;
+        }
+        // Snapshot all stages for this bucket and reset.
+        let snap = |s: &Stage| (s.ns[b].swap(0, Ordering::Relaxed) as f64) / 1_000.0;
+        let s_a = snap(&ALLOC);
+        let s_m = snap(&METADATA);
+        let s_sh = snap(&SHARED);
+        let s_i = snap(&INPUT_TENSOR);
+        let s_f = snap(&FORWARD);
+        let s_s = snap(&SAMPLING);
+        let s_d = snap(&DISPATCH);
+        let s_t = (TOTAL.ns[b].swap(0, Ordering::Relaxed) as f64) / 1_000.0;
+        let _ = TOTAL.steps[b].swap(0, Ordering::Relaxed);
+        let n = STEP_PROFILE_EVERY as f64;
+        let bucket_label = match b {
+            0 => "≤1",
+            1 => "≤2",
+            2 => "≤4",
+            3 => "≤8",
+            4 => "≤16",
+            5 => "≤32",
+            6 => "≤64",
+            _ => "≥128",
+        };
+        tracing::info!(
+            target: "vllm_core::step_profile",
+            "decode step (bucket={bucket_label}, {STEP_PROFILE_EVERY} steps, μs/step): \
+             alloc={a:.1} metadata={m:.1} shared={sh:.1} input={i:.1} forward={f:.1} \
+             sampling={s:.1} dispatch={d:.1} | total={t:.1} sum={sum:.1}",
+            a = s_a / n,
+            m = s_m / n,
+            sh = s_sh / n,
+            i = s_i / n,
+            f = s_f / n,
+            s = s_s / n,
+            d = s_d / n,
+            t = s_t / n,
+            sum = (s_a + s_m + s_sh + s_i + s_f + s_s + s_d) / n,
+        );
+    }
+}
+
 /// Result of checking if generation should stop.
 pub(crate) struct FinishCheck {
     pub reason: FinishReason,
@@ -664,18 +815,38 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     let mut failed: Vec<(RequestId, String)> = Vec::new();
     let mut batch_ids: Vec<RequestId> = Vec::with_capacity(decode_request_ids.len());
 
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        tracing::info!(
+            target: "vllm_core::step_profile",
+            "execute_batched_decode_with_graph entry, profiler enabled={}",
+            step_profile::enabled()
+        );
+    });
+
+    let step_start = std::time::Instant::now();
+    let step_dev = if step_profile::enabled() {
+        Some(model.device().clone())
+    } else {
+        None
+    };
+    let step_dev_ref = step_dev.as_ref();
+
     // Step 1: Allocate blocks for each sequence
-    for &req_id in decode_request_ids {
-        let Some(req) = requests.get_mut(&req_id) else {
-            failed.push((req_id, "request no longer active".to_string()));
-            continue;
-        };
-        if let Err(e) = kv_cache_mgr.allocate_for_request(&mut req.state.block_table, 1) {
-            failed.push((req_id, format!("kv cache allocate_for_request: {e}")));
-        } else {
-            batch_ids.push(req_id);
+    let bucket_in = step_profile::bucket(decode_request_ids.len());
+    step_profile::time_plain(step_dev_ref, &step_profile::ALLOC, bucket_in, || {
+        for &req_id in decode_request_ids {
+            let Some(req) = requests.get_mut(&req_id) else {
+                failed.push((req_id, "request no longer active".to_string()));
+                continue;
+            };
+            if let Err(e) = kv_cache_mgr.allocate_for_request(&mut req.state.block_table, 1) {
+                failed.push((req_id, format!("kv cache allocate_for_request: {e}")));
+            } else {
+                batch_ids.push(req_id);
+            }
         }
-    }
+    });
 
     if batch_ids.is_empty() {
         return failed;
@@ -687,29 +858,34 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // Per-sequence adapter name (None = base model), in same order as token_ids/sequences
     let mut adapter_names: Vec<Option<String>> = Vec::with_capacity(batch_ids.len());
 
-    for &req_id in &batch_ids {
-        let Some(req) = requests.get(&req_id) else {
-            continue;
-        };
-        let Some(&last_token) = req.state.generated_token_ids.last() else {
-            continue;
-        };
-        let slot_mapping = req
-            .state
-            .block_table
-            .slot_mapping(req.state.seqlen_offset, 1);
-        token_ids.push(last_token);
-        sequences.push(DecodeSequenceMetadata {
-            request_id: req_id,
-            seqlen_offset: req.state.seqlen_offset,
-            block_ids: req.state.block_table.block_ids().to_vec(),
-            slot_mapping,
-        });
-        adapter_names.push(req.state.lora_request.as_ref().map(|lr| lr.name.clone()));
-    }
+    let bucket = step_profile::bucket(batch_ids.len());
+    step_profile::time_plain(step_dev_ref, &step_profile::METADATA, bucket, || {
+        for &req_id in &batch_ids {
+            let Some(req) = requests.get(&req_id) else {
+                continue;
+            };
+            let Some(&last_token) = req.state.generated_token_ids.last() else {
+                continue;
+            };
+            let slot_mapping = req
+                .state
+                .block_table
+                .slot_mapping(req.state.seqlen_offset, 1);
+            token_ids.push(last_token);
+            sequences.push(DecodeSequenceMetadata {
+                request_id: req_id,
+                seqlen_offset: req.state.seqlen_offset,
+                block_ids: req.state.block_table.block_ids().to_vec(),
+                slot_mapping,
+            });
+            adapter_names.push(req.state.lora_request.as_ref().map(|lr| lr.name.clone()));
+        }
+    });
 
     // Step 3: Batched forward pass with multi-adapter grouping
     let batch_size = batch_ids.len();
+    let bucket = step_profile::bucket(batch_size);
+    let t_forward_start = step_profile::enabled().then(std::time::Instant::now);
     let has_any_adapter = adapter_names.iter().any(|a| a.is_some());
 
     // Helper: tag every request in the current batch with the same
@@ -822,6 +998,19 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             }
         }
     };
+
+    // Stamp the forward stage. We sync the device once here so the elapsed
+    // time captures actual GPU work rather than just kernel launches.
+    if let (Some(t0), Some(dev)) = (t_forward_start, step_dev_ref) {
+        if let candle_core::Device::Cuda(cd) = dev {
+            let _ = cd.cuda_stream().synchronize();
+        }
+        step_profile::FORWARD.ns[bucket].fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let t_sampling_start = step_profile::enabled().then(std::time::Instant::now);
 
     // Step 4: Extract logits and sample per-sequence
     let seq_dim = logits.dims()[1];
@@ -987,6 +1176,18 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                     req.state.seqlen_offset += 1;
                     req.state.generated_token_ids.push(token_ids[i]);
                 }
+                if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
+                    if let candle_core::Device::Cuda(cd) = dev {
+                        let _ = cd.cuda_stream().synchronize();
+                    }
+                    step_profile::SAMPLING.ns[bucket].fetch_add(
+                        t0.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                if step_profile::enabled() {
+                    step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
+                }
                 return failed;
             }
             Err(e) => {
@@ -1069,6 +1270,19 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 }
             }
         }
+    }
+
+    if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
+        if let candle_core::Device::Cuda(cd) = dev {
+            let _ = cd.cuda_stream().synchronize();
+        }
+        step_profile::SAMPLING.ns[bucket].fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    if step_profile::enabled() {
+        step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
     }
 
     failed

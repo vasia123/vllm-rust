@@ -575,3 +575,66 @@ long-context boundary crossing and concurrent batches.
 Snapshot of the M-sweep saved to
 `docs/perf/bench-history/2026-05-07-13D4-after.json`; the next
 perf-touching commit on this codepath diffs against it.
+
+---
+
+## Stage 13-E.1 — c=4 step instrumentation (2026-05-07)
+
+`engine::helpers::step_profile` (env `VLLM_PROFILE_STEP=1`) breaks down
+each `execute_batched_decode_with_graph` invocation into alloc /
+metadata / forward / sampling / dispatch buckets and dumps μs/step
+every 200 steps, keyed by batch_size bucket so c=1 and c=4 traffic
+share one log without losing resolution.
+
+**Steady-state per-step budget (Qwen3-4B-AWQ, RTX 4060 Laptop, after
+13-D.4 prefill fix):**
+
+| stage | c=1 (≤1) | c=4 (≤4) | scaling |
+|:--|--:|--:|--:|
+| forward | 21.18 ms | **66.92 ms** | **3.16 ×** |
+| sampling | 2.33 ms | 3.00 ms | 1.29 × |
+| alloc | 11 µs | 19 µs | — |
+| metadata | 1.4 µs | 2.0 µs | — |
+| **total** | **23.53 ms** | **70.20 ms** | 2.98 × |
+
+Sampling already batches well (1.29 × scaling at c=4 — within noise of
+the GPU `gpu_sample_batch_with_diffs` path). The c=4 throughput cliff
+is **entirely in `forward`**: layer-by-layer breakdown via
+`VLLM_PROFILE_DECODE=1` confirms it's the AWQ INT4 linears (mlp 3.3 ×,
+qkv 2.8 ×, o_proj 2.7 ×) that scale near-linearly with M.
+
+### Why
+
+`awq_gemv_int4_kt_bf16` (the decode kernel under
+`AWQ_GEMV_M_THRESHOLD = 16`) tiles per (m, n) cell — every output row
+re-reads its INT4 weight column from HBM. At M = 1 this is the right
+shape. At M = 4 each weight column is read 4 ×, with no shared-memory
+amortisation. The result is the near-linear scaling above.
+
+Lowering `AWQ_GEMV_M_THRESHOLD` does not help: the dequant + cuBLAS
+GEMM path carries ~1.4 ms/linear of fixed overhead (one PTX dequant
+launch + one BF16 GEMM launch), which makes M ∈ [2, 16] strictly
+slower than the gemv path. The crossover sits around M = 16-32.
+
+### Decision
+
+**13-E.2 (batch the sampling loop) is removed from Stage 13-E**:
+the data shows sampling is not on the critical path. It already
+batches via `gpu_sample_batch_with_diffs`; the per-seq CPU fallback
+fires only when `gpu_eligible_strict` rejects (multiplicative
+penalties, beam, logprobs, FSM constraints) — none of which Stage 13-E
+targeted.
+
+The remaining concurrent-batching gap is the GEMV-vs-GEMM scaling
+limit, which is **architectural** — it needs either:
+
+- A real INT4 GEMM kernel that tile-tiles across M (true Marlin
+  tile-MMA, or a Triton port), or
+- A reduction of the dequant + cuBLAS-GEMM overhead so the 13-D.4
+  path can dispatch profitably from M ≈ 4 onward.
+
+Both are stage-sized work and tracked as **Stage 13-F**.
+
+The remaining 13-E.x substeps (13-E.3 KV preemption, 13-E.4 num_blocks
+auto-tune) close the OOM-on-c=8 ceiling and increase concurrent
+capacity — independent of the per-request scaling limit.
