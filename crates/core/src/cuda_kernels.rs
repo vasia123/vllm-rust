@@ -358,12 +358,37 @@ pub const DEFAULT_V2_PARTITION_SIZE: usize = 128;
 
 /// Threshold: use V2 when max_seq_len exceeds this value.
 ///
-/// At batch=1 V2's split-K parallelism beats V1's single-block-per-head
-/// design even for short sequences — the per-token `__syncthreads` count
-/// inside V1 dominates the kernel runtime. V1 is kept only for very short
-/// sequences where the V2 reduce kernel's small launch overhead would
-/// noticeably show up.
-const V2_SEQ_LEN_THRESHOLD: usize = 64;
+/// `paged_attention_bench` (commit aca4b69) measured V1 losing to V2 at
+/// every sequence length on RTX 4060 Laptop, including seq_len = 64
+/// (V1 = 56.7 µs vs V2 p=64 = 54.0 µs).  V1 also has a hard ceiling
+/// around seq_len ≈ 12k where its `logits[max_seq_len]` shared-memory
+/// allocation overflows the per-block 100 KB Ada limit, so very long
+/// contexts have no choice but V2 anyway.  Set the threshold to 0 to
+/// always pick V2.
+const V2_SEQ_LEN_THRESHOLD: usize = 0;
+
+/// Pick the V2 partition size for a given `max_seq_len`.
+///
+/// Empirically derived in `crates/core/benches/paged_attention_bench.rs`
+/// (commit aca4b69) on Qwen3-4B-AWQ shape (num_q_heads=32, num_kv_heads=8,
+/// head_dim=128, block_size=16, batch=1) on RTX 4060 Laptop, sm_89:
+///
+///   seq_len ≤ 4096  → p=64  wins or ties on every measured point.
+///   seq_len > 4096  → p=256 wins (smaller p inflates partition count
+///                     and reduce-kernel overhead; larger p loses
+///                     occupancy below 8k tokens).
+///
+/// The same shape on different SM counts may want a different boundary
+/// (an Ada full-fat 4090 has 128 SMs vs the Laptop's 24 — the optimum
+/// p shifts accordingly).  Re-run the microbench on the target box and
+/// adjust if you see a regression.
+pub fn select_v2_partition_size(max_seq_len: usize) -> usize {
+    if max_seq_len <= 4096 {
+        64
+    } else {
+        256
+    }
+}
 
 /// Hard cap on `head_dim` for V2's warp-level K-pass (the
 /// `head_dim % 32 == 0 && head_dim <= 512` branch in
@@ -705,7 +730,7 @@ pub fn paged_attention_auto(
     block_size: usize,
 ) -> Result<Tensor> {
     if max_seq_len > V2_SEQ_LEN_THRESHOLD {
-        paged_attention_v2_cuda(
+        paged_attention_v2_cuda_with_partition_size(
             q,
             k_cache,
             v_cache,
@@ -718,6 +743,7 @@ pub fn paged_attention_auto(
             max_seq_len,
             head_dim,
             block_size,
+            select_v2_partition_size(max_seq_len),
         )
     } else {
         paged_attention_cuda(

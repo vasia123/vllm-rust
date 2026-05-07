@@ -350,3 +350,55 @@ Findings:
 These numbers feed Step 4: the adaptive selector picks p=64 below
 4096 and p=256 above.  The threshold `V2_SEQ_LEN_THRESHOLD` is
 dropped to 0 (always V2) since V1 wins nothing.
+
+## Phase 2 hardening — Step 4: adaptive partition_size selector
+
+`select_v2_partition_size(max_seq_len)` (new public function in
+`crates/core/src/cuda_kernels.rs`) returns the partition size derived
+from the Step 3 microbench:
+
+```
+seq_len ≤ 4096  → p = 64    (more grid blocks, ~5-15 % faster
+                              than p=128 in the Qwen3-4B hot range)
+seq_len > 4096  → p = 256   (fewer reduce-kernel partitions,
+                              less tmp_out write traffic at long ctx)
+```
+
+`paged_attention_auto` now routes through
+`paged_attention_v2_cuda_with_partition_size` with this value, and
+`V2_SEQ_LEN_THRESHOLD` drops from 64 to 0 (always V2 — V1 lost on
+every measured point and has the long-context shared-memory ceiling
+besides).
+
+End-to-end bench (`concurrency=1 max_tokens=256 prompt_len=256
+temperature=0 runs=5`):
+
+| Build                                  | tok/s steady |
+| -------------------------------------- | ------------ |
+| baseline (post Stage 12 disable)       | 33.9         |
+| Phase 2.A (PARTITION_SIZE=128)         | 42.7         |
+| Phase 2.B.1 (warp-level K-pass)        | 46.5         |
+| **Step 4 (adaptive p=64 for ≤4096)**   | **47.1**     |
+
+The +1.3 % over 2.B.1 matches the back-of-envelope prediction:
+paged_attn was already 11.4 % of per-layer time after 2.B.1, so the
+selector's ~10 % paged_attn improvement caps end-to-end at ~1.1 %
+wall-clock.  47.1 / 50 ≈ 94 % of the Stage 13-C target.
+
+Why this number is small but worth landing:
+- It is the data-driven choice, not a guess.  Anyone re-tuning the
+  kernel (different SM count, different head_dim, future kernel
+  rewrites) re-runs the microbench and updates the selector with
+  real numbers, not vibe.
+- Long-context performance moves with this change too: at seq=8192
+  the p=256 selection is ~6 % faster than the previous p=128
+  default (307 vs 325 µs), which matters for any future workload
+  with longer prompts than Qwen3 typical.
+
+Verification:
+- `cargo test --features cuda-default -p vllm-core --lib`: 4493 pass.
+- `cargo test --features "cuda-default gpu-test-medium" -p vllm-core
+  --lib paged`: 6/6 pass (V1↔V2 parity matrix from Step 2).
+- `scripts/test_qwen3_awq_correctness.sh`: 5/5 PASS.
+- `cargo clippy --features cuda -p vllm-core --lib --tests
+  -- -D warnings`: clean.
