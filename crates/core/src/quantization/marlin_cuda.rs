@@ -339,6 +339,21 @@ impl MarlinGemmOp {
         let use_split_k8 = packed_k.is_multiple_of(SPLIT8_K_THREADS as usize) && packed_k >= 16;
         let use_split_k4 = packed_k.is_multiple_of(SPLIT_K_THREADS as usize) && packed_k >= 8;
 
+        // 13-F template-specialised kt_mloop kernels: one weight read
+        // serves all M input rows. Two compile-time variants (M_FIXED=4
+        // and M_FIXED=8) avoid the predicated-NOP cost of a single
+        // M_MAX-unrolled kernel — the original PoC regressed at M=4
+        // exactly because of those NOPs (see Stage 13-F PoC notes).
+        // Dispatch each runtime M to the closest variant whose shared
+        // memory budget (M_FIXED × K × 2 bytes) fits the static 47 KiB
+        // per-block cap; otherwise fall through to the legacy kt
+        // m-loop.
+        const KT_MLOOP_SHMEM_CAP: usize = 47 * 1024;
+        let use_split_kt_mloop_m4 =
+            use_split_kt && self.m == 4 && (4 * self.k * 2) <= KT_MLOOP_SHMEM_CAP;
+        let use_split_kt_mloop_m8 =
+            use_split_kt && self.m == 8 && (8 * self.k * 2) <= KT_MLOOP_SHMEM_CAP;
+
         // One-shot confirmation that the decode path is actually live.
         // Helps diagnose whether wall-clock degradation is in the kernel
         // itself or somewhere upstream.
@@ -351,7 +366,11 @@ impl MarlinGemmOp {
                 self.n,
                 self.k,
                 self.num_groups,
-                if use_split_kt {
+                if use_split_kt_mloop_m8 {
+                    "kt_mloop_m8 (template-specialised, weight reuse over M=8)"
+                } else if use_split_kt_mloop_m4 {
+                    "kt_mloop_m4 (template-specialised, weight reuse over M=4)"
+                } else if use_split_kt {
                     "split_kt (vec4 LDG, transposed qweight)"
                 } else if use_split_k8 {
                     "split_k8"
@@ -376,7 +395,11 @@ impl MarlinGemmOp {
         let elem_count = self.m * self.n;
         let output = unsafe { dev.alloc::<half::bf16>(elem_count) }?;
 
-        let kernel_name = if use_split_kt {
+        let kernel_name = if use_split_kt_mloop_m8 {
+            "awq_gemv_int4_kt_mloop_m8_bf16"
+        } else if use_split_kt_mloop_m4 {
+            "awq_gemv_int4_kt_mloop_m4_bf16"
+        } else if use_split_kt {
             "awq_gemv_int4_kt_bf16"
         } else if use_split_k8 {
             "awq_gemv_int4_split_k8_bf16"
@@ -469,8 +492,17 @@ impl MarlinGemmOp {
         let has_bias_i32: i32 = i32::from(self.bias.is_some());
 
         let grid_x: u32 = (self.n as u32) / N_TILE;
-        // One BF16 input row cached in shared memory.
-        let smem_bytes: u32 = (self.k as u32) * 2;
+        // Shared memory: legacy kernels cache one BF16 input row at a
+        // time (K × 2 bytes). The kt_mloop variants cache all M_FIXED
+        // rows up-front (M_FIXED × K × 2). Dispatch already gated this
+        // on the static 47 KiB cap.
+        let smem_bytes: u32 = if use_split_kt_mloop_m8 {
+            (8 * self.k as u32) * 2
+        } else if use_split_kt_mloop_m4 {
+            (4 * self.k as u32) * 2
+        } else {
+            (self.k as u32) * 2
+        };
         let block_threads = if use_split_kt {
             SPLIT_KT_BLOCK_THREADS
         } else if use_split_k8 {

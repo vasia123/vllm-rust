@@ -350,6 +350,180 @@ extern "C" __global__ void awq_gemv_int4_split_k8_bf16(
 #define SPLIT_KT_THREADS 8
 #define SPLIT_KT_BLOCK_THREADS (N_TILE * SPLIT_KT_THREADS)  // 256
 
+// ─── kt_mloop variants for c=2..8 batched decode ──────────────────────────────
+//
+// Reverse-loop counterpart to `awq_gemv_int4_kt_bf16`: instead of looping
+// `for m in 0..M` (re-reading every weight column M× from HBM in the
+// process), cache all M input rows in shared memory once, walk K in vec4
+// chunks, and accumulate `M` partial dot products per thread in registers.
+// The weight stream is read **exactly once** per (block, K).
+//
+// First PoC (single kernel with M_MAX=8 unrolled, runtime guard) regressed
+// at M=4 because the unrolled FMAs at indices [4..8] still issue (Ada
+// SIMT) and predicated NOPs cost more than the saved HBM reads recover.
+// Fix: hand-instantiate the same body twice — once with M_MAX=4 and once
+// with M_MAX=8 — and dispatch picks whichever is closer to the runtime M.
+// At M=4 the M_MAX=4 variant has no predicated waste; at M=8 the M_MAX=8
+// variant matches the legacy compute exactly while reading 8× less HBM.
+//
+// Shared-memory budget: M × K × 2 ≤ 47 KiB (static per-block cap on
+// sm_8x). The dispatcher gates on this so MLP.down at K=9728 falls
+// back to the legacy m-loop kernel.
+//
+// Numerics: FP32 accumulation, BF16 output — bit-equivalent (modulo
+// reduction order) to the legacy kernel; validated by
+// `test_awq_gemv_matches_cpu_reference_*`.
+
+template <int M_FIXED>
+__device__ __forceinline__ void kt_mloop_body(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned int* __restrict__ qweight_kt,
+    const __nv_bfloat16* __restrict__ scales,
+    const unsigned int* __restrict__ qzeros,
+    const __nv_bfloat16* __restrict__ bias,
+    int N,
+    int K,
+    int group_size,
+    int has_zp,
+    int has_bias
+) {
+    const int tid     = threadIdx.x;
+    const int col_idx = tid / SPLIT_KT_THREADS;     // 0..31 → output column
+    const int k_chunk = tid % SPLIT_KT_THREADS;     // 0..7  → K-range
+    const int n       = blockIdx.x * N_TILE + col_idx;
+
+    extern __shared__ __nv_bfloat16 input_sh_all[];
+
+    const int packed_k     = K / 8;
+    const int packed_n     = N / 8;
+    const int kp_per_chunk = packed_k / SPLIT_KT_THREADS;
+    const int kp_start     = k_chunk * kp_per_chunk;
+
+    // Stage every M row of `input` into shared memory exactly once,
+    // **interleaved across M** so each (k, m_block) lane occupies a
+    // distinct shared-memory bank. The natural [m, k] layout makes
+    // every load with the same `k` and varying `m` hit the same bank
+    // (stride K bytes → wraps to bank 0 on every k for K ≥ 32 floats),
+    // serialising the M threads on the inner FMA. Using [k, m]
+    // (i.e. `input_sh_all[k * M_FIXED + m]`) puts adjacent m values
+    // in adjacent banks; the warp's broadcast of `wvals[i]` across
+    // M lanes then reads M conflict-free.
+    #pragma unroll
+    for (int m = 0; m < M_FIXED; ++m) {
+        for (int k = tid; k < K; k += SPLIT_KT_BLOCK_THREADS) {
+            input_sh_all[k * M_FIXED + m] = input[m * K + k];
+        }
+    }
+    __syncthreads();
+
+    // Per-thread accumulator. Compile-time M means no predicated NOPs.
+    float acc[M_FIXED];
+    #pragma unroll
+    for (int m = 0; m < M_FIXED; ++m) acc[m] = 0.0f;
+
+    if (n < N) {
+        int   cached_group = -1;
+        float cached_scale = 0.0f;
+        float cached_zp    = 8.0f;
+
+        const uint4* __restrict__ qw_base =
+            reinterpret_cast<const uint4*>(qweight_kt + (size_t)n * packed_k + kp_start);
+
+        const int vec_iters = kp_per_chunk / 4;
+        #pragma unroll 1
+        for (int v = 0; v < vec_iters; ++v) {
+            const uint4 packed4 = qw_base[v];
+            const unsigned int ws[4] = {packed4.x, packed4.y, packed4.z, packed4.w};
+
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int kp       = kp_start + v * 4 + j;
+                const int k_base   = kp * 8;
+                const int group_id = k_base / group_size;
+
+                if (group_id != cached_group) {
+                    cached_scale = __bfloat162float(scales[group_id * N + n]);
+                    if (has_zp) {
+                        const int zp_pack_col = n >> 3;
+                        const int zp_bit      = (n & 7) << 2;
+                        const unsigned int zw =
+                            qzeros[group_id * packed_n + zp_pack_col];
+                        cached_zp = (float)((zw >> zp_bit) & 0xFu);
+                    }
+                    cached_group = group_id;
+                }
+
+                float wvals[8];
+                const unsigned int w = ws[j];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int nib = (int)((w >> (i * 4)) & 0xFu);
+                    wvals[i] = ((float)nib - cached_zp) * cached_scale;
+                }
+
+                // No runtime predicate — every iteration is real work.
+                // Read order matches the [k, m] shmem layout described
+                // above: outer i (per-K position), inner m (across rows).
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float wv = wvals[i];
+                    #pragma unroll
+                    for (int m = 0; m < M_FIXED; ++m) {
+                        acc[m] += __bfloat162float(
+                            input_sh_all[(k_base + i) * M_FIXED + m]
+                        ) * wv;
+                    }
+                }
+            }
+        }
+    }
+
+    unsigned mask = 0xFFFFFFFFu;
+    #pragma unroll
+    for (int m = 0; m < M_FIXED; ++m) {
+        float a = acc[m];
+        a += __shfl_xor_sync(mask, a, 1);
+        a += __shfl_xor_sync(mask, a, 2);
+        a += __shfl_xor_sync(mask, a, 4);
+        if (k_chunk == 0 && n < N) {
+            float out_val = a;
+            if (has_bias) {
+                out_val += __bfloat162float(bias[n]);
+            }
+            output[m * N + n] = __float2bfloat16(out_val);
+        }
+    }
+}
+
+extern "C" __global__ void awq_gemv_int4_kt_mloop_m4_bf16(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned int* __restrict__ qweight_kt,
+    const __nv_bfloat16* __restrict__ scales,
+    const unsigned int* __restrict__ qzeros,
+    const __nv_bfloat16* __restrict__ bias,
+    int M, int N, int K, int group_size, int has_zp, int has_bias
+) {
+    (void)M;  // M_FIXED = 4; runtime M is required to equal 4 by dispatcher.
+    kt_mloop_body<4>(output, input, qweight_kt, scales, qzeros, bias,
+                     N, K, group_size, has_zp, has_bias);
+}
+
+extern "C" __global__ void awq_gemv_int4_kt_mloop_m8_bf16(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const unsigned int* __restrict__ qweight_kt,
+    const __nv_bfloat16* __restrict__ scales,
+    const unsigned int* __restrict__ qzeros,
+    const __nv_bfloat16* __restrict__ bias,
+    int M, int N, int K, int group_size, int has_zp, int has_bias
+) {
+    (void)M;  // M_FIXED = 8; runtime M is required to equal 8 by dispatcher.
+    kt_mloop_body<8>(output, input, qweight_kt, scales, qzeros, bias,
+                     N, K, group_size, has_zp, has_bias);
+}
+
 extern "C" __global__ void awq_gemv_int4_kt_bf16(
     __nv_bfloat16* __restrict__ output,         // [M, N]
     const __nv_bfloat16* __restrict__ input,    // [M, K]
