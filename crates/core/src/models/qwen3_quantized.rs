@@ -113,6 +113,136 @@ mod decode_profile {
     }
 }
 
+// ─── Prefill-path profiler ───────────────────────────────────────────────────
+//
+// Symmetric counterpart to `decode_profile`. Activated via env
+// `VLLM_PROFILE_PREFILL=1`. Each component slot accumulates ns across all
+// `num_hidden_layers` layer-calls of a single prefill forward, and the
+// per-pass top-level slots (embedding, causal_mask, final_norm, lm_head) are
+// added once. `dump_prefill()` is called at the end of each prefill forward
+// — prefills are rare, so per-call output is more useful than averaging.
+//
+// Naming: PA_NS includes the cache-write that `paged_attention()` performs
+// internally; we don't split it because the prefill path does not have a
+// separate `cache_engine.write_batch()` call (unlike the decode wrapper).
+
+#[cfg(feature = "cuda")]
+mod prefill_profile {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var("VLLM_PROFILE_PREFILL").is_ok())
+    }
+
+    pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MASK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static IN_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QKV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QK_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROPE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PA_NS: AtomicU64 = AtomicU64::new(0);
+    pub static O_PROJ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MLP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FINAL_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LAYERS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn time<T>(
+        dev: &candle_core::Device,
+        slot: &AtomicU64,
+        f: impl FnOnce() -> candle_core::Result<T>,
+    ) -> candle_core::Result<T> {
+        if !enabled() {
+            return f();
+        }
+        let t0 = Instant::now();
+        let out = f()?;
+        if let candle_core::Device::Cuda(cd) = dev {
+            cd.cuda_stream()
+                .synchronize()
+                .map_err(|e| candle_core::Error::Msg(format!("prefill profile sync: {e}")))?;
+        }
+        slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    pub fn bump_layer() {
+        if enabled() {
+            LAYERS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump_prefill(seq_len: usize) {
+        if !enabled() {
+            return;
+        }
+        let snap = |a: &AtomicU64| (a.swap(0, Ordering::Relaxed) as f64) / 1_000.0;
+        let s_emb = snap(&EMBED_NS);
+        let s_mask = snap(&MASK_NS);
+        let s_in = snap(&IN_NORM_NS);
+        let s_qkv = snap(&QKV_NS);
+        let s_qkn = snap(&QK_NORM_NS);
+        let s_rope = snap(&ROPE_NS);
+        let s_pa = snap(&PA_NS);
+        let s_op = snap(&O_PROJ_NS);
+        let s_pn = snap(&POST_NORM_NS);
+        let s_mlp = snap(&MLP_NS);
+        let s_fn = snap(&FINAL_NORM_NS);
+        let s_lm = snap(&LM_HEAD_NS);
+        let l = LAYERS.swap(0, Ordering::Relaxed).max(1);
+        let layered = s_in + s_qkv + s_qkn + s_rope + s_pa + s_op + s_pn + s_mlp;
+        let total = s_emb + s_mask + layered + s_fn + s_lm;
+        tracing::info!(
+            target: "vllm_core::prefill_profile",
+            "prefill breakdown (seq_len={}, layers={}, μs total): embed={:.1} mask={:.1} \
+             in_norm={:.1} qkv={:.1} qk_norm={:.1} rope={:.1} paged_attn={:.1} \
+             o_proj={:.1} post_norm={:.1} mlp={:.1} final_norm={:.1} lm_head={:.1} | sum={:.1}",
+            seq_len, l,
+            s_emb, s_mask,
+            s_in, s_qkv, s_qkn, s_rope, s_pa, s_op, s_pn, s_mlp,
+            s_fn, s_lm, total,
+        );
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(dead_code)]
+mod prefill_profile {
+    use std::sync::atomic::AtomicU64;
+
+    pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MASK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static IN_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QKV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static QK_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ROPE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PA_NS: AtomicU64 = AtomicU64::new(0);
+    pub static O_PROJ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MLP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FINAL_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    pub fn time<T>(
+        _dev: &candle_core::Device,
+        _slot: &AtomicU64,
+        f: impl FnOnce() -> candle_core::Result<T>,
+    ) -> candle_core::Result<T> {
+        f()
+    }
+
+    #[inline(always)]
+    pub fn bump_layer() {}
+    #[inline(always)]
+    pub fn dump_prefill(_seq_len: usize) {}
+}
+
 #[cfg(not(feature = "cuda"))]
 #[allow(dead_code)]
 mod decode_profile {
@@ -279,10 +409,14 @@ impl QuantizedQwen3Attention {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
+        let dev = xs.device();
 
-        let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
+        let (q, k, v) = prefill_profile::time(dev, &prefill_profile::QKV_NS, || {
+            let q = self.q_proj.forward(xs)?;
+            let k = self.k_proj.forward(xs)?;
+            let v = self.v_proj.forward(xs)?;
+            Ok((q, k, v))
+        })?;
 
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -295,26 +429,35 @@ impl QuantizedQwen3Attention {
             .transpose(1, 2)?;
 
         // Qwen3-specific: per-head RMSNorm on Q and K
-        let q = apply_per_head_norm(&q, &self.q_norm)?;
-        let k = apply_per_head_norm(&k, &self.k_norm)?;
+        let (q, k) = prefill_profile::time(dev, &prefill_profile::QK_NORM_NS, || {
+            let q = apply_per_head_norm(&q, &self.q_norm)?;
+            let k = apply_per_head_norm(&k, &self.k_norm)?;
+            Ok((q, k))
+        })?;
 
-        let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
+        let (q, k) = prefill_profile::time(dev, &prefill_profile::ROPE_NS, || {
+            self.rotary_emb.apply(&q, &k, seqlen_offset)
+        })?;
 
-        let attn_output = paged_attention(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            seqlen_offset,
-            cache_engine,
-            block_table.block_ids(),
-            slot_mapping,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )?;
+        let attn_output = prefill_profile::time(dev, &prefill_profile::PA_NS, || {
+            paged_attention(
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                seqlen_offset,
+                cache_engine,
+                block_table.block_ids(),
+                slot_mapping,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+        })?;
 
-        self.o_proj.forward(&attn_output)
+        prefill_profile::time(dev, &prefill_profile::O_PROJ_NS, || {
+            self.o_proj.forward(&attn_output)
+        })
     }
 
     fn forward_decode_batch_with_shared(
@@ -552,7 +695,10 @@ impl QuantizedQwen3DecoderLayer {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
+        let dev = xs.device();
+        let xs = prefill_profile::time(dev, &prefill_profile::IN_NORM_NS, || {
+            self.input_layernorm.forward(xs)
+        })?;
         let xs = self.self_attn.forward(
             &xs,
             attention_mask,
@@ -563,9 +709,12 @@ impl QuantizedQwen3DecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&xs)?)?;
+        let normed = prefill_profile::time(dev, &prefill_profile::POST_NORM_NS, || {
+            self.post_attention_layernorm.forward(&xs)
+        })?;
+        let xs =
+            prefill_profile::time(dev, &prefill_profile::MLP_NS, || self.mlp.forward(&normed))?;
+        prefill_profile::bump_layer();
         residual + xs
     }
 
@@ -675,18 +824,23 @@ impl QuantizedQwen3ForCausalLM {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
-        let attention_mask = if seq_len <= 1 {
-            None
-        } else {
-            Some(crate::layers::causal_mask(
-                seq_len,
-                seqlen_offset,
-                self.dtype,
-                &self.device,
-            )?)
-        };
+        let dev = &self.device;
+        let attention_mask = prefill_profile::time(dev, &prefill_profile::MASK_NS, || {
+            if seq_len <= 1 {
+                Ok(None)
+            } else {
+                Ok(Some(crate::layers::causal_mask(
+                    seq_len,
+                    seqlen_offset,
+                    self.dtype,
+                    &self.device,
+                )?))
+            }
+        })?;
 
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut xs = prefill_profile::time(dev, &prefill_profile::EMBED_NS, || {
+            self.embed_tokens.forward(input_ids)
+        })?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(
                 &xs,
@@ -698,8 +852,14 @@ impl QuantizedQwen3ForCausalLM {
                 slot_mapping,
             )?;
         }
-        let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)
+        let xs = prefill_profile::time(dev, &prefill_profile::FINAL_NORM_NS, || {
+            self.norm.forward(&xs)
+        })?;
+        let logits = prefill_profile::time(dev, &prefill_profile::LM_HEAD_NS, || {
+            self.lm_head.forward(&xs)
+        })?;
+        prefill_profile::dump_prefill(seq_len);
+        Ok(logits)
     }
 
     pub fn device(&self) -> &Device {
