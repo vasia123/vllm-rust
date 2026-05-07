@@ -459,3 +459,69 @@ production-grade Python vLLM reference on the same hardware.  The
 two big remaining gaps (prefill latency, batched scaling) are
 orthogonal to decode kernel performance and would each be a Stage
 13-D / 13-E in their own right.
+
+---
+
+## Stage 13-D — TTFT root cause (2026-05-07)
+
+### 13-D.3 verdict
+
+Per-component prefill profile (`VLLM_PROFILE_PREFILL=1`,
+`scripts/bench_prefill.py`) on Qwen3-4B-AWQ, RTX 4060 Laptop, 36 layers,
+greedy:
+
+| seq_len | mlp ms | qkv ms | o_proj ms | paged_attn ms | mask+norms+lm_head ms | total ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 122  | 1001 | 244  | 168 | 238 | 25  | 1676 |
+| 382  | 3107 | 754  | 513 | 237 | 41  | 4651 |
+| 1422 | 11765| 2814 | 1903| 245 | 230 | 16868 |
+| 1940 | 16190| 3855 | 2606| 257 | 358 | 23217 |
+
+**Quantized linears dominate: 97 % of total** (mlp + qkv + o_proj).
+`paged_attention` is a flat ~250 ms regardless of seq_len; `causal_mask`,
+embedding, RMSNorm, lm_head together stay under 2 %.
+
+Per-(layer, token) MLP cost: 16.19 s / 36 layers / 1940 tokens ≈
+**232 µs**.  Decode-path MLP (same weights, same kernel) was measured
+in Stage 13-C at ~80 µs / layer-call for a single token.  Prefill is
+3 × slower per token than decode — i.e. the kernel does **not** amortise
+weight re-use across the M (token-batch) axis.
+
+### Why
+
+`crates/core/src/quantization/marlin_cuda.rs:71-76` routes **every** AWQ
+INT4 forward — decode and prefill — through `cuda_fwd_awq_gemv`.  The
+`awq_gemv_int4_*` family is a vector-by-matrix kernel: each output column
+is a single warp-level dot product over K, and there is no shared-memory
+tile reuse across the M axis.  At M = 1 (decode) this is the right
+choice; at M = 1940 (prefill) it is catastrophic — the same INT4 weight
+column is read from HBM 1940 times instead of once.
+
+The dispatch comment on the same lines explicitly notes this: the legacy
+`marlin_gemm_int4_zp_bf16` GEMM kernel exists in the PTX bundle, but
+`AwqMarlinLinear::load_weights` transposes qweight to `[N, K/8]`
+(coalesced for gemv), which the row-major tile GEMM cannot consume.
+The result: a working GEMM exists but is unreachable.
+
+### Decision: 13-D.4 approach
+
+Adopt **fix candidate B′ — dequant + candle BF16 matmul on the M > 16
+path**.  Rationale:
+
+- Smallest blast radius: no new PTX, no qweight layout fork.  We
+  reuse the `qweight` already laid out for gemv; dequant emits a
+  fresh `[K, N]` BF16 buffer in a single CUDA launch.
+- Predictable cost: one dequant + one cuBLAS bf16 GEMM per linear per
+  forward.  At M = 1940, K = 4096, N = 3072 the bf16 GEMM is
+  ~0.6 ms on RTX 4060; dequant is ~0.3 ms.  Per layer total ≈ 0.9 ms,
+  not 17 ms.
+- Decode path untouched: M ≤ 16 keeps the gemv dispatch.  Decode
+  Stage 13-C numbers (47 tok/s) are not at risk.
+- Memory: dequant buffer is freed at end of forward — peak transient
+  ~12 MB per linear (4096 × 3072 × 2 bytes).  Negligible.
+
+A future stage (13-D.6 or later) can replace the dequant+matmul with
+a real fused GEMM (either a fork of the legacy `marlin_gemm_int4_zp_bf16`
+that consumes the gemv layout, or a Triton-style INT4 GEMM).  That work
+is gated on whether B′ closes the gap to the production target
+(prompt_len = 256 → ≤ 800 ms TTFT).
