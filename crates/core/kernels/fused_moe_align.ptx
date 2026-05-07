@@ -12,17 +12,17 @@
 
 	// .globl	moe_align_block_size_kernel
 // _ZZ27moe_align_block_size_kernelE9scan_temp has been demoted
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust6system6detail10sequential3seqE[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_1E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_2E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_3E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_4E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_5E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_6E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_7E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_8E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders2_9E[1];
-.global .align 1 .b8 _ZN49_INTERNAL_b0da2003_18_fused_moe_align_cu_a7df09966thrust12placeholders3_10E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust6system6detail10sequential3seqE[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_1E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_2E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_3E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_4E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_5E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_6E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_7E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_8E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders2_9E[1];
+.global .align 1 .b8 _ZN49_INTERNAL_f57a15dc_18_fused_moe_align_cu_a7df09966thrust12placeholders3_10E[1];
 .extern .shared .align 16 .b8 shared_mem[];
 
 .visible .entry moe_align_block_size_kernel(

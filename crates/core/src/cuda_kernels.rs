@@ -349,11 +349,21 @@ pub fn paged_attention_cuda(
 // ============================================================================
 
 /// Partition size for V2 split-K attention (must match PARTITION_SIZE in paged_attention.cu).
-const PARTITION_SIZE: usize = 512;
+///
+/// Smaller partitions give more grid blocks per (q_head, seq) pair which
+/// improves SM occupancy at batch=1 decode. With PARTITION_SIZE=128 and
+/// seq_len≈480, the V2 grid is (num_heads, 1, 4) = 128 blocks for Qwen3-4B,
+/// vs 32 blocks under V1 — ~4× more parallelism.
+const PARTITION_SIZE: usize = 128;
 
 /// Threshold: use V2 when max_seq_len exceeds this value.
-/// Below this, V1 is preferred (lower overhead from single-pass).
-const V2_SEQ_LEN_THRESHOLD: usize = 512;
+///
+/// At batch=1 V2's split-K parallelism beats V1's single-block-per-head
+/// design even for short sequences — the per-token `__syncthreads` count
+/// inside V1 dominates the kernel runtime. V1 is kept only for very short
+/// sequences where the V2 reduce kernel's small launch overhead would
+/// noticeably show up.
+const V2_SEQ_LEN_THRESHOLD: usize = 64;
 
 /// Stage 1: compute partitioned attention outputs.
 struct PagedAttnV2Op {

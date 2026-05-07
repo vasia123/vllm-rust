@@ -157,29 +157,70 @@ Out of scope for this push:
 - DtoH per-token drain (~17% wall-clock) — necessary for tokenizer
   feedback unless we batch generation client-side.
 
-## Next: Phase 2 plan (Β — paged_attn for M=1)
+## Phase 2.A — paged_attn V2 split-K with PARTITION_SIZE=128
 
-To be detailed in next plan iteration. Direction:
+Three small changes:
+- `paged_attention.cu:367`: `#define PARTITION_SIZE 512` → **128**
+- `cuda_kernels.rs:352`: `const PARTITION_SIZE: usize = 512` → **128**
+  (must stay in sync with the kernel)
+- `cuda_kernels.rs:356`: `const V2_SEQ_LEN_THRESHOLD: usize = 512`
+  → **64** (V2 always wins at batch=1; per-token __syncthreads cost
+  in V1's single-block-per-head design dominates the kernel runtime)
+- `qwen3_quantized.rs:435`: switch `paged_attention_cuda` (V1 only)
+  → `paged_attention_auto` (V2 picked above threshold). The decode
+  call site previously bypassed the auto dispatch entirely.
 
-1. Audit current `paged_attn_v1.cu` / `paged_attn_v2.cu` kernel
-   geometry. Confirm V1 vs V2 selection threshold for our seq_len
-   range (≈ 100–800).
-2. Design M=1 specialized kernel:
-   - Split-query per group of KV heads (GQA). For Qwen3-4B
-     (32 q-heads, 8 kv-heads, group=4), each block can serve one
-     KV-head group → 8 blocks/seq instead of 32, but each block
-     does 4× more compute per output. With 128 threads/block ×
-     8 blocks = 32 warps active, still low occupancy on 24 SMs.
-   - Better: split-K along sequence dimension. Each block processes
-     a chunk of the seq, partial reduction across blocks via
-     atomic add or two-stage reduce. This is essentially what
-     V2 does, but tuned for M=1 (vs M up to 16 currently).
-   - Or adopt FlashInfer decode kernel via the existing
-     `_with_plan` infrastructure (commit a fresh plan caching
-     pass at the engine level).
-3. Measure on real shapes (seq_len 100, 500, 1000); pick the
-   variant that wins all three.
-4. Numerical tolerance: BF16 ±1e-2 vs current.
+For seq_len ≈ 480 the V2 grid becomes `(num_q_heads, num_seqs,
+ceil(seq_len/128)) = (32, 1, 4) = 128 blocks` (was 32 under V1).
+Active warps jump from 128 (~17% of 768-warp budget on 24 SMs Ada)
+to 512 (~67%). Per-block `__syncthreads` count drops from ~480 in
+V1's K-pass to ~128 in each V2 partition.
 
-Expected gain: paged_attn 28% → ≤10% via 3× kernel speedup.
-End-to-end: 22.7 ms/token → ~17 ms/token = **~58 tok/s**.
+### Results (steady-state, post-Phase-2.A profile)
+
+`VLLM_PROFILE_DECODE=1` median sample over ~25 samples × 100
+layer-calls, max_tokens=400 generation:
+
+| Component   | Before (Phase 1) | After (Phase 2.A) | Δ          |
+| ----------- | ---------------- | ----------------- | ---------- |
+| in_norm     | 30 µs (3.0%)     | 26 µs (3.3%)      | flat       |
+| qkv         | 100 µs (10%)     | 97 µs (12.3%)     | flat       |
+| qk_norm     | 43 µs (4.3%)     | 36 µs (4.6%)      | flat       |
+| rope        | 80 µs (8%)       | 62 µs (7.9%)      | -23%       |
+| cache_w     | 40 µs (4%)       | 31 µs (3.9%)      | -23%       |
+| **paged_attn** | **280 µs (28%)** | **137 µs (17.4%)** | **-51%**   |
+| o_proj      | 80 µs (8%)       | 71 µs (9.0%)      | flat       |
+| post_norm   | 37 µs (3.7%)     | 28 µs (3.6%)      | flat       |
+| **mlp**     | 300 µs (30%)     | 299 µs (38%)      | flat → now dominant |
+| **sum**     | 1000 µs          | **785 µs**        | **-22%**   |
+
+End-to-end bench, `concurrency=1 max_tokens=256 prompt_len=256
+temperature=0 runs=5`:
+
+| Build                                | tok/s steady |
+| ------------------------------------ | ------------ |
+| baseline (post Stage 12 disable)     | 33.9         |
+| **Phase 2.A**                        | **42.7**     |
+
+**+26% wall-clock** (slightly above the +18% predicted, presumably
+because the per-component sync overhead also drops with smaller
+per-component time).
+
+### What's left after Phase 2.A
+
+MLP is now the largest single component at 38% of layer time
+(298 µs/call = ~10.7 ms/token). Three sub-GEMVs (gate/up/down).
+Already on `awq_gemv_int4_kt_bf16` near peak bandwidth. Further
+gain there needs gate+up fusion or different kernel geometry —
+high effort, low ROI per Phase 1 audit.
+
+paged_attn 137 µs/call is still ~18× over the theoretical bandwidth
+ceiling. Further wins from Phase 2.B candidates:
+- warp-level QK reduce (vs current block-level per-token sync)
+- vectorized V loads (uint4 = 8 BF16 per LDG; we currently read scalars)
+- GQA-aware grouping (Qwen3 has q_per_kv=4, currently each q_head
+  reads same KV redundantly)
+
+Decision: Phase 2.A target was ≥38 tok/s (+10%). Got 42.7 (+26%).
+**Continue with Phase 2.B**: pick the one with best ROI / lowest
+risk to push toward 50 tok/s.

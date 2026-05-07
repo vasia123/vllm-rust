@@ -432,7 +432,7 @@ impl QuantizedQwen3Attention {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
             let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
-                crate::cuda_kernels::paged_attention_cuda(
+                crate::cuda_kernels::paged_attention_auto(
                     &q,
                     cache_engine.k_cache(),
                     cache_engine.v_cache(),

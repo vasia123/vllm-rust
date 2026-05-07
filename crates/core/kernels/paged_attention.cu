@@ -364,7 +364,10 @@ extern "C" __global__ void paged_attention_v1_f16_alibi(
 // Grid: (num_heads, num_seqs, max_num_partitions)
 // Block: (NUM_THREADS, 1, 1)
 
-#define PARTITION_SIZE 512
+// PARTITION_SIZE controls split-K granularity for V2.
+// Smaller partitions => more grid blocks => higher SM occupancy at batch=1.
+// Must stay in sync with `PARTITION_SIZE` constant in cuda_kernels.rs.
+#define PARTITION_SIZE 128
 
 // V2 main kernel: compute attention for one partition of the sequence.
 template <typename T>
