@@ -707,3 +707,65 @@ explicit user value, and operators wanting more concurrency pass
 - Bench coverage policy (Stage 13-D.0) caught the 13-E.4 TTFT
   regression on the very first benchmark run — the rule paid for
   itself a third time.
+
+---
+
+## Stage 13-G — TTFT-vs-num_blocks regression (2026-05-07)
+
+### Diagnosis
+
+`VLLM_PROFILE_PREFILL=1` on Qwen3-4B-AWQ at prompt_len=256 with the
+13-E.4 auto-tune (num_blocks 1760 vs legacy 512):
+
+| Component | 512 blocks (μs) | 1760 blocks (μs) | scaling |
+|:--|--:|--:|--:|
+| qkv | 30,540 | 30,510 | 1.00 × |
+| paged_attn | 216,853 | 1,830,089 | **8.4 ×** |
+| o_proj | 77,160 | 409,239 | **5.3 ×** |
+| **mlp** | **263,360** | **4,373,889** | **16.6 ×** |
+
+`qkv` (3 small linears, K=2560 N≤4096) was unaffected. `mlp` (3 wide
+linears, gate/up at K=2560 N=9728, down inverse — peak ≈ 50 MB BF16
+scratch each through the 13-D.4 dequant+matmul path) blew up 17 ×.
+At 1760 blocks the KV cache occupies ~3.96 GiB on an 8 GiB card,
+leaving only ~1.5 GiB free; the per-prefill scratch demand
+(36 layers × 3 mlp linears × 50 MiB ≈ 5.4 GiB transient) overflows
+that headroom and cudarc falls back to a serialising/synchronising
+allocation path. `paged_attn` and `o_proj` shoulder smaller versions
+of the same effect.
+
+### Fix
+
+`estimate_kv_cache_budget` rewritten to use the **measured free VRAM
+after model load** (the function is already called post
+`report_gpu_mem("after model build")`) instead of the param-count
+estimate, and to reserve a **1.5 GiB scratch floor** on top of the
+percentage-based overhead. Empirical floor — covers the full prefill
++ long-context decode profile of Qwen3-4B-AWQ on RTX 4060 Laptop
+without leaving the dequant scratch starved.
+
+`estimate_kv_budget_bytes_with_overhead(...)` added to
+`crates/core/src/kv_cache/config.rs` so callers that know their
+actual scratch shape can pin a different floor (e.g. larger models,
+multi-stream serving, BF16-uncomp checkpoints).
+
+13-E.4 auto-tune re-enabled with the corrected estimator.
+
+### Result
+
+| Config | num_blocks | TTFT @ 256 | c=1 tok/s | c=4 agg | c=8 agg |
+|:--|--:|--:|--:|--:|--:|
+| Pre-13-G (broken) | 1760 | 6700 ms | 33 | — | — |
+| Post-13-G | **1029** | **252 ms** | 42.9 | 56.1 | 59.6 |
+| Legacy 512 (no auto-tune) | 512 | 629 ms* | 42.5 | 56.9 | 41 |
+
+(* legacy bench captured a different sample; the 252 ms 13-D.4 bench
+ran with the same effective config.)
+
+Auto-tune now yields **2 × legacy concurrency capacity (1029 vs 512
+blocks)** with no TTFT or decode regression, and case 6
+(long-context cross-4096) passes. The architectural follow-up — a
+real shared scratch buffer so the dequant+matmul path stops
+allocating per-call — is tracked under Stage 13-F (the same INT4
+GEMM rewrite that closes the c=4 cliff would supersede the scratch
+issue).

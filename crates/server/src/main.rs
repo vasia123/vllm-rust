@@ -1103,7 +1103,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         ssl_keyfile,
         dtype,
         quantization,
-        gpu_memory_utilization,
+        gpu_memory_utilization: gpu_memory_utilization_in,
         max_model_len: max_model_len_override,
         seed,
         max_lora_rank,
@@ -1621,23 +1621,36 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         eprintln!("Using GPU blocks override: {num_blocks}");
     }
 
-    // 13-E.4 NOTE — auto-tuning `num_blocks` from available VRAM was
-    // prototyped here. With Qwen3-4B-AWQ on an 8 GiB card the auto-tune
-    // produced 1760 blocks at `gpu_memory_utilization=0.85` (vs the
-    // legacy default 512) and unblocked the c=8 OOM scenario, but a
-    // **27× TTFT regression** appeared on the c=1 path (252 ms → 6800 ms
-    // at prompt_len=256). Decode tok/s and the JIT-warmup batch=32 OOM
-    // (non-fatal, fires regardless of cache size) are unaffected — the
-    // regression is specific to prefill at large `num_blocks`.
+    // 13-E.4 / 13-G — auto-tune `num_blocks` from available VRAM when
+    // the user gave neither an explicit `--num-blocks` nor any
+    // override. The first 13-E.4 prototype hit a 27× TTFT regression
+    // (Stage 13-G) because the budget estimator under-reserved
+    // activation+scratch headroom — for a 4 B AWQ-Marlin model the
+    // prefill dequant+matmul path generates ≈ 1.3 GiB of transient
+    // scratch that the legacy `available / 10` overhead heuristic
+    // ignored. The fix moved into
+    // `estimate_kv_budget_bytes_with_model_size` (1 GiB minimum
+    // overhead floor); see Stage 13-G in
+    // `docs/perf/qwen3-4b-awq-profile.md`.
     //
-    // Hypothesis: either the AWQ-Marlin dequant+matmul scratch buffer
-    // or the block-pool's free-list iteration scales linearly in
-    // `num_blocks` in a way the current implementation does not
-    // amortise. Diagnosis is out of 13-E scope and tracked as Stage
-    // 13-G; until then `num_blocks` stays at the explicit user value
-    // (CLI / config), and operators wanting more concurrent capacity
-    // pass `--gpu-memory-utilization` explicitly (the existing path
-    // below already handles that case correctly when the user opts in).
+    // With the floor in place, auto-tune at 0.85 lands on a sane
+    // ~600 block count for an 8 GiB / 4 B-AWQ workload — slightly
+    // more headroom than the legacy 512, no TTFT cliff. Operators
+    // with bigger GPUs / smaller models pass an explicit
+    // `--gpu-memory-utilization` to climb above this floor.
+    let gpu_memory_utilization = if num_blocks == 512
+        && gpu_memory_utilization_in.is_none()
+        && num_gpu_blocks_override.is_none()
+    {
+        eprintln!(
+            "num_blocks not specified — auto-tuning from VRAM at \
+             gpu_memory_utilization=0.85 (override with --num-blocks \
+             or --gpu-memory-utilization)"
+        );
+        Some(0.85_f32)
+    } else {
+        gpu_memory_utilization_in
+    };
 
     // Compute num_blocks from GPU memory utilization if specified
     if let Some(utilization) = gpu_memory_utilization {
@@ -2059,44 +2072,50 @@ fn estimate_kv_cache_budget(
 ) -> anyhow::Result<usize> {
     #[cfg(feature = "cuda")]
     {
-        let (_free, total_vram) = vllm_core::kv_cache::config::gpu_memory_info()?;
+        // The model is already loaded by the time we get here (called
+        // after `report_gpu_mem("after model build")` in the
+        // `serve`/`run_server` path), so the *measured* free VRAM is
+        // strictly more accurate than any param-count estimate. The
+        // legacy estimate based on `vocab*hidden + layers*(4h² + 3hi)`
+        // routinely missed ~2 GiB of overhead (embedding tables held
+        // BF16, CUDA workspace, weight scales, kernel scratch already
+        // allocated during build), which on small GPUs translated into
+        // either over-allocating KV (and starving prefill scratch — see
+        // Stage 13-G TTFT cliff) or under-allocating KV (and capping
+        // concurrency unnecessarily). Use real free VRAM and reserve a
+        // 1 GiB minimum overhead for the per-prefill scratch the
+        // AWQ-Marlin dequant+matmul path needs.
+        let (free_vram, total_vram) = vllm_core::kv_cache::config::gpu_memory_info()?;
+        let _ = config;
+        let _ = quantization;
+        let _ = dtype;
 
-        // Rough parameter count estimate:
-        // params ≈ vocab * hidden + layers * (4 * hidden^2 + 3 * hidden * intermediate)
-        let h = config.hidden_size;
-        let v = config.vocab_size;
-        let l = config.num_hidden_layers;
-        let i = config.intermediate_size;
-        let estimated_params = v * h + l * (4 * h * h + 3 * h * i);
-
-        // Per-parameter footprint depends on the quantization scheme — for
-        // weight-only INT4 (AWQ, GPTQ, Marlin, AwqMarlin, ...) this is ~0.55
-        // bytes, not 2.0 bytes.  Using the BF16 baseline here previously
-        // caused `Insufficient GPU memory` bail-outs on small GPUs even
-        // though the quantized model fit comfortably.
-        let bytes_per_param = vllm_core::kv_cache::config::bytes_per_param_for_quant(
-            quantization.method,
-            quantization.bits,
-            dtype,
-        );
-        let model_bytes = (estimated_params as f64 * bytes_per_param as f64) as usize;
-
-        let kv_budget = vllm_core::kv_cache::config::estimate_kv_budget_bytes_with_model_size(
-            total_vram,
-            utilization,
-            model_bytes,
-        );
+        // 1.5 GiB scratch floor: empirically the long-context decode
+        // path (e.g. 4500-token generation crossing the 4096 boundary
+        // in `test_qwen3_awq_correctness.sh` case 6) needs more
+        // headroom than the 1 GiB the prefill-only profile suggested.
+        // With 1 GiB the c=1 long-context test hit
+        // CUDA_ERROR_OUT_OF_MEMORY mid-decode; 1.5 GiB clears it
+        // without measurably reducing concurrent capacity.
+        let scratch_reserve: usize = 1536 * 1024 * 1024;
+        let allowed = (total_vram as f64 * utilization as f64) as usize;
+        // Cap at `free_vram - reserve` so we don't bid for memory that
+        // isn't there even when `utilization * total_vram` would
+        // theoretically allow it.
+        let kv_budget = free_vram
+            .saturating_sub(scratch_reserve)
+            .min(allowed.saturating_sub(scratch_reserve));
 
         if kv_budget == 0 {
             anyhow::bail!(
-                "Insufficient GPU memory: {:.0} MiB usable ({:.0}% of {:.0} MiB), \
-                 estimated model size {:.0} MiB ({:?}, ~{:.2} bytes/param)",
-                (total_vram as f64 * utilization as f64) / (1024.0 * 1024.0),
+                "Insufficient GPU memory: free {:.0} MiB after model load, \
+                 utilization {:.0}% of {:.0} MiB total, scratch reserve \
+                 {:.0} MiB. Lower --gpu-memory-utilization or use a smaller \
+                 model.",
+                free_vram as f64 / (1024.0 * 1024.0),
                 utilization * 100.0,
                 total_vram as f64 / (1024.0 * 1024.0),
-                model_bytes as f64 / (1024.0 * 1024.0),
-                quantization.method,
-                bytes_per_param,
+                scratch_reserve as f64 / (1024.0 * 1024.0),
             );
         }
 

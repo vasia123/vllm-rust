@@ -46,10 +46,38 @@ pub fn estimate_kv_budget_bytes_with_model_size(
     utilization: f32,
     model_bytes: usize,
 ) -> usize {
-    let available = (total_vram as f64 * utilization as f64) as usize;
+    estimate_kv_budget_bytes_with_overhead(
+        total_vram,
+        utilization,
+        model_bytes,
+        // Default min-overhead floor: enough to hold the per-prefill
+        // scratch buffers a 36-layer 2.5K-hidden quantised model
+        // generates through the AWQ-Marlin dequant+matmul path. The
+        // legacy `/ 10` heuristic returned 680 MiB on an 8 GiB card at
+        // utilisation=0.85, which is below the empirical 1.3 GiB
+        // working set and triggered the 13-G TTFT cliff. 1 GiB is a
+        // conservative floor that survives the next hidden-size bump.
+        1024 * 1024 * 1024,
+    )
+}
 
-    // Reserve 10% of available for activations and fragmentation.
-    let overhead = available / 10;
+/// Like [`estimate_kv_budget_bytes_with_model_size`] but the activation
+/// + scratch overhead is `max(available / 10, min_overhead_bytes)`.
+///
+/// Callers that know the actual prefill scratch shape (quantised
+/// models in particular) should pass an explicit floor here. Without
+/// it the `/ 10` heuristic systematically under-reserves on
+/// 8 GiB-class GPUs running 4-8 B quantised checkpoints, which the
+/// AWQ-Marlin dequant+matmul path makes catastrophic — see Stage
+/// 13-G in `docs/perf/qwen3-4b-awq-profile.md`.
+pub fn estimate_kv_budget_bytes_with_overhead(
+    total_vram: usize,
+    utilization: f32,
+    model_bytes: usize,
+    min_overhead_bytes: usize,
+) -> usize {
+    let available = (total_vram as f64 * utilization as f64) as usize;
+    let overhead = (available / 10).max(min_overhead_bytes);
     available
         .saturating_sub(model_bytes)
         .saturating_sub(overhead)
