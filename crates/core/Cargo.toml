@@ -98,3 +98,8 @@ harness = false
 [[bench]]
 name = "moe_routing_bench"
 harness = false
+
+[[bench]]
+name = "paged_attention_bench"
+harness = false
+required-features = ["cuda-kernels"]
