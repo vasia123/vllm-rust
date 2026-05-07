@@ -844,3 +844,64 @@ default cudarc stream policy, or the CPU-fallback path in
 - Bench coverage policy paid off again: the regression was caught
   immediately by the Stage 13-D bench harness, before any
   user-facing build saw it.
+
+---
+
+## Stage 13-F PoC — kt_mloop kernel (REVERTED)
+
+### Hypothesis
+
+Reverse the M / K loop nesting in `awq_gemv_int4_kt_bf16` so each
+INT4 weight column is read from HBM exactly once (the legacy kernel
+re-reads it M× in its outer m-loop). Cache all M input rows in
+shared memory up front, accumulate per-thread FP32 partials for
+all M outputs in registers, reduce via warp shuffles. Theoretically
+M× HBM bandwidth saving for the weight stream — the dominant cost
+at concurrent-decode batch sizes.
+
+### Implementation
+
+`awq_gemv_int4_kt_mloop_bf16` added to `crates/core/kernels/awq_gemv.cu`,
+gated on `M ∈ [2, 8] && M × K × 2 ≤ 47 KiB` (static SM shmem cap).
+Per-thread `acc[8]` array, M_MAX=8 unrolled across the inner FMA.
+Dispatch wired in `MarlinGemmOp::cuda_fwd_awq_gemv` between the
+existing kt and split_k8 paths.
+
+### Microbench result on RTX 4060 Laptop, full TGP
+
+| M | shape (K, N) | legacy kt (µs) | new kt_mloop (µs) | delta |
+|--:|:--|--:|--:|--:|
+| 4 | 4096, 11008 | 549 | 643 | **+17 % (regression)** |
+
+Cause: at runtime M=4 the M_MAX=8 unroll executes 4 predicated-NOP
+FMAs per K-step. SIMT issues those slots even though the predicate
+masks the writes, so the kernel is compute-bound *higher* than the
+HBM-bandwidth saving recovers. The PoC accidentally trades one cost
+for another that ends up bigger on Ada.
+
+### Decision
+
+PoC reverted. The bench coverage policy (`awq_marlin_path_bench`)
+caught the regression on the first criterion run, before any commit
+landed — exactly what the policy is for.
+
+The right fix is template-specialised kernel variants per M_MAX
+(2 / 4 / 8) so unused M-rows don't sit as predicated NOPs, plus
+opt-in to dynamic 100 KiB shmem so the M=8 path covers `mlp.down`'s
+K=9728 layer too. That's a multi-day rewrite — tracked as the proper
+**Stage 13-F**: a tiled INT4 GEMM for M ∈ [1, 16] backed by template
+specialisation, weight reuse across M, and dynamic shmem.
+
+A separate observation worth recording: the engine's
+`--multi-step-count` default (= 4) inflates the effective batch
+size at the GEMV layer to `concurrency × multi_step` (e.g. c=4
+arrives at the kernel as M=16, c=8 as M=32). That bypasses the
+M ≤ 16 GEMV regime entirely and lands on the dequant+matmul path —
+the reason 13-D.4 saw flat per-stream tps at c=8: the GEMV kernel
+isn't actually executing in the per-token critical path most of the
+time. This means the c=4 cliff diagnosed in Stage 13-E.1 was
+multi_step batching meeting the legacy split_kt kernel at M=16,
+not GEMV-at-M=4. Closing the c=4 gap probably needs the same
+template-specialised variant chain *plus* something at M=16
+(currently routed to legacy kt, which hits the same per-m-loop
+weight re-read pattern). Both fall under Stage 13-F.
