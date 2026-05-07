@@ -45,7 +45,7 @@ mkdir -p "$OUT_DIR"
 # All others compile under the default (no CUDA) build, but enabling
 # `cuda-kernels` everywhere is harmless on a host with CUDA available
 # and keeps the command simple.
-BENCH_FEATURES="cuda-kernels"
+BENCH_FEATURES="cuda-kernels,marlin"
 
 CARGO_BENCH=(cargo bench --features "$BENCH_FEATURES" -p vllm-core)
 if [[ -n "$FILTER" ]]; then

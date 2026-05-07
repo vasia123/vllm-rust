@@ -525,3 +525,53 @@ a real fused GEMM (either a fork of the legacy `marlin_gemm_int4_zp_bf16`
 that consumes the gemv layout, or a Triton-style INT4 GEMM).  That work
 is gated on whether B′ closes the gap to the production target
 (prompt_len = 256 → ≤ 800 ms TTFT).
+
+### 13-D.4 result
+
+Implementation landed: `crates/core/kernels/awq_marlin_dequant.cu` +
+`marlin_cuda::{AwqMarlinDequantOp, awq_marlin_dequant_to_bf16,
+awq_marlin_dequant_matmul}` + a guarded dispatch in `marlin_gemm`
+that routes M > `AWQ_GEMV_M_THRESHOLD` (= 16) on the AWQ INT4 + ZP +
+no-g_idx codepath through dequant + cuBLAS BF16 GEMM. Decode (M ≤ 16)
+keeps the existing `awq_gemv_int4_kt_bf16` kernel.
+
+**TTFT before / after (Qwen3-4B-AWQ, RTX 4060 Laptop, max_tokens=1, p50)**
+
+| prompt_len | before (ms) | after (ms) | speedup |
+|---:|---:|---:|---:|
+| 64   | 1646 | 173 | **9.5 ×** |
+| 256  | 4695 | **252** | **18.6 ×** |
+| 1024 | 16910 | 650 | 26.0 × |
+| 2048 | 23218 | 850 | 27.3 × |
+
+Plan target was ≤ 800 ms TTFT at prompt_len = 256; **delivered 252 ms,
+3 × inside the budget.** Gap vs Python vLLM 0.20.1 (47 ms at the same
+shape) tightens from **88 × → 5.4 ×**.
+
+**M-sweep microbench** (`crates/core/benches/awq_marlin_path_bench.rs`,
+Qwen3-4B-AWQ MLP-up shape K = 4096, N = 11008, group_size = 128):
+
+| M | path | time |
+|---:|:---|---:|
+| 1 | gemv | 143 µs |
+| 4 | gemv | 549 µs |
+| 32 | dequant + GEMM | 1.45 ms |
+| 64 | dequant + GEMM | 1.45 ms |
+| 256 | dequant + GEMM | 1.86 ms |
+| 512 | dequant + GEMM | 2.65 ms |
+| 1024 | dequant + GEMM | 4.17 ms |
+| 2048 | dequant + GEMM | 4.16 ms |
+
+The prefill curve enters the cuBLAS-bandwidth-saturated regime by
+M ≈ 1024; all M > 16 share a fixed ~1.4 ms dequant overhead. A future
+fused INT4 GEMM (no scratch) would mostly recoup that overhead, but
+the gain on the production prefill workload is bounded by it
+(~ 1.4 ms × 7 linears × 36 layers ≈ 350 ms saved at most).
+
+Decode (M = 1) was unaffected by design; e2e correctness suite
+`scripts/test_qwen3_awq_correctness.sh` passes 7/7 including
+long-context boundary crossing and concurrent batches.
+
+Snapshot of the M-sweep saved to
+`docs/perf/bench-history/2026-05-07-13D4-after.json`; the next
+perf-touching commit on this codepath diffs against it.

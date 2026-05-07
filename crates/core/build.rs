@@ -107,6 +107,14 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/awq_gemv.ptx",
         min_sm: 80,
     },
+    // AWQ-Marlin INT4 dequantization for the prefill path (M > 16);
+    // reads the transposed [N, K/8] qweight that AwqMarlinLinear stores
+    // and emits a dense [K, N] BF16 matrix consumable by cuBLAS GEMM.
+    KernelDef {
+        source: "kernels/awq_marlin_dequant.cu",
+        output: "kernels/awq_marlin_dequant.ptx",
+        min_sm: 80,
+    },
     // MXFP4 E2M1 × BF16 GEMM with blockwise E8M0 scales — uses bf16
     KernelDef {
         source: "kernels/mxfp4_gemm.cu",

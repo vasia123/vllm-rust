@@ -26,12 +26,20 @@ const MARLIN_GEMM_PTX: &str = include_str!("../../kernels/marlin_gemm.ptx");
 // re-link the legacy `marlin_gemm` module on every dispatch.
 const AWQ_GEMV_PTX: &str = include_str!("../../kernels/awq_gemv.ptx");
 
+// PTX module for the AWQ-Marlin INT4 dequantization kernel used on the
+// prefill path (M > AWQ_GEMV_M_THRESHOLD). Emits a dense [K, N] BF16
+// matrix consumable by candle's BF16 cuBLAS matmul.
+const AWQ_MARLIN_DEQUANT_PTX: &str = include_str!("../../kernels/awq_marlin_dequant.ptx");
+
 /// Maximum M for which the dedicated GEMV path is active.
 ///
-/// At M ≤ 16 the legacy `marlin_gemm_int4_zp_bf16` kernel under-utilises the
-/// SM (it tiles for M = 16 but each tile column is computed by 16 redundant
-/// threads). The GEMV path streams qweight at memory bandwidth instead.
-const AWQ_GEMV_M_THRESHOLD: usize = 16;
+/// At M ≤ 16 the AWQ GEMV kernel runs at memory bandwidth — each output
+/// column is one warp-level dot product over K, exactly the right shape
+/// for batch≤16 decode. Above this threshold the gemv would re-read every
+/// INT4 weight column M times from HBM (no shared-memory tiling across the
+/// M axis); the prefill path routes through `awq_marlin_dequant_matmul`
+/// instead, which dequants once and runs a real BF16 cuBLAS GEMM.
+pub const AWQ_GEMV_M_THRESHOLD: usize = 16;
 
 /// Marlin GEMM operation for INT4 quantized weights.
 struct MarlinGemmOp {
@@ -510,6 +518,183 @@ impl MarlinGemmOp {
     }
 }
 
+/// AWQ-Marlin INT4 → BF16 dequantization op.
+///
+/// Reads qweight in the transposed `[N, K/8]` layout that
+/// `AwqMarlinLinear::load_weights` produces and emits a dense `[K, N]`
+/// BF16 matrix. The output is consumed once by the caller's BF16 matmul
+/// and dropped — no per-forward weight cache.
+///
+/// `qweight` is the primary tensor (its shape determines `N` and `K/8`);
+/// `scales` and `qzeros` ride along as struct fields. The shape returned
+/// by `cuda_fwd` is `[K, N]`, which is *different* from the input's
+/// `[N, K/8]` — candle's CustomOp1 contract supports this.
+struct AwqMarlinDequantOp {
+    scales: Tensor,
+    qzeros: Tensor,
+    k: usize,
+    n: usize,
+    group_size: usize,
+}
+
+impl CustomOp1 for AwqMarlinDequantOp {
+    fn name(&self) -> &'static str {
+        "awq_marlin_dequant_int4_bf16"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("awq_marlin_dequant requires CUDA")
+    }
+
+    fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &storage.device;
+
+        let qweight = match &storage.slice {
+            CudaStorageSlice::U32(s) => s,
+            _ => candle_core::bail!("awq_marlin_dequant: qweight must be U32"),
+        };
+
+        let (scales_guard, _) = self.scales.storage_and_layout();
+        let (qzeros_guard, _) = self.qzeros.storage_and_layout();
+        let scales = match &*scales_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::BF16(s) => s,
+                _ => candle_core::bail!("awq_marlin_dequant: scales must be BF16"),
+            },
+            _ => candle_core::bail!("awq_marlin_dequant: scales must be on CUDA"),
+        };
+        let qzeros = match &*qzeros_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("awq_marlin_dequant: qzeros must be U32"),
+            },
+            _ => candle_core::bail!("awq_marlin_dequant: qzeros must be on CUDA"),
+        };
+
+        let elem_count = self.k * self.n;
+        // Every (k, n) is written exactly once by the kernel — no zero-init
+        // needed. The kernel guards out-of-bounds threads.
+        let output = unsafe { dev.alloc::<half::bf16>(elem_count) }?;
+
+        let k_i32 = self.k as i32;
+        let n_i32 = self.n as i32;
+        let group_size = self.group_size as i32;
+        let num_groups = (self.k / self.group_size) as i32;
+
+        // 32 × 8 threads per block: 32 along N (coalesced row of bf16 stores),
+        // 8 along K. K is reduced sequentially within each (k, n) thread.
+        const BX: u32 = 32;
+        const BY: u32 = 8;
+        let grid_x = self.n.div_ceil(BX as usize) as u32;
+        let grid_y = self.k.div_ceil(BY as usize) as u32;
+
+        let func = dev.get_or_load_custom_func(
+            "awq_marlin_dequant_int4_bf16",
+            "awq_marlin_dequant",
+            AWQ_MARLIN_DEQUANT_PTX,
+        )?;
+
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (BX, BY, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&output);
+        builder.arg(qweight);
+        builder.arg(scales);
+        builder.arg(qzeros);
+        builder.arg(&k_i32);
+        builder.arg(&n_i32);
+        builder.arg(&group_size);
+        builder.arg(&num_groups);
+
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("awq_marlin_dequant launch: {e}")))?;
+
+        drop(scales_guard);
+        drop(qzeros_guard);
+
+        let out_storage = CudaStorage {
+            slice: CudaStorageSlice::BF16(output),
+            device: dev.clone(),
+        };
+        Ok((out_storage, Shape::from_dims(&[self.k, self.n])))
+    }
+}
+
+/// Dequantize a transposed AWQ-Marlin qweight to a dense BF16 `[K, N]` tensor.
+///
+/// `qweight` must be `[N, K/8]` U32 (the layout `AwqMarlinLinear::load_weights`
+/// produces); `scales` `[K/g, N]` BF16; `qzeros` `[K/g, N/8]` U32 in
+/// GPTQ-ordered nibble form (`repack_awq_nibbles` output).
+///
+/// Returns a `[K, N]` BF16 tensor. The caller passes this into a standard
+/// candle BF16 matmul (`x @ w`); the resulting GEMM runs on cuBLAS at
+/// hardware throughput, not the GEMV-rate the per-token prefill path
+/// otherwise exhibits.
+pub fn awq_marlin_dequant_to_bf16(
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    size_k: usize,
+    size_n: usize,
+) -> Result<Tensor> {
+    let group_size = size_k / scales.dims()[0];
+    if group_size == 0 || !size_k.is_multiple_of(group_size) {
+        candle_core::bail!(
+            "awq_marlin_dequant: K ({}) must be divisible by group_size ({})",
+            size_k,
+            group_size
+        );
+    }
+    let op = AwqMarlinDequantOp {
+        scales: scales.clone(),
+        qzeros: qzeros.clone(),
+        k: size_k,
+        n: size_n,
+        group_size,
+    };
+    qweight.apply_op1(op)
+}
+
+/// Prefill path for AWQ-Marlin INT4: dequant → BF16 GEMM via candle.
+///
+/// Dispatched from `marlin_gemm` whenever `M > AWQ_GEMV_M_THRESHOLD` on
+/// the AWQ INT4 + zero-point + no-g_idx codepath. Replaces what would
+/// otherwise be `M` repeated GEMV invocations (each re-reading every
+/// weight column from HBM) with a single dequant pass + a single
+/// hardware-accelerated GEMM.
+pub fn awq_marlin_dequant_matmul(
+    input: &Tensor,
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    bias: Option<&Tensor>,
+    size_k: usize,
+    size_n: usize,
+) -> Result<Tensor> {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        tracing::info!(
+            target: "vllm_core::awq_marlin_path",
+            "awq_marlin_dequant_matmul prefill kernel active (K={size_k}, N={size_n})"
+        );
+    });
+
+    // Input is BF16 on this path — `marlin_gemm` checks dtype upstream.
+    let weight_bf16 = awq_marlin_dequant_to_bf16(qweight, scales, qzeros, size_k, size_n)?;
+    let mut out = input.matmul(&weight_bf16)?;
+    if let Some(b) = bias {
+        // Bias is `[N]`; broadcast over the M (and any leading batch) dims.
+        out = out.broadcast_add(b)?;
+    }
+    Ok(out)
+}
+
 /// Perform Marlin optimized GEMM: output = input @ dequant(weight).T + bias
 ///
 /// This is the main entry point for Marlin inference. It provides 2-3x speedup
@@ -571,6 +756,43 @@ pub fn marlin_gemm(
 
     // Calculate number of groups
     let num_groups = scales.dims()[0];
+
+    // Prefill (M > AWQ_GEMV_M_THRESHOLD) + AWQ INT4 zero-point + no
+    // activation reorder → dequant + cuBLAS BF16 GEMM. The GEMV path in
+    // `cuda_fwd_awq_gemv` does not amortise weight re-use across the M
+    // axis, so above this threshold its per-token cost dominates the
+    // prefill profile (Stage 13-D.3 measured 232 µs/(layer, token) at
+    // M = 1940 vs ~80 µs/layer-call in decode).
+    if matches!(scalar_type, MarlinScalarType::Uint4)
+        && qzeros.is_some()
+        && g_idx.is_none()
+        && m > AWQ_GEMV_M_THRESHOLD
+    {
+        // Candle's matmul does not broadcast a 2D weight over a higher-rank
+        // input (e.g. 3D batched activations [B, M, K] @ [K, N]); flatten
+        // to 2D first, then reshape the GEMM output back. The flatten is
+        // free when input is already contiguous (no copy).
+        let input_2d = if dims.len() == 2 {
+            input.clone()
+        } else {
+            input.reshape((m, k))?
+        };
+        let result_2d = awq_marlin_dequant_matmul(
+            &input_2d,
+            qweight,
+            scales,
+            qzeros.expect("guarded above"),
+            bias,
+            size_k,
+            size_n,
+        )?;
+        if dims.len() > 2 {
+            let mut out_shape: Vec<usize> = dims[..dims.len() - 1].to_vec();
+            out_shape.push(size_n);
+            return result_2d.reshape(out_shape);
+        }
+        return Ok(result_2d);
+    }
 
     let op = MarlinGemmOp {
         qweight: qweight.clone(),
@@ -1884,6 +2106,150 @@ mod tests {
             assert!(
                 max_abs <= tol,
                 "awq_gemv (m=4) vs CPU ref max_abs={max_abs} > tol={tol} (max_expected={max_expected})"
+            );
+        }
+
+        /// M=32 (> AWQ_GEMV_M_THRESHOLD) routes through the prefill
+        /// `awq_marlin_dequant_matmul` path: dequant → cuBLAS BF16 GEMM.
+        /// Compares against the same CPU reference the GEMV tests use, so
+        /// any drift between the two GPU paths fails this test.
+        #[test]
+        fn test_awq_marlin_dequant_matmul_matches_cpu_reference_m32() {
+            let Some(device) = get_cuda_device() else {
+                eprintln!("Skipping test: no CUDA device");
+                return;
+            };
+
+            // Larger M to force the prefill path and to exercise the GEMM
+            // K accumulation across more rows. K and N intentionally chosen
+            // to land on group_size and N_TILE boundaries the dequant
+            // kernel uses.
+            let m = 32usize;
+            let k = 256usize;
+            let n = 64usize;
+            let group_size = 128usize;
+            let num_groups = k / group_size;
+            let packed_k = k / 8;
+            let packed_n = n / 8;
+
+            let mut rng: u32 = 0xDEAD_BEEF;
+            let mut next = |modulus: u32| -> u32 {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                rng % modulus
+            };
+
+            let mut qweight_words: Vec<u32> = Vec::with_capacity(packed_k * n);
+            for _ in 0..(packed_k * n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qweight_words.push(w);
+            }
+            let mut qzeros_words: Vec<u32> = Vec::with_capacity(num_groups * packed_n);
+            for _ in 0..(num_groups * packed_n) {
+                let mut w: u32 = 0;
+                for i in 0..8 {
+                    w |= (next(16) & 0xF) << (i * 4);
+                }
+                qzeros_words.push(w);
+            }
+            let scales_f32: Vec<f32> = (0..(num_groups * n))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-4)
+                .collect();
+            let inputs_f32: Vec<f32> = (0..(m * k))
+                .map(|_| ((next(2000) as f32) - 1000.0) * 1e-3)
+                .collect();
+            let bf16_round = |v: f32| -> f32 { half::bf16::from_f32(v).to_f32() };
+            let scales: Vec<f32> = scales_f32.iter().map(|&v| bf16_round(v)).collect();
+            let inputs: Vec<f32> = inputs_f32.iter().map(|&v| bf16_round(v)).collect();
+
+            let mut expected = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for ni in 0..n {
+                    let zp_pack_col = ni / 8;
+                    let zp_bit = (ni % 8) * 4;
+                    let mut acc = 0.0f32;
+                    for k_idx in 0..k {
+                        let group_id = k_idx / group_size;
+                        let pack_row = k_idx / 8;
+                        let pack_idx = k_idx % 8;
+                        let w_word = qweight_words[pack_row * n + ni];
+                        let nib = ((w_word >> (pack_idx * 4)) & 0xF) as i32;
+                        let zp_word = qzeros_words[group_id * packed_n + zp_pack_col];
+                        let zp = ((zp_word >> zp_bit) & 0xF) as i32;
+                        let scale = scales[group_id * n + ni];
+                        let w_val = ((nib - zp) as f32) * scale;
+                        acc += inputs[mi * k + k_idx] * w_val;
+                    }
+                    expected[mi * n + ni] = acc;
+                }
+            }
+
+            // Same transposed `[N, K/8]` qweight layout the production
+            // loader produces — the dequant kernel reads exactly this.
+            let qweight = Tensor::from_vec(qweight_words, (packed_k, n), &device)
+                .unwrap()
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let qzeros = Tensor::from_vec(qzeros_words, (num_groups, packed_n), &device).unwrap();
+            let scales_t = Tensor::from_vec(scales.clone(), (num_groups, n), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let input = Tensor::from_vec(inputs.clone(), (m, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let workspace = Tensor::zeros(64usize, DType::U32, &device).unwrap();
+
+            // M=32 > AWQ_GEMV_M_THRESHOLD ⇒ marlin_gemm dispatches to
+            // awq_marlin_dequant_matmul.
+            let output = marlin_gemm(
+                &input,
+                &qweight,
+                &scales_t,
+                Some(&qzeros),
+                None,
+                None,
+                &workspace,
+                None,
+                MarlinScalarType::Uint4,
+                k,
+                n,
+                true,
+                true,
+            )
+            .expect("awq_marlin_dequant_matmul launch should succeed");
+
+            let got: Vec<f32> = output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            assert_eq!(got.len(), expected.len());
+            // BF16 cuBLAS GEMM accumulates in higher precision but rounds
+            // the output back to BF16 — same final-stage quantisation as
+            // the GEMV path, so the same tolerance applies.
+            let max_expected = expected.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let tol = (max_expected * 0.01).max(5e-2);
+            let max_abs = got
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= tol,
+                "awq_marlin_dequant_matmul (m=32) vs CPU ref max_abs={max_abs} > tol={tol} (max_expected={max_expected})"
             );
         }
 

@@ -115,3 +115,8 @@ harness = false
 [[bench]]
 name = "sampling_pipeline_bench"
 harness = false
+
+[[bench]]
+name = "awq_marlin_path_bench"
+harness = false
+required-features = ["cuda-kernels", "marlin"]
