@@ -536,6 +536,77 @@ pub fn gpu_sample_batch(logits: &Tensor, configs: &[GpuSamplingConfig]) -> Resul
 /// (logit_bias, freq+pres penalties, banned tokens, bad words) on-GPU before
 /// temperature scaling.  The eligibility check in the caller is responsible
 /// for ensuring no multiplicative or filter-style modifiers slipped in.
+/// Stage A'.3 — async-sampling-friendly variant.
+/// Returns the sampled token IDs as a GPU `Tensor` (`[num_seqs]` U32)
+/// WITHOUT the blocking host-side `to_vec1()`. The caller can use this
+/// tensor directly as the next forward's `input_ids` (no DtoH+HtoD
+/// round-trip), and asynchronously DtoH the IDs in parallel with the
+/// next forward's compute.
+///
+/// nsys profile (2026-05-08) showed `to_vec1()` blocking 50 ms per call
+/// at c=8 — pure stream-drain wait, NOT the 32-byte DMA itself. This
+/// API breaks the autoregressive serialization: GPU keeps running
+/// while host reads the IDs.
+pub fn gpu_sample_batch_with_diffs_to_tensor(
+    logits: &Tensor,
+    configs: &[GpuSamplingConfig],
+    diffs: &[LogitsDiff],
+) -> Result<Tensor> {
+    let (num_seqs, _vocab_size) = logits.dims2()?;
+    assert_eq!(num_seqs, configs.len());
+
+    let logits = logits.to_dtype(DType::F32)?;
+    let logits = gpu_apply_logits_diff(&logits, diffs)?;
+    let logits = &logits;
+
+    let all_greedy = configs.iter().all(|c| c.inv_temperature == 0.0);
+    if all_greedy {
+        return gpu_argmax(logits);
+    }
+
+    let inv_temps: Vec<f32> = configs
+        .iter()
+        .map(|c| {
+            if c.inv_temperature == 0.0 {
+                1.0
+            } else {
+                c.inv_temperature
+            }
+        })
+        .collect();
+    let scaled_logits = gpu_temperature_scale(logits, &inv_temps)?;
+    let probs = gpu_softmax(&scaled_logits)?;
+
+    let top_k_arr: Vec<i32> = configs.iter().map(|c| c.top_k).collect();
+    let top_p_arr: Vec<f32> = configs.iter().map(|c| c.top_p).collect();
+    let rand_arr: Vec<f32> = configs.iter().map(|c| c.rand_val).collect();
+
+    let rand_tensor = Tensor::from_vec(rand_arr, num_seqs, logits.device())?;
+    let result = gpu_top_k_top_p_sample(&probs, &rand_tensor, &top_k_arr, &top_p_arr)?;
+
+    // Mixed greedy + multinomial: need to merge in argmax results for
+    // the greedy seqs. Stage A'.3 caveat — this path falls back to a
+    // host round-trip. Most production batches are uniformly
+    // multinomial OR uniformly greedy (handled by all_greedy branch
+    // above), so the mixed path is rare; deferring its async fix to
+    // a follow-up. For now, materialise on host, override, and
+    // re-upload.
+    let has_greedy = configs.iter().any(|c| c.inv_temperature == 0.0);
+    if has_greedy {
+        let mut ids: Vec<u32> = result.to_vec1()?;
+        let argmax_result = gpu_argmax(logits)?;
+        let argmax_ids: Vec<u32> = argmax_result.to_vec1()?;
+        for (i, config) in configs.iter().enumerate() {
+            if config.inv_temperature == 0.0 {
+                ids[i] = argmax_ids[i];
+            }
+        }
+        return Tensor::from_vec(ids, num_seqs, logits.device());
+    }
+
+    Ok(result)
+}
+
 pub fn gpu_sample_batch_with_diffs(
     logits: &Tensor,
     configs: &[GpuSamplingConfig],
@@ -582,8 +653,43 @@ pub fn gpu_sample_batch_with_diffs(
     let rand_tensor = Tensor::from_vec(rand_arr, num_seqs, logits.device())?;
     let result = gpu_top_k_top_p_sample(&probs, &rand_tensor, &top_k_arr, &top_p_arr)?;
 
+    // Stage A'.3 diag: measure the to_vec1 stall directly. nsys profile
+    // shows cuMemcpyDtoHAsync_v2 taking 13-54 ms per call — this is the
+    // host blocking on stream drain, NOT the 32-byte DMA itself.
+    // Confirmation here lets us scope the async-sampling fix.
+    static SAMPLE_TO_VEC_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let log_first = std::env::var("VLLM_PROFILE_SAMPLER_TOVEC").is_ok();
+    let t0 = if log_first {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     // Handle greedy sequences: override with argmax result
     let mut ids: Vec<u32> = result.to_vec1()?;
+
+    if let Some(t0) = t0 {
+        let elapsed = t0.elapsed();
+        SAMPLE_TO_VEC_LOGGED.get_or_init(|| {
+            tracing::info!(
+                target: "vllm_core::sampler_diag",
+                "first sampler to_vec1: {} µs (size={} u32, expected ~32 bytes)",
+                elapsed.as_micros(),
+                ids.len()
+            );
+        });
+        // Log every 100 calls thereafter
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_multiple_of(100) {
+            tracing::info!(
+                target: "vllm_core::sampler_diag",
+                "sampler to_vec1 ({} calls): last={} µs (expected 32B DMA <100µs)",
+                n,
+                elapsed.as_micros()
+            );
+        }
+    }
     let has_greedy = configs.iter().any(|c| c.inv_temperature == 0.0);
     if has_greedy {
         let argmax_result = gpu_argmax(logits)?;
