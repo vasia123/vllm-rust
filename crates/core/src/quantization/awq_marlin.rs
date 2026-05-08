@@ -462,29 +462,39 @@ impl AwqMarlinLinear {
 #[cfg(feature = "marlin")]
 pub(crate) const HYBRID_M_THRESHOLD: usize = 8;
 
-/// Returns `true` if hybrid dispatch is disabled by env override.
+/// Returns `true` if hybrid dispatch is enabled via env opt-in.
+/// **Default is OFF** — turning it on doubles the qweight footprint at
+/// load time (Stage 15.E.3 measured +2.2 GiB on Qwen3-4B-AWQ vs the
+/// ADR 0016 prediction of +1.1 GiB; the laptop ran out of KV-cache room
+/// at default settings). Users with VRAM headroom can opt in via
+/// `VLLM_AWQ_HYBRID=1` for the 1.10-1.24× decode-side win.
+///
 /// Read once per process — re-checking on every forward call would cost
-/// us a syscall per layer per token at decode hot path.
+/// a syscall per layer per token at decode hot path.
 #[cfg(feature = "marlin")]
-fn hybrid_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var("VLLM_AWQ_DISABLE_HYBRID").is_ok())
+fn hybrid_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VLLM_AWQ_HYBRID").is_ok())
 }
 
 impl QuantizedLinear for AwqMarlinLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Stage 15.E.2 hybrid dispatch:
-        //   M ≤ 8 + tile_b populated + not env-disabled → tile_mma_v1 software
-        //                                                  path (1.10–1.24× win)
+        //   M ≤ 8 + tile_b populated → tile_mma_v1 software path
+        //                              (1.10–1.24× win on the AWQ-Marlin slice)
         //   else → existing MarlinLinear → marlin_gemm path (saturated cuBLAS
         //          GEMM for M ≥ 16, dequant+matmul for the M=12-16 crossover)
-        // ADR 0016 documents the rationale and bench data.
+        // tile_b is only populated when `VLLM_AWQ_HYBRID=1` is set at load
+        // time, so this branch is dead under the default configuration —
+        // production behaviour unchanged. ADR 0016 documents the rationale
+        // and bench data; the env opt-in protects laptop / VRAM-tight
+        // deployments from the +2.2 GiB load-time cost.
         #[cfg(feature = "marlin")]
         {
-            if !hybrid_disabled() && x.dims().len() == 2 {
-                let m = x.dims()[0];
-                if m > 0 && m <= HYBRID_M_THRESHOLD {
-                    if let Some(tile_b) = self.tile_b.as_ref() {
+            if let Some(tile_b) = self.tile_b.as_ref() {
+                if x.dims().len() == 2 {
+                    let m = x.dims()[0];
+                    if m > 0 && m <= HYBRID_M_THRESHOLD {
                         let group_size_i = self.inner.config_ref().group_size;
                         // Per-channel scales (group_size = -1) are
                         // disallowed by the tile_mma_v1 dispatcher; drop
@@ -521,17 +531,23 @@ impl QuantizedLinear for AwqMarlinLinear {
         let mut repacked: HashMap<String, Tensor> = HashMap::with_capacity(weights.len());
 
         if let Some(qw) = weights.get("qweight") {
-            // Stage 15.E.1: compute the Marlin tile layout BEFORE the GPTQ
+            // Stage 15.E.1/3: compute the Marlin tile layout BEFORE the GPTQ
             // transpose consumes the AWQ-original `[K, N/8]` shape. Gated on
-            // the `marlin` feature (we only need it when the hybrid dispatch
-            // path is compiled in) and on shape divisibility (Marlin tile
-            // requires `K % 16 == 0`, `N % 64 == 0`). Heavy CPU work — runs
-            // ~5-7 s once at load time on Qwen3-4B; production decode path
-            // is unaffected (forward still routes through MarlinLinear until
-            // 15.E.2 adds the runtime gate).
+            // (a) the `marlin` feature, (b) the `VLLM_AWQ_HYBRID=1` env opt-in
+            // (15.E.3 measured +2.2 GiB VRAM on Qwen3-4B vs the ADR 0016
+            // prediction of +1.1 GiB; default is OFF to preserve KV-cache
+            // budget on memory-tight devices), and (c) shape divisibility
+            // (Marlin tile requires `K % 16 == 0`, `N % 64 == 0`).
             #[cfg(feature = "marlin")]
             {
-                if self.in_features.is_multiple_of(16) && self.out_features.is_multiple_of(64) {
+                // `cfg(test)` keeps the unit tests below independent of
+                // the env var (OnceLock would otherwise pin the first
+                // observed state for the whole test process).
+                let gate_open = cfg!(test) || hybrid_enabled();
+                if gate_open
+                    && self.in_features.is_multiple_of(16)
+                    && self.out_features.is_multiple_of(64)
+                {
                     let qw_cpu = qw.to_dtype(DType::U32)?.to_device(&Device::Cpu)?;
                     let tile = awq_to_marlin_tile_repack_cpu(
                         &qw_cpu,

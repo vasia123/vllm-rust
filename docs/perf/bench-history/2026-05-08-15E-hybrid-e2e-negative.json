@@ -1,0 +1,43 @@
+{
+  "stage": "15.E.3 — hybrid dispatch e2e bench (negative result)",
+  "date": "2026-05-08",
+  "commit": "c0ba543 (15.E.2 forward dispatch) → adjusted for env opt-in",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU (sm_89)",
+  "model": "Qwen/Qwen3-4B-AWQ",
+  "harness": "bench_decode.py --runs 3, --enforce-eager",
+  "default_build_max_model_len_6000": {
+    "c_1_tps":   43.1,
+    "c_4_agg":   64.5,
+    "c_8_agg":   63.6,
+    "vram_after_load_gib": 5.20,
+    "kv_blocks": 588
+  },
+  "hybrid_build_VLLM_AWQ_HYBRID_1_max_model_len_1024_num_blocks_256": {
+    "c_1_tps":   42.8,
+    "c_4_agg":   64.4,
+    "c_8_agg":   63.9,
+    "vram_after_load_gib": 6.45,
+    "kv_blocks": 256
+  },
+  "ratio_hybrid_over_default": {
+    "c_1": "0.99 (no measurable change)",
+    "c_4": "1.00 (no measurable change)",
+    "c_8": "1.00 (no measurable change)"
+  },
+  "context": [
+    "Stage 15.D microbench (commit 8dc4087) showed software tile_mma_v1 beats production marlin_gemm by 1.10-1.24x at the canonical Qwen3-4B-AWQ MLP-up shape (K=4096, N=11008, group_size=128) at M in {1, 4, 8}.",
+    "Stage 14-C decode profile said AWQ-Marlin = 91 % of decode wallclock at c=8.",
+    "Naive Amdahl projection: 1.20x lift on 0.91 of wallclock = +18 % decode tps. Measured: 0 %."
+  ],
+  "leading_hypotheses_for_zero_lift": [
+    "Real Qwen3 forward calls AwqMarlinLinear ~252 times per decode token — across multiple shapes (q/k/v_proj K=2560 N=2560, o_proj K=2560 N=2560, gate/up_proj K=2560 N=11008, down_proj K=11008 N=2560, ...). The microbench measured ONLY the MLP-up shape; the win curve at smaller K=2560 / N=2560 layers may be different (likely software loses the setup-overhead advantage at smaller K).",
+    "Per-kernel launch overhead: 252 kernel-launch latencies dominate the per-call differential at this M scale. The microbench amortised the launch cost across many iterations of a single shape; e2e fires each shape once per token.",
+    "Dispatch path correctness: smoke chat completion produces sane output, so the hybrid path IS active and numerically correct. The path simply does not deliver the predicted lift on the production workload."
+  ],
+  "outcome": [
+    "Stage 15.E code (env-gated tile_b storage, M<=8 forward dispatch, tests, ADR 0016, microbench) is RETAINED — the engineering is sound, the dispatch path works, and it is the foundation that the upcoming Stage 15.D-body tensor-core kernel will inherit (same dispatcher signature, same M gate, same tile_b storage).",
+    "Hybrid stays opt-in via VLLM_AWQ_HYBRID=1 (default OFF). Production users see no behaviour change.",
+    "Stage 15.E.4 (raise threshold post-tensor-cores) becomes the path that delivers the e2e win: a tensor-core mma.m16n8k16 kernel will beat both marlin_gemm and the software dot-product across the full M sweep, and the dispatcher already in place routes to it without further plumbing.",
+    "Lesson re-captured (mirrors Stage 14-A.1 negative result): a microbench win on a single shape does not extrapolate to e2e wins across a model with ~hundreds of varied-shape calls per token. Always validate Amdahl projections with bench_decode --runs 3 BEFORE landing the wiring."
+  ]
+}

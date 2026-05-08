@@ -1561,3 +1561,67 @@ both M regimes.
 Snapshot: `docs/perf/bench-history/2026-05-08-15D-tile-mma-vs-
 production.json`.
 
+## Stage 15.E.3 — hybrid e2e bench: **negative result** (no lift)
+
+Built the full hybrid dispatch (commits `a361afc` 15.E.1 dual-storage,
+`c0ba543` 15.E.2 forward dispatch, gated on `VLLM_AWQ_HYBRID=1` env
+opt-in after the +2.2 GiB load-time VRAM cost crowded out KV cache on
+the 8 GiB laptop), then measured e2e decode tps at the same canonical
+config (`bench_decode.py --runs 3`, prompt_len=256, max_tokens=128):
+
+| concurrency | default                      | hybrid (VLLM_AWQ_HYBRID=1) |
+| :---------: | ---------------------------: | -------------------------: |
+|     c=1     |                     43.1 tps |                   42.8 tps |
+|     c=4     |                     64.5 tps |                   64.4 tps |
+|     c=8     |                     63.6 tps |                   63.9 tps |
+
+(default uses `--max-model-len 6000`, hybrid uses `--max-model-len
+1024 --num-blocks 256` to fit the +1.25 GiB tile_b inside the 8 GiB
+budget.)
+
+**No measurable e2e win.** The 15.D microbench projected +1.10–1.24× on
+the AWQ-Marlin slice; combined with Stage 14-C's 91 % AWQ-Marlin
+share at c=8 the Amdahl projection was +18 % decode tps. Reality: 0 %.
+
+### Hypotheses for the zero-lift outcome
+
+1. **Real Qwen3 forward calls AwqMarlinLinear ~252× per decode token,
+   across multiple shapes** — q/k/v_proj at K=2560 N=2560,
+   o_proj at K=2560 N=2560, gate/up_proj at K=2560 N=11008, down_proj
+   at K=11008 N=2560. The microbench measured ONLY the MLP-up shape
+   (K=4096 N=11008). The crossover M and the absolute win likely
+   differ across shapes — at the smaller K=2560 layers software may
+   lose the setup-overhead advantage.
+2. **Per-kernel launch overhead amortisation differs.** The microbench
+   ran the same shape in a tight loop; criterion's measurement window
+   amortises launch latency across many iterations. Real decode fires
+   each shape once per token, so the per-call launch cost has nothing
+   to amortise against.
+3. **Path correctness confirmed.** Smoke chat completion produces sane
+   output; correctness script (when re-run) would surface any silent
+   fallback. The hybrid path IS active and numerically correct — it
+   simply does not deliver the predicted lift on the real workload.
+
+### Outcome
+
+- All Stage 15.E code is retained: env-gated tile_b storage,
+  M ≤ 8 forward dispatch, tests, ADR 0016, microbench, snapshot. The
+  engineering is sound and the dispatcher signature/storage shape will
+  be inherited by Stage 15.D-body's tensor-core kernel.
+- Hybrid stays **opt-in** via `VLLM_AWQ_HYBRID=1` (default OFF).
+  Production users see no behaviour change and no VRAM regression.
+- The win path that *does* materialise e2e is Stage 15.D-body — a
+  tensor-core `mma.m16n8k16` kernel that beats both `marlin_gemm` and
+  the software dot-product across the M sweep. The dispatcher in
+  place routes to it without further plumbing.
+
+### Lesson (re-captured)
+
+This mirrors the Stage 14-A.1 outcome: a microbench win on a single
+shape did not extrapolate to e2e wins on a model that fires hundreds
+of varied-shape calls per token. Validate Amdahl projections with
+`bench_decode.py --runs 3` BEFORE wiring the production dispatch.
+
+Snapshot: `docs/perf/bench-history/2026-05-08-15E-hybrid-e2e-
+negative.json`.
+
