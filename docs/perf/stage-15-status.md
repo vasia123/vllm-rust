@@ -33,7 +33,8 @@ path) starts from a clean foundation.
 | 15.D-body.3b | `a837f80` | TC multi-K extension (group_size=K) |
 | 15.D-body.3c | `63f97fa` | TC multi-group_size extension |
 | 15.D-body.3d | `03e5896` | TC small-M / multi-m-tile via masking — full production-shape contract on TC |
-| 15.D-body.4  | (this commit) | TC microbench: 2-5× vs production marlin_gemm at M=4..8 |
+| 15.D-body.4  | `b9bc05f` | TC microbench: 2-5× vs production marlin_gemm at M=4..8 |
+| 15.D-body.5  | (this commit) | **NEGATIVE: e2e 0% lift** (replay of 15.E.3 hypothesis 2) |
 
 ## Current production behaviour
 
