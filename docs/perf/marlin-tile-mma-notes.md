@@ -1,5 +1,45 @@
 # Marlin INT4 GEMM Tile-MMA Kernel: Implementation Notes for Rust+CUDA Reimplementation
 
+## What's already in vllm-rust (Stage 15.B integration map)
+
+Audited 2026-05-08, before starting Stage 15.B. Existing repack
+plumbing should be **reused, not duplicated**:
+
+| component                                  | location                                             | status                                     |
+| ------------------------------------------ | ---------------------------------------------------- | ------------------------------------------ |
+| AWQ→GPTQ nibble undo_pack                  | `awq_marlin.rs::repack_awq_nibbles` (line 126)       | DONE (Stage 13-J)                          |
+| Marlin scale permutation                   | `marlin.rs::marlin_permute_scales` (line 380)        | DONE — uses `get_scale_perms()`            |
+| GPTQ→Marlin tile qweight repack (CPU)      | `marlin.rs::repack_gptq_to_marlin` (line 416)        | **STUB** — returns `qweight.clone()` (462) |
+| GPTQ→Marlin tile qweight repack (CUDA PTX) | would-be `marlin_gemm.ptx::repack_gptq_to_marlin_…`  | MISSING entry (per `process_weights` doc)  |
+| `MarlinLinear::process_weights`            | `marlin.rs:698`                                      | deliberate no-op until tile-MMA kernel ships |
+
+So **15.B = replace the CPU stub at `marlin.rs:462-465` with a real
+nibble-tile rearrangement**, following the reference algorithm in
+`reference/vllm/csrc/quantization/marlin/awq_marlin_repack.cu`. The
+scales side is already correct; AWQ→GPTQ is already correct. Do not
+reintroduce parallel implementations; route through what exists.
+
+The new CPU repack also unblocks `process_weights` to do the full
+GPTQ→Marlin tile transform — but that wiring is gated until 15.E
+dispatch decides per-call whether to use the new tile-MMA kernel or
+fall back to the existing kernels (`awq_gemv_int4_bf16`,
+`marlin_gemm`, etc.) which read raw GPTQ and would break if their
+input arrives tile-laid-out. Two options at integration time:
+
+1. **Per-instance dual storage**: `MarlinLinear` holds both raw GPTQ
+   weights (for the existing kernels) and tile-laid-out weights (for
+   the new kernel). VRAM cost: ~2× weight footprint. Acceptable for
+   Qwen3-4B (≈1.1 GiB int4 weights → 2.2 GiB).
+2. **Lazy repack**: Keep raw GPTQ; the first time the new kernel
+   dispatches, repack on the fly into a per-instance cache. First call
+   pays a 5–10 s repack cost; subsequent calls free. Better for VRAM
+   but adds complexity (where to store the tensor, when to free).
+
+Option 1 is simpler and matches reference vLLM's behaviour (always
+keep the tile-laid-out qweight resident). Pick at 15.E.
+
+---
+
 ## Overview
 These notes capture the essential design choices in vLLM's Marlin reference (GPTQ/AWQ INT4 GEMM) to guide a minimal-viable Rust+CUDA reimplementation for sm_89 (RTX 4060 Ada). Focus: extract the 30% that is necessary, defer the 70% that can be added in v2.
 
