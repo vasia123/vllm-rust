@@ -125,3 +125,8 @@ required-features = ["cuda-kernels", "marlin"]
 name = "marlin_tile_mma_path_bench"
 harness = false
 required-features = ["cuda-kernels", "marlin"]
+
+[[bench]]
+name = "lm_head_matmul_bench"
+harness = false
+required-features = ["cuda"]
