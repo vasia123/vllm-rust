@@ -1483,8 +1483,18 @@ pub(crate) fn finish_request_with_error_deferred(
     req_id: RequestId,
     error: EngineError,
     requests: &mut HashMap<RequestId, ActiveRequest>,
+    kv_cache_mgr: &mut KVCacheManager,
 ) -> Option<RequestId> {
-    if let Some(req) = requests.remove(&req_id) {
+    if let Some(mut req) = requests.remove(&req_id) {
+        // Free KV cache blocks BEFORE dropping the request — without this
+        // the blocks stay allocated in the pool's free-list accounting
+        // even though no request owns them, eventually hard-deadlocking
+        // the scheduler (cache=100%, num_running=0, num_waiting>0).
+        // Diagnosed 2026-05-08 under c=16 bench: prefill OOM cascade
+        // leaked all 384 blocks within seconds.
+        if let Err(e) = kv_cache_mgr.free_request(&mut req.state.block_table) {
+            tracing::warn!(error = %e, request_id = req_id, "Failed to free request KV blocks during error finalisation");
+        }
         send_error(req.response, error);
         Some(req_id)
     } else {

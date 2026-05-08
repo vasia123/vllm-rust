@@ -731,7 +731,8 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 &mut state.requests,
                 tokenizer,
             ) {
-                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                if let Some(id) =
+                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
                 {
                     state.errored_ids.push(id);
                 }
@@ -744,7 +745,8 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 None => continue,
             };
             if let Err(e) = self.proposer.init_request(req_id, &prompt_tokens) {
-                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                if let Some(id) =
+                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
                 {
                     state.errored_ids.push(id);
                 }
@@ -783,7 +785,8 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 )
             };
             if let Err(e) = result {
-                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                if let Some(id) =
+                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
                 {
                     state.errored_ids.push(id);
                 }

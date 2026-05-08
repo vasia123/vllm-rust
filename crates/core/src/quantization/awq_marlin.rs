@@ -476,8 +476,14 @@ impl AwqMarlinLinear {
 /// kept it in.
 #[cfg(feature = "marlin")]
 pub(crate) const HYBRID_M_MIN: usize = 4;
+/// Stage 15.D-body.5 fix landed +74% c=8 e2e via tensor cores. Tile_mma
+/// kernel is m=16 native and accumulates in FP32 — performance scales
+/// linearly with M for M ≥ 16 (kernel does ceildiv(M,16) m-tiles). The
+/// gate stays at 32 to cover typical decode batches without speculative
+/// extrapolation: untested above c=8 in e2e bench. Widen further only
+/// after benching c ∈ {16, 32}.
 #[cfg(feature = "marlin")]
-pub(crate) const HYBRID_M_MAX: usize = 8;
+pub(crate) const HYBRID_M_MAX: usize = 32;
 
 /// Returns `true` if hybrid dispatch is enabled via env opt-in.
 /// **Default is OFF** — turning it on doubles the qweight footprint at

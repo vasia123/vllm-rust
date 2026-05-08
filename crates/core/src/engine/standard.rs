@@ -318,7 +318,8 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 &mut state.requests,
                 tokenizer,
             ) {
-                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                if let Some(id) =
+                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
                 {
                     state.errored_ids.push(id);
                 }
@@ -362,7 +363,8 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 &mut state.requests,
                 _tokenizer,
             ) {
-                if let Some(id) = finish_request_with_error_deferred(req_id, e, &mut state.requests)
+                if let Some(id) =
+                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
                 {
                     state.errored_ids.push(id);
                 }
@@ -405,6 +407,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                         req_id,
                         EngineError::Model(format!("batched decode failed: {err_msg}")),
                         &mut state.requests,
+                        kv_cache_mgr,
                     ) {
                         state.errored_ids.push(id);
                     }
