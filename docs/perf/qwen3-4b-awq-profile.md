@@ -845,6 +845,55 @@ default cudarc stream policy, or the CPU-fallback path in
   immediately by the Stage 13-D bench harness, before any
   user-facing build saw it.
 
+### Stage 13-H follow-up (2026-05-08): the regression was a power-state artefact
+
+Re-investigating the bump under `--runs 3` sustained load (so the GPU
+stays at ~max graphics clock instead of dropping to ~74 % under
+`--runs 1` between samples) reveals the original 13-H drop was a
+**measurement artefact, not a real regression**. Same RTX 4060 Laptop
+sm_89, same Qwen/Qwen3-4B-AWQ, same `--enforce-eager --max-model-len
+6000`, prompt_len 256, max_tokens 128:
+
+| concurrency | vendored 0.9.1 fork (baseline) | candle 0.10.2 vanilla |
+| :---------: | -----------------------------: | --------------------: |
+|     c=1     |                       42.6 tps |          **42.6 tps** |
+|     c=4 agg |                       61.2 tps |          **61.8 tps** |
+|     c=8 agg |                       63.3 tps |          **63.3 tps** |
+
+(Both with `--runs 3` so the 2nd–3rd run hits steady-state clocks.)
+
+The non-default-stream patch (`CudaDevice::new` → `new_stream()` instead
+of `default_stream()`) was load-bearing only for CUDA Graph capture,
+which is independently blocked by cudarc 0.16 V3 (memory note
+`perf_cuda_graph_capture.md`); dropping the patch costs nothing
+practical for our workload.
+
+API drift (12 errors documented in 13-H) and the runtime AWQ
+qweight/qzeros load issue (HF stores them as I32; candle 0.10 chains a
+non-existent CUDA cast kernel that errors with `CUDA_ERROR_NOT_FOUND,
+"named symbol not found"`) were both fixed:
+
+- API drift: mechanical renames (`memcpy_stod` → `clone_htod`,
+  `memcpy_dtov` → `clone_dtoh`), missing `SimpleBackend::get_unchecked`
+  impl in `GgufVarBuilderBackend`, wildcard arms for new DType /
+  CudaStorageSlice variants.
+- Runtime AWQ load: in `weight_loader::vb_get_as`, when the VarBuilder
+  is on a CUDA device and the requested dtype is `U8 | U32 | I64`,
+  clone the VarBuilder onto `Device::Cpu` via `set_device(Device::Cpu)`,
+  fetch the tensor on CPU (where the cast is bitwise), then move to GPU.
+  One-shot at load time; production decode path is unchanged.
+
+`vendor/candle/` directory + `scripts/setup-vendor-candle.sh` retired
+(the script kept on disk with a deprecation header for archival
+reasons; the directory is left in place pending a follow-up cleanup
+commit). Dockerfile vendor-setup step removed.
+
+**Lesson**: GPU power state matters in micro-benchmarks. Always run
+with `--runs 3` (or more) so the device leaves the idle clock-down
+state before the measurement window. A 30 % clock drop maps directly
+into a ~30 % tps drop, which is enough to mis-attribute a bump as a
+regression.
+
 ---
 
 ## Stage 13-F PoC — kt_mloop kernel (REVERTED)

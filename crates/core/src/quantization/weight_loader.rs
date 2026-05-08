@@ -14,13 +14,31 @@ use candle_nn::{Init, VarBuilder};
 /// packed integer tensors (GPTQ qweight, AWQ qweight/qzeros, etc.) that
 /// must keep their raw bit pattern even when the model's activation
 /// dtype is F16/BF16/F32.
+///
+/// candle 0.10 routes the on-disk-dtype → activation-dtype → target-dtype
+/// chain through CUDA cast kernels. The integer-cast variants
+/// (e.g. I32→U32) hit `CUDA_ERROR_NOT_FOUND, "named symbol not found"`
+/// because we don't ship those kernels — and the older "via BF16" cast
+/// path corrupts packed nibbles. Workaround: when the VarBuilder is on a
+/// CUDA device and we want an integer dtype, clone the VarBuilder onto
+/// `Device::Cpu` (cheap — backend is reference-counted), fetch there
+/// (CPU casts are bitwise / native), then move the result back to GPU.
+/// This is one-shot at load time. See Stage 13-H follow-up notes.
 fn vb_get_as<S: Into<candle_core::Shape>>(
     vb: &VarBuilder<'static>,
     shape: S,
     name: &str,
     dtype: DType,
 ) -> Result<Tensor> {
-    vb.get_with_hints_dtype(shape, name, Init::Const(0.0), dtype)
+    let dev = vb.device().clone();
+    let needs_cpu_workaround =
+        dev.is_cuda() && matches!(dtype, DType::U8 | DType::U32 | DType::I64);
+    if !needs_cpu_workaround {
+        return vb.get_with_hints_dtype(shape, name, Init::Const(0.0), dtype);
+    }
+    let cpu_vb = vb.clone().set_device(Device::Cpu);
+    let t_cpu = cpu_vb.get_with_hints_dtype(shape, name, Init::Const(0.0), dtype)?;
+    t_cpu.to_device(&dev)
 }
 
 use super::awq::{AwqConfig, AwqLinear};

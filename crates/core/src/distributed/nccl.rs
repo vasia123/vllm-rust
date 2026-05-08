@@ -82,6 +82,9 @@ impl NcclDataType {
             candle_core::DType::F16 => Some(Self::Float16),
             candle_core::DType::F32 => Some(Self::Float32),
             candle_core::DType::F64 => Some(Self::Float64),
+            // candle 0.10 added I16/I32/F8E4M3/F6E2M3/F6E3M2/F4/F8E8M0 — no
+            // NCCL counterpart for these; surface as None so callers bail.
+            _ => None,
         }
     }
 }
@@ -1251,6 +1254,15 @@ impl<P: ProcessGroup> NcclDeviceCommunicator<P> {
             CudaStorageSlice::F16(s) => get_ptr!(s, offset),
             CudaStorageSlice::F32(s) => get_ptr!(s, offset),
             CudaStorageSlice::F64(s) => get_ptr!(s, offset),
+            // candle 0.10 added I16/I32/F8E4M3/F6E2M3/F6E3M2/F4/F8E8M0;
+            // NCCL has no transport for these on this codepath.
+            _ => {
+                return Err(crate::distributed::error::DistributedError::TensorError(
+                    candle_core::Error::Msg(
+                        "NCCL: unsupported CudaStorageSlice variant in candle 0.10".to_string(),
+                    ),
+                ))
+            }
         };
         Ok(ptr)
     }

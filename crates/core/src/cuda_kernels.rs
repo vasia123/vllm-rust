@@ -17,6 +17,10 @@ fn clone_cuda_storage_slice(slice: &CudaStorageSlice) -> CudaStorageSlice {
         CudaStorageSlice::F16(s) => CudaStorageSlice::F16(s.clone()),
         CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.clone()),
         CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.clone()),
+        // candle 0.10 added I16/I32/F8E4M3/F6E2M3/F6E3M2/F4/F8E8M0; we don't
+        // use them in any kernel that exercises this clone helper, so panic
+        // loudly if one ever reaches here rather than silently dropping data.
+        _ => panic!("clone_cuda_storage_slice: unsupported variant in candle 0.10"),
     }
 }
 
@@ -1871,7 +1875,7 @@ impl CustomOp1 for RopeOp {
                         .iter()
                         .map(|&v| v as i32)
                         .collect();
-                    Some(dev.memcpy_stod(&pos_vec)?)
+                    Some(dev.clone_htod(&pos_vec)?)
                 }
                 _ => candle_core::bail!(
                     "rope: positions must be i64 or u32, got {:?}",

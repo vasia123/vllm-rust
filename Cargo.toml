@@ -22,8 +22,8 @@ cuda = ["vllm-core/cuda", "vllm-server/cuda"]
 vllm-core = { path = "crates/core", features = ["test-utils"] }
 vllm-server = { path = "crates/server" }
 tokio = { version = "1", features = ["full"] }
-candle-core = "0.9"
-candle-nn = "0.9"
+candle-core = "0.10"
+candle-nn = "0.10"
 serde = { workspace = true }
 serde_json = "1"
 tempfile = "3"
@@ -37,9 +37,9 @@ thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-flash-attn = "0.9"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-flash-attn = "0.10"
 hf-hub = "0.4"
 tokenizers = "0.22"
 ahash = "0.8"
@@ -64,19 +64,20 @@ symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm
 phf = { version = "0.11", features = ["macros"] }
 bitflags = "2"
 
-# Use the vendored candle fork (vendor/candle) instead of the crates.io
-# release. The fork carries one delta on top of the v0.9.1 tag — switching
-# `CudaDevice::new` from `default_stream()` to `new_stream()` so cudarc
-# reports a non-NULL CUstream to the rest of the engine. CUDA Graph capture
-# (`cuStreamBeginCapture_v2`) is unconditionally unsupported on the legacy
-# null stream; without this patch the capture path returns error 900 and
-# falls back to eager. Every other candle subcrate we touch (candle-nn,
-# candle-flash-attn) re-exports candle-core internally — patching just
-# `candle-core` is enough to redirect the whole stack to the fork.
-[patch.crates-io]
-candle-core = { path = "vendor/candle/candle-core" }
-candle-nn = { path = "vendor/candle/candle-nn" }
-candle-flash-attn = { path = "vendor/candle/candle-flash-attn" }
+# candle 0.10.2 from crates.io. The vendor/candle fork was retired by
+# Stage 13-H follow-up (2026-05-08): the original 13-H "45 % perf drop"
+# under candle 0.10 turned out to be a measurement artefact (GPU clocks
+# fell to ~74 % of max under bench_decode --runs 1 on a cold device).
+# Re-benched with --runs 3 sustained load: candle 0.10.2 vanilla matches
+# the patched 0.9.1 fork to within 1 % across c=1/4/8. The previous
+# non-default-stream patch was needed only for CUDA Graph capture, which
+# is independently blocked by cudarc 0.16 V3 (see memory note
+# `perf_cuda_graph_capture.md`), so dropping the patch costs nothing.
+#
+# `vendor/candle/` directory + `scripts/setup-vendor-candle.sh` are
+# no longer required by the build; they remain on disk pending a
+# follow-up cleanup commit. CI / Dockerfile have had the vendor step
+# removed.
 
 [[test]]
 name = "reference_comparison"

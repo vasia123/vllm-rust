@@ -646,6 +646,10 @@ impl candle_nn::var_builder::SimpleBackend for GgufVarBuilderBackend {
     fn contains_tensor(&self, name: &str) -> bool {
         self.try_load(name, DType::F32).is_ok()
     }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, _dev: &Device) -> Result<Tensor> {
+        self.try_load(name, dtype)
+    }
 }
 
 impl QuantizedWeightLoader for GgufWeightLoader {

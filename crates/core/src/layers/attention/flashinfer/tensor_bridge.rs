@@ -69,6 +69,14 @@ pub fn tensor_to_device_ptr(tensor: &Tensor) -> Result<*const std::ffi::c_void> 
                     let (ptr, _guard) = slice.device_ptr(&stream);
                     ptr as *const std::ffi::c_void
                 }
+                // candle 0.10 added I16/I32/F8E4M3/F6E2M3/F6E3M2/F4/F8E8M0;
+                // FlashInfer doesn't support these activation/cache dtypes.
+                _ => {
+                    return Err(candle_core::Error::Msg(format!(
+                        "FlashInfer: unsupported tensor dtype {:?}",
+                        tensor.dtype()
+                    )))
+                }
             };
 
             // Add byte offset for non-zero start offsets

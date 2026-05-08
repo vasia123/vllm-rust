@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Vendors a pinned candle commit into vendor/candle/ and applies the
-# `perf/non-default-stream` patch (CudaDevice uses `new_stream()` instead
-# of the legacy null `default_stream()`, unblocking part 1 of CUDA Graph
-# capture; capture is V3-blocked separately, see Stage 13-A verdict).
+# DEPRECATED (Stage 13-H follow-up, 2026-05-08).
+#
+# vllm-rust no longer depends on a vendored candle fork. The crates.io
+# release of candle 0.10.2 is consumed directly through Cargo. This
+# script is retained only for archival reasons; it is not invoked by any
+# build path (CI, Dockerfile, dev setup). Safe to delete in a follow-up
+# cleanup commit alongside the `vendor/candle/` directory.
+#
+# (Original purpose: vendored candle 0.9.1 + perf/non-default-stream
+# patch. The patch turned out to be unnecessary once the 13-H regression
+# was traced to GPU power-state, not the lost stream patch.)
 #
 # Why pin a commit, not a tag/branch?
 #   `--branch 0.9.1` resolves to the *branch head* of the upstream

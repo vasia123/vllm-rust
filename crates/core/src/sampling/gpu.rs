@@ -252,8 +252,8 @@ mod cuda_ops {
                 _ => candle_core::bail!("top_k_top_p_sample: rand_vals must be F32"),
             };
 
-            let top_k_gpu = dev.memcpy_stod(&self.top_k)?;
-            let top_p_gpu = dev.memcpy_stod(&self.top_p)?;
+            let top_k_gpu = dev.clone_htod(&self.top_k)?;
+            let top_p_gpu = dev.clone_htod(&self.top_p)?;
 
             let output_slice = dev
                 .alloc_zeros::<u32>(num_seqs)
