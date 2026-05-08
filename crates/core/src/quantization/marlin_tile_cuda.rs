@@ -279,7 +279,14 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
         let n = self.n as usize;
         let m = self.m as usize;
         let m_tiles = m.div_ceil(16) as u32;
-        let output = dev.alloc_zeros::<half::bf16>(m * n)?;
+        // SAFETY (Stage 15.D-body opt): the kernel writes every output
+        // row m_base..m_base+M (rows 0..M-1 → all of [M, N]) via the
+        // `valid_lo`/`valid_hi` masked stores. Rows beyond M are not
+        // part of the allocation. Therefore `alloc_zeros`'s pre-fill
+        // is redundant — saves a per-call `cuMemsetD8Async` on every
+        // mlp gate/up/down (3 × 36 layers × 4 multi-step = 432 saved
+        // memsets per multi-step block).
+        let output = unsafe { dev.alloc::<half::bf16>(m * n)? };
         let cfg = LaunchConfig {
             grid_dim: ((n / 16) as u32, m_tiles, 1),
             block_dim: (32, 1, 1),
