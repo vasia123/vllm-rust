@@ -40,71 +40,53 @@ use super::backend::{AttentionBackend, BatchedDecodeMetadata, PagedAttentionMeta
 ///
 /// Falls back to naive attention on CPU or when FlashInfer is unavailable.
 pub struct FlashInferBackend {
+    /// Workspace buffer for FlashInfer operations (lazily initialized on first CUDA call)
+    #[cfg(feature = "flashinfer")]
+    workspace: std::sync::Mutex<Option<WorkspaceBuffer>>,
+
     /// Block size for paged KV cache
     #[cfg_attr(not(feature = "flashinfer"), allow(dead_code))]
     block_size: usize,
-}
-
-/// Process-wide FlashInfer workspace singleton (Stage 14-A.0b).
-///
-/// Originally a per-`FlashInferBackend` field, but `select_backend()`
-/// constructs a fresh `FlashInferBackend` on every `paged_attention()`
-/// call — meaning a plan built by one backend instance pointed into a
-/// workspace that was freed (along with the instance) before the
-/// caller could replay the plan from a *different* backend instance.
-///
-/// Hoisting workspace to a `'static` `OnceLock` makes the per-device
-/// buffer outlive every backend instance: plan-cached pointers stay
-/// valid across `select_backend()` re-entry, which is the precondition
-/// Stage 14-A engine wiring depends on.
-///
-/// Single device per process is assumed (TP=1 is the only supported
-/// shape). On a multi-device build, this would key by `Device`.
-#[cfg(feature = "flashinfer")]
-static FLASHINFER_WORKSPACE: std::sync::OnceLock<std::sync::Mutex<Option<WorkspaceBuffer>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(feature = "flashinfer")]
-fn workspace_handle() -> &'static std::sync::Mutex<Option<WorkspaceBuffer>> {
-    FLASHINFER_WORKSPACE.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(feature = "flashinfer")]
-fn ensure_workspace_on(device: &Device) -> Result<()> {
-    let handle = workspace_handle();
-    let mut ws_guard = handle
-        .lock()
-        .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
-    if let Some(ref ws) = *ws_guard {
-        if ws.device().same_device(device) {
-            return Ok(());
-        }
-    }
-    *ws_guard = Some(WorkspaceBuffer::new(device)?);
-    Ok(())
 }
 
 impl FlashInferBackend {
     /// Create a new FlashInfer backend with default configuration.
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "flashinfer")]
+            workspace: std::sync::Mutex::new(None),
             block_size: 16, // Default block size
         }
     }
 
     /// Create a new FlashInfer backend with specified block size.
     pub fn with_block_size(block_size: usize) -> Self {
-        Self { block_size }
+        Self {
+            #[cfg(feature = "flashinfer")]
+            workspace: std::sync::Mutex::new(None),
+            block_size,
+        }
     }
 
-    /// Get or create the process-wide FlashInfer workspace for `device`.
+    /// Get or create workspace buffer for the given device.
     ///
-    /// Uses the static [`FLASHINFER_WORKSPACE`] singleton so workspace
-    /// memory outlives any single backend instance. See module-level
-    /// notes on Stage 14-A.0b.
+    /// Uses interior mutability via Mutex since AttentionBackend trait
+    /// methods take `&self`.
     #[cfg(feature = "flashinfer")]
     fn get_or_create_workspace(&self, device: &Device) -> Result<()> {
-        ensure_workspace_on(device)
+        let mut ws_guard = self
+            .workspace
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
+
+        if let Some(ref ws) = *ws_guard {
+            if ws.device().same_device(device) {
+                return Ok(());
+            }
+        }
+
+        *ws_guard = Some(WorkspaceBuffer::new(device)?);
+        Ok(())
     }
 
     /// Run prefill attention using FlashInfer kernels.
@@ -160,7 +142,8 @@ impl FlashInferBackend {
         let wrapper = PrefillWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
-        let mut ws_guard = workspace_handle()
+        let mut ws_guard = self
+            .workspace
             .lock()
             .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
         let ws = ws_guard
@@ -249,7 +232,8 @@ impl FlashInferBackend {
         let wrapper = DecodeWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
-        let mut ws_guard = workspace_handle()
+        let mut ws_guard = self
+            .workspace
             .lock()
             .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
         let ws = ws_guard
@@ -402,7 +386,8 @@ impl FlashInferBackend {
         let wrapper = DecodeWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
-        let mut ws_guard = workspace_handle()
+        let mut ws_guard = self
+            .workspace
             .lock()
             .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
         let ws = ws_guard
@@ -669,7 +654,8 @@ impl AttentionBackend for FlashInferBackend {
         let wrapper = wrapper::PrefillWrapper::new(config, device)?;
 
         self.get_or_create_workspace(device)?;
-        let mut ws_guard = workspace_handle()
+        let mut ws_guard = self
+            .workspace
             .lock()
             .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
         let ws = ws_guard
