@@ -9,12 +9,14 @@ use crate::request::{RequestId, RequestStatus};
 use crate::scheduler::SchedulerOutput;
 use crate::tokenizer::TokenizerWrapper;
 
+use super::async_sampler::AsyncSamplerInfra;
 use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
 use super::cuda_graph_runner::CudaGraphRunner;
 use super::helpers::{
-    execute_batched_decode_with_graph, execute_beam_decode, execute_prefill,
-    finish_request_with_error_deferred, is_beam_request, reclaim_sliding_window_blocks,
+    execute_batched_decode_with_graph, execute_beam_decode, execute_pipelined_multi_step_decode,
+    execute_prefill, finish_request_with_error_deferred, is_beam_request,
+    reclaim_sliding_window_blocks,
 };
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
@@ -35,6 +37,18 @@ pub struct StandardExecution<M: ModelForward> {
     sliding_window: Option<usize>,
     /// Block size for sliding window reclamation math.
     block_size: usize,
+    /// Async-sampler infrastructure (ADR 0017 / Substep 2.2). Lazy
+    /// init on first decode invocation when the model device is
+    /// known. Gated by env var `VLLM_ASYNC_SAMPLING=1`. `None` if env
+    /// unset or device is non-CUDA. `Some(Err)` if init failed (we
+    /// don't retry; the std path runs forever in that session).
+    async_sampler: std::sync::Mutex<AsyncSamplerSlot>,
+}
+
+enum AsyncSamplerSlot {
+    Uninit,
+    Disabled,
+    Init(AsyncSamplerInfra),
 }
 
 impl<M: ModelForward> StandardExecution<M> {
@@ -44,7 +58,44 @@ impl<M: ModelForward> StandardExecution<M> {
             graph_runner: None,
             sliding_window: None,
             block_size: 16,
+            async_sampler: std::sync::Mutex::new(AsyncSamplerSlot::Uninit),
         }
+    }
+
+    /// Initialise (lazily) and return a mutable reference to the
+    /// async-sampler infra. Returns `None` when the env gate is unset,
+    /// the device is non-CUDA, or a prior init attempt failed.
+    ///
+    /// The lock is short — held only for the slot transition. Hot-
+    /// path callers acquire-mutate-release on every multi-step block;
+    /// this is cheap because the engine is single-threaded inside
+    /// `spawn_blocking` once a step starts.
+    fn ensure_async_sampler(
+        &self,
+        max_batch: usize,
+        max_steps: usize,
+    ) -> std::sync::MutexGuard<'_, AsyncSamplerSlot> {
+        let mut slot = self.async_sampler.lock().expect("async_sampler poisoned");
+        if matches!(*slot, AsyncSamplerSlot::Uninit) {
+            if std::env::var("VLLM_ASYNC_SAMPLING").is_err() {
+                *slot = AsyncSamplerSlot::Disabled;
+                return slot;
+            }
+            match AsyncSamplerInfra::new(self.model.device(), max_batch, max_steps) {
+                Ok(infra) => {
+                    info!(
+                        max_batch,
+                        max_steps, "async-sampler infra initialised (VLLM_ASYNC_SAMPLING=1)"
+                    );
+                    *slot = AsyncSamplerSlot::Init(infra);
+                }
+                Err(e) => {
+                    warn!(error = %e, "async-sampler init failed; falling back to std path");
+                    *slot = AsyncSamplerSlot::Disabled;
+                }
+            }
+        }
+        slot
     }
 
     pub fn with_sliding_window(mut self, sliding_window: Option<usize>, block_size: usize) -> Self {
@@ -425,6 +476,50 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             );
 
             let num_steps = multi_step_count.max(1);
+
+            // ADR 0017 / Substep 2.2: env-gated async DtoH pipeline.
+            // The pipelined helper runs the multi-step block with
+            // sampler-result DtoH on a side stream and pushes tokens
+            // only after the multi-step block drains — collapsing N
+            // host stalls into 1.
+            let try_pipelined = num_steps > 1
+                && regular_ids.len() <= 256 // matches infra.max_batch
+                && std::env::var("VLLM_ASYNC_SAMPLING").is_ok();
+            if try_pipelined {
+                let mut slot_guard = self.ensure_async_sampler(256, num_steps.max(8));
+                if let AsyncSamplerSlot::Init(infra) = &mut *slot_guard {
+                    if regular_ids.len() <= infra.max_batch && num_steps <= infra.max_steps {
+                        let mut active = regular_ids.clone();
+                        let mut step_preempted: Vec<RequestId> = Vec::new();
+                        let pipelined_failed = execute_pipelined_multi_step_decode(
+                            &active,
+                            num_steps,
+                            &self.model,
+                            kv_cache_mgr,
+                            &mut state.requests,
+                            Some(&state.cuda_graph_dispatcher),
+                            self.graph_runner.as_ref(),
+                            &mut step_preempted,
+                            infra,
+                        );
+                        for (req_id, err_msg) in pipelined_failed {
+                            active.retain(|&id| id != req_id);
+                            if let Some(id) = finish_request_with_error_deferred(
+                                req_id,
+                                EngineError::Model(format!("pipelined decode failed: {err_msg}")),
+                                &mut state.requests,
+                                kv_cache_mgr,
+                            ) {
+                                state.errored_ids.push(id);
+                            }
+                        }
+                        state.preempted_ids.append(&mut step_preempted);
+                        return;
+                    }
+                }
+                drop(slot_guard);
+            }
+
             let mut active_decode_ids = regular_ids;
             // Substep 2.1 / ADR 0017: GPU tensor pass-through across
             // multi-step iterations. Carries the previous step's
@@ -445,6 +540,7 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 let (failed, next_sampled) = execute_batched_decode_with_graph(
                     &active_decode_ids,
                     prev_sampled.as_ref(),
+                    false, // defer_dtoh — std path keeps host-blocking to_vec1
                     &self.model,
                     kv_cache_mgr,
                     &mut state.requests,

@@ -18,6 +18,7 @@
 //! let result = handle.generate(request).await?;
 //! ```
 
+mod async_sampler;
 mod context;
 pub mod cuda_graph;
 pub mod cuda_graph_runner;

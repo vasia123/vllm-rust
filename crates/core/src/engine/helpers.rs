@@ -722,6 +722,7 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     let (failed, _next) = execute_batched_decode_with_graph(
         decode_request_ids,
         None,
+        false, // defer_dtoh
         model,
         kv_cache_mgr,
         requests,
@@ -821,6 +822,16 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // perf-neutral on its own (Substep 2.1) but is the prerequisite for
     // async DtoH overlap in Substep 2.2.
     prev_sampled_ids: Option<&Tensor>,
+    // `defer_dtoh`: ADR 0017 / Substep 2.2. When `true` AND the GPU
+    // sampler fast path succeeds, skip the blocking `to_vec1()` and
+    // skip `generated_token_ids.push`. Block-table / seqlen counters
+    // are still advanced (they don't depend on the token value). The
+    // caller is responsible for syncing the returned tensor on a
+    // dedicated DtoH stream and pushing the tokens once the event
+    // completes. Has no effect when the GPU fast path is unavailable
+    // (mixed-mode batches, CPU sampling fallback, etc.) — those go
+    // through the existing host-blocking path regardless.
+    defer_dtoh: bool,
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
@@ -1251,35 +1262,62 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         // perf-neutral on its own. Substep 2.2 will move the DtoH onto
         // a separate stream to actually overlap with the next forward.
         match sampling::gpu::gpu_sample_batch_with_diffs_to_tensor(&last_logits, &configs, &diffs) {
-            Ok(token_tensor) => match token_tensor.to_vec1::<u32>() {
-                Ok(token_ids_out) => {
-                    for (i, &req_id) in batch_ids.iter().enumerate() {
-                        let Some(req) = requests.get_mut(&req_id) else {
-                            failed.push((req_id, "request no longer active".to_string()));
-                            continue;
-                        };
-                        req.state.block_table.advance(1);
-                        req.state.seqlen_offset += 1;
-                        req.state.generated_token_ids.push(token_ids_out[i]);
-                    }
-                    if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
-                        if let candle_core::Device::Cuda(cd) = dev {
-                            let _ = cd.cuda_stream().synchronize();
+            Ok(token_tensor) => {
+                if defer_dtoh {
+                    // ADR 0017 / Substep 2.2: skip the host-blocking
+                    // `to_vec1` and `generated_token_ids.push`. Caller
+                    // will sync a side-stream DtoH event and push the
+                    // tokens once they land in pinned host memory. We
+                    // still advance block-table and seqlen_offset
+                    // because those are pure host counters that don't
+                    // depend on the token value, and the next decode
+                    // step's metadata reads them.
+                    for &req_id in &batch_ids {
+                        if let Some(req) = requests.get_mut(&req_id) {
+                            req.state.block_table.advance(1);
+                            req.state.seqlen_offset += 1;
                         }
-                        step_profile::SAMPLING.ns[bucket].fetch_add(
-                            t0.elapsed().as_nanos() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     }
+                    // No SAMPLING profile sync — that would block on
+                    // the very stream we're trying to keep busy.
                     if step_profile::enabled() {
                         step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
                     }
                     return (failed, Some(token_tensor));
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "GPU sampler tensor->vec failed; falling back to CPU");
+                match token_tensor.to_vec1::<u32>() {
+                    Ok(token_ids_out) => {
+                        for (i, &req_id) in batch_ids.iter().enumerate() {
+                            let Some(req) = requests.get_mut(&req_id) else {
+                                failed.push((req_id, "request no longer active".to_string()));
+                                continue;
+                            };
+                            req.state.block_table.advance(1);
+                            req.state.seqlen_offset += 1;
+                            req.state.generated_token_ids.push(token_ids_out[i]);
+                        }
+                        if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
+                            if let candle_core::Device::Cuda(cd) = dev {
+                                let _ = cd.cuda_stream().synchronize();
+                            }
+                            step_profile::SAMPLING.ns[bucket].fetch_add(
+                                t0.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        if step_profile::enabled() {
+                            step_profile::step_done(
+                                batch_size,
+                                step_start.elapsed().as_nanos() as u64,
+                            );
+                        }
+                        return (failed, Some(token_tensor));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GPU sampler tensor->vec failed; falling back to CPU");
+                    }
                 }
-            },
+            }
             Err(e) => {
                 // Fall through to CPU path on GPU sampling failure
                 tracing::warn!(error = %e, "GPU batched sampling failed; falling back to CPU");
@@ -1377,6 +1415,359 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
 
     // CPU sampler path: no GPU tensor to carry forward; next step uses host vec.
     (failed, None)
+}
+
+/// Pipelined multi-step decode (ADR 0017 / Substep 2.2).
+///
+/// Replaces the serial multi-step loop's "forward → sampler →
+/// to_vec1 (blocks ~50 ms) → next forward" pattern with "forward →
+/// sampler → async DtoH on side stream → next forward immediately".
+/// The host syncs the side-stream events only at the END of the
+/// multi-step block — one host stall instead of N.
+///
+/// Invariants:
+/// - `infra.slots.len() >= num_steps` AND `infra.max_batch >=
+///   decode_request_ids.len()` — caller (StandardExecution) guarantees
+///   this; if violated we bail to safe sync DtoH for that step.
+/// - The model device is CUDA (env gate already verified).
+/// - Tensors held in `pending` keep their underlying `CudaSlice`
+///   alive until the corresponding pinned slot has been read.
+/// - Push of `generated_token_ids` is deferred until the drain phase;
+///   block-table / seqlen counters advance per step (they don't
+///   depend on the token value).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_pipelined_multi_step_decode<M: ModelForward>(
+    decode_request_ids: &[RequestId],
+    num_steps: usize,
+    model: &M,
+    kv_cache_mgr: &mut KVCacheManager,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+    dispatcher: Option<&Arc<std::sync::RwLock<CudaGraphDispatcher>>>,
+    graph_runner: Option<&Arc<CudaGraphRunner>>,
+    preempted_out: &mut Vec<RequestId>,
+    infra: &mut super::async_sampler::AsyncSamplerInfra,
+) -> Vec<(RequestId, String)> {
+    let prof_enabled = std::env::var("VLLM_PROFILE_PIPELINED").is_ok();
+    let prof_total_start = prof_enabled.then(std::time::Instant::now);
+
+    let mut failed: Vec<(RequestId, String)> = Vec::new();
+    let mut active: Vec<RequestId> = decode_request_ids.to_vec();
+    let mut prev_sampled: Option<Tensor> = None;
+
+    // Get main CUDA stream for cross-stream event synchronisation.
+    let main_stream = match model.device() {
+        candle_core::Device::Cuda(d) => d.cuda_stream(),
+        _ => {
+            tracing::warn!("pipelined decode invoked on non-CUDA device; std fallback");
+            // Safe fallback: run serial sync path
+            return run_serial_fallback_decode(
+                decode_request_ids,
+                num_steps,
+                model,
+                kv_cache_mgr,
+                requests,
+                dispatcher,
+                graph_runner,
+                preempted_out,
+            );
+        }
+    };
+
+    // Per-step pending: (batch_ids, slot_idx, tensor_keep_alive). Tensor
+    // is kept alive until the pinned slot is drained — its underlying
+    // CudaSlice is what dtoh_stream's memcpy reads from.
+    let mut pending: Vec<(Vec<RequestId>, usize, Tensor)> = Vec::with_capacity(num_steps);
+
+    for step in 0..num_steps {
+        if active.is_empty() {
+            break;
+        }
+        // Capacity guards. If violated, bail this step into sync path.
+        if step >= infra.slots.len() || active.len() > infra.max_batch {
+            tracing::warn!(
+                step,
+                slots = infra.slots.len(),
+                batch = active.len(),
+                max_batch = infra.max_batch,
+                "pipelined decode capacity exceeded; bailing remainder of multi-step block"
+            );
+            break;
+        }
+
+        let active_size_before = active.len();
+        let active_at_call = active.clone();
+        let mut step_preempted: Vec<RequestId> = Vec::new();
+
+        let (step_failed, sampler_tensor) = execute_batched_decode_with_graph(
+            &active,
+            prev_sampled.as_ref(),
+            true, // defer_dtoh — that's the whole point
+            model,
+            kv_cache_mgr,
+            requests,
+            dispatcher,
+            graph_runner,
+            &mut step_preempted,
+        );
+
+        // Compute batch_ids in active order (subset of active that
+        // actually went through Step 1's KV-alloc and was processed
+        // by the sampler).
+        let failed_set: std::collections::HashSet<RequestId> =
+            step_failed.iter().map(|(id, _)| *id).collect();
+        let preempted_set: std::collections::HashSet<RequestId> =
+            step_preempted.iter().copied().collect();
+        let batch_ids: Vec<RequestId> = active_at_call
+            .iter()
+            .copied()
+            .filter(|id| !failed_set.contains(id) && !preempted_set.contains(id))
+            .collect();
+
+        // Apply step's failed/preempted to outer state.
+        for (req_id, msg) in step_failed {
+            failed.push((req_id, msg));
+            active.retain(|&id| id != req_id);
+        }
+        for &p in &step_preempted {
+            active.retain(|&id| id != p);
+        }
+        preempted_out.extend(step_preempted);
+
+        // Dispatch async DtoH if helper produced a sampler tensor.
+        // (None = CPU fallback path inside helper which already pushed
+        // tokens synchronously; next step rebuilds input from host.)
+        if let Some(tensor) = sampler_tensor {
+            let actual_size = tensor.dims().first().copied().unwrap_or(0);
+            if actual_size != batch_ids.len() {
+                tracing::warn!(
+                    actual = actual_size,
+                    batch_ids_len = batch_ids.len(),
+                    "sampler tensor / batch_ids size mismatch in pipelined decode; sync fallback"
+                );
+                if let Ok(ids) = tensor.to_vec1::<u32>() {
+                    for (i, &id) in batch_ids.iter().enumerate().take(ids.len()) {
+                        if let Some(req) = requests.get_mut(&id) {
+                            req.state.generated_token_ids.push(ids[i]);
+                        }
+                    }
+                }
+                prev_sampled = None;
+                continue;
+            }
+
+            match dispatch_async_dtoh_for_sampler(
+                &tensor,
+                actual_size,
+                &main_stream,
+                &infra.dtoh_stream,
+                &mut infra.slots[step],
+            ) {
+                Ok(()) => {
+                    pending.push((batch_ids.clone(), step, tensor.clone()));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "async DtoH dispatch failed; sync fallback this step");
+                    if let Ok(ids) = tensor.to_vec1::<u32>() {
+                        for (i, &id) in batch_ids.iter().enumerate().take(ids.len()) {
+                            if let Some(req) = requests.get_mut(&id) {
+                                req.state.generated_token_ids.push(ids[i]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            prev_sampled = if active.len() == active_size_before {
+                Some(tensor)
+            } else {
+                None
+            };
+        } else {
+            prev_sampled = None;
+        }
+    }
+
+    // Profile: time the dispatch-loop wallclock vs the drain.
+    let prof_enqueue_us = prof_total_start.map(|t| t.elapsed().as_micros());
+    let prof_drain_start = prof_enabled.then(std::time::Instant::now);
+
+    // Drain pending DtoHs and push tokens. `as_slice()` syncs each
+    // slot's pinned event (= sampler kernel + memcpy_dtoh complete);
+    // total wallclock is dominated by the LAST step's drain.
+    for (batch_ids, slot_idx, _tensor_alive) in &pending {
+        if let Err(e) = infra.slots[*slot_idx].event_synchronize() {
+            tracing::warn!(error = %e, "pinned slot event_synchronize failed");
+            continue;
+        }
+        let buf = infra.slots[*slot_idx].as_slice();
+        for (i, &id) in batch_ids.iter().enumerate() {
+            if i >= buf.len() {
+                break;
+            }
+            if let Some(req) = requests.get_mut(&id) {
+                req.state.generated_token_ids.push(buf[i]);
+            }
+        }
+    }
+    if let (Some(t0), Some(enq_us)) = (prof_drain_start, prof_enqueue_us) {
+        let drain_us = t0.elapsed().as_micros();
+        let total_us = prof_total_start.unwrap().elapsed().as_micros();
+        tracing::info!(
+            target: "vllm_core::async_sampling",
+            enqueue_us = enq_us as u64,
+            drain_us = drain_us as u64,
+            total_us = total_us as u64,
+            steps = pending.len(),
+            "pipelined timings"
+        );
+    }
+    drop(pending); // tensors drop here, freeing their CUDA storage
+
+    // Diagnostic counter — confirms env-gated path is exercised in
+    // production benches (memory rule `feedback_shape_gate_diag.md`).
+    let n = infra
+        .call_counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    if n == 1 || n.is_power_of_two() || n.is_multiple_of(200) {
+        tracing::info!(
+            target: "vllm_core::async_sampling",
+            calls = n,
+            "pipelined multi-step decode active"
+        );
+    }
+
+    failed
+}
+
+/// Issue an async `DtoH` on `dtoh_stream` for the first `n_elems`
+/// elements of `tensor`'s underlying `CudaSlice<u32>` into `pinned`.
+/// Cross-stream synchronisation is established via a `record_event` on
+/// `main_stream` and `wait` on `dtoh_stream` — non-blocking on the host.
+/// On `Ok(())` the pinned slot's internal event tracks the memcpy
+/// completion; the caller reads via `pinned.as_slice()` later.
+fn dispatch_async_dtoh_for_sampler(
+    tensor: &Tensor,
+    n_elems: usize,
+    main_stream: &Arc<candle_core::cuda::cudarc::driver::CudaStream>,
+    dtoh_stream: &Arc<candle_core::cuda::cudarc::driver::CudaStream>,
+    pinned: &mut super::async_sampler::SamplerPinnedSlot,
+) -> candle_core::Result<()> {
+    use candle_core::Storage;
+
+    // Ensure tensor is contiguous before extracting CudaSlice.
+    // sampler returns a 1D [B] tensor that should already be contiguous
+    // (allocated fresh by the kernel) — this is a defensive guard.
+    let owned;
+    let t = if tensor.is_contiguous() {
+        tensor
+    } else {
+        owned = tensor.contiguous()?;
+        &owned
+    };
+
+    let (storage, _layout) = t.storage_and_layout();
+    let cuda_storage = match &*storage {
+        Storage::Cuda(s) => s,
+        _ => {
+            return Err(candle_core::Error::Msg(
+                "dispatch_async_dtoh: non-CUDA storage".into(),
+            ));
+        }
+    };
+    let cuda_slice = cuda_storage.as_cuda_slice::<u32>()?;
+
+    // Cross-stream sync: dtoh waits for main's sampler kernel.
+    let main_event = main_stream
+        .record_event(None)
+        .map_err(|e| candle_core::Error::Msg(format!("main record_event: {e}")))?;
+    dtoh_stream
+        .wait(&main_event)
+        .map_err(|e| candle_core::Error::Msg(format!("dtoh wait: {e}")))?;
+
+    // Issue the DtoH on the side stream. We pass a `&mut [u32]` of
+    // length `n_elems` as the destination — cudarc's `[T]` HostSlice
+    // impl uses `SyncOnDrop::Sync(None)` (no post-op sync), and the
+    // driver auto-detects the pointer as pinned (we allocated via
+    // `cuMemHostAlloc`), so the copy stays asynchronous.
+    let src_view = cuda_slice.slice(0..n_elems);
+    // SAFETY: pinned slot owns the memory for max_batch u32s; we
+    // sub-slice to n_elems which fits. We record the dtoh_stream
+    // event onto the slot's internal event right after queueing so
+    // the caller can synchronise on it before reading.
+    let dst_slice: &mut [u32] = unsafe { pinned.as_mut_slice_first(n_elems) };
+    dtoh_stream
+        .memcpy_dtoh(&src_view, dst_slice)
+        .map_err(|e| candle_core::Error::Msg(format!("memcpy_dtoh: {e}")))?;
+    // Record dtoh_stream completion onto pinned slot's event so we
+    // can synchronise on it during the drain phase.
+    pinned.record_event_on(dtoh_stream)?;
+
+    Ok(())
+}
+
+/// Defensive serial fallback used by the pipelined helper only when
+/// the device unexpectedly turns out non-CUDA (env gate should
+/// prevent this; here as a last-resort safety net).
+#[allow(clippy::too_many_arguments)]
+fn run_serial_fallback_decode<M: ModelForward>(
+    decode_request_ids: &[RequestId],
+    num_steps: usize,
+    model: &M,
+    kv_cache_mgr: &mut KVCacheManager,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+    dispatcher: Option<&Arc<std::sync::RwLock<CudaGraphDispatcher>>>,
+    graph_runner: Option<&Arc<CudaGraphRunner>>,
+    preempted_out: &mut Vec<RequestId>,
+) -> Vec<(RequestId, String)> {
+    let mut failed: Vec<(RequestId, String)> = Vec::new();
+    let mut active: Vec<RequestId> = decode_request_ids.to_vec();
+    let mut prev: Option<Tensor> = None;
+    for _ in 0..num_steps {
+        if active.is_empty() {
+            break;
+        }
+        let size_before = active.len();
+        let mut p: Vec<RequestId> = Vec::new();
+        let (f, next) = execute_batched_decode_with_graph(
+            &active,
+            prev.as_ref(),
+            false,
+            model,
+            kv_cache_mgr,
+            requests,
+            dispatcher,
+            graph_runner,
+            &mut p,
+        );
+        for (id, m) in f {
+            failed.push((id, m));
+            active.retain(|&x| x != id);
+        }
+        for &x in &p {
+            active.retain(|&y| y != x);
+        }
+        preempted_out.extend(p);
+        active.retain(|&id| {
+            requests
+                .get(&id)
+                .map(|r| {
+                    let s = &r.state;
+                    let last = s.generated_token_ids.last().copied();
+                    let eos = last.map(|t| t == s.eos_token_id).unwrap_or(false);
+                    let stop_token = last.map(|t| s.stop_token_ids.contains(&t)).unwrap_or(false);
+                    let max_len = s.num_generated() >= s.max_new_tokens;
+                    !eos && !stop_token && !max_len
+                })
+                .unwrap_or(false)
+        });
+        prev = if active.len() == size_before {
+            next
+        } else {
+            None
+        };
+    }
+    failed
 }
 
 pub(crate) fn check_finished(
