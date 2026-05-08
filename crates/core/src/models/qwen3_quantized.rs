@@ -78,7 +78,44 @@ mod decode_profile {
     pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
     pub static FINAL_NORM_NS: AtomicU64 = AtomicU64::new(0);
     pub static LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// Stage A'.2 diagnostic: parallel synchronize+Instant timing for
+    /// lm_head, opt-in via `VLLM_PROFILE_LM_HEAD_SYNC=1`. Forces a
+    /// `cuda_stream::synchronize()` before AND after the matmul so the
+    /// host wallclock captures EXACT kernel duration in isolation
+    /// (different from CUDA-event timing which can include adjacent
+    /// stream-pending work). Comparing the two slot values reveals
+    /// whether the 16-24 ms event-measured lm_head time is real GPU
+    /// work or a profiler artefact.
+    pub static LM_HEAD_SYNC_NS: AtomicU64 = AtomicU64::new(0);
     pub static LAYERS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn sync_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("VLLM_PROFILE_LM_HEAD_SYNC").is_ok())
+    }
+
+    /// synchronize + Instant timer. Forces full GPU sync before/after.
+    /// Only call when measuring is intentional — adds a sync per call.
+    pub fn time_sync<T>(
+        dev: &candle_core::Device,
+        slot: &'static AtomicU64,
+        f: impl FnOnce() -> candle_core::Result<T>,
+    ) -> candle_core::Result<T> {
+        if !sync_enabled() {
+            return f();
+        }
+        if let candle_core::Device::Cuda(cd) = dev {
+            let stream = cd.cuda_stream();
+            let _ = stream.synchronize();
+            let t0 = Instant::now();
+            let out = f()?;
+            let _ = stream.synchronize();
+            slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            Ok(out)
+        } else {
+            f()
+        }
+    }
 
     /// Record a start event, run `f`, record an end event, queue the pair
     /// against `slot`. `elapsed_ms` is queried later in `flush_events()`.
@@ -167,6 +204,7 @@ mod decode_profile {
         let s_embed = snap(&EMBED_NS);
         let s_fn = snap(&FINAL_NORM_NS);
         let s_lm = snap(&LM_HEAD_NS);
+        let s_lm_sync = snap(&LM_HEAD_SYNC_NS);
         let layer_total = s_in + s_qkv + s_qkn + s_rope + s_cw + s_pa + s_op + s_pn + s_mlp;
         let n = PROFILE_EVERY as f64;
         // Approx number of forwards covered by this dump window (PROFILE_EVERY
@@ -177,7 +215,7 @@ mod decode_profile {
             "decode breakdown ({} layer-calls, μs/call): in_norm={:.1} qkv={:.1} \
              qk_norm={:.1} rope={:.1} cache_w={:.1} paged_attn={:.1} o_proj={:.1} \
              post_norm={:.1} mlp={:.1} | layer_sum={:.1} | per-forward μs: \
-             embed={:.1} final_norm={:.1} lm_head={:.1}",
+             embed={:.1} final_norm={:.1} lm_head_evt={:.1} lm_head_sync={:.1}",
             PROFILE_EVERY,
             s_in / n,
             s_qkv / n,
@@ -192,6 +230,7 @@ mod decode_profile {
             s_embed / approx_forwards,
             s_fn / approx_forwards,
             s_lm / approx_forwards,
+            s_lm_sync / approx_forwards,
         );
     }
 }
@@ -1104,7 +1143,9 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
             self.norm.forward(&xs)
         })?;
         decode_profile::time(dev, &decode_profile::LM_HEAD_NS, || {
-            self.lm_head.forward(&xs)
+            decode_profile::time_sync(dev, &decode_profile::LM_HEAD_SYNC_NS, || {
+                self.lm_head.forward(&xs)
+            })
         })
     }
 
@@ -1142,7 +1183,9 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
             self.norm.forward(&xs)
         })?;
         decode_profile::time(dev, &decode_profile::LM_HEAD_NS, || {
-            self.lm_head.forward(&xs)
+            decode_profile::time_sync(dev, &decode_profile::LM_HEAD_SYNC_NS, || {
+                self.lm_head.forward(&xs)
+            })
         })
     }
 

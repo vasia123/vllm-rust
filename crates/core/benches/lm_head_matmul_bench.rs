@@ -95,6 +95,25 @@ fn bench_lm_head_paths(c: &mut Criterion) {
                 let _ = y.dim(0).unwrap();
             });
         });
+
+        // Path 4: tied + force GPU sync per iteration (replicates the
+        // production decode_profile timing model — synchronize before/
+        // after each matmul call). If this number matches production's
+        // 16-24 ms, the slowdown is in sync overhead / cuBLAS handle
+        // context, NOT the matmul kernel itself. If it stays ~3 ms,
+        // production has additional context the microbench doesn't
+        // replicate.
+        if let Device::Cuda(cd) = &device {
+            let stream = cd.cuda_stream();
+            group.bench_with_input(BenchmarkId::new("tied_view_t_sync", m), &m, |b, _| {
+                b.iter(|| {
+                    let _ = stream.synchronize();
+                    let y = black_box(&x).matmul(&w_emb.t().unwrap()).unwrap();
+                    let _ = stream.synchronize();
+                    let _ = y.dim(0).unwrap();
+                });
+            });
+        }
     }
 
     group.finish();
