@@ -29,6 +29,11 @@ path) starts from a clean foundation.
 | 15.D-body.1 | `87c060e` | INT4→BF16 LOP3 dequant primitive + standalone GPU test |
 | 15.D-body.2a | `c286f0f` | bf16 mma.m16n8k16 single-tile probe (manual fragments, no ldmatrix) |
 | 15.D-body.2b | `29cd5e8` | INT4 dequant + scale/zp + mma fused in one kernel (single-tile) |
+| 15.D-body.3a | `52c7b15` | TC kernel for M=16,K=16,g=16 routed via dispatcher |
+| 15.D-body.3b | `a837f80` | TC multi-K extension (group_size=K) |
+| 15.D-body.3c | `63f97fa` | TC multi-group_size extension |
+| 15.D-body.3d | `03e5896` | TC small-M / multi-m-tile via masking — full production-shape contract on TC |
+| 15.D-body.4  | (this commit) | TC microbench: 2-5× vs production marlin_gemm at M=4..8 |
 
 ## Current production behaviour
 

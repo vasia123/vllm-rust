@@ -484,7 +484,13 @@ pub(crate) const HYBRID_M_MAX: usize = 8;
 /// load time (Stage 15.E.3 measured +2.2 GiB on Qwen3-4B-AWQ vs the
 /// ADR 0016 prediction of +1.1 GiB; the laptop ran out of KV-cache room
 /// at default settings). Users with VRAM headroom can opt in via
-/// `VLLM_AWQ_HYBRID=1` for the 1.10-1.24× decode-side win.
+/// `VLLM_AWQ_HYBRID=1`.
+///
+/// Stage 15.D-body landed tensor cores in the tile_mma path. With TC,
+/// hybrid wins 2-5× over production marlin_gemm at M ∈ {4, 8} on
+/// Qwen3-4B AWQ shapes (vs the 1.10-1.24× the software path mustered),
+/// so opting in is now a much stronger value proposition. See
+/// `docs/perf/bench-history/2026-05-08-15D-body-3-tc-vs-prod.md`.
 ///
 /// Read once per process — re-checking on every forward call would cost
 /// a syscall per layer per token at decode hot path.
