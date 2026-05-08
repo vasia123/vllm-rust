@@ -1383,6 +1383,161 @@ mod gpu_tests {
         assert_tensors_close(&output_fi, &output_naive, 0.2, "prefill_long");
     }
 
+    /// Lock down the dormant decode plan-caching path
+    /// (`prepare_decode_plan` + `batched_decode_attention_with_plan`).
+    /// Until Stage 14-A wires this into the engine, the path has no
+    /// production caller and could regress silently. This test
+    /// exercises both halves and asserts they produce the same output
+    /// as the eager `batched_decode_attention` path.
+    ///
+    /// If this test fails, the plan-caching infrastructure has drifted
+    /// — either fix it or rip it out. It is on the Stage 14-A
+    /// dependency tree.
+    #[test]
+    fn test_decode_with_plan_matches_eager_gpu() {
+        let device = cuda_device();
+        let num_blocks = 8;
+
+        let config = test_cache_config(&device, num_blocks);
+        let mut cache_eager = CacheEngine::new(&config).unwrap();
+        let mut cache_plan = CacheEngine::new(&config).unwrap();
+
+        // Seed both caches with identical KV history so the eager and
+        // plan paths see the same memory state. Two sequences of
+        // different lengths exercise the metadata.
+        let k0 = rand_f16(&[NUM_KV_HEADS, 12, HEAD_DIM], &device, 700);
+        let v0 = rand_f16(&[NUM_KV_HEADS, 12, HEAD_DIM], &device, 701);
+        let slots0: Vec<usize> = (0..12).collect();
+        cache_eager.write(&k0, &v0, &slots0).unwrap();
+        cache_plan.write(&k0, &v0, &slots0).unwrap();
+
+        let k1 = rand_f16(&[NUM_KV_HEADS, 19, HEAD_DIM], &device, 702);
+        let v1 = rand_f16(&[NUM_KV_HEADS, 19, HEAD_DIM], &device, 703);
+        let slots1: Vec<usize> = (32..51).collect();
+        cache_eager.write(&k1, &v1, &slots1).unwrap();
+        cache_plan.write(&k1, &v1, &slots1).unwrap();
+
+        let batch_size = 2;
+        let q = rand_f16(&[batch_size, NUM_HEADS, HEAD_DIM], &device, 704);
+        let k_new = rand_f16(&[batch_size, NUM_KV_HEADS, HEAD_DIM], &device, 705);
+        let v_new = rand_f16(&[batch_size, NUM_KV_HEADS, HEAD_DIM], &device, 706);
+
+        let block_ids_0: Vec<usize> = vec![0];
+        let block_ids_1: Vec<usize> = vec![2, 3];
+        let metadata = BatchedDecodeMetadata {
+            seq_block_ids: &[&block_ids_0, &block_ids_1],
+            all_slot_mapping: &[12, 51],
+            kv_lengths: &[13, 20],
+        };
+
+        let backend = FlashInferBackend::with_block_size(BLOCK_SIZE);
+
+        // Eager path: builds a fresh plan inside the call, runs.
+        let output_eager = backend
+            .batched_decode_attention(
+                &q,
+                &k_new,
+                &v_new,
+                &mut cache_eager,
+                &metadata,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+
+        // Plan-cached path: prepare plan, then replay via `with_plan`.
+        let plan = backend
+            .prepare_decode_plan(
+                &cache_plan,
+                &metadata,
+                q.dtype(),
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap()
+            .expect("FlashInferBackend must produce a plan");
+        let output_with_plan = backend
+            .batched_decode_attention_with_plan(
+                &q,
+                &k_new,
+                &v_new,
+                &mut cache_plan,
+                &metadata,
+                Some(plan.as_ref()),
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+
+        assert_eq!(output_eager.dims(), output_with_plan.dims());
+        // Both paths run the same kernel via the same workspace; outputs
+        // should be bit-equivalent modulo any non-determinism in
+        // FlashInfer split-K reduction. 1e-3 tolerance covers F16
+        // round-trip without masking real drift.
+        assert_tensors_close(&output_with_plan, &output_eager, 1e-3, "decode_with_plan");
+    }
+
+    /// Locks down that calling `batched_decode_attention_with_plan` with
+    /// `plan: None` falls through to the eager path bit-equivalently.
+    /// This is the contract that lets future engine code pass an
+    /// `Option<plan>` unconditionally without checking which backend it
+    /// has.
+    #[test]
+    fn test_decode_with_plan_none_falls_through_gpu() {
+        let device = cuda_device();
+        let num_blocks = 4;
+        let config = test_cache_config(&device, num_blocks);
+        let mut cache_a = CacheEngine::new(&config).unwrap();
+        let mut cache_b = CacheEngine::new(&config).unwrap();
+
+        let k = rand_f16(&[NUM_KV_HEADS, 8, HEAD_DIM], &device, 800);
+        let v = rand_f16(&[NUM_KV_HEADS, 8, HEAD_DIM], &device, 801);
+        let slots: Vec<usize> = (0..8).collect();
+        cache_a.write(&k, &v, &slots).unwrap();
+        cache_b.write(&k, &v, &slots).unwrap();
+
+        let q = rand_f16(&[1, NUM_HEADS, HEAD_DIM], &device, 802);
+        let k_new = rand_f16(&[1, NUM_KV_HEADS, HEAD_DIM], &device, 803);
+        let v_new = rand_f16(&[1, NUM_KV_HEADS, HEAD_DIM], &device, 804);
+        let block_ids: Vec<usize> = vec![0];
+        let metadata = BatchedDecodeMetadata {
+            seq_block_ids: &[&block_ids],
+            all_slot_mapping: &[8],
+            kv_lengths: &[9],
+        };
+
+        let backend = FlashInferBackend::with_block_size(BLOCK_SIZE);
+        let eager = backend
+            .batched_decode_attention(
+                &q,
+                &k_new,
+                &v_new,
+                &mut cache_a,
+                &metadata,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+        let with_none = backend
+            .batched_decode_attention_with_plan(
+                &q,
+                &k_new,
+                &v_new,
+                &mut cache_b,
+                &metadata,
+                None,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+        assert_tensors_close(&with_none, &eager, 1e-3, "with_plan_none_fallthrough");
+    }
+
     // =========================================================================
     // MLA (Multi-head Latent Attention) GPU tests
     // =========================================================================
