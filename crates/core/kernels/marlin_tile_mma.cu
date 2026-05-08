@@ -1,8 +1,13 @@
-// Stage 15.C/D — Marlin tile-MMA kernel (N=16 fixed, M = any ≥ 1, K = any multiple of 16).
+// Stage 15.C/D — Marlin tile-MMA kernel.
 //
-// Hard-coded for v1: BF16 activations, INT4 AWQ weights laid out per
+// Shape constraints (v1 software scaffold):
+//   M  any ≥ 1
+//   N  any multiple of 64    (tile_n_size; producer requirement)
+//   K  any multiple of 16    (tile_k_size; producer requirement)
+//
+// BF16 activations, INT4 AWQ weights laid out per
 // `awq_to_marlin_tile_repack_cpu` (Stage 15.B), per-channel scales
-// (group_size = K).  Single warp's worth of output columns (N=16).
+// (group_size = K).
 //
 // **Scaffold-first.** Currently a software dequant + dot-product path,
 // not yet tensor cores. Validates the producer/consumer interface end-
@@ -11,18 +16,20 @@
 //
 // Inputs:
 //   a_ptr [M, K]       BF16 row-major activations.
-//   b_ptr [k_tiles*32] u32 — concatenated warp_id=0 quarters of the
-//                            multi-tile output of
-//                            `awq_to_marlin_tile_repack_cpu(K, 64)`.
-//                            Each 32-u32 segment is one k-tile (16 K
-//                            rows × 16 N cols of nibbles).
-//                            Index: `b_ptr[k_tile * 32 + th_id]`.
-//   s_ptr [N=16]       BF16 per-channel scale.
-//   m                  int — any ≥ 1.
-//   k                  int — must be a multiple of 16.
+//   b_ptr              u32, length = k_tiles × n_tiles × 128, where
+//                      k_tiles = K / 16 and n_tiles = N / 64. Layout
+//                      matches `awq_to_marlin_tile_repack_cpu(K, N)`'s
+//                      flat output `[k_tiles, n_tiles*128]` after
+//                      flatten. Index for (k_tile, n_tile, warp_id,
+//                      th_id):
+//                        b_ptr[k_tile * (n_tiles * 128)
+//                              + n_tile * 128
+//                              + th_id * 4 + warp_id]
+//   s_ptr [N]          BF16 per-channel scale.
+//   m, n, k            int — see constraints above.
 //
 // Output:
-//   c_ptr [M, N=16]    BF16 row-major output.
+//   c_ptr [M, N]       BF16 row-major output.
 //
 // Launch:  block_dim = (256, 1, 1); grid_dim = (ceildiv(M*N, 256), 1, 1).
 //          Threads with linear index ≥ M*N early-return.
@@ -51,40 +58,48 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define V1_N 16
-#define V1_K_TILE 16
+#define V1_TILE_N 64
+#define V1_TILE_K 16
+#define V1_TILE_INTS 128  // tile_k * tile_n / 8 (INT4 pack)
 
-extern "C" __global__ void marlin_tile_mma_int4_bf16_n16k(
+extern "C" __global__ void marlin_tile_mma_int4_bf16(
     const __nv_bfloat16* __restrict__ a_ptr,
     const uint32_t*      __restrict__ b_ptr,
     const __nv_bfloat16* __restrict__ s_ptr,
     __nv_bfloat16*       __restrict__ c_ptr,
     int m,
+    int n,
     int k) {
     const int inv_pack_idx[8] = {0, 4, 1, 5, 2, 6, 3, 7};
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= m * V1_N) return;
+    if (idx >= m * n) return;
 
-    int row = idx / V1_N;
-    int col = idx % V1_N;
+    int row = idx / n;  // 0..m-1
+    int col = idx % n;  // 0..n-1
 
-    int m_n = col;
+    int n_tile = col / V1_TILE_N;
+    int n_in_tile = col % V1_TILE_N;     // 0..63
+    int warp_id = n_in_tile / 16;        // 0..3
+    int m_n = n_in_tile % 16;            // 0..15
     int val_high = (m_n >= 8) ? 1 : 0;
     int tc_col = m_n - (val_high ? 8 : 0);
 
-    int k_tiles = k / V1_K_TILE;
+    int k_tiles = k / V1_TILE_K;
+    int n_tiles = n / V1_TILE_N;
+    int row_stride_u32 = n_tiles * V1_TILE_INTS;
+
     float acc = 0.0f;
 
     for (int kt = 0; kt < k_tiles; kt++) {
-        int b_base = kt * 32;  // 32 u32 per k-tile (warp_id=0 quarter)
-        int k_base = kt * V1_K_TILE;
-        for (int k_in_tile = 0; k_in_tile < V1_K_TILE; k_in_tile++) {
+        int b_tile_base = kt * row_stride_u32 + n_tile * V1_TILE_INTS;
+        int k_base = kt * V1_TILE_K;
+        for (int k_in_tile = 0; k_in_tile < V1_TILE_K; k_in_tile++) {
             int tc_row = ((k_in_tile / 2) % 4) * 2;
             int i_inner = (k_in_tile % 2) + (k_in_tile / 8) * 2;
             int th_id = tc_row / 2 + tc_col * 4;
             int val_idx = i_inner + (val_high ? 4 : 0);
-            int u32_idx = b_base + th_id;
+            int u32_idx = b_tile_base + th_id * 4 + warp_id;
             int bit_off = inv_pack_idx[val_idx] * 4;
 
             uint32_t packed = b_ptr[u32_idx];
@@ -96,7 +111,7 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_n16k(
         }
     }
 
-    c_ptr[row * V1_N + col] = __float2bfloat16_rn(acc);
+    c_ptr[row * n + col] = __float2bfloat16_rn(acc);
 }
 
 // TODO(stage 15.D-body): replace the per-thread software dot product

@@ -1,13 +1,14 @@
 //! Stage 15.C/D — Marlin tile-MMA dispatcher.
 //!
-//! Wires the `marlin_tile_mma_int4_bf16_m16n16k` kernel (in
+//! Wires the `marlin_tile_mma_int4_bf16` kernel (in
 //! `kernels/marlin_tile_mma.cu`) into a Rust-callable function.
 //!
-//! v1 fixed M = N = 16, K any multiple of 16, BF16 activations, INT4 AWQ
-//! weights laid out per [`super::awq_marlin::awq_to_marlin_tile_repack_cpu`]
-//! (warp_id = 0 quarters of each k-tile concatenated, 32 u32 per tile),
-//! per-channel BF16 scales. See `docs/perf/marlin-tile-mma-step-15c-design.md`
-//! for the full kernel design and the upcoming tensor-core path.
+//! v1 supports M ≥ 1, N multiple of 64 (tile_n_size), K multiple of 16
+//! (tile_k_size). BF16 activations, INT4 AWQ weights laid out per
+//! [`super::awq_marlin::awq_to_marlin_tile_repack_cpu`] (full multi-tile
+//! output, k_tiles × n_tiles × 128 u32), per-channel BF16 scales. See
+//! `docs/perf/marlin-tile-mma-step-15c-design.md` for the full kernel
+//! design and the upcoming tensor-core path.
 //!
 //! The current kernel body is a software dot-product scaffold (proves
 //! the build + dispatch pipeline). Stage 15.D-body replaces it with a
@@ -28,12 +29,13 @@ struct MarlinTileMmaV1Op {
     b_tile: Tensor,
     scales: Tensor,
     m: i32,
+    n: i32,
     k: i32,
 }
 
 impl CustomOp1 for MarlinTileMmaV1Op {
     fn name(&self) -> &'static str {
-        "marlin_tile_mma_int4_bf16_n16k"
+        "marlin_tile_mma_int4_bf16"
     }
 
     fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
@@ -45,7 +47,7 @@ impl CustomOp1 for MarlinTileMmaV1Op {
 
         let dev = &storage.device;
         let func = dev.get_or_load_custom_func(
-            "marlin_tile_mma_int4_bf16_n16k",
+            "marlin_tile_mma_int4_bf16",
             "marlin_tile_mma",
             MARLIN_TILE_MMA_PTX,
         )?;
@@ -73,9 +75,10 @@ impl CustomOp1 for MarlinTileMmaV1Op {
             _ => candle_core::bail!("marlin_tile_mma: S must be on CUDA"),
         };
 
-        // v1: N = 16 fixed; M, K vary. Output [M, 16] BF16.
+        // v1: M ≥ 1, N multiple of 64, K multiple of 16. Output [M, N] BF16.
         let m = self.m as usize;
-        let elem_count = m * 16;
+        let n = self.n as usize;
+        let elem_count = m * n;
         let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
 
         // Block 256 threads; grid covers ceildiv(M*N, 256) blocks.
@@ -92,6 +95,7 @@ impl CustomOp1 for MarlinTileMmaV1Op {
         builder.arg(scales);
         builder.arg(&output);
         builder.arg(&self.m);
+        builder.arg(&self.n);
         builder.arg(&self.k);
 
         unsafe { builder.launch(cfg) }
@@ -101,23 +105,28 @@ impl CustomOp1 for MarlinTileMmaV1Op {
             slice: CudaStorageSlice::BF16(output),
             device: dev.clone(),
         };
-        Ok((out_storage, Shape::from_dims(&[m, 16])))
+        Ok((out_storage, Shape::from_dims(&[m, n])))
     }
 }
 
-/// Dispatch the v1 multi-K, multi-M Marlin tile-MMA kernel.
+/// Dispatch the v1 Marlin tile-MMA kernel.
 ///
 /// # Arguments
-/// * `a` — `[M, K]` BF16 activations on CUDA. `M ≥ 1`, `K` must be a multiple
-///   of 16.
-/// * `b_tile` — `[(K/16) * 32]` u32, concatenated warp_id=0 quarters of
-///   `awq_to_marlin_tile_repack_cpu(.., K, N=64)` (one 32-u32 quarter per
-///   k-tile, 16 K-rows per tile). For K=16 this is 32 u32 (single tile);
-///   for K=32 it's 64 u32, etc.
-/// * `scales` — `[16]` BF16 per-channel scale (group_size = K).
+/// * `a` — `[M, K]` BF16 activations on CUDA. `M ≥ 1`, `K` multiple of 16.
+/// * `b_tile` — `[k_tiles * n_tiles * 128]` u32, the full output of
+///   `awq_to_marlin_tile_repack_cpu(K, N)` where `k_tiles = K / 16` and
+///   `n_tiles = N / 64`. The producer's `[k_tiles, n_tiles*128]` shape is
+///   accepted as either 1-D flat or 2-D — both are flattened internally.
+/// * `scales` — `[N]` BF16 per-channel scale (group_size = K).
+/// * `n` — output column count, must be a multiple of 64.
 ///
-/// Returns `[M, 16]` BF16 row-major output on the same device.
-pub fn dispatch_marlin_tile_mma_v1(a: &Tensor, b_tile: &Tensor, scales: &Tensor) -> Result<Tensor> {
+/// Returns `[M, N]` BF16 row-major output on the same device.
+pub fn dispatch_marlin_tile_mma_v1(
+    a: &Tensor,
+    b_tile: &Tensor,
+    scales: &Tensor,
+    n: usize,
+) -> Result<Tensor> {
     if a.dims().len() != 2 || a.dtype() != DType::BF16 {
         candle_core::bail!(
             "marlin_tile_mma v1: A must be 2D BF16, got {:?} {:?}",
@@ -133,19 +142,25 @@ pub fn dispatch_marlin_tile_mma_v1(a: &Tensor, b_tile: &Tensor, scales: &Tensor)
     if !k.is_multiple_of(16) {
         candle_core::bail!("marlin_tile_mma v1: K ({}) must be a multiple of 16", k);
     }
+    if !n.is_multiple_of(64) {
+        candle_core::bail!("marlin_tile_mma v1: N ({}) must be a multiple of 64", n);
+    }
     let k_tiles = k / 16;
-    let expected_b_len = k_tiles * 32;
-    if b_tile.dims() != [expected_b_len] || b_tile.dtype() != DType::U32 {
+    let n_tiles = n / 64;
+    let expected_b_len = k_tiles * n_tiles * 128;
+    let actual_b_len: usize = b_tile.dims().iter().product();
+    if actual_b_len != expected_b_len || b_tile.dtype() != DType::U32 {
         candle_core::bail!(
-            "marlin_tile_mma v1: B must be [{}] U32, got {:?} {:?}",
+            "marlin_tile_mma v1: B must contain {} U32 elements, got {:?} {:?}",
             expected_b_len,
             b_tile.dims(),
             b_tile.dtype()
         );
     }
-    if scales.dims() != [16] || scales.dtype() != DType::BF16 {
+    if scales.dims() != [n] || scales.dtype() != DType::BF16 {
         candle_core::bail!(
-            "marlin_tile_mma v1: S must be [16] BF16, got {:?} {:?}",
+            "marlin_tile_mma v1: S must be [{}] BF16, got {:?} {:?}",
+            n,
             scales.dims(),
             scales.dtype()
         );
@@ -155,6 +170,7 @@ pub fn dispatch_marlin_tile_mma_v1(a: &Tensor, b_tile: &Tensor, scales: &Tensor)
         b_tile: b_tile.clone(),
         scales: scales.clone(),
         m: m as i32,
+        n: n as i32,
         k: k as i32,
     };
     a.apply_op1(op)
@@ -172,15 +188,14 @@ mod gpu_tests {
     /// dispatch the v1 kernel, compare against a CPU reference that does the
     /// same dequant + multiply + matmul. BF16 reduction tolerance scales
     /// with K (each summand is up to ~16 in magnitude × bf16 mantissa noise).
-    fn run_lock_down(m: usize, k: usize, tolerance: f32) {
+    fn run_lock_down(m: usize, n: usize, k: usize, tolerance: f32) {
         let Ok(cuda) = Device::new_cuda(0) else {
             eprintln!("no CUDA device — skipping");
             return;
         };
         assert!(k.is_multiple_of(16), "K must be multiple of 16");
+        assert!(n.is_multiple_of(64), "N must be multiple of 64");
         assert!(m >= 1);
-
-        let n: usize = 16;
 
         // 1. Activations A[M, K] BF16: deterministic small floats in [-1, 1].
         let a_vals: Vec<half::bf16> = (0..m * k)
@@ -198,37 +213,21 @@ mod gpu_tests {
             }
         }
 
-        // 3. Pad N=16 → N=64 to clear the producer's tile_n_size; only the
-        // warp_id=0 quarter of the resulting tiles is consumed.
-        let mut awq_padded = vec![0u32; k * (64 / 8)];
-        for kk in 0..k {
-            for col_pack in 0..(n / 8) {
-                awq_padded[kk * 8 + col_pack] = awq[kk * (n / 8) + col_pack];
-            }
-        }
-        let awq_padded_t = Tensor::from_vec(awq_padded, (k, 64 / 8), &Device::Cpu).unwrap();
-        let tile_full = awq_to_marlin_tile_repack_cpu(&awq_padded_t, k, 64).unwrap();
-        // tile_full shape [k/16, 128]; for each k-tile take the warp_id=0
-        // quarter (positions th_id*4 + 0 for th_id in 0..32) and concat.
-        let tile_full_vec: Vec<u32> = tile_full.flatten_all().unwrap().to_vec1().unwrap();
-        let k_tiles = k / 16;
-        let mut b_v1 = vec![0u32; k_tiles * 32];
-        for kt in 0..k_tiles {
-            let row_base = kt * 128;
-            for th_id in 0..32 {
-                b_v1[kt * 32 + th_id] = tile_full_vec[row_base + th_id * 4];
-            }
-        }
-        let b_tile = Tensor::from_vec(b_v1, k_tiles * 32, &cuda).unwrap();
+        // 3. Repack via Stage 15.B and pass the FULL multi-tile output to
+        // the kernel (no manual quarter extraction — the kernel reads all
+        // 4 warps' worth per tile).
+        let awq_t = Tensor::from_vec(awq, (k, n / 8), &Device::Cpu).unwrap();
+        let tile_full = awq_to_marlin_tile_repack_cpu(&awq_t, k, n).unwrap();
+        let b_tile = tile_full.flatten_all().unwrap().to_device(&cuda).unwrap();
 
-        // 4. Per-channel scales [N=16] BF16.
+        // 4. Per-channel scales [N] BF16.
         let scales_vec: Vec<half::bf16> = (0..n)
-            .map(|i| half::bf16::from_f32(0.05 + (i as f32) * 0.01))
+            .map(|i| half::bf16::from_f32(0.05 + (i as f32) * 0.0025))
             .collect();
         let scales = Tensor::from_vec(scales_vec.clone(), n, &cuda).unwrap();
 
         // 5. Dispatch.
-        let c = dispatch_marlin_tile_mma_v1(&a, &b_tile, &scales).unwrap();
+        let c = dispatch_marlin_tile_mma_v1(&a, &b_tile, &scales, n).unwrap();
         let c_host: Vec<half::bf16> = c.flatten_all().unwrap().to_vec1().unwrap();
 
         // 6. CPU reference.
@@ -244,48 +243,56 @@ mod gpu_tests {
                 let diff = (got - acc).abs();
                 assert!(
                     diff < tolerance,
-                    "M={m} K={k} mismatch at (row={row}, col={col}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
+                    "M={m} N={n} K={k} mismatch at (row={row}, col={col}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
                 );
             }
         }
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_m16_k16_matches_cpu_reference() {
-        run_lock_down(16, 16, 5e-2);
+    fn test_marlin_tile_mma_v1_n64_m16_k16() {
+        run_lock_down(16, 64, 16, 5e-2);
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_m16_k32_matches_cpu_reference() {
-        run_lock_down(16, 32, 1e-1);
+    fn test_marlin_tile_mma_v1_n64_m16_k32() {
+        run_lock_down(16, 64, 32, 1e-1);
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_m16_k64_matches_cpu_reference() {
-        run_lock_down(16, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n64_m16_k64() {
+        run_lock_down(16, 64, 64, 2e-1);
     }
 
-    /// M=1 — the canonical c=1 decode case. Single output row.
+    /// M=1 — the canonical c=1 decode case.
     #[test]
-    fn test_marlin_tile_mma_v1_m1_k64_matches_cpu_reference() {
-        run_lock_down(1, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n64_m1_k64() {
+        run_lock_down(1, 64, 64, 2e-1);
     }
 
-    /// M=4 — typical decode multi-step output.
+    /// M=4 — typical multi-step decode.
     #[test]
-    fn test_marlin_tile_mma_v1_m4_k64_matches_cpu_reference() {
-        run_lock_down(4, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n64_m4_k64() {
+        run_lock_down(4, 64, 64, 2e-1);
     }
 
-    /// M=32 — beyond a single 256-thread block (32×16 = 512 cells, 2 blocks).
+    /// Multi-block M.
     #[test]
-    fn test_marlin_tile_mma_v1_m32_k32_matches_cpu_reference() {
-        run_lock_down(32, 32, 1e-1);
+    fn test_marlin_tile_mma_v1_n64_m32_k32() {
+        run_lock_down(32, 64, 32, 1e-1);
     }
 
-    /// M=64 — 4 blocks; biggest test in the lock-down set.
+    /// N=128 (2 n-tiles) — exercises the n_tile axis of the producer.
     #[test]
-    fn test_marlin_tile_mma_v1_m64_k64_matches_cpu_reference() {
-        run_lock_down(64, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n128_m16_k64() {
+        run_lock_down(16, 128, 64, 2e-1);
+    }
+
+    /// N=256 with M and K above 16. Tolerance 3e-1 to absorb bf16 mantissa
+    /// noise on the larger absolute sums (output magnitudes ≈ 30+ at this
+    /// shape; 0.4 % relative bf16 error → ~0.12 abs).
+    #[test]
+    fn test_marlin_tile_mma_v1_n256_m32_k32() {
+        run_lock_down(32, 256, 32, 3e-1);
     }
 }
