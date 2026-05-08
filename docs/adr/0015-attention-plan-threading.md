@@ -181,8 +181,60 @@ Shape B becomes the fallback.
    lock keeps the engine-forward path serialized; tests keep their
    instance-bound workspaces by constructing `FlashInferBackend::with_block_size(...)`
    directly (which still works — just doesn't go through the
-   `select_backend()` singleton path). **TODO — must land before any
-   engine wiring touches this path.**
+   `select_backend()` singleton path). **Done — Stage 14-A.0c
+   (commit ee7e85b).**
+
+3. **Engine wiring via TLS (FAILED, reverted).** With the singleton
+   in place, the natural plan-threading shape is a thread-local
+   `PrefillPlanScope` RAII guard entered before `model.forward(...)`
+   in `engine::helpers::execute_prefill`. The scope's first
+   `paged_attention()` call lazily builds a plan and stows it; the
+   remaining N-1 attention layers reuse it. Drop clears.
+
+   Implementation landed cleanly (~150 lines in
+   `layers/attention/mod.rs` + a 3-line wrap in
+   `engine/helpers.rs::execute_prefill`). 4497 lib tests + 45
+   FlashInfer GPU tests + 7/7 e2e correctness PASSED. Looks great
+   on paper.
+
+   **`bench_prefill.py` showed a 240 → 336 ms TTFT regression at
+   `prompt_len=256` (5-run p50 stable).** The same prompt without
+   the TLS scope active comes back at 240 ms baseline. So the win
+   path the ADR predicted (saving 35× `BatchPrefillPlan::new` cost
+   per forward → ~190 ms TTFT) is *backwards* on this stack: the
+   plan-cached path is **slower**, not faster.
+
+   The build/run split inside `BatchPrefillPlan` on the FlashInfer
+   side must be cheaper than the model-forward analysis assumed —
+   most of the per-layer wallclock isn't plan-build, it's the
+   actual attention kernel + KV-cache write + Q/K/V projections.
+   Saving the plan-build ~doesn't move the needle, and even the
+   small overhead of TLS lookup + `Arc::clone` + downcast on every
+   layer call eats it.
+
+   **Reverted** the engine wiring (helpers.rs + the `PrefillPlanScope`
+   plumbing in `attention/mod.rs`). Foundation kept:
+   - `prepare_prefill_plan` / `prefill_attention_with_plan` API
+     surface remains in the `AttentionBackend` trait + FlashInfer
+     impl (Stage 14-A.0a).
+   - `select_backend()` singleton stays (Stage 14-A.0c).
+   - GPU lock-down tests for both prefill and decode plan paths
+     stay locked-in.
+
+   **Lesson recorded for future plan-caching attempts on this stack:**
+   profile before believing the 13-K.1 audit's interpretation. The
+   audit said "67.8 % of forward in `paged_attn`, dominated by
+   per-layer plan build" — but the breakdown was measured under
+   `VLLM_PROFILE_PREFILL=1` which adds a `cuda_stream::synchronize()`
+   per measurement, inflating ratios non-uniformly. Real wall-clock
+   shows the kernel itself dominates. Future ROI work in this area
+   should target the kernel (Stage 13-L Marlin tile-MMA) or the KV-
+   cache write path, not plan caching.
+
+   Stage 14-A status: **CLOSED**, no engine wiring beyond foundation.
+   Next time this is revisited, the foundation API surface can be
+   used immediately — but only if a new measurement shows
+   plan-build is actually meaningful in the workload.
 3. Add `attention_plan: Option<&dyn Any>` to `PagedAttentionMetadata`
    and `BatchedDecodeMetadata`; default-construct as `None` everywhere
    so existing callers don't change.
