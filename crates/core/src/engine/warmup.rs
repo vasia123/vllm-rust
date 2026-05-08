@@ -33,6 +33,14 @@ pub struct WarmupConfig {
     pub enable_graph_capture: bool,
     /// Batch sizes to warm up for decode operations.
     pub decode_batch_sizes: Vec<usize>,
+    /// Prompt lengths to warm up for prefill operations. Decode warmup
+    /// only compiles the M=batch decode-attention path; the first real
+    /// prefill request still pays JIT cost on the prefill attention path
+    /// (causal mask, distinct kernel from paged-attn decode). Pre-warming
+    /// at typical prompt lengths cuts cold-start TTFT by 2-3× on the
+    /// first request. Empty by default for back-compat — opt in via
+    /// server CLI flag or programmatic config.
+    pub prefill_prompt_lens: Vec<usize>,
     /// Whether to log progress during warmup.
     pub show_progress: bool,
 }
@@ -43,6 +51,7 @@ impl Default for WarmupConfig {
             enable_jit_warmup: true,
             enable_graph_capture: false,
             decode_batch_sizes: vec![1, 2, 4, 8, 16, 32],
+            prefill_prompt_lens: Vec::new(),
             show_progress: true,
         }
     }
@@ -50,10 +59,25 @@ impl Default for WarmupConfig {
 
 impl From<&CudaGraphConfig> for WarmupConfig {
     fn from(config: &CudaGraphConfig) -> Self {
+        // Env opt-in: `VLLM_PREFILL_WARMUP_LENS=128,256,512`. Empty / unset
+        // → no prefill warmup (default, back-compat). Avoids server-CLI
+        // plumbing; the env path is sufficient for the laptop / single-node
+        // deployments that benefit most from a 2-3× cold-start TTFT cut.
+        let prefill_prompt_lens = std::env::var("VLLM_PREFILL_WARMUP_LENS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         Self {
             enable_jit_warmup: true, // Always do JIT warmup
             enable_graph_capture: config.enabled,
             decode_batch_sizes: config.capture_sizes.clone(),
+            prefill_prompt_lens,
             show_progress: true,
         }
     }
@@ -80,12 +104,19 @@ impl WarmupConfig {
 
     /// Check if any warmup is needed.
     pub fn needs_warmup(&self) -> bool {
-        (self.enable_jit_warmup || self.enable_graph_capture) && !self.decode_batch_sizes.is_empty()
+        (self.enable_jit_warmup || self.enable_graph_capture)
+            && (!self.decode_batch_sizes.is_empty() || !self.prefill_prompt_lens.is_empty())
     }
 
     /// Set custom batch sizes.
     pub fn with_batch_sizes(mut self, sizes: Vec<usize>) -> Self {
         self.decode_batch_sizes = sizes;
+        self
+    }
+
+    /// Set prefill prompt lengths to pre-warm.
+    pub fn with_prefill_lens(mut self, lens: Vec<usize>) -> Self {
+        self.prefill_prompt_lens = lens;
         self
     }
 }
@@ -97,6 +128,8 @@ impl WarmupConfig {
 pub struct WarmupStats {
     /// Batch sizes that completed JIT warmup successfully.
     pub jit_warmed_sizes: Vec<usize>,
+    /// Prefill prompt lengths that completed JIT warmup successfully.
+    pub prefill_warmed_lens: Vec<usize>,
     /// Number of CUDA graphs successfully captured.
     pub graphs_captured: usize,
     /// Number of CUDA graph captures that failed.

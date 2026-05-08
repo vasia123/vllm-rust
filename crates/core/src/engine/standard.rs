@@ -282,6 +282,48 @@ impl<M: ModelForward> StandardExecution<M> {
     }
 
     /// Clean up dummy sequences and free allocated blocks.
+    /// Run a dummy prefill pass for JIT warmup at a given prompt length.
+    ///
+    /// Decode warmup compiles only the M=batch decode-attention path; the
+    /// first real prefill request still pays JIT cost on the prefill
+    /// attention path (causal mask, distinct kernel from paged-attn decode).
+    /// This pre-warms the prefill path at typical prompt lengths.
+    fn run_dummy_prefill(
+        &self,
+        prompt_len: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<(), WarmupError> {
+        let mut block_table = BlockTable::new(kv_cache_mgr.block_size());
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, prompt_len)
+            .map_err(|e| WarmupError::CacheAllocation(e.to_string()))?;
+
+        let slot_mapping = block_table.slot_mapping(0, prompt_len);
+
+        let input = candle_core::Tensor::zeros(
+            (1, prompt_len),
+            candle_core::DType::U32,
+            self.model.device(),
+        )?;
+
+        let forward_result =
+            self.model
+                .forward(&input, 0, kv_cache_mgr, &block_table, &slot_mapping);
+
+        // Free regardless of forward result so a single failure doesn't
+        // leak blocks across the warmup loop.
+        let block_ids = block_table.release();
+        if !block_ids.is_empty() {
+            if let Err(e) = kv_cache_mgr.free_blocks(&block_ids) {
+                tracing::warn!(error = %e, prompt_len, "Failed to free dummy prefill blocks");
+            }
+        }
+
+        forward_result
+            .map(|_| ())
+            .map_err(|e| WarmupError::CacheAllocation(e.to_string()))
+    }
+
     fn cleanup_dummy_sequences(
         &self,
         sequences: Vec<DummySequence>,
@@ -551,6 +593,40 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                         stats
                             .errors
                             .push(format!("graph batch_size={batch_size}: {e}"));
+                    }
+                }
+            }
+        }
+
+        // Phase 3: prefill prompt-length warmup. Compiles the prefill
+        // attention path (causal mask, separate kernel from paged-attn
+        // decode) for typical prompt lengths so the first real request
+        // doesn't pay full JIT cost. Empty by default; opt-in via
+        // `WarmupConfig::with_prefill_lens(...)`.
+        if config.enable_jit_warmup && !config.prefill_prompt_lens.is_empty() {
+            // Process in ascending order so a smaller prompt JIT-compiles the
+            // attention shape before larger prompts that need more VRAM.
+            let mut prefill_lens = config.prefill_prompt_lens.clone();
+            prefill_lens.sort();
+            for prompt_len in prefill_lens {
+                if prompt_len == 0 {
+                    stats
+                        .errors
+                        .push("prefill prompt_len=0: skipped (invalid)".to_string());
+                    continue;
+                }
+                match self.run_dummy_prefill(prompt_len, kv_cache_mgr) {
+                    Ok(()) => {
+                        stats.prefill_warmed_lens.push(prompt_len);
+                        if config.show_progress {
+                            info!(prompt_len, "Prefill JIT warmup complete");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(prompt_len, error = %e, "Prefill JIT warmup failed");
+                        stats
+                            .errors
+                            .push(format!("prefill prompt_len={prompt_len}: {e}"));
                     }
                 }
             }
