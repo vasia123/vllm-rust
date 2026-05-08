@@ -1534,8 +1534,17 @@ pub(crate) fn send_stream_token(
         let text_so_far = tokenizer
             .decode(&req.state.generated_token_ids[..=i])
             .unwrap_or_default();
-        let token_text = text_so_far[req.streamed_text_len..].to_string();
-        req.streamed_text_len = text_so_far.len();
+        // SAFETY: streamed_text_len from a previous iteration may not land
+        // on a char boundary if cumulative tokenizer decode is non-monotonic
+        // (rare but observed with CJK / multi-byte BPE merges) — `.get()`
+        // returns None instead of panicking; in that case emit nothing this
+        // round and DON'T advance streamed_text_len, so the next iteration's
+        // longer prefix has a chance to land on a valid boundary.
+        let (token_text, advance_to) = match text_so_far.get(req.streamed_text_len..) {
+            Some(s) => (s.to_string(), text_so_far.len()),
+            None => (String::new(), req.streamed_text_len),
+        };
+        req.streamed_text_len = advance_to;
 
         // Include logprob data when the request has logprobs enabled
         let logprob = if req.state.num_top_logprobs.is_some() {
