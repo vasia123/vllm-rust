@@ -35,7 +35,10 @@ path) starts from a clean foundation.
 | 15.D-body.3d | `03e5896` | TC small-M / multi-m-tile via masking — full production-shape contract on TC |
 | 15.D-body.4  | `b9bc05f` | TC microbench: 2-5× vs production marlin_gemm at M=4..8 |
 | 15.D-body.5  | `ce162d6` | initial e2e bench: 0% lift (caused by 3D-shape gate bug) |
-| 15.D-body.5 fix | (this commit) | **+74% c=8, +23% c=4** after 3D-shape fix in awq_marlin gate |
+| 15.D-body.5 fix | `67055da` | +74% c=8, +23% c=4 after 3D-shape fix in awq_marlin gate |
+| KV leak fix | `1f9a198` | finish_request_with_error_deferred now frees blocks (was hard-deadlocking c=16) |
+| UTF-8 fix | `40c595e` | safe slice in send_stream_token (panicked on Chinese output) |
+| 15.D final c=16 | (this commit) | **185 tps aggregate at c=16** — 2.89× pre-stage c=8 baseline |
 
 ## Current production behaviour
 
