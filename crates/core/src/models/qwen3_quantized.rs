@@ -126,37 +126,51 @@ mod decode_profile {
 // internally; we don't split it because the prefill path does not have a
 // separate `cache_engine.write_batch()` call (unlike the decode wrapper).
 //
-// **Measurement caveat (Stage 14-A.1, ADR 0015):** the `prefill_profile::time`
-// helper below issues a `cuda_stream::synchronize()` after every measurement,
-// which forces the host to wait for all queued GPU work in that closure to
-// complete. That serialises the GPU pipeline that would otherwise overlap
-// kernel launches with host code, so the absolute numbers reported by the
-// `dump_prefill` tracing line are **8–10× wallclock**.
+// **Measurement model (Stage 14-B):** every `prefill_profile::time(...)` call
+// records a pair of CUDA events on the device stream — one before the
+// closure dispatches its work, one after — and queues the pair in a
+// thread-local Vec. No host sync per measurement; the GPU pipeline overlap
+// is preserved. At `dump_prefill` time the Vec drains, each pair's
+// `elapsed_ms` is queried (which syncs the **second** event of the pair, a
+// single sync per pair, not per measurement), and the deltas accumulate
+// into the per-component `*_NS` slots.
 //
-// More importantly the **ratios** can mislead. Components that wait on lots
-// of in-flight kernel work (the attention block, with its 36-layer chain
-// queued ahead of the sync) appear larger relative to components that sit
-// on quiet GPU state (norms, projections that ran first). The Stage 13-K.1
-// audit read 67.8 % of forward as `paged_attn` and concluded plan-build was
-// the dominant cost; Stage 14-A.1 implemented the corresponding
-// optimization and measured a 240 → 336 ms TTFT *regression* — the kernel
-// itself dominates real wallclock, the sync-mode profile just made plan-
-// build look big.
+// Why this matters: the previous `cuda_stream::synchronize()`-per-measurement
+// approach made the absolute numbers 8–10× wallclock and — more dangerously
+// — distorted ratios non-uniformly. Components downstream of long kernel
+// chains looked bigger than they really are. Stage 13-K.1 audit read 67.8 %
+// of forward as `paged_attn` under the old profile; Stage 14-A.1 implemented
+// the implied optimization (per-forward plan caching) and measured a
+// 240 → 336 ms TTFT *regression* — the kernel itself dominates wallclock,
+// the sync-mode profile just made plan-build look big. ADR 0015 § 3 has
+// the full post-mortem.
 //
-// **Use this profile for "is this component even on the hot path?" not for
-// "how much wallclock does it cost?"**. Real wallclock breakdowns need
-// CUDA events (no host sync) — TODO future work, see ADR 0015 § 3.
+// CPU device fallback still uses `Instant`-based wallclock; CUDA path uses
+// events. Either way enable with `VLLM_PROFILE_PREFILL=1`.
 
 #[cfg(feature = "cuda")]
 mod prefill_profile {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::OnceLock;
     use std::time::Instant;
+
+    use candle_core::cuda::cudarc::driver::sys::CUevent_flags_enum;
+    use candle_core::cuda::cudarc::driver::CudaEvent;
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
 
     pub fn enabled() -> bool {
         *ENABLED.get_or_init(|| std::env::var("VLLM_PROFILE_PREFILL").is_ok())
+    }
+
+    // Thread-local queue of CUDA-event pairs awaiting elapsed-ms readout.
+    // A 36-layer Qwen3 forward queues ~12 × 36 = 432 pairs; each pair holds
+    // two `CudaEvent`s (~24 B + small FFI handle) and a static slot pointer.
+    // `dump_prefill` drains and resets.
+    type EventEntry = (CudaEvent, CudaEvent, &'static AtomicU64);
+    thread_local! {
+        static EVENT_QUEUE: RefCell<Vec<EventEntry>> = const { RefCell::new(Vec::new()) };
     }
 
     pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
@@ -175,21 +189,62 @@ mod prefill_profile {
 
     pub fn time<T>(
         dev: &candle_core::Device,
-        slot: &AtomicU64,
+        slot: &'static AtomicU64,
         f: impl FnOnce() -> candle_core::Result<T>,
     ) -> candle_core::Result<T> {
         if !enabled() {
             return f();
         }
-        let t0 = Instant::now();
-        let out = f()?;
-        if let candle_core::Device::Cuda(cd) = dev {
-            cd.cuda_stream()
-                .synchronize()
-                .map_err(|e| candle_core::Error::Msg(format!("prefill profile sync: {e}")))?;
+        match dev {
+            candle_core::Device::Cuda(cd) => {
+                // Stage 14-B — event-based timing without per-measurement
+                // host sync. `CU_EVENT_DEFAULT` keeps timing enabled (default
+                // would be `DISABLE_TIMING`, optimised for sync-only events).
+                let stream = cd.cuda_stream();
+                let start = stream
+                    .record_event(Some(CUevent_flags_enum::CU_EVENT_DEFAULT))
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("prefill profile start event: {e}"))
+                    })?;
+                let out = f()?;
+                let end = stream
+                    .record_event(Some(CUevent_flags_enum::CU_EVENT_DEFAULT))
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("prefill profile end event: {e}"))
+                    })?;
+                EVENT_QUEUE.with(|cell| cell.borrow_mut().push((start, end, slot)));
+                Ok(out)
+            }
+            _ => {
+                // CPU path: fall back to host wallclock. Same shape as before.
+                let t0 = Instant::now();
+                let out = f()?;
+                slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                Ok(out)
+            }
         }
-        slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Ok(out)
+    }
+
+    /// Drain queued event pairs, query elapsed_ms (one sync per pair via the
+    /// `end` event), and accumulate into the matching `*_NS` slot.
+    fn flush_events() {
+        EVENT_QUEUE.with(|cell| {
+            let pairs = std::mem::take(&mut *cell.borrow_mut());
+            for (start, end, slot) in pairs {
+                match start.elapsed_ms(&end) {
+                    Ok(ms) => {
+                        let ns = (ms as f64 * 1_000_000.0) as u64;
+                        slot.fetch_add(ns, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "vllm_core::prefill_profile",
+                            "elapsed_ms query failed, dropping event pair: {e}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     pub fn bump_layer() {
@@ -202,6 +257,11 @@ mod prefill_profile {
         if !enabled() {
             return;
         }
+        // Stage 14-B: drain queued event pairs into the slots before
+        // reading them. CPU device path skipped events and updated slots
+        // directly via Instant; CUDA path queued events and we collect
+        // here. Either way, slots are authoritative below.
+        flush_events();
         let snap = |a: &AtomicU64| (a.swap(0, Ordering::Relaxed) as f64) / 1_000.0;
         let s_emb = snap(&EMBED_NS);
         let s_mask = snap(&MASK_NS);

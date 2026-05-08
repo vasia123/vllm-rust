@@ -1220,6 +1220,66 @@ with Stage 13-J. **Lifted to its own milestone (Stage 13-K-bis or
 Stage 14-A).** The audit (this section) is the deliverable for
 13-K.1; subsequent substeps stay pending for that future milestone.
 
+## Stage 14-B — honest profile via CUDA events (Stage 14-A.1 post-mortem)
+
+Stage 13-K.1 audit was based on `VLLM_PROFILE_PREFILL=1` numbers from
+the per-measurement `cuda_stream::synchronize()` profiler. Those
+numbers were *wallclock-distorted* (8–10× true cost) and *ratio-
+distorted* in a non-uniform way: components downstream of long kernel
+chains looked bigger than they were. Stage 14-A.1 implemented the
+implied optimization (per-forward plan caching) and measured a
+240 → 336 ms TTFT *regression* — the audit was wrong about where the
+forward spent its time.
+
+Stage 14-B replaces the profile internals with CUDA events
+(`stream.record_event(CU_EVENT_DEFAULT)` + `start.elapsed_ms(&end)` —
+one host sync **per pair** at flush time, not per measurement). The
+GPU pipeline overlap is preserved; the resulting numbers are 2.7×
+wallclock instead of 8–10×, and the ratios reflect actual GPU work.
+
+### Old (sync-mode) vs new (event-mode) on a 489-token prefill
+
+| component   | event μs | event % | sync % | direction        |
+|---          |--:       |--:      |--:     |---               |
+| **mlp**     | 329 150  | **40.3** | 19.1   | sync UNDERcounted by 2.1× |
+| **paged_attn** | 292 152 | **35.8** | 67.8 | sync OVERcounted by 1.9× |
+| o_proj      |  93 097  | 11.4    |  4.7   | undercount       |
+| qkv         |  66 908  |  8.2    |  5.8   | undercount       |
+| qk_norm     |  15 598  |  1.9    |  0.8   | undercount       |
+| rope        |   3 346  |  0.4    |  0.5   | flat             |
+| lm_head     |  13 291  |  1.6    |  0.8   | flat             |
+| in_norm     |     752  |  0.1    |  0.2   | flat             |
+| post_norm   |     789  |  0.1    |  0.2   | flat             |
+| embed       |     564  |  0.1    |  0.05  | flat             |
+| mask        |   1 401  |  0.2    |  0.06  | flat             |
+| final_norm  |      12  |  0.0    |  0.002 | flat             |
+| **total**   | 817 059  | 100     | 100    |                  |
+
+### Implications
+
+1. **MLP is the largest component, not paged_attn.** Both go through
+   the AWQ-Marlin kt_mloop kernel (gate/up/down for MLP, q/k/v/o for
+   attention). Stage 13-J's kt_mloop wins applied uniformly to both —
+   that's why the +11 % c=4 / +8 % c=8 wins landed even though the
+   audit pointed at the wrong component.
+2. **paged_attn is 35.8 %, not 67.8 %.** Plan-build is a small slice
+   *within* paged_attn; replacing it with cached plans (Stage 14-A.1)
+   couldn't have moved the needle. Audit-driven implementation
+   without first checking the audit was the failure mode.
+3. **The big knob for further wins is still the AWQ-Marlin kernel.**
+   MLP + paged_attn + o_proj + qkv = 95.7 % of forward; all four go
+   through the same INT4 GEMM path. A tile-MMA tensor-core rewrite
+   (Stage 13-L, deferred 2–4 weeks) lifts all four. Anything else is
+   noise relative to that.
+
+### Verification
+
+Event-based profile is opt-in via `VLLM_PROFILE_PREFILL=1`. Production
+forwards skip the instrumentation entirely. 4497 lib tests +
+7/7 e2e correctness PASS unchanged.
+
+---
+
 Stage 13 closes here with cumulative wins from `git log`:
 
 - 13-D: TTFT 4695 → 252 ms (18.6×)
