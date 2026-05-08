@@ -219,6 +219,99 @@ mod gpu_tests {
     use crate::quantization::awq_marlin::awq_to_marlin_tile_repack_cpu;
     use candle_core::Device;
 
+    /// Stage 15.D-body.1 — CustomOp1 wrapping the standalone LOP3
+    /// dequant kernel. Input `q` is U32 [count]; output is BF16
+    /// [count, 4] with nibbles {#0, #4, #1, #5} per u32.
+    struct DequantInt4Bf16Lo4Op {
+        count: i32,
+    }
+
+    impl CustomOp1 for DequantInt4Bf16Lo4Op {
+        fn name(&self) -> &'static str {
+            "marlin_test_dequant_int4_bf16_lo4"
+        }
+        fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+            candle_core::bail!("dequant_int4_bf16_lo4: CUDA only")
+        }
+        fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+            use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+            let dev = &storage.device;
+            let q = match &storage.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("dequant_int4_bf16_lo4: q must be U32"),
+            };
+            let func = dev.get_or_load_custom_func(
+                "marlin_test_dequant_int4_bf16_lo4",
+                "marlin_tile_mma",
+                MARLIN_TILE_MMA_PTX,
+            )?;
+            let count = self.count as usize;
+            let output = dev.alloc_zeros::<half::bf16>(count * 4)?;
+            const BLOCK: u32 = 256;
+            let cfg = LaunchConfig {
+                grid_dim: (count.div_ceil(BLOCK as usize) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(q);
+            builder.arg(&output);
+            builder.arg(&self.count);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| candle_core::Error::Msg(format!("dequant_int4 launch: {e}")))?;
+            Ok((
+                CudaStorage {
+                    slice: CudaStorageSlice::BF16(output),
+                    device: dev.clone(),
+                },
+                Shape::from_dims(&[count, 4]),
+            ))
+        }
+    }
+
+    fn dispatch_dequant_int4_bf16_lo4(q: &Tensor) -> Result<Tensor> {
+        if q.dtype() != DType::U32 {
+            candle_core::bail!("dequant_int4_bf16_lo4: q must be U32");
+        }
+        let count = q.dims().iter().product::<usize>();
+        let q_flat = q.flatten_all()?.contiguous()?;
+        q_flat.apply_op1(DequantInt4Bf16Lo4Op {
+            count: count as i32,
+        })
+    }
+
+    #[test]
+    fn test_dequant_int4_bf16_lo4_primitive() {
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("no CUDA device — skipping");
+            return;
+        };
+        // Deterministic test inputs covering the full byte range.
+        let q_vals: Vec<u32> = (0..256u32).map(|i| i.wrapping_mul(0x9E3779B1)).collect();
+        let q = Tensor::from_vec(q_vals.clone(), 256, &cuda).unwrap();
+
+        let out = dispatch_dequant_int4_bf16_lo4(&q).unwrap();
+        let out_host: Vec<half::bf16> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        // CPU reference: same bit extraction as the kernel.
+        for (i, &qv) in q_vals.iter().enumerate() {
+            let expected = [
+                (qv & 0xF) as f32,
+                ((qv >> 16) & 0xF) as f32,
+                ((qv >> 4) & 0xF) as f32,
+                ((qv >> 20) & 0xF) as f32,
+            ];
+            for j in 0..4 {
+                let got = out_host[i * 4 + j].to_f32();
+                assert!(
+                    (got - expected[j]).abs() < 1e-3,
+                    "i={i} j={j} q=0x{qv:08x} expected={} got={got}",
+                    expected[j]
+                );
+            }
+        }
+    }
+
     /// Numeric-correctness lock-down for arbitrary K (multiple of 16).
     ///
     /// Build a deterministic AWQ qweight + per-channel scales + activations,

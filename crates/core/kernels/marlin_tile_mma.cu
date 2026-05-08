@@ -156,3 +156,85 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16(
 //   4. Output store: FragC FP32 → BF16 with the m16n8 thread-mapping
 //      from `marlin-tile-mma-step-15c-design.md` §3.
 // Block dims become (32, 1, 1) (1 warp); this scaffold uses (256, 1, 1).
+
+// ─── Stage 15.D-body.1 — INT4 → BF16 LOP3 dequant primitive ─────────────
+//
+// Two LOP3 calls + an `__hsub2` recover the raw nibble values from a
+// packed INT4 u32, mirroring the reference at
+// `reference/vllm/csrc/quantization/marlin/dequant.h:174-215`. One call
+// produces 4 bf16 values from 4 of the 8 nibbles in the input u32; for
+// our nibble pack order (`pack_idx = [0,2,4,6,1,3,5,7]`) the chosen 4 are
+// at packed-bit positions 0/4/16/20 of `q`, which decode (in our logical
+// ordering) to vals 0, 2, 1, 3 — i.e. the FIRST FOUR vals of the 8-nibble
+// pack. A second call on `q >> 8` extracts vals 4, 5, 6, 7.
+//
+// Output layout: the 4 bf16 values populate `frag_b` (a 2-element
+// `__nv_bfloat162` array) so the upper-half of `frag_b[0]` and the
+// upper-half of `frag_b[1]` are produced by the OFFSET LOP3 (after the
+// `q >>= 4` shift in the reference's tight clang-format-off block).
+//
+// Standalone correctness test: see
+// `marlin_test_dequant_int4_bf16_lo4` below.
+
+template <int LOP3_IMM = 0xea>
+__device__ __forceinline__ uint32_t lop3(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t out;
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(out)
+                 : "r"(a), "r"(b), "r"(c), "n"(LOP3_IMM));
+    return out;
+}
+
+__device__ __forceinline__ void dequant_int4_bf16_lo4(uint32_t q,
+                                                     __nv_bfloat162* frag_b) {
+    // (a & MASK) | EX → emits bf16(128 + nibble) per byte half.
+    constexpr uint32_t MASK = 0x000f000f;
+    constexpr uint32_t EX = 0x43004300;
+    constexpr uint32_t SUB = 0x43004300;  // bf16(128.0) duplicated
+
+    // First LOP3: nibbles at q-bits [3:0] and [19:16]
+    // (i.e. our pack_idx positions 0 and 1, which are vals[0] and vals[1]).
+    uint32_t lo = lop3<0xea>(q, MASK, EX);
+    // Shift q by 4 and LOP3 again: now picks nibbles at original q-bits [7:4]
+    // and [23:20] (pack_idx positions 2 and 3, vals[2] and vals[3]).
+    uint32_t q_shift = q >> 4;
+    uint32_t hi = lop3<0xea>(q_shift, MASK, EX);
+
+    __nv_bfloat162 lo_bf16 = *reinterpret_cast<__nv_bfloat162*>(&lo);
+    __nv_bfloat162 hi_bf16 = *reinterpret_cast<__nv_bfloat162*>(&hi);
+    __nv_bfloat162 sub_bf16 = *reinterpret_cast<const __nv_bfloat162*>(&SUB);
+
+    frag_b[0] = __hsub2(lo_bf16, sub_bf16);
+    frag_b[1] = __hsub2(hi_bf16, sub_bf16);
+}
+
+// Test kernel — Stage 15.D-body.1 standalone correctness.
+//
+// Reads `count` u32s from `q_ptr`, dequants the lower 4 nibbles of each
+// (in pack_idx order vals[0..3]) into 4 bf16 values written contiguously
+// to `out_ptr`. CPU reference + this kernel must agree.
+//
+// Launch: blockDim = (256,1,1); grid_dim = (ceildiv(count,256),1,1).
+extern "C" __global__ void marlin_test_dequant_int4_bf16_lo4(
+    const uint32_t*    __restrict__ q_ptr,
+    __nv_bfloat16*     __restrict__ out_ptr,
+    int count) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+
+    __nv_bfloat162 frag_b[2];
+    dequant_int4_bf16_lo4(q_ptr[idx], frag_b);
+
+    // The 4 outputs correspond to nibbles at q-bit positions:
+    //   out[0] = bits [3:0]    (nibble #0)
+    //   out[1] = bits [19:16]  (nibble #4)
+    //   out[2] = bits [7:4]    (nibble #1)
+    //   out[3] = bits [23:20]  (nibble #5)
+    // The Marlin tile-frag permutation: nibbles 16 bits apart packed
+    // into a single LOP3 to produce a bf16x2 fragment in one instruction.
+    int out_base = idx * 4;
+    out_ptr[out_base + 0] = __low2bfloat16(frag_b[0]);
+    out_ptr[out_base + 1] = __high2bfloat16(frag_b[0]);
+    out_ptr[out_base + 2] = __low2bfloat16(frag_b[1]);
+    out_ptr[out_base + 3] = __high2bfloat16(frag_b[1]);
+}
