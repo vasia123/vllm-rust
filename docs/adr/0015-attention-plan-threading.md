@@ -148,11 +148,41 @@ Shape B becomes the fallback.
    `test_decode_with_plan_matches_eager_gpu` and
    `test_decode_with_plan_none_falls_through_gpu`
    (`crates/core/src/layers/attention/flashinfer/mod.rs`,
-   `gpu-test-small` feature). **Done — landed in this milestone.**
+   `gpu-test-small` feature). **Done — Stage 14-A.0 (commit 2e0e829).**
 2. Add `prepare_prefill_plan` to `AttentionBackend` (default `None`),
    plus `prefill_attention_with_plan` (default falls through).
    Implement both in `FlashInferBackend` reusing the work already in
-   `prefill_flashinfer`.
+   `prefill_flashinfer`. **Done — Stage 14-A.0a (commit 0f7be25).**
+2.5. **Backend-singleton precondition** — currently `select_backend()`
+   constructs a fresh `Box<FlashInferBackend>` on every helper call,
+   so the workspace inside it dies with the box. A plan returned by
+   `prepare_prefill_plan` holds pointers into that workspace; once
+   the backend drops the pointers are dangling.
+
+   **Failed approach (Stage 14-A.0b, reverted commit ffc6331):** lift
+   `workspace` to a `static OnceLock<Mutex<…>>`. Single-thread tests
+   passed, but `cargo test --jobs N` runs FlashInfer GPU tests in
+   parallel; concurrent `ensure_size` resizes deallocated the
+   underlying CudaSlice while one test still held a plan pointing
+   into it → 10/45 GPU tests crashed. The singleton is unsafe under
+   concurrent access regardless of the plan-caching shape.
+
+   The right fix is to make **the backend itself** a singleton via
+   `OnceLock<Box<dyn AttentionBackend>>` returned by `select_backend()`
+   — then the workspace stays per-backend (so each backend instance
+   has its own workspace and tests don't collide), but the lone
+   live instance outlives any plan that flows through it. Single-
+   threaded engine forward gets serial access through the existing
+   workspace `Mutex` inside the singleton backend.
+
+   Implementation is small: change `select_backend()` return from
+   `Box<dyn …>` to `&'static dyn …` (or `Arc<dyn …>`), update the
+   two callers in `attention/mod.rs`. Existing per-backend workspace
+   lock keeps the engine-forward path serialized; tests keep their
+   instance-bound workspaces by constructing `FlashInferBackend::with_block_size(...)`
+   directly (which still works — just doesn't go through the
+   `select_backend()` singleton path). **TODO — must land before any
+   engine wiring touches this path.**
 3. Add `attention_plan: Option<&dyn Any>` to `PagedAttentionMetadata`
    and `BatchedDecodeMetadata`; default-construct as `None` everywhere
    so existing callers don't change.
