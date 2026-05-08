@@ -280,6 +280,115 @@ mod gpu_tests {
         })
     }
 
+    /// Stage 15.D-body.2a — single-tile bf16 mma.m16n8k16 probe.
+    /// A: [16, 16] BF16 row-major; B: [8, 16] BF16 (col-major over [K=16, N=8],
+    /// stored as `b[n*16 + k]`); output C: [16, 8] FP32 row-major.
+    struct MmaM16N8K16Bf16Op {
+        b: Tensor, // [8, 16] BF16, col-major K-N pack
+    }
+
+    impl CustomOp1 for MmaM16N8K16Bf16Op {
+        fn name(&self) -> &'static str {
+            "marlin_test_mma_m16n8k16_bf16"
+        }
+        fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+            candle_core::bail!("mma_m16n8k16: CUDA only")
+        }
+        fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+            use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+            let dev = &storage.device;
+            let a = match &storage.slice {
+                CudaStorageSlice::BF16(s) => s,
+                _ => candle_core::bail!("mma_m16n8k16: A must be BF16"),
+            };
+            let (b_guard, _) = self.b.storage_and_layout();
+            let b = match &*b_guard {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::BF16(s) => s,
+                    _ => candle_core::bail!("mma_m16n8k16: B must be BF16"),
+                },
+                _ => candle_core::bail!("mma_m16n8k16: B must be on CUDA"),
+            };
+            let func = dev.get_or_load_custom_func(
+                "marlin_test_mma_m16n8k16_bf16",
+                "marlin_tile_mma",
+                MARLIN_TILE_MMA_PTX,
+            )?;
+            let output = dev.alloc_zeros::<f32>(16 * 8)?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(a);
+            builder.arg(b);
+            builder.arg(&output);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| candle_core::Error::Msg(format!("mma_m16n8k16 launch: {e}")))?;
+            Ok((
+                CudaStorage {
+                    slice: CudaStorageSlice::F32(output),
+                    device: dev.clone(),
+                },
+                Shape::from_dims(&[16, 8]),
+            ))
+        }
+    }
+
+    fn dispatch_mma_m16n8k16_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        if a.dims() != [16, 16] || a.dtype() != DType::BF16 {
+            candle_core::bail!("mma_m16n8k16: A must be [16,16] BF16");
+        }
+        if b.dims() != [8, 16] || b.dtype() != DType::BF16 {
+            candle_core::bail!("mma_m16n8k16: B must be [8,16] BF16 (col-major K,N pack)");
+        }
+        a.contiguous()?
+            .apply_op1(MmaM16N8K16Bf16Op { b: b.contiguous()? })
+    }
+
+    #[test]
+    fn test_mma_m16n8k16_bf16_correctness() {
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("no CUDA device — skipping");
+            return;
+        };
+        // A [16, 16] row-major; B [8, 16] col-major (B(k,n) = b[n*16+k]).
+        // Use small deterministic floats so BF16 quantisation noise is
+        // bounded. K=16 reduction → tolerance scales linearly: each
+        // summand ≤ 1.0 × 1.0 = 1.0; bf16 has ~3-decimal mantissa, so
+        // expect error per element ≲ 16 × 1.0 × 2^-7 ≈ 0.125.
+        let a_vals: Vec<half::bf16> = (0..16 * 16)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.073) % 2.0) - 1.0))
+            .collect();
+        let b_vals: Vec<half::bf16> = (0..8 * 16)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.117) % 2.0) - 1.0))
+            .collect();
+        let a = Tensor::from_vec(a_vals.clone(), (16, 16), &cuda).unwrap();
+        let b = Tensor::from_vec(b_vals.clone(), (8, 16), &cuda).unwrap();
+
+        let c = dispatch_mma_m16n8k16_bf16(&a, &b).unwrap();
+        let c_host: Vec<f32> = c.flatten_all().unwrap().to_vec1().unwrap();
+
+        for m in 0..16 {
+            for n in 0..8 {
+                let mut acc = 0.0f32;
+                for k in 0..16 {
+                    let av = a_vals[m * 16 + k].to_f32();
+                    // B is col-major [K=16, N=8]; we stored b[n*16+k]
+                    let bv = b_vals[n * 16 + k].to_f32();
+                    acc += av * bv;
+                }
+                let got = c_host[m * 8 + n];
+                let diff = (got - acc).abs();
+                assert!(
+                    diff < 0.2,
+                    "mma m16n8k16 mismatch at (m={m},n={n}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_dequant_int4_bf16_lo4_primitive() {
         let Ok(cuda) = Device::new_cuda(0) else {

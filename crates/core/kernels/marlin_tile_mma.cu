@@ -238,3 +238,71 @@ extern "C" __global__ void marlin_test_dequant_int4_bf16_lo4(
     out_ptr[out_base + 2] = __low2bfloat16(frag_b[1]);
     out_ptr[out_base + 3] = __high2bfloat16(frag_b[1]);
 }
+
+// ─── Stage 15.D-body.2a — minimal bf16 mma.m16n8k16 kernel (no INT4) ────
+//
+// Single-warp, single-tile (M=16, N=8, K=16) probe of the
+// `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` instruction.
+// Each thread builds its own fragments directly from global memory using
+// the PTX-spec thread layout (no ldmatrix yet — that's body.2c).
+//
+// Layout (PTX 8.0 spec, mma.m16n8k16 with .f16/.bf16 operands;
+// group_id = lane/4, group_thread = lane%4):
+//   FragA (M=16, K=16, row-major, 4 u32/thread):
+//     a[0] (lo,hi) = A(gid,    gth*2),   A(gid,    gth*2+1)
+//     a[1] (lo,hi) = A(gid+8,  gth*2),   A(gid+8,  gth*2+1)
+//     a[2] (lo,hi) = A(gid,    gth*2+8), A(gid,    gth*2+9)
+//     a[3] (lo,hi) = A(gid+8,  gth*2+8), A(gid+8,  gth*2+9)
+//   FragB (K=16, N=8, col-major, 2 u32/thread):
+//     b[0] (lo,hi) = B(gth*2,   gid), B(gth*2+1, gid)
+//     b[1] (lo,hi) = B(gth*2+8, gid), B(gth*2+9, gid)
+//   FragC (M=16, N=8, row-major, 4 f32/thread):
+//     c[0] = C(gid,    gth*2)
+//     c[1] = C(gid,    gth*2+1)
+//     c[2] = C(gid+8,  gth*2)
+//     c[3] = C(gid+8,  gth*2+1)
+//
+// B is laid out col-major: B(k, n) = b_ptr[n * 16 + k]. CPU reference
+// in the dispatcher must match this convention.
+//
+// Launch: block_dim = (32, 1, 1); grid_dim = (1, 1, 1). Single warp.
+
+extern "C" __global__ void marlin_test_mma_m16n8k16_bf16(
+    const __nv_bfloat16* __restrict__ a_ptr,  // [16, 16] row-major
+    const __nv_bfloat16* __restrict__ b_ptr,  // [8, 16] col-major (b[n*16+k])
+    float* __restrict__ c_ptr) {              // [16, 8] row-major
+    int lane = threadIdx.x;
+    if (lane >= 32) return;
+    int gid = lane / 4;
+    int gth = lane % 4;
+
+    auto pack = [](__nv_bfloat16 lo, __nv_bfloat16 hi) {
+        __nv_bfloat162 v = __halves2bfloat162(lo, hi);
+        return *reinterpret_cast<uint32_t*>(&v);
+    };
+
+    uint32_t a[4];
+    a[0] = pack(a_ptr[gid       * 16 + gth * 2    ], a_ptr[gid       * 16 + gth * 2 + 1]);
+    a[1] = pack(a_ptr[(gid + 8) * 16 + gth * 2    ], a_ptr[(gid + 8) * 16 + gth * 2 + 1]);
+    a[2] = pack(a_ptr[gid       * 16 + gth * 2 + 8], a_ptr[gid       * 16 + gth * 2 + 9]);
+    a[3] = pack(a_ptr[(gid + 8) * 16 + gth * 2 + 8], a_ptr[(gid + 8) * 16 + gth * 2 + 9]);
+
+    uint32_t b[2];
+    b[0] = pack(b_ptr[gid * 16 + gth * 2    ], b_ptr[gid * 16 + gth * 2 + 1]);
+    b[1] = pack(b_ptr[gid * 16 + gth * 2 + 8], b_ptr[gid * 16 + gth * 2 + 9]);
+
+    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+
+    c_ptr[gid       * 8 + gth * 2    ] = c[0];
+    c_ptr[gid       * 8 + gth * 2 + 1] = c[1];
+    c_ptr[(gid + 8) * 8 + gth * 2    ] = c[2];
+    c_ptr[(gid + 8) * 8 + gth * 2 + 1] = c[3];
+}
