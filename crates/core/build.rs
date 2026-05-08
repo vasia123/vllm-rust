@@ -115,6 +115,16 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/awq_marlin_dequant.ptx",
         min_sm: 80,
     },
+    // Stage 15.C — Minimum-viable Marlin tile-MMA kernel
+    // (single tile, M=N=K=16, BF16 act, INT4 weights, per-channel scales).
+    // Scaffold-first: kernel body is a software dequant+matmul; the
+    // tensor-core mma.m16n8k16 path lands once the pipeline is verified.
+    // Min sm: 80 because the eventual mma.m16n8k16.bf16.bf16 needs sm_80+.
+    KernelDef {
+        source: "kernels/marlin_tile_mma.cu",
+        output: "kernels/marlin_tile_mma.ptx",
+        min_sm: 80,
+    },
     // MXFP4 E2M1 × BF16 GEMM with blockwise E8M0 scales — uses bf16
     KernelDef {
         source: "kernels/mxfp4_gemm.cu",
