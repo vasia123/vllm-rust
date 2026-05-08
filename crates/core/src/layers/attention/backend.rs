@@ -289,21 +289,42 @@ pub trait AttentionBackend: Send + Sync {
 /// 1. FlashInfer (best for paged attention decode)
 /// 2. FlashAttention (good for prefill)
 /// 3. Naive (fallback)
-pub fn select_backend() -> Box<dyn AttentionBackend> {
-    #[cfg(feature = "flashinfer")]
-    {
-        Box::new(super::flashinfer::FlashInferBackend::new())
-    }
-
-    #[cfg(all(feature = "flash-attn", not(feature = "flashinfer")))]
-    {
-        Box::new(super::flash::FlashAttentionBackend::new())
-    }
-
-    #[cfg(not(any(feature = "flash-attn", feature = "flashinfer")))]
-    {
-        Box::new(super::naive::NaiveAttentionBackend::new())
-    }
+///
+/// Returns a reference to a process-wide singleton attention backend.
+///
+/// Stage 14-A.0c — was `Box<dyn AttentionBackend>` constructed fresh on
+/// every call. That ate 36 box allocations per Qwen3 forward AND made
+/// the per-backend workspace die together with the box, which leaves
+/// any plan returned by `prepare_*_plan` with dangling pointers.
+/// The singleton outlives every plan that flows through it; the inner
+/// workspace `Mutex` keeps the (single-threaded) engine forward path
+/// serial.
+///
+/// Tests that construct backend instances directly (e.g.
+/// `FlashInferBackend::with_block_size(...)`) keep their own per-instance
+/// workspace and don't go through this singleton — `cargo test --jobs N`
+/// stays race-free.
+pub fn select_backend() -> &'static dyn AttentionBackend {
+    use std::sync::OnceLock;
+    // `Box::leak` returns `&'static mut`; we coerce to `&'static dyn`
+    // by binding through `OnceLock<Box<dyn AttentionBackend + Sync>>`.
+    static BACKEND: OnceLock<Box<dyn AttentionBackend + Sync>> = OnceLock::new();
+    BACKEND
+        .get_or_init(|| {
+            #[cfg(feature = "flashinfer")]
+            {
+                Box::new(super::flashinfer::FlashInferBackend::new())
+            }
+            #[cfg(all(feature = "flash-attn", not(feature = "flashinfer")))]
+            {
+                Box::new(super::flash::FlashAttentionBackend::new())
+            }
+            #[cfg(not(any(feature = "flash-attn", feature = "flashinfer")))]
+            {
+                Box::new(super::naive::NaiveAttentionBackend::new())
+            }
+        })
+        .as_ref()
 }
 
 #[cfg(test)]
