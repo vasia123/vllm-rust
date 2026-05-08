@@ -70,6 +70,14 @@ mod decode_profile {
     pub static MLP_NS: AtomicU64 = AtomicU64::new(0);
     pub static IN_NORM_NS: AtomicU64 = AtomicU64::new(0);
     pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    /// Per-pass top-level slots — incremented once per forward, NOT once
+    /// per layer. EMBED is the input_ids → hidden lookup; FINAL_NORM is
+    /// the post-all-layers RMSNorm; LM_HEAD is the [hidden → vocab]
+    /// matmul (BF16 dense, ~25 GFLOPs/step at M=8 for Qwen3-4B's 152K
+    /// vocab — quantified in `docs/perf/post-15D-decode-profile.md`).
+    pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FINAL_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
     pub static LAYERS_DONE: AtomicUsize = AtomicUsize::new(0);
 
     /// Record a start event, run `f`, record an end event, queue the pair
@@ -153,13 +161,23 @@ mod decode_profile {
         let s_op = snap(&O_PROJ_NS);
         let s_pn = snap(&POST_NORM_NS);
         let s_mlp = snap(&MLP_NS);
-        let total = s_in + s_qkv + s_qkn + s_rope + s_cw + s_pa + s_op + s_pn + s_mlp;
+        // Top-level (per-forward, not per-layer) slots. Each forward fires
+        // once → these accumulate ~PROFILE_EVERY/36 = ~3 events between
+        // dumps. Reported as μs/forward (NOT μs/layer-call).
+        let s_embed = snap(&EMBED_NS);
+        let s_fn = snap(&FINAL_NORM_NS);
+        let s_lm = snap(&LM_HEAD_NS);
+        let layer_total = s_in + s_qkv + s_qkn + s_rope + s_cw + s_pa + s_op + s_pn + s_mlp;
         let n = PROFILE_EVERY as f64;
+        // Approx number of forwards covered by this dump window (PROFILE_EVERY
+        // layer-calls / num_layers). Used to normalise per-forward slots.
+        let approx_forwards = (PROFILE_EVERY as f64) / 36.0;
         tracing::info!(
             target: "vllm_core::decode_profile",
             "decode breakdown ({} layer-calls, μs/call): in_norm={:.1} qkv={:.1} \
              qk_norm={:.1} rope={:.1} cache_w={:.1} paged_attn={:.1} o_proj={:.1} \
-             post_norm={:.1} mlp={:.1} | sum={:.1}",
+             post_norm={:.1} mlp={:.1} | layer_sum={:.1} | per-forward μs: \
+             embed={:.1} final_norm={:.1} lm_head={:.1}",
             PROFILE_EVERY,
             s_in / n,
             s_qkv / n,
@@ -170,7 +188,10 @@ mod decode_profile {
             s_op / n,
             s_pn / n,
             s_mlp / n,
-            total / n,
+            layer_total / n,
+            s_embed / approx_forwards,
+            s_fn / approx_forwards,
+            s_lm / approx_forwards,
         );
     }
 }
@@ -1070,14 +1091,21 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
         sequences: &[DecodeSequenceMetadata],
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let dev = input_ids.device();
+        let mut xs = decode_profile::time(dev, &decode_profile::EMBED_NS, || {
+            self.embed_tokens.forward(input_ids)
+        })?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
         }
 
-        let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)
+        let xs = decode_profile::time(dev, &decode_profile::FINAL_NORM_NS, || {
+            self.norm.forward(&xs)
+        })?;
+        decode_profile::time(dev, &decode_profile::LM_HEAD_NS, || {
+            self.lm_head.forward(&xs)
+        })
     }
 
     /// Override the default trait fall-through so the per-forward shared
@@ -1097,7 +1125,10 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
             .as_ref()
             .and_then(|arc| arc.downcast_ref::<crate::layers::attention::DecodeBatchShared>());
 
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let dev = input_ids.device();
+        let mut xs = decode_profile::time(dev, &decode_profile::EMBED_NS, || {
+            self.embed_tokens.forward(input_ids)
+        })?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch_with_shared(
                 &xs,
@@ -1107,8 +1138,12 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
                 shared,
             )?;
         }
-        let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)
+        let xs = decode_profile::time(dev, &decode_profile::FINAL_NORM_NS, || {
+            self.norm.forward(&xs)
+        })?;
+        decode_profile::time(dev, &decode_profile::LM_HEAD_NS, || {
+            self.lm_head.forward(&xs)
+        })
     }
 
     fn device(&self) -> &Device {
