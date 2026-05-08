@@ -28,14 +28,15 @@
 //                                         + n_tile * 128
 //                                         + th_id * 4 + warp_id]
 //   s_ptr   [num_groups, N]       BF16 per-group scale.
-//   z_ptr   [num_groups, N/8]     u32 — AWQ-packed qzeros (8 zp per word,
-//                                 AWQ undo_pack [0,4,1,5,2,6,3,7] applies
-//                                 just like for qweight). Pass null
-//                                 (`std::nullptr` from the host) to skip
-//                                 zero-point subtraction; we currently
-//                                 require it (set to a real tensor, or
-//                                 to a zeros buffer for symmetric
-//                                 quant).
+//   z_ptr   [num_groups, N/8]     u32 — GPTQ-sequential qzeros (8 zp per
+//                                 u32, packed in plain little-endian
+//                                 order: zp_n at bit (n%8)*4 of word
+//                                 z_ptr[g*(N/8) + n/8]). This matches
+//                                 the layout MarlinLinear stores after
+//                                 `repack_awq_nibbles` runs at load
+//                                 time, so the hybrid path can reuse
+//                                 the already-loaded qzeros tensor with
+//                                 no extra repack.
 //   m, n, k, group_size           int — see constraints above.
 //
 // Output:
@@ -72,14 +73,11 @@
 #define V1_TILE_K 16
 #define V1_TILE_INTS 128  // tile_k * tile_n / 8 (INT4 pack)
 
-// AWQ packs 8 nibbles per u32 with the [0,4,1,5,2,6,3,7] undo_pack ordering;
-// the bit shift to extract the i-th logical nibble of a packed word is
-// `AWQ_UNDO_PACK_SHIFTS[i % 8]`. Used for qzeros which keeps the AWQ
-// per-word layout (qweight nibble extraction goes through the Marlin tile
-// permutation instead).
-__device__ __forceinline__ uint32_t awq_undo_shift(int n_in_word) {
-    const int shifts[8] = {0, 16, 4, 20, 8, 24, 12, 28};
-    return (uint32_t)shifts[n_in_word & 7];
+// GPTQ-sequential nibble shift: zero-point at logical column n lives at bit
+// (n & 7) * 4 of the corresponding qzeros u32. Matches the layout
+// `repack_awq_nibbles` produces at AwqMarlinLinear load time.
+__device__ __forceinline__ uint32_t gptq_zp_shift(int n) {
+    return (uint32_t)((n & 7) * 4);
 }
 
 extern "C" __global__ void marlin_tile_mma_int4_bf16(
@@ -111,7 +109,7 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16(
     int n_tiles = n / V1_TILE_N;
     int row_stride_u32 = n_tiles * V1_TILE_INTS;
     int qz_stride_u32 = n / 8;
-    uint32_t zp_shift = awq_undo_shift(col);
+    uint32_t zp_shift = gptq_zp_shift(col);
     int zp_word_col = col / 8;
 
     float acc = 0.0f;

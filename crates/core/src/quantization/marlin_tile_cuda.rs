@@ -274,11 +274,12 @@ mod gpu_tests {
         }
         let scales = Tensor::from_vec(scales_vec.clone(), (num_groups, n), &cuda).unwrap();
 
-        // 5. AWQ-packed qzeros [num_groups, N/8] u32.
+        // 5. GPTQ-sequential qzeros [num_groups, N/8] u32 (matches
+        // MarlinLinear's stored format after repack_awq_nibbles).
         let mut qz = vec![0u32; num_groups * (n / 8)];
         for g in 0..num_groups {
             for nn in 0..n {
-                qz[g * (n / 8) + nn / 8] |= zp_val(g, nn) << AWQ_PACK_SHIFTS[nn % 8];
+                qz[g * (n / 8) + nn / 8] |= zp_val(g, nn) << ((nn % 8) * 4);
             }
         }
         let qzeros = Tensor::from_vec(qz, (num_groups, n / 8), &cuda).unwrap();

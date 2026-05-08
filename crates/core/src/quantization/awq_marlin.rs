@@ -456,8 +456,55 @@ impl AwqMarlinLinear {
     }
 }
 
+/// Stage 15.E.2 hybrid dispatch threshold (ADR 0016). At M ≤ this value the
+/// software tile-MMA path beats production `marlin_gemm` by 1.10–1.24× on
+/// the canonical Qwen3-4B-AWQ MLP-up shape (commit `8dc4087` bench).
+#[cfg(feature = "marlin")]
+pub(crate) const HYBRID_M_THRESHOLD: usize = 8;
+
+/// Returns `true` if hybrid dispatch is disabled by env override.
+/// Read once per process — re-checking on every forward call would cost
+/// us a syscall per layer per token at decode hot path.
+#[cfg(feature = "marlin")]
+fn hybrid_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("VLLM_AWQ_DISABLE_HYBRID").is_ok())
+}
+
 impl QuantizedLinear for AwqMarlinLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Stage 15.E.2 hybrid dispatch:
+        //   M ≤ 8 + tile_b populated + not env-disabled → tile_mma_v1 software
+        //                                                  path (1.10–1.24× win)
+        //   else → existing MarlinLinear → marlin_gemm path (saturated cuBLAS
+        //          GEMM for M ≥ 16, dequant+matmul for the M=12-16 crossover)
+        // ADR 0016 documents the rationale and bench data.
+        #[cfg(feature = "marlin")]
+        {
+            if !hybrid_disabled() && x.dims().len() == 2 {
+                let m = x.dims()[0];
+                if m > 0 && m <= HYBRID_M_THRESHOLD {
+                    if let Some(tile_b) = self.tile_b.as_ref() {
+                        let group_size_i = self.inner.config_ref().group_size;
+                        // Per-channel scales (group_size = -1) are
+                        // disallowed by the tile_mma_v1 dispatcher; drop
+                        // through to the existing path on those layers.
+                        if group_size_i > 0 {
+                            let group_size = group_size_i as usize;
+                            return super::marlin_tile_cuda::dispatch_marlin_tile_mma_v1(
+                                x,
+                                tile_b,
+                                self.inner.scales_ref(),
+                                self.inner.qzeros_ref(),
+                                self.out_features,
+                                group_size,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         self.inner.forward(x)
     }
 

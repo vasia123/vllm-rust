@@ -700,6 +700,30 @@ impl MarlinLinear {
     }
 }
 
+#[cfg(feature = "marlin")]
+impl MarlinLinear {
+    /// Stage 15.E.2 hybrid dispatch hook: the underlying MarlinConfig.
+    /// `AwqMarlinLinear::forward` reads `group_size` to drive the
+    /// `dispatch_marlin_tile_mma_v1` call.
+    pub(crate) fn config_ref(&self) -> &MarlinConfig {
+        &self.config
+    }
+
+    /// Stage 15.E.2 hybrid dispatch hook: per-group BF16 scales tensor.
+    /// Shape `[num_groups, N]`. Set during `load_weights`.
+    pub(crate) fn scales_ref(&self) -> &Tensor {
+        &self.scales
+    }
+
+    /// Stage 15.E.2 hybrid dispatch hook: GPTQ-ordered qzeros tensor.
+    /// Shape `[num_groups, N/8]` U32 with bit `(n%8)*4` of u32
+    /// `qzeros[g, n/8]` holding the zero-point for column `n`. Matches
+    /// the kernel's `gptq_zp_shift` decode.
+    pub(crate) fn qzeros_ref(&self) -> &Tensor {
+        &self.qzeros
+    }
+}
+
 impl QuantizedLinear for MarlinLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if !self.is_initialized {
