@@ -1,0 +1,60 @@
+{
+  "stage": "15.D — tile-MMA software vs production marlin_gemm",
+  "date": "2026-05-08",
+  "commit": "b54692c (Stage 15.D bench landed)",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU (sm_89)",
+  "shape": {
+    "K": 4096,
+    "N": 11008,
+    "group_size": 128
+  },
+  "harness": "criterion 10-sample median, --runs implicit (criterion warm-up + sustained sampling)",
+  "production_marlin_gemm_us": {
+    "M_1":    142,
+    "M_4":    456,
+    "M_8":    889,
+    "M_10":   1549,
+    "M_12":   1330,
+    "M_13":   1470,
+    "M_14":   1525,
+    "M_16":   1479,
+    "M_24":   1465,
+    "M_32":   1468,
+    "M_64":   1476,
+    "M_256":  1868,
+    "M_512":  2690,
+    "M_1024": 4234
+  },
+  "tile_mma_v1_software_us": {
+    "M_1":   115,
+    "M_4":   415,
+    "M_8":   761,
+    "M_16":  1485,
+    "M_32":  2940,
+    "M_64":  5800,
+    "M_256": 23192,
+    "M_512": 46567
+  },
+  "ratio_prod_over_software": {
+    "M_1":   "0.81 (software 1.24x faster)",
+    "M_4":   "0.91 (software 1.10x faster)",
+    "M_8":   "0.86 (software 1.17x faster)",
+    "M_16":  "1.00 (tie)",
+    "M_32":  "0.50 (production 2.00x faster)",
+    "M_64":  "0.25 (production 3.93x faster)",
+    "M_256": "0.08 (production 12.4x faster)",
+    "M_512": "0.06 (production 17.3x faster)"
+  },
+  "findings": [
+    "Software tile_mma_v1 BEATS production marlin_gemm at M in [1, 8]. Crossover at M ~= 16. Above M = 16 the production dequant+matmul saturates at ~1.4 ms while software scales linearly and loses badly.",
+    "Why software wins at low M: marlin_gemm at M <= 16 dispatches to awq_gemv_int4_kt_bf16 which has kt_mloop shmem setup + dispatch overhead. The naive software per-cell dot product has none of that — at M = 1 there are 11008 cells with K = 4096 reads each, fully memory-bound, pure throughput.",
+    "Why production wins at high M: at M >= 32 marlin_gemm uses the dequant + cuBLAS GEMM fallback. cuBLAS BF16 GEMM is heavily tuned and runs roughly constant ~1.4 ms across M = 16..256 (saturated). Software remains O(M*N*K/threads) and loses linearly.",
+    "Hybrid dispatch (M <= 8 -> tile_mma_v1, M > 8 -> marlin_gemm) is a deployable Stage 15.E win WITHOUT tensor cores. ~1.20x decode-side win at M = 1..8 maps directly to c=1 (1 token/forward) and c=4 multi_step=4 (M=4-8) workloads — exactly the 91 % AWQ-Marlin slice from the Stage 14-C decode profile."
+  ],
+  "implications_for_stage_15": [
+    "Stage 15.E should NOT just gate on M >= 8 (the original plan); the gate that maximises wins is M < ~12, route to tile_mma_v1, otherwise route to existing marlin_gemm.",
+    "Stage 15.D-body (tensor-core mma.m16n8k16) is still the largest potential win — it would beat both the software path and the production dequant+matmul at M = 16..256 (the prefill / large-batch decode regime). But its priority shifts from 'unblock any win' to 'win the high-M regime'.",
+    "If the hybrid dispatch lands first (low risk), the Stage 14-C-projected c=8 lift drops a bit because the M = 32 case is unaffected by the low-M hybrid. But the c=1 / c=4 cases get a free 1.10-1.24x today.",
+    "Both wins can stack: hybrid dispatch + tensor-core MMA = best of both regimes."
+  ]
+}

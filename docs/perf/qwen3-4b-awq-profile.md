@@ -1510,3 +1510,54 @@ even if it had worked. Stage 14-A’s reverted state remains correct;
 no further engineering on plan-caching is warranted until Stage 15
 moves the AWQ-Marlin component below 30 % of layer wallclock.
 
+## Stage 15.D — software vs production microbench (surprise)
+
+Once the v1 software tile-MMA scaffold cleared all shape extensions
+(15.D.1–4, commits `7013f24`..`27b0bef`), the next planned step was
+the tensor-core `mma.m16n8k16` body. Before diving in, an
+`awq_marlin_path_bench` vs `marlin_tile_mma_path_bench` microbench
+was run at the canonical Qwen3-4B-AWQ MLP-up shape (K=4096, N=11008,
+group_size=128). It revealed something the plan didn't anticipate:
+
+| M     | production `marlin_gemm` |  v1 software `tile_mma` | ratio (prod / sw) |
+| ----: | -----------------------: | ----------------------: | ----------------: |
+| 1     |                  142 µs  |              **115 µs** | **0.81 (sw 1.24×)** |
+| 4     |                  456 µs  |              **415 µs** | **0.91 (sw 1.10×)** |
+| 8     |                  889 µs  |              **761 µs** | **0.86 (sw 1.17×)** |
+| 16    |                 1479 µs  |                 1485 µs |              1.00 |
+| 32    |                 1468 µs  |                 2940 µs |       0.50        |
+| 64    |                 1476 µs  |                 5800 µs |       0.25        |
+| 256   |                 1868 µs  |                23192 µs |       0.08        |
+| 512   |                 2690 µs  |                46567 µs |       0.06        |
+
+**The naive software dot-product beats the production kernel at
+M ∈ {1, 4, 8}.** Cause: at low M, `marlin_gemm` dispatches to the
+`awq_gemv_int4_kt_bf16` family which carries kt_mloop shmem setup
++ dispatch overhead. The simple per-cell software loop has none of
+that — at M=1 there are 11008 output cells × K=4096 reads each,
+fully memory-bound, no kernel-side bookkeeping.
+
+Above M=16 production wins decisively: `marlin_gemm` switches to
+dequant + cuBLAS BF16 GEMM, which runs at a roughly constant ~1.4 ms
+through M ≤ 256 (saturated tensor engine). Software keeps scaling
+linearly and loses badly.
+
+### Implications for Stage 15.E
+
+The original plan set the dispatch gate at "M ≥ 8 → use tile_mma".
+The bench inverts that: **M ≤ ~12 → use tile_mma_v1, M > 12 → keep
+existing marlin_gemm.** This is a **deployable win today, without
+tensor cores**: ~1.10–1.24× on the AWQ-Marlin path at M=1..8, which
+maps directly onto c=1 decode (M=1) and c=4 multi-step decode (M=4–8)
+— exactly the regime where the Stage 14-C profile showed 91 % of
+decode wallclock is in AWQ-Marlin GEMV.
+
+Stage 15.D-body (tensor-core MMA) is still the larger potential win,
+but its priority shifts: from "unblock any Stage 15 win" to "win the
+high-M regime that the hybrid dispatch leaves on the table". Both
+optimisations stack — hybrid dispatch + tensor-core path = best of
+both M regimes.
+
+Snapshot: `docs/perf/bench-history/2026-05-08-15D-tile-mma-vs-
+production.json`.
+
