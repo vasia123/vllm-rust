@@ -201,20 +201,19 @@ pub fn dispatch_marlin_tile_mma_v1(
         );
     }
 
-    // Stage 15.D-body.3a/3b/3c: route M=16 shapes through the tensor-core
-    // kernel (any K%16==0, any group_size that divides K). M != 16 still
-    // uses software (.3d will widen this).
-    if m == 16 {
-        let op = MarlinTileMmaTcM16K16Op {
-            b_tile: b_tile.clone(),
-            scales: scales.clone(),
-            qzeros: qzeros.clone(),
-            k: k as i32,
-            n: n as i32,
-            group_size: group_size as i32,
-        };
-        return a.apply_op1(op);
-    }
+    // Stage 15.D-body.3a..3d: tensor-core path supports any M ≥ 1, any K%16==0,
+    // any group_size that divides K and is a multiple of 16. (Out-of-range M
+    // rows handled via FragA/FragC masking inside the kernel.)
+    let op = MarlinTileMmaTcM16K16Op {
+        b_tile: b_tile.clone(),
+        scales: scales.clone(),
+        qzeros: qzeros.clone(),
+        m: m as i32,
+        k: k as i32,
+        n: n as i32,
+        group_size: group_size as i32,
+    };
+    return a.apply_op1(op);
 
     let op = MarlinTileMmaV1Op {
         b_tile: b_tile.clone(),
@@ -233,6 +232,7 @@ struct MarlinTileMmaTcM16K16Op {
     b_tile: Tensor,
     scales: Tensor,
     qzeros: Tensor,
+    m: i32,
     k: i32,
     n: i32,
     group_size: i32,
@@ -277,9 +277,11 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
             _ => candle_core::bail!("tc kernel: qzeros must be on CUDA"),
         };
         let n = self.n as usize;
-        let output = dev.alloc_zeros::<half::bf16>(16 * n)?;
+        let m = self.m as usize;
+        let m_tiles = m.div_ceil(16) as u32;
+        let output = dev.alloc_zeros::<half::bf16>(m * n)?;
         let cfg = LaunchConfig {
-            grid_dim: ((n / 16) as u32, 1, 1),
+            grid_dim: ((n / 16) as u32, m_tiles, 1),
             block_dim: (32, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -288,14 +290,13 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
             "marlin_tile_mma",
             MARLIN_TILE_MMA_PTX,
         )?;
-        let m_arg: i32 = 16;
         let mut builder = func.builder();
         builder.arg(a);
         builder.arg(b);
         builder.arg(sc);
         builder.arg(zp);
         builder.arg(&output);
-        builder.arg(&m_arg);
+        builder.arg(&self.m);
         builder.arg(&self.n);
         builder.arg(&self.k);
         builder.arg(&self.group_size);
@@ -306,7 +307,7 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
                 slice: CudaStorageSlice::BF16(output),
                 device: dev.clone(),
             },
-            Shape::from_dims(&[16, n]),
+            Shape::from_dims(&[m, n]),
         ))
     }
 }

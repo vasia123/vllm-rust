@@ -339,30 +339,41 @@ extern "C" __global__ void marlin_test_mma_m16n8k16_bf16(
 // dequant_int4_bf16_lo4(q)        extracts bits {0, 16, 4, 20} → FragB#1
 // dequant_int4_bf16_lo4(q >> 8)   extracts bits {8, 24, 12, 28} → FragB#2
 
-// Stage 15.D-body.3b/3c extends 3a from K=16 to any K%16==0 with
-// any group_size that divides K and is a multiple of 16 (so each
-// k-tile fits in a single group). Inner k-tile loop loads A and
-// dequants B per k-tile, accumulating into FragC across k-tiles in
-// FP32. Scale + zp are looked up per k-tile (g = k_base / group_size).
+// Stage 15.D-body.3b/3c/3d extends 3a from K=16 / M=16 to any K%16==0,
+// any M ≥ 1, any group_size that divides K and is a multiple of 16.
+// Outer m-tile loop (gridDim.y = ceildiv(M,16)) covers M ≥ 1 with
+// padding/masking for the last m-tile (M not a multiple of 16); inner
+// k-tile loop loads A and dequants B per k-tile, accumulating into
+// FragC in FP32. Scale + zp looked up per k-tile (g = k_base / group_size).
 extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
-    const __nv_bfloat16* __restrict__ a_ptr,    // [16, K] BF16 row-major
+    const __nv_bfloat16* __restrict__ a_ptr,    // [M, K] BF16 row-major
     const uint32_t*      __restrict__ b_ptr,    // [k_tiles * n_tiles * 128] u32
-    const __nv_bfloat16* __restrict__ s_ptr,    // [1, N] BF16 (single group)
-    const uint32_t*      __restrict__ z_ptr,    // [1, N/8] u32 (single group, GPTQ-seq.)
-    __nv_bfloat16*       __restrict__ c_ptr,    // [16, N] BF16 row-major
-    int /*m=16*/, int n, int k, int group_size) {
+    const __nv_bfloat16* __restrict__ s_ptr,    // [num_groups, N] BF16
+    const uint32_t*      __restrict__ z_ptr,    // [num_groups, N/8] u32 (GPTQ-seq.)
+    __nv_bfloat16*       __restrict__ c_ptr,    // [M, N] BF16 row-major
+    int m, int n, int k, int group_size) {
     int lane = threadIdx.x;
     if (lane >= 32) return;
     int gid = lane / 4;
     int gth = lane % 4;
 
     int warp_global = blockIdx.x;          // 0..(N/16 - 1)
+    int m_tile      = blockIdx.y;          // 0..ceildiv(M,16)-1
+    int m_base      = m_tile * 16;
     int n_tile      = warp_global / 4;
     int warp_id     = warp_global % 4;     // 0..3 within tile
     int n_base      = warp_global * 16;    // first N-col of this warp
     int n_tiles     = n / 64;
     int row_stride_u32 = n_tiles * 128;
     int qz_stride_u32 = n / 8;
+
+    // Per-thread M-row coverage: this thread writes rows m_base+gid (lo)
+    // and m_base+gid+8 (hi). Mask flags cache validity for both A loads
+    // and C stores when m_base+gid* exceeds M-1.
+    int row_lo_global = m_base + gid;
+    int row_hi_global = m_base + gid + 8;
+    bool valid_lo = row_lo_global < m;
+    bool valid_hi = row_hi_global < m;
 
     auto pack_bf16x2 = [](__nv_bfloat16 lo, __nv_bfloat16 hi) {
         __nv_bfloat162 v = __halves2bfloat162(lo, hi);
@@ -395,12 +406,20 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
         __nv_bfloat162 zp_lo2 = __halves2bfloat162(__float2bfloat16(zp_lo), __float2bfloat16(zp_lo));
         __nv_bfloat162 zp_hi2 = __halves2bfloat162(__float2bfloat16(zp_hi), __float2bfloat16(zp_hi));
 
-        // FragA: 4 u32 per thread, m16n8k16 layout, advanced by k_base.
+        // FragA: 4 u32 per thread, m16n8k16 layout. Out-of-range rows
+        // (m_base + gid* >= M) load zeros so they contribute nothing to
+        // the accumulator — equivalent to masking A.
+        __nv_bfloat16 zero_bf = __float2bfloat16(0.0f);
+        auto a_at = [&](bool valid, int row_g, int col_off_lo, int col_off_hi) {
+            if (!valid) return pack_bf16x2(zero_bf, zero_bf);
+            return pack_bf16x2(a_ptr[row_g * k + k_base + col_off_lo],
+                               a_ptr[row_g * k + k_base + col_off_hi]);
+        };
         uint32_t a[4];
-        a[0] = pack_bf16x2(a_ptr[gid       * k + k_base + gth * 2    ], a_ptr[gid       * k + k_base + gth * 2 + 1]);
-        a[1] = pack_bf16x2(a_ptr[(gid + 8) * k + k_base + gth * 2    ], a_ptr[(gid + 8) * k + k_base + gth * 2 + 1]);
-        a[2] = pack_bf16x2(a_ptr[gid       * k + k_base + gth * 2 + 8], a_ptr[gid       * k + k_base + gth * 2 + 9]);
-        a[3] = pack_bf16x2(a_ptr[(gid + 8) * k + k_base + gth * 2 + 8], a_ptr[(gid + 8) * k + k_base + gth * 2 + 9]);
+        a[0] = a_at(valid_lo, row_lo_global, gth * 2,     gth * 2 + 1);
+        a[1] = a_at(valid_hi, row_hi_global, gth * 2,     gth * 2 + 1);
+        a[2] = a_at(valid_lo, row_lo_global, gth * 2 + 8, gth * 2 + 9);
+        a[3] = a_at(valid_hi, row_hi_global, gth * 2 + 8, gth * 2 + 9);
 
         // This k-tile's u32 of packed nibbles for this thread.
         uint32_t q = b_ptr[kt * row_stride_u32 + n_tile * 128 + lane * 4 + warp_id];
@@ -434,23 +453,25 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
               "f"(c_hi[0]), "f"(c_hi[1]), "f"(c_hi[2]), "f"(c_hi[3]));
     }
 
-    // FragC store: 4 fp32 per thread, m16n8 layout.
-    //   c[0]: row=gid,    col=n_base + gth*2
-    //   c[1]: row=gid,    col=n_base + gth*2 + 1
-    //   c[2]: row=gid+8,  col=n_base + gth*2
-    //   c[3]: row=gid+8,  col=n_base + gth*2 + 1
-    int row_lo = gid;
-    int row_hi = gid + 8;
+    // FragC store: 4 fp32 per thread, m16n8 layout. Skip rows beyond M.
     int col0_lo = n_base + gth * 2;
     int col0_hi = n_base + 8 + gth * 2;
-    c_ptr[row_lo * n + col0_lo    ] = __float2bfloat16_rn(c_lo[0]);
-    c_ptr[row_lo * n + col0_lo + 1] = __float2bfloat16_rn(c_lo[1]);
-    c_ptr[row_hi * n + col0_lo    ] = __float2bfloat16_rn(c_lo[2]);
-    c_ptr[row_hi * n + col0_lo + 1] = __float2bfloat16_rn(c_lo[3]);
-    c_ptr[row_lo * n + col0_hi    ] = __float2bfloat16_rn(c_hi[0]);
-    c_ptr[row_lo * n + col0_hi + 1] = __float2bfloat16_rn(c_hi[1]);
-    c_ptr[row_hi * n + col0_hi    ] = __float2bfloat16_rn(c_hi[2]);
-    c_ptr[row_hi * n + col0_hi + 1] = __float2bfloat16_rn(c_hi[3]);
+    if (valid_lo) {
+        c_ptr[row_lo_global * n + col0_lo    ] = __float2bfloat16_rn(c_lo[0]);
+        c_ptr[row_lo_global * n + col0_lo + 1] = __float2bfloat16_rn(c_lo[1]);
+    }
+    if (valid_hi) {
+        c_ptr[row_hi_global * n + col0_lo    ] = __float2bfloat16_rn(c_lo[2]);
+        c_ptr[row_hi_global * n + col0_lo + 1] = __float2bfloat16_rn(c_lo[3]);
+    }
+    if (valid_lo) {
+        c_ptr[row_lo_global * n + col0_hi    ] = __float2bfloat16_rn(c_hi[0]);
+        c_ptr[row_lo_global * n + col0_hi + 1] = __float2bfloat16_rn(c_hi[1]);
+    }
+    if (valid_hi) {
+        c_ptr[row_hi_global * n + col0_hi    ] = __float2bfloat16_rn(c_hi[2]);
+        c_ptr[row_hi_global * n + col0_hi + 1] = __float2bfloat16_rn(c_hi[3]);
+    }
 }
 
 // ─── Stage 15.D-body.2b — INT4 dequant + scale/zp + mma in one kernel ───
