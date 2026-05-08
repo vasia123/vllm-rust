@@ -1,13 +1,17 @@
 // Stage 15.C/D — Marlin tile-MMA kernel.
 //
 // Shape constraints (v1 software scaffold):
-//   M  any ≥ 1
-//   N  any multiple of 64    (tile_n_size; producer requirement)
-//   K  any multiple of 16    (tile_k_size; producer requirement)
+//   M           any ≥ 1
+//   N           any multiple of 64    (tile_n_size; producer requirement)
+//   K           any multiple of 16    (tile_k_size; producer requirement)
+//   group_size  must divide K and be a multiple of 16 (so each group spans
+//               a whole number of k-tiles). num_groups = K / group_size.
 //
 // BF16 activations, INT4 AWQ weights laid out per
-// `awq_to_marlin_tile_repack_cpu` (Stage 15.B), per-channel scales
-// (group_size = K).
+// `awq_to_marlin_tile_repack_cpu` (Stage 15.B), per-group AWQ scales +
+// qzeros. Dequantisation: `(nibble - zp_{g,n}) * scale_{g,n}` where
+// `g = k_index / group_size` and the AWQ packing of zp matches qweight
+// (8 zp per u32, undo_pack [0,4,1,5,2,6,3,7]).
 //
 // **Scaffold-first.** Currently a software dequant + dot-product path,
 // not yet tensor cores. Validates the producer/consumer interface end-
@@ -15,21 +19,27 @@
 // written. See `docs/perf/marlin-tile-mma-step-15c-design.md` §3-§7.
 //
 // Inputs:
-//   a_ptr [M, K]       BF16 row-major activations.
-//   b_ptr              u32, length = k_tiles × n_tiles × 128, where
-//                      k_tiles = K / 16 and n_tiles = N / 64. Layout
-//                      matches `awq_to_marlin_tile_repack_cpu(K, N)`'s
-//                      flat output `[k_tiles, n_tiles*128]` after
-//                      flatten. Index for (k_tile, n_tile, warp_id,
-//                      th_id):
-//                        b_ptr[k_tile * (n_tiles * 128)
-//                              + n_tile * 128
-//                              + th_id * 4 + warp_id]
-//   s_ptr [N]          BF16 per-channel scale.
-//   m, n, k            int — see constraints above.
+//   a_ptr   [M, K]                BF16 row-major activations.
+//   b_ptr                         u32, length k_tiles × n_tiles × 128
+//                                 (full Marlin tile output of
+//                                 `awq_to_marlin_tile_repack_cpu(K, N)`).
+//                                 Index for (k_tile, n_tile, warp_id, th_id):
+//                                   b_ptr[k_tile * (n_tiles * 128)
+//                                         + n_tile * 128
+//                                         + th_id * 4 + warp_id]
+//   s_ptr   [num_groups, N]       BF16 per-group scale.
+//   z_ptr   [num_groups, N/8]     u32 — AWQ-packed qzeros (8 zp per word,
+//                                 AWQ undo_pack [0,4,1,5,2,6,3,7] applies
+//                                 just like for qweight). Pass null
+//                                 (`std::nullptr` from the host) to skip
+//                                 zero-point subtraction; we currently
+//                                 require it (set to a real tensor, or
+//                                 to a zeros buffer for symmetric
+//                                 quant).
+//   m, n, k, group_size           int — see constraints above.
 //
 // Output:
-//   c_ptr [M, N]       BF16 row-major output.
+//   c_ptr [M, N]      BF16 row-major output.
 //
 // Launch:  block_dim = (256, 1, 1); grid_dim = (ceildiv(M*N, 256), 1, 1).
 //          Threads with linear index ≥ M*N early-return.
@@ -62,14 +72,26 @@
 #define V1_TILE_K 16
 #define V1_TILE_INTS 128  // tile_k * tile_n / 8 (INT4 pack)
 
+// AWQ packs 8 nibbles per u32 with the [0,4,1,5,2,6,3,7] undo_pack ordering;
+// the bit shift to extract the i-th logical nibble of a packed word is
+// `AWQ_UNDO_PACK_SHIFTS[i % 8]`. Used for qzeros which keeps the AWQ
+// per-word layout (qweight nibble extraction goes through the Marlin tile
+// permutation instead).
+__device__ __forceinline__ uint32_t awq_undo_shift(int n_in_word) {
+    const int shifts[8] = {0, 16, 4, 20, 8, 24, 12, 28};
+    return (uint32_t)shifts[n_in_word & 7];
+}
+
 extern "C" __global__ void marlin_tile_mma_int4_bf16(
     const __nv_bfloat16* __restrict__ a_ptr,
     const uint32_t*      __restrict__ b_ptr,
     const __nv_bfloat16* __restrict__ s_ptr,
+    const uint32_t*      __restrict__ z_ptr,
     __nv_bfloat16*       __restrict__ c_ptr,
     int m,
     int n,
-    int k) {
+    int k,
+    int group_size) {
     const int inv_pack_idx[8] = {0, 4, 1, 5, 2, 6, 3, 7};
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -88,12 +110,23 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16(
     int k_tiles = k / V1_TILE_K;
     int n_tiles = n / V1_TILE_N;
     int row_stride_u32 = n_tiles * V1_TILE_INTS;
+    int qz_stride_u32 = n / 8;
+    uint32_t zp_shift = awq_undo_shift(col);
+    int zp_word_col = col / 8;
 
     float acc = 0.0f;
 
     for (int kt = 0; kt < k_tiles; kt++) {
         int b_tile_base = kt * row_stride_u32 + n_tile * V1_TILE_INTS;
         int k_base = kt * V1_TILE_K;
+        // The whole k-tile (16 K-rows) lies within a single group because
+        // group_size is a multiple of 16. So we look up scale and zp once
+        // per k-tile for this column.
+        int g = k_base / group_size;
+        float scale = __bfloat162float(s_ptr[g * n + col]);
+        uint32_t zp_packed = z_ptr[g * qz_stride_u32 + zp_word_col];
+        int zp = (int)((zp_packed >> zp_shift) & 0xF);
+
         for (int k_in_tile = 0; k_in_tile < V1_TILE_K; k_in_tile++) {
             int tc_row = ((k_in_tile / 2) % 4) * 2;
             int i_inner = (k_in_tile % 2) + (k_in_tile / 8) * 2;
@@ -105,7 +138,7 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16(
             uint32_t packed = b_ptr[u32_idx];
             int nib = (int)((packed >> bit_off) & 0xF);
 
-            float w_f = (float)nib * __bfloat162float(s_ptr[col]);
+            float w_f = (float)(nib - zp) * scale;
             float a_f = __bfloat162float(a_ptr[row * k + k_base + k_in_tile]);
             acc += a_f * w_f;
         }

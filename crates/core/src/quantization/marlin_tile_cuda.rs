@@ -28,9 +28,11 @@ const MARLIN_TILE_MMA_PTX: &str = include_str!("../../kernels/marlin_tile_mma.pt
 struct MarlinTileMmaV1Op {
     b_tile: Tensor,
     scales: Tensor,
+    qzeros: Tensor,
     m: i32,
     n: i32,
     k: i32,
+    group_size: i32,
 }
 
 impl CustomOp1 for MarlinTileMmaV1Op {
@@ -75,6 +77,15 @@ impl CustomOp1 for MarlinTileMmaV1Op {
             _ => candle_core::bail!("marlin_tile_mma: S must be on CUDA"),
         };
 
+        let (z_guard, _) = self.qzeros.storage_and_layout();
+        let qzeros = match &*z_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("marlin_tile_mma: qzeros must be U32"),
+            },
+            _ => candle_core::bail!("marlin_tile_mma: qzeros must be on CUDA"),
+        };
+
         // v1: M ≥ 1, N multiple of 64, K multiple of 16. Output [M, N] BF16.
         let m = self.m as usize;
         let n = self.n as usize;
@@ -93,10 +104,12 @@ impl CustomOp1 for MarlinTileMmaV1Op {
         builder.arg(a);
         builder.arg(b);
         builder.arg(scales);
+        builder.arg(qzeros);
         builder.arg(&output);
         builder.arg(&self.m);
         builder.arg(&self.n);
         builder.arg(&self.k);
+        builder.arg(&self.group_size);
 
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("marlin_tile_mma launch: {e}")))?;
@@ -117,15 +130,19 @@ impl CustomOp1 for MarlinTileMmaV1Op {
 ///   `awq_to_marlin_tile_repack_cpu(K, N)` where `k_tiles = K / 16` and
 ///   `n_tiles = N / 64`. The producer's `[k_tiles, n_tiles*128]` shape is
 ///   accepted as either 1-D flat or 2-D — both are flattened internally.
-/// * `scales` — `[N]` BF16 per-channel scale (group_size = K).
+/// * `scales` — `[num_groups, N]` BF16, per-group scale.
+/// * `qzeros` — `[num_groups, N/8]` u32 — AWQ-packed (8 zp per word).
 /// * `n` — output column count, must be a multiple of 64.
+/// * `group_size` — must divide K and be a multiple of 16.
 ///
 /// Returns `[M, N]` BF16 row-major output on the same device.
 pub fn dispatch_marlin_tile_mma_v1(
     a: &Tensor,
     b_tile: &Tensor,
     scales: &Tensor,
+    qzeros: &Tensor,
     n: usize,
+    group_size: usize,
 ) -> Result<Tensor> {
     if a.dims().len() != 2 || a.dtype() != DType::BF16 {
         candle_core::bail!(
@@ -145,6 +162,14 @@ pub fn dispatch_marlin_tile_mma_v1(
     if !n.is_multiple_of(64) {
         candle_core::bail!("marlin_tile_mma v1: N ({}) must be a multiple of 64", n);
     }
+    if group_size == 0 || !group_size.is_multiple_of(16) || !k.is_multiple_of(group_size) {
+        candle_core::bail!(
+            "marlin_tile_mma v1: group_size ({}) must be a multiple of 16 that divides K ({})",
+            group_size,
+            k
+        );
+    }
+    let num_groups = k / group_size;
     let k_tiles = k / 16;
     let n_tiles = n / 64;
     let expected_b_len = k_tiles * n_tiles * 128;
@@ -157,21 +182,33 @@ pub fn dispatch_marlin_tile_mma_v1(
             b_tile.dtype()
         );
     }
-    if scales.dims() != [n] || scales.dtype() != DType::BF16 {
+    if scales.dims() != [num_groups, n] || scales.dtype() != DType::BF16 {
         candle_core::bail!(
-            "marlin_tile_mma v1: S must be [{}] BF16, got {:?} {:?}",
+            "marlin_tile_mma v1: S must be [{}, {}] BF16, got {:?} {:?}",
+            num_groups,
             n,
             scales.dims(),
             scales.dtype()
+        );
+    }
+    if qzeros.dims() != [num_groups, n / 8] || qzeros.dtype() != DType::U32 {
+        candle_core::bail!(
+            "marlin_tile_mma v1: qzeros must be [{}, {}] U32, got {:?} {:?}",
+            num_groups,
+            n / 8,
+            qzeros.dims(),
+            qzeros.dtype()
         );
     }
 
     let op = MarlinTileMmaV1Op {
         b_tile: b_tile.clone(),
         scales: scales.clone(),
+        qzeros: qzeros.clone(),
         m: m as i32,
         n: n as i32,
         k: k as i32,
+        group_size: group_size as i32,
     };
     a.apply_op1(op)
 }
@@ -188,7 +225,9 @@ mod gpu_tests {
     /// dispatch the v1 kernel, compare against a CPU reference that does the
     /// same dequant + multiply + matmul. BF16 reduction tolerance scales
     /// with K (each summand is up to ~16 in magnitude × bf16 mantissa noise).
-    fn run_lock_down(m: usize, n: usize, k: usize, tolerance: f32) {
+    /// Run end-to-end lock-down for given (M, N, K, group_size).
+    /// `group_size` must be a multiple of 16 that divides K.
+    fn run_lock_down(m: usize, n: usize, k: usize, group_size: usize, tolerance: f32) {
         let Ok(cuda) = Device::new_cuda(0) else {
             eprintln!("no CUDA device — skipping");
             return;
@@ -196,6 +235,8 @@ mod gpu_tests {
         assert!(k.is_multiple_of(16), "K must be multiple of 16");
         assert!(n.is_multiple_of(64), "N must be multiple of 64");
         assert!(m >= 1);
+        assert!(group_size.is_multiple_of(16) && k.is_multiple_of(group_size));
+        let num_groups = k / group_size;
 
         // 1. Activations A[M, K] BF16: deterministic small floats in [-1, 1].
         let a_vals: Vec<half::bf16> = (0..m * k)
@@ -203,8 +244,14 @@ mod gpu_tests {
             .collect();
         let a = Tensor::from_vec(a_vals.clone(), (m, k), &cuda).unwrap();
 
-        // 2. AWQ qweight: [K, N/8] u32. Pack a deterministic logical nibble.
+        // 2. AWQ qweight: [K, N/8] u32 with deterministic logical nibbles.
         let nibble = |kk: usize, nn: usize| -> u32 { ((kk * 113 + nn * 29 + 7) as u32) % 16 };
+        // Per-group, per-column zero point in [0, 15].
+        let zp_val = |g: usize, nn: usize| -> u32 { ((g * 17 + nn * 11 + 3) as u32) % 16 };
+        // Per-group, per-column scale.
+        let scale_val =
+            |g: usize, nn: usize| -> f32 { 0.05 + (g as f32) * 0.01 + (nn as f32) * 0.0025 };
+
         const AWQ_PACK_SHIFTS: [u32; 8] = [0, 16, 4, 20, 8, 24, 12, 28];
         let mut awq = vec![0u32; k * (n / 8)];
         for kk in 0..k {
@@ -213,29 +260,40 @@ mod gpu_tests {
             }
         }
 
-        // 3. Repack via Stage 15.B and pass the FULL multi-tile output to
-        // the kernel (no manual quarter extraction — the kernel reads all
-        // 4 warps' worth per tile).
+        // 3. Repack qweight via Stage 15.B.
         let awq_t = Tensor::from_vec(awq, (k, n / 8), &Device::Cpu).unwrap();
         let tile_full = awq_to_marlin_tile_repack_cpu(&awq_t, k, n).unwrap();
         let b_tile = tile_full.flatten_all().unwrap().to_device(&cuda).unwrap();
 
-        // 4. Per-channel scales [N] BF16.
-        let scales_vec: Vec<half::bf16> = (0..n)
-            .map(|i| half::bf16::from_f32(0.05 + (i as f32) * 0.0025))
-            .collect();
-        let scales = Tensor::from_vec(scales_vec.clone(), n, &cuda).unwrap();
+        // 4. Per-group scales [num_groups, N] BF16.
+        let mut scales_vec: Vec<half::bf16> = Vec::with_capacity(num_groups * n);
+        for g in 0..num_groups {
+            for nn in 0..n {
+                scales_vec.push(half::bf16::from_f32(scale_val(g, nn)));
+            }
+        }
+        let scales = Tensor::from_vec(scales_vec.clone(), (num_groups, n), &cuda).unwrap();
 
-        // 5. Dispatch.
-        let c = dispatch_marlin_tile_mma_v1(&a, &b_tile, &scales, n).unwrap();
+        // 5. AWQ-packed qzeros [num_groups, N/8] u32.
+        let mut qz = vec![0u32; num_groups * (n / 8)];
+        for g in 0..num_groups {
+            for nn in 0..n {
+                qz[g * (n / 8) + nn / 8] |= zp_val(g, nn) << AWQ_PACK_SHIFTS[nn % 8];
+            }
+        }
+        let qzeros = Tensor::from_vec(qz, (num_groups, n / 8), &cuda).unwrap();
+
+        // 6. Dispatch.
+        let c = dispatch_marlin_tile_mma_v1(&a, &b_tile, &scales, &qzeros, n, group_size).unwrap();
         let c_host: Vec<half::bf16> = c.flatten_all().unwrap().to_vec1().unwrap();
 
-        // 6. CPU reference.
+        // 7. CPU reference.
         for row in 0..m {
             for col in 0..n {
                 let mut acc = 0.0f32;
                 for kk in 0..k {
-                    let w = nibble(kk, col) as f32 * scales_vec[col].to_f32();
+                    let g = kk / group_size;
+                    let w = (nibble(kk, col) as f32 - zp_val(g, col) as f32) * scale_val(g, col);
                     let av = a_vals[row * k + kk].to_f32();
                     acc += av * w;
                 }
@@ -243,56 +301,62 @@ mod gpu_tests {
                 let diff = (got - acc).abs();
                 assert!(
                     diff < tolerance,
-                    "M={m} N={n} K={k} mismatch at (row={row}, col={col}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
+                    "M={m} N={n} K={k} g={group_size} mismatch at (row={row}, col={col}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
                 );
             }
         }
     }
 
+    // ─── group_size = K (per-channel, smallest case) ─────────────────────
+
     #[test]
-    fn test_marlin_tile_mma_v1_n64_m16_k16() {
-        run_lock_down(16, 64, 16, 5e-2);
+    fn test_marlin_tile_mma_v1_n64_m16_k16_g16() {
+        run_lock_down(16, 64, 16, 16, 5e-2);
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_n64_m16_k32() {
-        run_lock_down(16, 64, 32, 1e-1);
+    fn test_marlin_tile_mma_v1_n64_m16_k64_g64() {
+        run_lock_down(16, 64, 64, 64, 2e-1);
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_n64_m16_k64() {
-        run_lock_down(16, 64, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n64_m1_k64_g64() {
+        run_lock_down(1, 64, 64, 64, 2e-1);
     }
 
-    /// M=1 — the canonical c=1 decode case.
     #[test]
-    fn test_marlin_tile_mma_v1_n64_m1_k64() {
-        run_lock_down(1, 64, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n64_m4_k64_g64() {
+        run_lock_down(4, 64, 64, 64, 2e-1);
     }
 
-    /// M=4 — typical multi-step decode.
     #[test]
-    fn test_marlin_tile_mma_v1_n64_m4_k64() {
-        run_lock_down(4, 64, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n128_m16_k64_g64() {
+        run_lock_down(16, 128, 64, 64, 2e-1);
     }
 
-    /// Multi-block M.
+    // ─── group_size < K (multiple groups along K) ────────────────────────
+
+    /// K=64 split into 4 groups of 16 each.
     #[test]
-    fn test_marlin_tile_mma_v1_n64_m32_k32() {
-        run_lock_down(32, 64, 32, 1e-1);
+    fn test_marlin_tile_mma_v1_n64_m16_k64_g16() {
+        run_lock_down(16, 64, 64, 16, 2e-1);
     }
 
-    /// N=128 (2 n-tiles) — exercises the n_tile axis of the producer.
+    /// K=128 with group_size=32 (4 groups). Larger reduction depth.
     #[test]
-    fn test_marlin_tile_mma_v1_n128_m16_k64() {
-        run_lock_down(16, 128, 64, 2e-1);
+    fn test_marlin_tile_mma_v1_n64_m16_k128_g32() {
+        run_lock_down(16, 64, 128, 32, 4e-1);
     }
 
-    /// N=256 with M and K above 16. Tolerance 3e-1 to absorb bf16 mantissa
-    /// noise on the larger absolute sums (output magnitudes ≈ 30+ at this
-    /// shape; 0.4 % relative bf16 error → ~0.12 abs).
+    /// K=128 with the AWQ default group_size=128 (single group).
     #[test]
-    fn test_marlin_tile_mma_v1_n256_m32_k32() {
-        run_lock_down(32, 256, 32, 3e-1);
+    fn test_marlin_tile_mma_v1_n128_m4_k128_g128() {
+        run_lock_down(4, 128, 128, 128, 4e-1);
+    }
+
+    /// Multi-block, multi-group, larger N.
+    #[test]
+    fn test_marlin_tile_mma_v1_n256_m32_k64_g32() {
+        run_lock_down(32, 256, 64, 32, 4e-1);
     }
 }
