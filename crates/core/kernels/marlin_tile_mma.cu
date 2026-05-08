@@ -307,6 +307,134 @@ extern "C" __global__ void marlin_test_mma_m16n8k16_bf16(
     c_ptr[(gid + 8) * 8 + gth * 2 + 1] = c[3];
 }
 
+// ─── Stage 15.D-body.3a — production-shaped tensor-core kernel ──────────
+//
+// Tensor-core implementation of the v1 software path constrained to:
+//   M = 16   (one m-tile)
+//   K = 16   (one k-tile)
+//   group_size = K  (one group along K)
+//   N divisible by 16
+//
+// Launch: block_dim = (32, 1, 1) (1 warp per output 16×16 slice);
+//         grid_dim = (N / 16, 1, 1).
+//
+// Per-warp thread layout: lane = gid*4 + gth where gid = lane/4 ∈ [0,7],
+// gth = lane%4. The 16 output cols of the warp split into:
+//   cols [0..7]   covered by mma#1 (val_high = 0)
+//   cols [8..15]  covered by mma#2 (val_high = 1)
+//
+// B-tile pack: per producer (`awq_to_marlin_tile_repack_cpu`), for each
+// thread lane in warp warp_id, the u32 at index `lane*4 + warp_id` of the
+// warp's 32-u32 chunk holds:
+//   bits  [3:0]   → B(k=gth*2,   n=warp_id*16+gid)         val_idx 0
+//   bits  [19:16] → B(k=gth*2+1, n=warp_id*16+gid)         val_idx 1
+//   bits  [7:4]   → B(k=gth*2+8, n=warp_id*16+gid)         val_idx 2
+//   bits  [23:20] → B(k=gth*2+9, n=warp_id*16+gid)         val_idx 3
+//   bits  [11:8]  → B(k=gth*2,   n=warp_id*16+gid+8)       val_idx 4
+//   bits  [27:24] → B(k=gth*2+1, n=warp_id*16+gid+8)       val_idx 5
+//   bits  [15:12] → B(k=gth*2+8, n=warp_id*16+gid+8)       val_idx 6
+//   bits  [31:28] → B(k=gth*2+9, n=warp_id*16+gid+8)       val_idx 7
+// (verified against software-path indexing formulas in the v1 kernel.)
+//
+// dequant_int4_bf16_lo4(q)        extracts bits {0, 16, 4, 20} → FragB#1
+// dequant_int4_bf16_lo4(q >> 8)   extracts bits {8, 24, 12, 28} → FragB#2
+
+extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
+    const __nv_bfloat16* __restrict__ a_ptr,    // [16, 16] BF16 row-major
+    const uint32_t*      __restrict__ b_ptr,    // [n_tiles * 128] u32
+    const __nv_bfloat16* __restrict__ s_ptr,    // [1, N] BF16
+    const uint32_t*      __restrict__ z_ptr,    // [1, N/8] u32 (GPTQ-seq.)
+    __nv_bfloat16*       __restrict__ c_ptr,    // [16, N] BF16 row-major
+    int /*m=16*/, int n, int /*k=16*/, int /*g=16*/) {
+    int lane = threadIdx.x;
+    if (lane >= 32) return;
+    int gid = lane / 4;
+    int gth = lane % 4;
+
+    int warp_global = blockIdx.x;          // 0..(N/16 - 1)
+    int n_tile      = warp_global / 4;
+    int warp_id     = warp_global % 4;     // 0..3 within tile
+    int n_base      = warp_global * 16;    // first N-col of this warp
+
+    auto pack_bf16x2 = [](__nv_bfloat16 lo, __nv_bfloat16 hi) {
+        __nv_bfloat162 v = __halves2bfloat162(lo, hi);
+        return *reinterpret_cast<uint32_t*>(&v);
+    };
+
+    // FragA: 4 u32 per thread, m16n8k16 layout (PTX-spec).
+    uint32_t a[4];
+    a[0] = pack_bf16x2(a_ptr[gid       * 16 + gth * 2    ], a_ptr[gid       * 16 + gth * 2 + 1]);
+    a[1] = pack_bf16x2(a_ptr[(gid + 8) * 16 + gth * 2    ], a_ptr[(gid + 8) * 16 + gth * 2 + 1]);
+    a[2] = pack_bf16x2(a_ptr[gid       * 16 + gth * 2 + 8], a_ptr[gid       * 16 + gth * 2 + 9]);
+    a[3] = pack_bf16x2(a_ptr[(gid + 8) * 16 + gth * 2 + 8], a_ptr[(gid + 8) * 16 + gth * 2 + 9]);
+
+    // Load this thread's u32 of packed nibbles (single k-tile).
+    uint32_t q = b_ptr[n_tile * 128 + lane * 4 + warp_id];
+
+    // Two FragBs: one for cols [0..7] of warp slice (val_high=0), one for
+    // cols [8..15] (val_high=1). Dequant + (nibble - zp) * scale per col.
+    __nv_bfloat162 fb_lo[2];
+    __nv_bfloat162 fb_hi[2];
+    dequant_int4_bf16_lo4(q,       fb_lo);
+    dequant_int4_bf16_lo4(q >> 8,  fb_hi);
+
+    int col_lo = n_base + gid;       // n column for FragB_lo
+    int col_hi = n_base + gid + 8;   // n column for FragB_hi
+    __nv_bfloat16 sc_lo = s_ptr[col_lo];
+    __nv_bfloat16 sc_hi = s_ptr[col_hi];
+    int zp_lo = (int)((z_ptr[col_lo / 8] >> gptq_zp_shift(col_lo)) & 0xF);
+    int zp_hi = (int)((z_ptr[col_hi / 8] >> gptq_zp_shift(col_hi)) & 0xF);
+
+    __nv_bfloat162 sc_lo2 = __halves2bfloat162(sc_lo, sc_lo);
+    __nv_bfloat162 sc_hi2 = __halves2bfloat162(sc_hi, sc_hi);
+    __nv_bfloat162 zp_lo2 = __halves2bfloat162(__float2bfloat16(zp_lo), __float2bfloat16(zp_lo));
+    __nv_bfloat162 zp_hi2 = __halves2bfloat162(__float2bfloat16(zp_hi), __float2bfloat16(zp_hi));
+    fb_lo[0] = __hmul2(__hsub2(fb_lo[0], zp_lo2), sc_lo2);
+    fb_lo[1] = __hmul2(__hsub2(fb_lo[1], zp_lo2), sc_lo2);
+    fb_hi[0] = __hmul2(__hsub2(fb_hi[0], zp_hi2), sc_hi2);
+    fb_hi[1] = __hmul2(__hsub2(fb_hi[1], zp_hi2), sc_hi2);
+
+    uint32_t b_lo[2] = {*reinterpret_cast<uint32_t*>(&fb_lo[0]), *reinterpret_cast<uint32_t*>(&fb_lo[1])};
+    uint32_t b_hi[2] = {*reinterpret_cast<uint32_t*>(&fb_hi[0]), *reinterpret_cast<uint32_t*>(&fb_hi[1])};
+
+    float c_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float c_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(c_lo[0]), "=f"(c_lo[1]), "=f"(c_lo[2]), "=f"(c_lo[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b_lo[0]), "r"(b_lo[1]),
+          "f"(c_lo[0]), "f"(c_lo[1]), "f"(c_lo[2]), "f"(c_lo[3]));
+
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(c_hi[0]), "=f"(c_hi[1]), "=f"(c_hi[2]), "=f"(c_hi[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b_hi[0]), "r"(b_hi[1]),
+          "f"(c_hi[0]), "f"(c_hi[1]), "f"(c_hi[2]), "f"(c_hi[3]));
+
+    // FragC store: 4 fp32 per thread, m16n8 layout.
+    //   c[0]: row=gid,    col=n_base + gth*2
+    //   c[1]: row=gid,    col=n_base + gth*2 + 1
+    //   c[2]: row=gid+8,  col=n_base + gth*2
+    //   c[3]: row=gid+8,  col=n_base + gth*2 + 1
+    int row_lo = gid;
+    int row_hi = gid + 8;
+    int col0_lo = n_base + gth * 2;
+    int col0_hi = n_base + 8 + gth * 2;
+    c_ptr[row_lo * n + col0_lo    ] = __float2bfloat16_rn(c_lo[0]);
+    c_ptr[row_lo * n + col0_lo + 1] = __float2bfloat16_rn(c_lo[1]);
+    c_ptr[row_hi * n + col0_lo    ] = __float2bfloat16_rn(c_lo[2]);
+    c_ptr[row_hi * n + col0_lo + 1] = __float2bfloat16_rn(c_lo[3]);
+    c_ptr[row_lo * n + col0_hi    ] = __float2bfloat16_rn(c_hi[0]);
+    c_ptr[row_lo * n + col0_hi + 1] = __float2bfloat16_rn(c_hi[1]);
+    c_ptr[row_hi * n + col0_hi    ] = __float2bfloat16_rn(c_hi[2]);
+    c_ptr[row_hi * n + col0_hi + 1] = __float2bfloat16_rn(c_hi[3]);
+}
+
 // ─── Stage 15.D-body.2b — INT4 dequant + scale/zp + mma in one kernel ───
 //
 // Single-warp single-tile (M=16, N=8, K=16) kernel that:

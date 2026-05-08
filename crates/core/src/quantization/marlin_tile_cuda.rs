@@ -201,6 +201,18 @@ pub fn dispatch_marlin_tile_mma_v1(
         );
     }
 
+    // Stage 15.D-body.3a: route the M=16, K=16, group_size=16 shape
+    // through the tensor-core kernel. Other shapes still use software.
+    if m == 16 && k == 16 && group_size == 16 {
+        let op = MarlinTileMmaTcM16K16Op {
+            b_tile: b_tile.clone(),
+            scales: scales.clone(),
+            qzeros: qzeros.clone(),
+            n: n as i32,
+        };
+        return a.apply_op1(op);
+    }
+
     let op = MarlinTileMmaV1Op {
         b_tile: b_tile.clone(),
         scales: scales.clone(),
@@ -211,6 +223,89 @@ pub fn dispatch_marlin_tile_mma_v1(
         group_size: group_size as i32,
     };
     a.apply_op1(op)
+}
+
+/// Tensor-core kernel CustomOp for the (M=16, K=16, g=16) shape.
+struct MarlinTileMmaTcM16K16Op {
+    b_tile: Tensor,
+    scales: Tensor,
+    qzeros: Tensor,
+    n: i32,
+}
+
+impl CustomOp1 for MarlinTileMmaTcM16K16Op {
+    fn name(&self) -> &'static str {
+        "marlin_tile_mma_int4_bf16_tc_m16k16g16"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("marlin_tile_mma_tc: CUDA only")
+    }
+    fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+        let dev = &storage.device;
+        let a = match &storage.slice {
+            CudaStorageSlice::BF16(s) => s,
+            _ => candle_core::bail!("tc kernel: A must be BF16"),
+        };
+        let (bg, _) = self.b_tile.storage_and_layout();
+        let b = match &*bg {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("tc kernel: B must be U32"),
+            },
+            _ => candle_core::bail!("tc kernel: B must be on CUDA"),
+        };
+        let (sg, _) = self.scales.storage_and_layout();
+        let sc = match &*sg {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::BF16(s) => s,
+                _ => candle_core::bail!("tc kernel: scales must be BF16"),
+            },
+            _ => candle_core::bail!("tc kernel: scales must be on CUDA"),
+        };
+        let (zg, _) = self.qzeros.storage_and_layout();
+        let zp = match &*zg {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("tc kernel: qzeros must be U32"),
+            },
+            _ => candle_core::bail!("tc kernel: qzeros must be on CUDA"),
+        };
+        let n = self.n as usize;
+        let output = dev.alloc_zeros::<half::bf16>(16 * n)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n / 16) as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev.get_or_load_custom_func(
+            "marlin_tile_mma_int4_bf16_tc_m16k16g16",
+            "marlin_tile_mma",
+            MARLIN_TILE_MMA_PTX,
+        )?;
+        let m_arg: i32 = 16;
+        let k_arg: i32 = 16;
+        let g_arg: i32 = 16;
+        let mut builder = func.builder();
+        builder.arg(a);
+        builder.arg(b);
+        builder.arg(sc);
+        builder.arg(zp);
+        builder.arg(&output);
+        builder.arg(&m_arg);
+        builder.arg(&self.n);
+        builder.arg(&k_arg);
+        builder.arg(&g_arg);
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("tc kernel launch: {e}")))?;
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::BF16(output),
+                device: dev.clone(),
+            },
+            Shape::from_dims(&[16, n]),
+        ))
+    }
 }
 
 #[cfg(all(test, feature = "gpu-test-small"))]
