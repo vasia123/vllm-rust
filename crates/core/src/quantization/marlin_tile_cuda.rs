@@ -27,12 +27,13 @@ const MARLIN_TILE_MMA_PTX: &str = include_str!("../../kernels/marlin_tile_mma.pt
 struct MarlinTileMmaV1Op {
     b_tile: Tensor,
     scales: Tensor,
+    m: i32,
     k: i32,
 }
 
 impl CustomOp1 for MarlinTileMmaV1Op {
     fn name(&self) -> &'static str {
-        "marlin_tile_mma_int4_bf16_m16n16k"
+        "marlin_tile_mma_int4_bf16_n16k"
     }
 
     fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
@@ -44,7 +45,7 @@ impl CustomOp1 for MarlinTileMmaV1Op {
 
         let dev = &storage.device;
         let func = dev.get_or_load_custom_func(
-            "marlin_tile_mma_int4_bf16_m16n16k",
+            "marlin_tile_mma_int4_bf16_n16k",
             "marlin_tile_mma",
             MARLIN_TILE_MMA_PTX,
         )?;
@@ -72,14 +73,16 @@ impl CustomOp1 for MarlinTileMmaV1Op {
             _ => candle_core::bail!("marlin_tile_mma: S must be on CUDA"),
         };
 
-        // v1 hard-coded: M = N = K = 16. Output [16, 16] BF16 = 256 elements.
-        let output = dev.alloc_zeros::<half::bf16>(256)?;
+        // v1: N = 16 fixed; M, K vary. Output [M, 16] BF16.
+        let m = self.m as usize;
+        let elem_count = m * 16;
+        let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
 
-        // Scaffold uses 256 threads (one per output cell) + 1 block. The
-        // tensor-core body will switch this to (32, 1, 1) (1 warp).
+        // Block 256 threads; grid covers ceildiv(M*N, 256) blocks.
+        const BLOCK: u32 = 256;
         let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (256, 1, 1),
+            grid_dim: (elem_count.div_ceil(BLOCK as usize) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
 
@@ -88,6 +91,7 @@ impl CustomOp1 for MarlinTileMmaV1Op {
         builder.arg(b);
         builder.arg(scales);
         builder.arg(&output);
+        builder.arg(&self.m);
         builder.arg(&self.k);
 
         unsafe { builder.launch(cfg) }
@@ -97,30 +101,35 @@ impl CustomOp1 for MarlinTileMmaV1Op {
             slice: CudaStorageSlice::BF16(output),
             device: dev.clone(),
         };
-        Ok((out_storage, Shape::from_dims(&[16, 16])))
+        Ok((out_storage, Shape::from_dims(&[m, 16])))
     }
 }
 
-/// Dispatch the v1 multi-K Marlin tile-MMA kernel.
+/// Dispatch the v1 multi-K, multi-M Marlin tile-MMA kernel.
 ///
 /// # Arguments
-/// * `a` — `[16, K]` BF16 activations on CUDA. `K` must be a multiple of 16.
+/// * `a` — `[M, K]` BF16 activations on CUDA. `M ≥ 1`, `K` must be a multiple
+///   of 16.
 /// * `b_tile` — `[(K/16) * 32]` u32, concatenated warp_id=0 quarters of
 ///   `awq_to_marlin_tile_repack_cpu(.., K, N=64)` (one 32-u32 quarter per
 ///   k-tile, 16 K-rows per tile). For K=16 this is 32 u32 (single tile);
 ///   for K=32 it's 64 u32, etc.
 /// * `scales` — `[16]` BF16 per-channel scale (group_size = K).
 ///
-/// Returns `[16, 16]` BF16 row-major output on the same device.
+/// Returns `[M, 16]` BF16 row-major output on the same device.
 pub fn dispatch_marlin_tile_mma_v1(a: &Tensor, b_tile: &Tensor, scales: &Tensor) -> Result<Tensor> {
-    if a.dims().len() != 2 || a.dims()[0] != 16 || a.dtype() != DType::BF16 {
+    if a.dims().len() != 2 || a.dtype() != DType::BF16 {
         candle_core::bail!(
-            "marlin_tile_mma v1: A must be [16, K] BF16, got {:?} {:?}",
+            "marlin_tile_mma v1: A must be 2D BF16, got {:?} {:?}",
             a.dims(),
             a.dtype()
         );
     }
+    let m = a.dims()[0];
     let k = a.dims()[1];
+    if m == 0 {
+        candle_core::bail!("marlin_tile_mma v1: M must be ≥ 1");
+    }
     if !k.is_multiple_of(16) {
         candle_core::bail!("marlin_tile_mma v1: K ({}) must be a multiple of 16", k);
     }
@@ -145,6 +154,7 @@ pub fn dispatch_marlin_tile_mma_v1(a: &Tensor, b_tile: &Tensor, scales: &Tensor)
     let op = MarlinTileMmaV1Op {
         b_tile: b_tile.clone(),
         scales: scales.clone(),
+        m: m as i32,
         k: k as i32,
     };
     a.apply_op1(op)
@@ -162,14 +172,14 @@ mod gpu_tests {
     /// dispatch the v1 kernel, compare against a CPU reference that does the
     /// same dequant + multiply + matmul. BF16 reduction tolerance scales
     /// with K (each summand is up to ~16 in magnitude × bf16 mantissa noise).
-    fn run_lock_down(k: usize, tolerance: f32) {
+    fn run_lock_down(m: usize, k: usize, tolerance: f32) {
         let Ok(cuda) = Device::new_cuda(0) else {
             eprintln!("no CUDA device — skipping");
             return;
         };
         assert!(k.is_multiple_of(16), "K must be multiple of 16");
+        assert!(m >= 1);
 
-        let m: usize = 16;
         let n: usize = 16;
 
         // 1. Activations A[M, K] BF16: deterministic small floats in [-1, 1].
@@ -234,24 +244,48 @@ mod gpu_tests {
                 let diff = (got - acc).abs();
                 assert!(
                     diff < tolerance,
-                    "K={k} mismatch at (row={row}, col={col}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
+                    "M={m} K={k} mismatch at (row={row}, col={col}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
                 );
             }
         }
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_k16_matches_cpu_reference() {
-        run_lock_down(16, 5e-2);
+    fn test_marlin_tile_mma_v1_m16_k16_matches_cpu_reference() {
+        run_lock_down(16, 16, 5e-2);
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_k32_matches_cpu_reference() {
-        run_lock_down(32, 1e-1);
+    fn test_marlin_tile_mma_v1_m16_k32_matches_cpu_reference() {
+        run_lock_down(16, 32, 1e-1);
     }
 
     #[test]
-    fn test_marlin_tile_mma_v1_k64_matches_cpu_reference() {
-        run_lock_down(64, 2e-1);
+    fn test_marlin_tile_mma_v1_m16_k64_matches_cpu_reference() {
+        run_lock_down(16, 64, 2e-1);
+    }
+
+    /// M=1 — the canonical c=1 decode case. Single output row.
+    #[test]
+    fn test_marlin_tile_mma_v1_m1_k64_matches_cpu_reference() {
+        run_lock_down(1, 64, 2e-1);
+    }
+
+    /// M=4 — typical decode multi-step output.
+    #[test]
+    fn test_marlin_tile_mma_v1_m4_k64_matches_cpu_reference() {
+        run_lock_down(4, 64, 2e-1);
+    }
+
+    /// M=32 — beyond a single 256-thread block (32×16 = 512 cells, 2 blocks).
+    #[test]
+    fn test_marlin_tile_mma_v1_m32_k32_matches_cpu_reference() {
+        run_lock_down(32, 32, 1e-1);
+    }
+
+    /// M=64 — 4 blocks; biggest test in the lock-down set.
+    #[test]
+    fn test_marlin_tile_mma_v1_m64_k64_matches_cpu_reference() {
+        run_lock_down(64, 64, 2e-1);
     }
 }

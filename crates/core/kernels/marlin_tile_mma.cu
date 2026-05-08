@@ -1,8 +1,8 @@
-// Stage 15.C/D — Marlin tile-MMA kernel (M=N=16 fixed, K = any multiple of 16).
+// Stage 15.C/D — Marlin tile-MMA kernel (N=16 fixed, M = any ≥ 1, K = any multiple of 16).
 //
 // Hard-coded for v1: BF16 activations, INT4 AWQ weights laid out per
 // `awq_to_marlin_tile_repack_cpu` (Stage 15.B), per-channel scales
-// (group_size = K).  Single CTA, single warp's worth of output (N=16).
+// (group_size = K).  Single warp's worth of output columns (N=16).
 //
 // **Scaffold-first.** Currently a software dequant + dot-product path,
 // not yet tensor cores. Validates the producer/consumer interface end-
@@ -10,7 +10,7 @@
 // written. See `docs/perf/marlin-tile-mma-step-15c-design.md` §3-§7.
 //
 // Inputs:
-//   a_ptr [M=16, K]    BF16 row-major activations.
+//   a_ptr [M, K]       BF16 row-major activations.
 //   b_ptr [k_tiles*32] u32 — concatenated warp_id=0 quarters of the
 //                            multi-tile output of
 //                            `awq_to_marlin_tile_repack_cpu(K, 64)`.
@@ -18,10 +18,14 @@
 //                            rows × 16 N cols of nibbles).
 //                            Index: `b_ptr[k_tile * 32 + th_id]`.
 //   s_ptr [N=16]       BF16 per-channel scale.
+//   m                  int — any ≥ 1.
 //   k                  int — must be a multiple of 16.
 //
 // Output:
-//   c_ptr [M=16, N=16] BF16 row-major output.
+//   c_ptr [M, N=16]    BF16 row-major output.
+//
+// Launch:  block_dim = (256, 1, 1); grid_dim = (ceildiv(M*N, 256), 1, 1).
+//          Threads with linear index ≥ M*N early-return.
 //
 // Numeric contract: same as `dequant(b) * s` followed by
 // `a [16, K] @ that [K, 16]` (a row-vector dot product per output cell,
@@ -47,23 +51,23 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define V1_M 16
 #define V1_N 16
 #define V1_K_TILE 16
 
-extern "C" __global__ void marlin_tile_mma_int4_bf16_m16n16k(
+extern "C" __global__ void marlin_tile_mma_int4_bf16_n16k(
     const __nv_bfloat16* __restrict__ a_ptr,
     const uint32_t*      __restrict__ b_ptr,
     const __nv_bfloat16* __restrict__ s_ptr,
     __nv_bfloat16*       __restrict__ c_ptr,
+    int m,
     int k) {
     const int inv_pack_idx[8] = {0, 4, 1, 5, 2, 6, 3, 7};
 
-    int t = threadIdx.x;
-    if (t >= V1_M * V1_N) return;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * V1_N) return;
 
-    int row = t / V1_N;  // 0..15  (m)
-    int col = t % V1_N;  // 0..15  (n)
+    int row = idx / V1_N;
+    int col = idx % V1_N;
 
     int m_n = col;
     int val_high = (m_n >= 8) ? 1 : 0;
