@@ -239,6 +239,132 @@ pub(crate) fn awq_to_gptq_qweight(
     Tensor::from_vec(out, (packed_k, out_features), &Device::Cpu)?.to_device(&original_device)
 }
 
+/// CPU port of vLLM's `awq_marlin_repack_kernel` (INT4 path, `is_a_8bit=false`).
+///
+/// Reads AWQ qweight `[size_k, size_n / 8]` (u32, output-axis packed,
+/// interleaved nibble ordering) and produces Marlin tile-laid-out qweight
+/// `[size_k / 16, size_n * 16 / 8]` = `[size_k / 16, size_n * 2]` u32 ready
+/// for the tensor-core `mma.m16n8k16` kernel.
+///
+/// **One-shot.** This function combines AWQ undo_pack and Marlin tile
+/// permutation in a single pass; the caller does not need to invoke
+/// [`repack_awq_nibbles`] or [`awq_to_gptq_qweight`] beforehand.
+///
+/// Tile sizes (from `reference/vllm/csrc/quantization/marlin/marlin.cuh`):
+/// - `tile_k_size = 16`, `tile_n_size = 64`, `pack_factor = 8` (INT4)
+/// - Each tile holds 16×64 = 1024 nibbles = 128 u32 in the output.
+/// - Output stride per k-tile-row: `n_tiles × 128` = `(size_n / 64) × 128`
+///   = `size_n × 2` u32.
+///
+/// Per-tile thread-block layout in the reference kernel: 4 warps × 32 threads
+/// = 128 thread-output-positions, each writing one u32 at offset
+/// `th_id * 4 + warp_id` within the tile. We replicate that mapping so the
+/// output bytes match the kernel byte-for-byte.
+///
+/// Reference: `csrc/quantization/marlin/awq_marlin_repack.cu` lines 70–151.
+///
+/// # Arguments
+/// * `awq_qweight` — u32 tensor with shape `[size_k, size_n / 8]`.
+/// * `size_k` — input feature count (must be divisible by 16).
+/// * `size_n` — output feature count (must be divisible by 64).
+///
+/// # Returns
+/// u32 tensor with shape `[size_k / 16, size_n * 2]` on the same device as
+/// the input. Currently CPU-only; the caller should `.to_device(...)` if a
+/// CUDA copy is needed (a CUDA-side mirror lives in `marlin_cuda` for
+/// load-time GPU repack and is wired separately at Stage 15.E).
+pub fn awq_to_marlin_tile_repack_cpu(
+    awq_qweight: &Tensor,
+    size_k: usize,
+    size_n: usize,
+) -> Result<Tensor> {
+    const PACK_FACTOR: usize = 8;
+    const TILE_K: usize = 16;
+    const TILE_N: usize = 64;
+    const TILE_INTS: usize = TILE_K * TILE_N / PACK_FACTOR; // 128
+
+    // Reference kernel: undo_pack[8] = {0, 4, 1, 5, 2, 6, 3, 7}; pack_idx[8] =
+    // {0, 2, 4, 6, 1, 3, 5, 7}. Hardcoded for INT4. tc_offsets[4] = {0, 1, 8, 9}
+    // identifies the 4 k-rows each thread reads within the 16-row k-tile.
+    const UNDO_PACK: [u32; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+    const PACK_IDX: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    const TC_OFFSETS: [usize; 4] = [0, 1, 8, 9];
+
+    if !size_k.is_multiple_of(TILE_K) {
+        candle_core::bail!(
+            "awq_to_marlin_tile_repack_cpu: size_k ({size_k}) must be divisible by {TILE_K}"
+        );
+    }
+    if !size_n.is_multiple_of(TILE_N) {
+        candle_core::bail!(
+            "awq_to_marlin_tile_repack_cpu: size_n ({size_n}) must be divisible by {TILE_N}"
+        );
+    }
+    if awq_qweight.dtype() != DType::U32 {
+        candle_core::bail!(
+            "awq_to_marlin_tile_repack_cpu: qweight must be U32, got {:?}",
+            awq_qweight.dtype()
+        );
+    }
+    let packed_n = size_n / PACK_FACTOR;
+    if awq_qweight.dims() != [size_k, packed_n] {
+        candle_core::bail!(
+            "awq_to_marlin_tile_repack_cpu: qweight shape {:?} != expected [{size_k}, {packed_n}]",
+            awq_qweight.dims()
+        );
+    }
+
+    let original_device = awq_qweight.device().clone();
+    let words: Vec<u32> = awq_qweight
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+
+    let k_tiles = size_k / TILE_K;
+    let n_tiles = size_n / TILE_N;
+    let out_n_per_row = n_tiles * TILE_INTS; // = size_n * 2
+    let mut out = vec![0u32; k_tiles * out_n_per_row];
+
+    for k_tile_id in 0..k_tiles {
+        let first_k = k_tile_id * TILE_K;
+        for n_tile_id in 0..n_tiles {
+            let first_n_packed = (n_tile_id * TILE_N) / PACK_FACTOR; // ×8 packed cols/tile
+            let tile_out_base = k_tile_id * out_n_per_row + n_tile_id * TILE_INTS;
+
+            // Replicate the reference kernel's 4 warps × 32 threads layout.
+            for warp_id in 0..4 {
+                for th_id in 0..32 {
+                    let tc_col = th_id / 4; // 0..7
+                    let tc_row = (th_id % 4) * 2; // 0,2,4,6
+                    let cur_n = warp_id * 16 + tc_col;
+                    let cur_n_packed = cur_n / PACK_FACTOR;
+                    let cur_n_pos = cur_n % PACK_FACTOR;
+                    let undo_shift = UNDO_PACK[cur_n_pos] * 4;
+
+                    let mut vals = [0u32; 8];
+                    for i in 0..4 {
+                        let cur_elem = tc_row + TC_OFFSETS[i];
+                        let row_base = (first_k + cur_elem) * packed_n + first_n_packed;
+                        let packed_src_0 = words[row_base + cur_n_packed];
+                        let packed_src_1 = words[row_base + cur_n_packed + 1];
+                        vals[i] = (packed_src_0 >> undo_shift) & 0xF;
+                        vals[4 + i] = (packed_src_1 >> undo_shift) & 0xF;
+                    }
+
+                    let mut res: u32 = 0;
+                    for j in 0..8 {
+                        res |= vals[PACK_IDX[j]] << (j * 4);
+                    }
+
+                    out[tile_out_base + th_id * 4 + warp_id] = res;
+                }
+            }
+        }
+    }
+
+    Tensor::from_vec(out, (k_tiles, out_n_per_row), &Device::Cpu)?.to_device(&original_device)
+}
+
 /// Bit-shift positions per output lane in an AWQ packed word.
 ///
 /// AWQ encodes 8 int4 outputs in a u32 with `undo_pack = {0,4,1,5,2,6,3,7}`,
@@ -512,6 +638,145 @@ mod tests {
         let result = repack_awq_nibbles(&qweight).unwrap();
         let flat: Vec<u32> = result.flatten_all().unwrap().to_vec1().unwrap();
         assert!(flat.iter().all(|&v| v == 0));
+    }
+
+    // ─── awq_to_marlin_tile_repack_cpu ───────────────────────────────────
+
+    /// Bit offset of logical nibble at column `n` in an AWQ-packed u32.
+    /// Mirrors `AWQ_UNDO_PACK_SHIFTS` but keyed by logical column rather
+    /// than output lane (they happen to be the same array since both are
+    /// indexed by the AWQ undo_pack permutation).
+    const AWQ_PACK_SHIFTS: [u32; 8] = AWQ_UNDO_PACK_SHIFTS;
+
+    /// Predicted output (u32_idx_in_tile, bit_offset) for a logical nibble
+    /// at (k_in_tile ∈ 0..16, n_in_tile ∈ 0..64) — derived independently from
+    /// the kernel comments at `awq_marlin_repack.cu:75-150` so the round-trip
+    /// test is not circular.
+    fn marlin_tile_decode_position(k_in_tile: usize, n_in_tile: usize) -> (usize, u32) {
+        const INV_PACK_IDX: [u32; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+        let m_n = n_in_tile % 16;
+        let warp_id = n_in_tile / 16;
+        let (tc_col, val_offset_high) = if m_n < 8 { (m_n, 0) } else { (m_n - 8, 4) };
+        let tc_row = ((k_in_tile / 2) % 4) * 2;
+        let i_inner = (k_in_tile % 2) + (k_in_tile / 8) * 2;
+        let th_id = tc_row / 2 + tc_col * 4;
+        let val_idx = i_inner + val_offset_high;
+        let u32_idx_in_tile = th_id * 4 + warp_id;
+        let bit_offset = INV_PACK_IDX[val_idx] * 4;
+        (u32_idx_in_tile, bit_offset)
+    }
+
+    #[test]
+    fn test_awq_to_marlin_tile_repack_cpu_shape() {
+        // K=32 (2 k-tiles), N=128 (2 n-tiles) → output [2, 256].
+        let device = Device::Cpu;
+        let q = Tensor::zeros((32usize, 16usize), DType::U32, &device).unwrap();
+        let out = awq_to_marlin_tile_repack_cpu(&q, 32, 128).unwrap();
+        assert_eq!(out.dims(), &[2, 256]);
+        assert_eq!(out.dtype(), DType::U32);
+        let flat: Vec<u32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(flat.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_awq_to_marlin_tile_repack_cpu_rejects_bad_shape() {
+        let device = Device::Cpu;
+        // size_k not divisible by 16
+        let q = Tensor::zeros((15usize, 8usize), DType::U32, &device).unwrap();
+        assert!(awq_to_marlin_tile_repack_cpu(&q, 15, 64).is_err());
+        // size_n not divisible by 64
+        let q = Tensor::zeros((16usize, 5usize), DType::U32, &device).unwrap();
+        assert!(awq_to_marlin_tile_repack_cpu(&q, 16, 40).is_err());
+        // wrong dtype
+        let q = Tensor::zeros((16usize, 8usize), DType::F32, &device).unwrap();
+        assert!(awq_to_marlin_tile_repack_cpu(&q, 16, 64).is_err());
+        // wrong shape
+        let q = Tensor::zeros((16usize, 16usize), DType::U32, &device).unwrap();
+        assert!(awq_to_marlin_tile_repack_cpu(&q, 16, 64).is_err());
+    }
+
+    #[test]
+    fn test_awq_to_marlin_tile_repack_cpu_round_trip_single_tile() {
+        // 1 tile (K=16, N=64). Pack a deterministic logical nibble at every
+        // (k, n) into AWQ format, run the repack, then for each (k, n)
+        // decode the predicted output position and assert the nibble matches.
+        let device = Device::Cpu;
+        let k: usize = 16;
+        let n: usize = 64;
+        let packed_n = n / 8;
+
+        let nibble = |row: usize, col: usize| -> u32 { ((row * n + col) as u32 * 7 + 3) % 16 };
+
+        // AWQ pack: awq[k][n/8] holds 8 nibbles at AWQ_PACK_SHIFTS positions.
+        let mut awq = vec![0u32; k * packed_n];
+        for kk in 0..k {
+            for nn in 0..n {
+                let shift = AWQ_PACK_SHIFTS[nn % 8];
+                awq[kk * packed_n + nn / 8] |= nibble(kk, nn) << shift;
+            }
+        }
+        let q = Tensor::from_vec(awq, (k, packed_n), &device).unwrap();
+        let out = awq_to_marlin_tile_repack_cpu(&q, k, n).unwrap();
+        assert_eq!(out.dims(), &[1, 128]);
+        let out_flat: Vec<u32> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        for kk in 0..k {
+            for nn in 0..n {
+                let (u32_idx, bit_off) = marlin_tile_decode_position(kk, nn);
+                let actual = (out_flat[u32_idx] >> bit_off) & 0xF;
+                let expected = nibble(kk, nn);
+                assert_eq!(
+                    actual, expected,
+                    "mismatch at (k={kk}, n={nn}): u32_idx={u32_idx} bit_off={bit_off}, \
+                     expected {expected} got {actual}, raw_u32=0x{:08x}",
+                    out_flat[u32_idx]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_awq_to_marlin_tile_repack_cpu_round_trip_multi_tile() {
+        // Multi-tile: K=32 (2 k-tiles), N=128 (2 n-tiles) → output [2, 256].
+        // Same round-trip invariant; this tile addressing exercises both
+        // tile-axes and the per-tile output stride.
+        let device = Device::Cpu;
+        let k: usize = 32;
+        let n: usize = 128;
+        let packed_n = n / 8;
+
+        let nibble = |row: usize, col: usize| -> u32 { ((row * 1023 + col * 17 + 5) as u32) % 16 };
+
+        let mut awq = vec![0u32; k * packed_n];
+        for kk in 0..k {
+            for nn in 0..n {
+                awq[kk * packed_n + nn / 8] |= nibble(kk, nn) << AWQ_PACK_SHIFTS[nn % 8];
+            }
+        }
+        let q = Tensor::from_vec(awq, (k, packed_n), &device).unwrap();
+        let out = awq_to_marlin_tile_repack_cpu(&q, k, n).unwrap();
+        assert_eq!(out.dims(), &[2, 256]);
+        let out_flat: Vec<u32> = out.flatten_all().unwrap().to_vec1().unwrap();
+
+        for kk in 0..k {
+            for nn in 0..n {
+                let k_tile = kk / 16;
+                let k_in_tile = kk % 16;
+                let n_tile = nn / 64;
+                let n_in_tile = nn % 64;
+                let (u32_idx_in_tile, bit_off) = marlin_tile_decode_position(k_in_tile, n_in_tile);
+                // Output row = k_tile, col within row = n_tile * 128 + u32_idx_in_tile.
+                let row = k_tile;
+                let col = n_tile * 128 + u32_idx_in_tile;
+                let raw = out_flat[row * 256 + col];
+                let actual = (raw >> bit_off) & 0xF;
+                let expected = nibble(kk, nn);
+                assert_eq!(
+                    actual, expected,
+                    "mismatch at (k={kk}, n={nn}, k_tile={k_tile}, n_tile={n_tile})"
+                );
+            }
+        }
     }
 
     /// Numeric equivalence between the GPU `awq_to_gptq_qweight_cuda`
