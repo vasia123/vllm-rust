@@ -407,11 +407,26 @@ fn awq_to_gptq_u32(w: u32) -> u32 {
 /// the Marlin INT4 kernel when `feature = "marlin"`, otherwise falls
 /// back to `gptq_cuda::gptq_gemm` (via `cuda-kernels`).  Either way is
 /// dramatically faster than `AwqLinear`'s per-forward CPU dequant.
+///
+/// **Stage 15.E.1 — hybrid dispatch dual storage.** When the
+/// `marlin` feature and a CUDA device are available, `load_weights`
+/// also computes a Marlin tile-laid-out qweight (`tile_b`) from the
+/// AWQ-original `qweight` via [`awq_to_marlin_tile_repack_cpu`]. The
+/// production forward path (`MarlinLinear::forward` →
+/// `marlin_gemm`) ignores it; Stage 15.E.2 adds a forward-time
+/// dispatch that routes M ≤ 8 calls to
+/// `dispatch_marlin_tile_mma_v1` for a 1.1–1.24× win on the
+/// AWQ-Marlin GEMV regime (see ADR 0016).
 #[derive(Debug)]
 pub struct AwqMarlinLinear {
     inner: MarlinLinear,
     in_features: usize,
     out_features: usize,
+    /// Marlin tile-laid-out qweight, populated when the `marlin`
+    /// feature is on and the load-device is CUDA. `None` otherwise
+    /// (or on layers whose `(K, N)` violate the `awq_to_marlin_tile_
+    /// repack_cpu` shape constraints — `K % 16 == 0`, `N % 64 == 0`).
+    tile_b: Option<Tensor>,
 }
 
 impl AwqMarlinLinear {
@@ -428,7 +443,16 @@ impl AwqMarlinLinear {
             inner,
             in_features,
             out_features,
+            tile_b: None,
         })
+    }
+
+    /// Stage 15.E.2 hook: tile_b for the hybrid M ≤ 8 dispatch path.
+    /// Returns `None` until `load_weights` has run on a hybrid-eligible
+    /// (CUDA, `marlin` feature, valid shape) layer.
+    #[allow(dead_code)]
+    pub(crate) fn tile_b(&self) -> Option<&Tensor> {
+        self.tile_b.as_ref()
     }
 }
 
@@ -450,6 +474,28 @@ impl QuantizedLinear for AwqMarlinLinear {
         let mut repacked: HashMap<String, Tensor> = HashMap::with_capacity(weights.len());
 
         if let Some(qw) = weights.get("qweight") {
+            // Stage 15.E.1: compute the Marlin tile layout BEFORE the GPTQ
+            // transpose consumes the AWQ-original `[K, N/8]` shape. Gated on
+            // the `marlin` feature (we only need it when the hybrid dispatch
+            // path is compiled in) and on shape divisibility (Marlin tile
+            // requires `K % 16 == 0`, `N % 64 == 0`). Heavy CPU work — runs
+            // ~5-7 s once at load time on Qwen3-4B; production decode path
+            // is unaffected (forward still routes through MarlinLinear until
+            // 15.E.2 adds the runtime gate).
+            #[cfg(feature = "marlin")]
+            {
+                if self.in_features.is_multiple_of(16) && self.out_features.is_multiple_of(64) {
+                    let qw_cpu = qw.to_dtype(DType::U32)?.to_device(&Device::Cpu)?;
+                    let tile = awq_to_marlin_tile_repack_cpu(
+                        &qw_cpu,
+                        self.in_features,
+                        self.out_features,
+                    )?;
+                    let tile_dev = tile.to_device(qw.device())?;
+                    self.tile_b = Some(tile_dev);
+                }
+            }
+
             // Step 1: AWQ interleaved nibbles → GPTQ sequential `[K/8, N]`.
             let gptq_qw = awq_to_gptq_qweight(qw, self.in_features, self.out_features)?;
 
@@ -638,6 +684,58 @@ mod tests {
         let result = repack_awq_nibbles(&qweight).unwrap();
         let flat: Vec<u32> = result.flatten_all().unwrap().to_vec1().unwrap();
         assert!(flat.iter().all(|&v| v == 0));
+    }
+
+    /// Stage 15.E.1: `tile_b` is populated when the layer's shape clears
+    /// the Marlin tile constraints (`K % 16 == 0`, `N % 64 == 0`) and the
+    /// `marlin` feature is on. Output shape: `[K/16, N*2]` per the
+    /// `awq_to_marlin_tile_repack_cpu` contract.
+    ///
+    /// Note: MarlinLinear's own constructor enforces `K % 128 == 0`,
+    /// `N % 64 == 0`, and a supported group_size — so any AwqMarlinLinear
+    /// that builds at all already satisfies the strictly weaker
+    /// awq_to_marlin_tile_repack_cpu shape constraints. The
+    /// `is_multiple_of` check inside load_weights is purely defensive.
+    #[cfg(feature = "marlin")]
+    #[test]
+    fn test_awq_marlin_linear_load_populates_tile_b() {
+        let device = Device::Cpu;
+        let in_features = 128usize; // K, mult of 128 (Marlin min)
+        let out_features = 128usize; // N, mult of 64
+        let group_size = 128i32; // K = 1 group
+
+        let cfg = MarlinConfig::awq_int4(group_size);
+        let mut layer =
+            AwqMarlinLinear::new(in_features, out_features, false, cfg, &device).unwrap();
+
+        // Synthesize the AWQ-original weights with the right shapes.
+        let qweight = Tensor::zeros((in_features, out_features / 8), DType::U32, &device).unwrap();
+        let scales = Tensor::zeros(
+            (in_features / group_size as usize, out_features),
+            DType::F16,
+            &device,
+        )
+        .unwrap();
+        let qzeros = Tensor::zeros(
+            (in_features / group_size as usize, out_features / 8),
+            DType::U32,
+            &device,
+        )
+        .unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert("qweight".to_string(), qweight);
+        weights.insert("scales".to_string(), scales);
+        weights.insert("qzeros".to_string(), qzeros);
+
+        layer.load_weights(&weights).unwrap();
+
+        let tile_b = layer.tile_b().expect("tile_b populated");
+        let k_tiles = in_features / 16;
+        let n_tiles = out_features / 64;
+        let expected_inner = n_tiles * 128;
+        assert_eq!(tile_b.dims(), &[k_tiles, expected_inner]);
+        assert_eq!(tile_b.dtype(), DType::U32);
     }
 
     // ─── awq_to_marlin_tile_repack_cpu ───────────────────────────────────
