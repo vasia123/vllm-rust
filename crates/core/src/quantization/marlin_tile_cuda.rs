@@ -201,13 +201,14 @@ pub fn dispatch_marlin_tile_mma_v1(
         );
     }
 
-    // Stage 15.D-body.3a: route the M=16, K=16, group_size=16 shape
+    // Stage 15.D-body.3a/3b: route M=16, group_size=K (single group) shapes
     // through the tensor-core kernel. Other shapes still use software.
-    if m == 16 && k == 16 && group_size == 16 {
+    if m == 16 && group_size == k {
         let op = MarlinTileMmaTcM16K16Op {
             b_tile: b_tile.clone(),
             scales: scales.clone(),
             qzeros: qzeros.clone(),
+            k: k as i32,
             n: n as i32,
         };
         return a.apply_op1(op);
@@ -230,6 +231,7 @@ struct MarlinTileMmaTcM16K16Op {
     b_tile: Tensor,
     scales: Tensor,
     qzeros: Tensor,
+    k: i32,
     n: i32,
 }
 
@@ -284,8 +286,6 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
             MARLIN_TILE_MMA_PTX,
         )?;
         let m_arg: i32 = 16;
-        let k_arg: i32 = 16;
-        let g_arg: i32 = 16;
         let mut builder = func.builder();
         builder.arg(a);
         builder.arg(b);
@@ -294,8 +294,8 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
         builder.arg(&output);
         builder.arg(&m_arg);
         builder.arg(&self.n);
-        builder.arg(&k_arg);
-        builder.arg(&g_arg);
+        builder.arg(&self.k);
+        builder.arg(&self.k); // group_size = k (single group)
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("tc kernel launch: {e}")))?;
         Ok((

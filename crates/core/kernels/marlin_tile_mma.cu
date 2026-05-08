@@ -339,13 +339,18 @@ extern "C" __global__ void marlin_test_mma_m16n8k16_bf16(
 // dequant_int4_bf16_lo4(q)        extracts bits {0, 16, 4, 20} → FragB#1
 // dequant_int4_bf16_lo4(q >> 8)   extracts bits {8, 24, 12, 28} → FragB#2
 
+// Stage 15.D-body.3b extends 3a from K=16 to any K%16==0 with the
+// constraint group_size = K (single group along K). Inner k-tile loop
+// loads A and dequants B per k-tile, accumulating into FragC across
+// k-tiles in FP32. Scale + zp are looked up ONCE outside the loop
+// (single group → constants per output column).
 extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
-    const __nv_bfloat16* __restrict__ a_ptr,    // [16, 16] BF16 row-major
-    const uint32_t*      __restrict__ b_ptr,    // [n_tiles * 128] u32
-    const __nv_bfloat16* __restrict__ s_ptr,    // [1, N] BF16
-    const uint32_t*      __restrict__ z_ptr,    // [1, N/8] u32 (GPTQ-seq.)
+    const __nv_bfloat16* __restrict__ a_ptr,    // [16, K] BF16 row-major
+    const uint32_t*      __restrict__ b_ptr,    // [k_tiles * n_tiles * 128] u32
+    const __nv_bfloat16* __restrict__ s_ptr,    // [1, N] BF16 (single group)
+    const uint32_t*      __restrict__ z_ptr,    // [1, N/8] u32 (single group, GPTQ-seq.)
     __nv_bfloat16*       __restrict__ c_ptr,    // [16, N] BF16 row-major
-    int /*m=16*/, int n, int /*k=16*/, int /*g=16*/) {
+    int /*m=16*/, int n, int k, int /*g=k*/) {
     int lane = threadIdx.x;
     if (lane >= 32) return;
     int gid = lane / 4;
@@ -355,66 +360,71 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
     int n_tile      = warp_global / 4;
     int warp_id     = warp_global % 4;     // 0..3 within tile
     int n_base      = warp_global * 16;    // first N-col of this warp
+    int n_tiles     = n / 64;
+    int row_stride_u32 = n_tiles * 128;
 
     auto pack_bf16x2 = [](__nv_bfloat16 lo, __nv_bfloat16 hi) {
         __nv_bfloat162 v = __halves2bfloat162(lo, hi);
         return *reinterpret_cast<uint32_t*>(&v);
     };
 
-    // FragA: 4 u32 per thread, m16n8k16 layout (PTX-spec).
-    uint32_t a[4];
-    a[0] = pack_bf16x2(a_ptr[gid       * 16 + gth * 2    ], a_ptr[gid       * 16 + gth * 2 + 1]);
-    a[1] = pack_bf16x2(a_ptr[(gid + 8) * 16 + gth * 2    ], a_ptr[(gid + 8) * 16 + gth * 2 + 1]);
-    a[2] = pack_bf16x2(a_ptr[gid       * 16 + gth * 2 + 8], a_ptr[gid       * 16 + gth * 2 + 9]);
-    a[3] = pack_bf16x2(a_ptr[(gid + 8) * 16 + gth * 2 + 8], a_ptr[(gid + 8) * 16 + gth * 2 + 9]);
-
-    // Load this thread's u32 of packed nibbles (single k-tile).
-    uint32_t q = b_ptr[n_tile * 128 + lane * 4 + warp_id];
-
-    // Two FragBs: one for cols [0..7] of warp slice (val_high=0), one for
-    // cols [8..15] (val_high=1). Dequant + (nibble - zp) * scale per col.
-    __nv_bfloat162 fb_lo[2];
-    __nv_bfloat162 fb_hi[2];
-    dequant_int4_bf16_lo4(q,       fb_lo);
-    dequant_int4_bf16_lo4(q >> 8,  fb_hi);
-
-    int col_lo = n_base + gid;       // n column for FragB_lo
-    int col_hi = n_base + gid + 8;   // n column for FragB_hi
+    // Per-column scale + zp (single group → constants across k-tiles).
+    int col_lo = n_base + gid;
+    int col_hi = n_base + gid + 8;
     __nv_bfloat16 sc_lo = s_ptr[col_lo];
     __nv_bfloat16 sc_hi = s_ptr[col_hi];
     int zp_lo = (int)((z_ptr[col_lo / 8] >> gptq_zp_shift(col_lo)) & 0xF);
     int zp_hi = (int)((z_ptr[col_hi / 8] >> gptq_zp_shift(col_hi)) & 0xF);
-
     __nv_bfloat162 sc_lo2 = __halves2bfloat162(sc_lo, sc_lo);
     __nv_bfloat162 sc_hi2 = __halves2bfloat162(sc_hi, sc_hi);
     __nv_bfloat162 zp_lo2 = __halves2bfloat162(__float2bfloat16(zp_lo), __float2bfloat16(zp_lo));
     __nv_bfloat162 zp_hi2 = __halves2bfloat162(__float2bfloat16(zp_hi), __float2bfloat16(zp_hi));
-    fb_lo[0] = __hmul2(__hsub2(fb_lo[0], zp_lo2), sc_lo2);
-    fb_lo[1] = __hmul2(__hsub2(fb_lo[1], zp_lo2), sc_lo2);
-    fb_hi[0] = __hmul2(__hsub2(fb_hi[0], zp_hi2), sc_hi2);
-    fb_hi[1] = __hmul2(__hsub2(fb_hi[1], zp_hi2), sc_hi2);
-
-    uint32_t b_lo[2] = {*reinterpret_cast<uint32_t*>(&fb_lo[0]), *reinterpret_cast<uint32_t*>(&fb_lo[1])};
-    uint32_t b_hi[2] = {*reinterpret_cast<uint32_t*>(&fb_hi[0]), *reinterpret_cast<uint32_t*>(&fb_hi[1])};
 
     float c_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float c_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-        : "=f"(c_lo[0]), "=f"(c_lo[1]), "=f"(c_lo[2]), "=f"(c_lo[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b_lo[0]), "r"(b_lo[1]),
-          "f"(c_lo[0]), "f"(c_lo[1]), "f"(c_lo[2]), "f"(c_lo[3]));
+    int k_tiles = k / 16;
+    for (int kt = 0; kt < k_tiles; kt++) {
+        int k_base = kt * 16;
 
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-        : "=f"(c_hi[0]), "=f"(c_hi[1]), "=f"(c_hi[2]), "=f"(c_hi[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b_hi[0]), "r"(b_hi[1]),
-          "f"(c_hi[0]), "f"(c_hi[1]), "f"(c_hi[2]), "f"(c_hi[3]));
+        // FragA: 4 u32 per thread, m16n8k16 layout, advanced by k_base.
+        uint32_t a[4];
+        a[0] = pack_bf16x2(a_ptr[gid       * k + k_base + gth * 2    ], a_ptr[gid       * k + k_base + gth * 2 + 1]);
+        a[1] = pack_bf16x2(a_ptr[(gid + 8) * k + k_base + gth * 2    ], a_ptr[(gid + 8) * k + k_base + gth * 2 + 1]);
+        a[2] = pack_bf16x2(a_ptr[gid       * k + k_base + gth * 2 + 8], a_ptr[gid       * k + k_base + gth * 2 + 9]);
+        a[3] = pack_bf16x2(a_ptr[(gid + 8) * k + k_base + gth * 2 + 8], a_ptr[(gid + 8) * k + k_base + gth * 2 + 9]);
+
+        // This k-tile's u32 of packed nibbles for this thread.
+        uint32_t q = b_ptr[kt * row_stride_u32 + n_tile * 128 + lane * 4 + warp_id];
+
+        __nv_bfloat162 fb_lo[2];
+        __nv_bfloat162 fb_hi[2];
+        dequant_int4_bf16_lo4(q,       fb_lo);
+        dequant_int4_bf16_lo4(q >> 8,  fb_hi);
+        fb_lo[0] = __hmul2(__hsub2(fb_lo[0], zp_lo2), sc_lo2);
+        fb_lo[1] = __hmul2(__hsub2(fb_lo[1], zp_lo2), sc_lo2);
+        fb_hi[0] = __hmul2(__hsub2(fb_hi[0], zp_hi2), sc_hi2);
+        fb_hi[1] = __hmul2(__hsub2(fb_hi[1], zp_hi2), sc_hi2);
+
+        uint32_t b_lo[2] = {*reinterpret_cast<uint32_t*>(&fb_lo[0]), *reinterpret_cast<uint32_t*>(&fb_lo[1])};
+        uint32_t b_hi[2] = {*reinterpret_cast<uint32_t*>(&fb_hi[0]), *reinterpret_cast<uint32_t*>(&fb_hi[1])};
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+            : "=f"(c_lo[0]), "=f"(c_lo[1]), "=f"(c_lo[2]), "=f"(c_lo[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+              "r"(b_lo[0]), "r"(b_lo[1]),
+              "f"(c_lo[0]), "f"(c_lo[1]), "f"(c_lo[2]), "f"(c_lo[3]));
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+            : "=f"(c_hi[0]), "=f"(c_hi[1]), "=f"(c_hi[2]), "=f"(c_hi[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+              "r"(b_hi[0]), "r"(b_hi[1]),
+              "f"(c_hi[0]), "f"(c_hi[1]), "f"(c_hi[2]), "f"(c_hi[3]));
+    }
 
     // FragC store: 4 fp32 per thread, m16n8 layout.
     //   c[0]: row=gid,    col=n_base + gth*2
