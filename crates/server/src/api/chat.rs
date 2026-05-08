@@ -74,7 +74,12 @@ pub async fn create_chat_completion(
 
     // Apply template with tools if provided
     let prompt = chat_template
-        .apply_with_tools(&messages, req.tools.as_deref(), true)
+        .apply_with_tools_and_kwargs(
+            &messages,
+            req.tools.as_deref(),
+            true,
+            req.chat_template_kwargs.as_ref(),
+        )
         .map_err(|e| ApiError::TemplateError(e.to_string()))?;
 
     // Early-fail: reject prompts that are clearly too long before tokenizing
@@ -770,7 +775,12 @@ pub async fn render_chat_completion(
     super::response_format::inject_json_system_prompt(&mut messages, req.response_format.as_ref());
 
     let prompt = chat_template
-        .apply_with_tools(&messages, req.tools.as_deref(), true)
+        .apply_with_tools_and_kwargs(
+            &messages,
+            req.tools.as_deref(),
+            true,
+            req.chat_template_kwargs.as_ref(),
+        )
         .map_err(|e| ApiError::TemplateError(e.to_string()))?;
 
     let token_ids = state

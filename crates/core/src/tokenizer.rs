@@ -274,7 +274,7 @@ impl ChatTemplateEngine {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> anyhow::Result<String> {
-        self.apply_with_tools(messages, None, add_generation_prompt)
+        self.apply_with_tools_and_kwargs(messages, None, add_generation_prompt, None)
     }
 
     /// Apply the chat template with optional tool definitions.
@@ -286,6 +286,24 @@ impl ChatTemplateEngine {
         messages: &[ChatMessage],
         tools: Option<&[crate::tool_parser::ToolDefinition]>,
         add_generation_prompt: bool,
+    ) -> anyhow::Result<String> {
+        self.apply_with_tools_and_kwargs(messages, tools, add_generation_prompt, None)
+    }
+
+    /// Apply the chat template with optional tools AND
+    /// `chat_template_kwargs` — extra named values forwarded into the
+    /// Jinja render context. Qwen3 (and many newer chat templates) read
+    /// `enable_thinking` from this bag to decide whether to emit a
+    /// `<think>\n` opener for the assistant turn; silently dropping the
+    /// kwarg makes the template fall back to the thinking-on default,
+    /// which produces a `<think>\n…</think>` prefix that the user sees
+    /// instead of a clean response.
+    pub fn apply_with_tools_and_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[crate::tool_parser::ToolDefinition]>,
+        add_generation_prompt: bool,
+        chat_template_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> anyhow::Result<String> {
         let mut env = minijinja::Environment::new();
         // Add Python-compatible string methods (startswith, endswith, etc.)
@@ -301,13 +319,39 @@ impl ChatTemplateEngine {
                 .collect()
         });
 
-        let rendered = tmpl.render(minijinja::context! {
-            messages => messages,
-            bos_token => &self.bos_token,
-            eos_token => &self.eos_token,
-            add_generation_prompt => add_generation_prompt,
-            tools => tools_json,
-        })?;
+        // Build the render context as a JSON map so we can splice the
+        // user-supplied kwargs in without enumerating every possible key.
+        // The reserved keys (messages/bos_token/eos_token/etc.) win on
+        // collision — kwargs cannot redefine the template's structural
+        // inputs.
+        let mut ctx_map = serde_json::Map::new();
+        if let Some(kwargs) = chat_template_kwargs {
+            for (k, v) in kwargs {
+                ctx_map.insert(k.clone(), v.clone());
+            }
+        }
+        ctx_map.insert(
+            "messages".to_string(),
+            serde_json::to_value(messages).unwrap_or(serde_json::Value::Null),
+        );
+        ctx_map.insert(
+            "bos_token".to_string(),
+            serde_json::Value::String(self.bos_token.clone()),
+        );
+        ctx_map.insert(
+            "eos_token".to_string(),
+            serde_json::Value::String(self.eos_token.clone()),
+        );
+        ctx_map.insert(
+            "add_generation_prompt".to_string(),
+            serde_json::Value::Bool(add_generation_prompt),
+        );
+        ctx_map.insert(
+            "tools".to_string(),
+            serde_json::to_value(tools_json).unwrap_or(serde_json::Value::Null),
+        );
+
+        let rendered = tmpl.render(serde_json::Value::Object(ctx_map))?;
         Ok(rendered)
     }
 }
@@ -380,6 +424,46 @@ mod tests {
         assert!(result.contains("<|im_start|>assistant\n4<|im_end|>"));
         assert!(result.contains("<|im_start|>user\nAnd 3+3?<|im_end|>"));
         assert!(result.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn chat_template_kwargs_reach_template() {
+        // Mirrors the relevant slice of the Qwen3 default template:
+        // when `enable_thinking is false`, render an empty think block.
+        // Without forwarding chat_template_kwargs, this branch never
+        // fires and the assistant ends up emitting a real `<think>…`
+        // prefix that pollutes the user-visible response.
+        let template = r#"{% for message in messages %}<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
+{% if enable_thinking is defined and enable_thinking is false %}<think>
+
+</think>
+
+{% endif %}{% endif %}"#;
+        let engine = ChatTemplateEngine::new(template.to_string(), "".to_string(), "".to_string());
+        let messages = vec![ChatMessage::new("user", "Hi")];
+
+        // Default render: no kwargs → no enable_thinking variable → no <think> block.
+        let plain = engine.apply(&messages, true).unwrap();
+        assert!(
+            !plain.contains("<think>"),
+            "no kwargs render must not inject a <think> block"
+        );
+
+        // With enable_thinking=false → template emits the empty think block.
+        let mut kwargs = std::collections::HashMap::new();
+        kwargs.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let no_think = engine
+            .apply_with_tools_and_kwargs(&messages, None, true, Some(&kwargs))
+            .unwrap();
+        assert!(
+            no_think.contains("<think>"),
+            "enable_thinking=false kwarg must reach the template"
+        );
     }
 
     #[test]
