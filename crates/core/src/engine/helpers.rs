@@ -719,15 +719,17 @@ pub(crate) fn execute_batched_decode<M: ModelForward>(
     requests: &mut HashMap<RequestId, ActiveRequest>,
 ) -> Vec<(RequestId, String)> {
     let mut preempted: Vec<RequestId> = Vec::new();
-    execute_batched_decode_with_graph(
+    let (failed, _next) = execute_batched_decode_with_graph(
         decode_request_ids,
+        None,
         model,
         kv_cache_mgr,
         requests,
         None,
         None,
         &mut preempted,
-    )
+    );
+    failed
 }
 
 /// Group sequences by LoRA adapter name and execute forward passes per group.
@@ -806,8 +808,19 @@ fn forward_grouped_by_adapter<M: ModelForward>(
 /// Execute batched decode with optional CUDA graph support.
 /// When a dispatcher is provided, dispatches to cached graphs when available.
 /// When a graph runner is provided, uses it for optimized execution.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     decode_request_ids: &[RequestId],
+    // `prev_sampled_ids`: the U32 [B] tensor returned from the previous
+    // decode step's GPU sampler (Phase 1 foundation, ADR 0017). When
+    // `Some` AND its leading dim equals the current batch size AND no
+    // preemption occurred (`batch_ids.len() == decode_request_ids.len()`),
+    // it is reshaped to [B,1] and used directly as `input_ids`,
+    // bypassing the host `Tensor::from_vec` round-trip. When shape /
+    // batch composition mismatch, fallback to host path. This is
+    // perf-neutral on its own (Substep 2.1) but is the prerequisite for
+    // async DtoH overlap in Substep 2.2.
+    prev_sampled_ids: Option<&Tensor>,
     model: &M,
     kv_cache_mgr: &mut KVCacheManager,
     requests: &mut HashMap<RequestId, ActiveRequest>,
@@ -819,7 +832,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // re-admitted on the next compute_schedule pass instead of being
     // errored out.
     preempted_out: &mut Vec<RequestId>,
-) -> Vec<(RequestId, String)> {
+) -> (Vec<(RequestId, String)>, Option<Tensor>) {
     let mut failed: Vec<(RequestId, String)> = Vec::new();
     let mut batch_ids: Vec<RequestId> = Vec::with_capacity(decode_request_ids.len());
 
@@ -899,7 +912,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     });
 
     if batch_ids.is_empty() {
-        return failed;
+        return (failed, None);
     }
 
     // Step 2: Collect input tokens, per-sequence metadata, and adapter grouping
@@ -962,7 +975,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 let msg = format!("forward_grouped_by_adapter: {e}");
                 tracing::error!(error = %e, "batched decode forward failed");
                 failed.extend(failed_batch(msg, &batch_ids));
-                return failed;
+                return (failed, None);
             }
         }
     } else {
@@ -1003,14 +1016,31 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             }
         }
 
-        let input = match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
-            Ok(t) => t,
-            Err(e) => {
-                let msg = format!("Tensor::from_vec(decode input): {e}");
-                tracing::error!(error = %e, "batched decode tensor build failed");
-                failed.extend(failed_batch(msg, &batch_ids));
-                return failed;
+        // Substep 2.1 / ADR 0017: prefer GPU tensor pass-through from
+        // the previous decode step's sampler output. Valid only when no
+        // sequences were preempted this step (batch_ids covers all
+        // decode_request_ids) AND prev tensor's leading dim matches
+        // current batch size. Otherwise fallback to host vec → tensor.
+        let prev_input = prev_sampled_ids
+            .filter(|_| batch_ids.len() == decode_request_ids.len())
+            .filter(|t| t.dims().first().copied() == Some(batch_size))
+            .and_then(|t| t.unsqueeze(1).ok());
+
+        let input = match prev_input {
+            Some(t) => {
+                // token_ids is unused on this path; dropped at end of scope.
+                drop(token_ids);
+                t
             }
+            None => match Tensor::from_vec(token_ids, (batch_size, 1), model.device()) {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg = format!("Tensor::from_vec(decode input): {e}");
+                    tracing::error!(error = %e, "batched decode tensor build failed");
+                    failed.extend(failed_batch(msg, &batch_ids));
+                    return (failed, None);
+                }
+            },
         };
 
         if let Some(runner) = graph_runner {
@@ -1026,7 +1056,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                             let msg = format!("forward_decode_batch (eager fallback): {e}");
                             tracing::error!(error = %e, "eager decode fallback failed");
                             failed.extend(failed_batch(msg, &batch_ids));
-                            return failed;
+                            return (failed, None);
                         }
                     }
                 }
@@ -1043,7 +1073,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                     let msg = format!("forward_decode_batch_with_ctx: {e}");
                     tracing::error!(error = %e, "batched decode forward failed");
                     failed.extend(failed_batch(msg, &batch_ids));
-                    return failed;
+                    return (failed, None);
                 }
             }
         }
@@ -1071,14 +1101,14 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 let msg = format!("last-logits squeeze: {e}");
                 tracing::error!(error = %e, "batched decode last-logits squeeze failed");
                 failed.extend(failed_batch(msg, &batch_ids));
-                return failed;
+                return (failed, None);
             }
         },
         Err(e) => {
             let msg = format!("last-logits narrow: {e}");
             tracing::error!(error = %e, "batched decode last-logits narrow failed");
             failed.extend(failed_batch(msg, &batch_ids));
-            return failed;
+            return (failed, None);
         }
     };
 
@@ -1215,31 +1245,41 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             })
             .collect();
 
-        match sampling::gpu::gpu_sample_batch_with_diffs(&last_logits, &configs, &diffs) {
-            Ok(token_ids) => {
-                for (i, &req_id) in batch_ids.iter().enumerate() {
-                    let Some(req) = requests.get_mut(&req_id) else {
-                        failed.push((req_id, "request no longer active".to_string()));
-                        continue;
-                    };
-                    req.state.block_table.advance(1);
-                    req.state.seqlen_offset += 1;
-                    req.state.generated_token_ids.push(token_ids[i]);
-                }
-                if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
-                    if let candle_core::Device::Cuda(cd) = dev {
-                        let _ = cd.cuda_stream().synchronize();
+        // Substep 2.1 / ADR 0017: sample to GPU tensor (no host trip
+        // inside the sampler). Phase 1 still does a `to_vec1` here for
+        // host-side bookkeeping (`generated_token_ids`); this is
+        // perf-neutral on its own. Substep 2.2 will move the DtoH onto
+        // a separate stream to actually overlap with the next forward.
+        match sampling::gpu::gpu_sample_batch_with_diffs_to_tensor(&last_logits, &configs, &diffs) {
+            Ok(token_tensor) => match token_tensor.to_vec1::<u32>() {
+                Ok(token_ids_out) => {
+                    for (i, &req_id) in batch_ids.iter().enumerate() {
+                        let Some(req) = requests.get_mut(&req_id) else {
+                            failed.push((req_id, "request no longer active".to_string()));
+                            continue;
+                        };
+                        req.state.block_table.advance(1);
+                        req.state.seqlen_offset += 1;
+                        req.state.generated_token_ids.push(token_ids_out[i]);
                     }
-                    step_profile::SAMPLING.ns[bucket].fetch_add(
-                        t0.elapsed().as_nanos() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
+                        if let candle_core::Device::Cuda(cd) = dev {
+                            let _ = cd.cuda_stream().synchronize();
+                        }
+                        step_profile::SAMPLING.ns[bucket].fetch_add(
+                            t0.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    if step_profile::enabled() {
+                        step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
+                    }
+                    return (failed, Some(token_tensor));
                 }
-                if step_profile::enabled() {
-                    step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
+                Err(e) => {
+                    tracing::warn!(error = %e, "GPU sampler tensor->vec failed; falling back to CPU");
                 }
-                return failed;
-            }
+            },
             Err(e) => {
                 // Fall through to CPU path on GPU sampling failure
                 tracing::warn!(error = %e, "GPU batched sampling failed; falling back to CPU");
@@ -1259,7 +1299,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             let msg = format!("last-logits to F32 vec2: {e}");
             tracing::error!(error = %e, "batched decode logits->cpu transfer failed");
             failed.extend(failed_batch(msg, &batch_ids));
-            return failed;
+            return (failed, None);
         }
     };
     let vocab_size = last_logits.dims()[1];
@@ -1335,7 +1375,8 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
     }
 
-    failed
+    // CPU sampler path: no GPU tensor to carry forward; next step uses host vec.
+    (failed, None)
 }
 
 pub(crate) fn check_finished(

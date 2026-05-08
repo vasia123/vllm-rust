@@ -426,15 +426,25 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
 
             let num_steps = multi_step_count.max(1);
             let mut active_decode_ids = regular_ids;
+            // Substep 2.1 / ADR 0017: GPU tensor pass-through across
+            // multi-step iterations. Carries the previous step's
+            // sampler-output tensor so the next step can use it as
+            // `input_ids` directly (no host vec → tensor round-trip).
+            // Only valid when the active set didn't shrink between
+            // steps; on any size change we drop it and the helper
+            // falls back to the host path.
+            let mut prev_sampled: Option<candle_core::Tensor> = None;
 
             for _step in 0..num_steps {
                 if active_decode_ids.is_empty() {
                     break;
                 }
+                let active_size_before = active_decode_ids.len();
 
                 let mut step_preempted: Vec<RequestId> = Vec::new();
-                let failed = execute_batched_decode_with_graph(
+                let (failed, next_sampled) = execute_batched_decode_with_graph(
                     &active_decode_ids,
+                    prev_sampled.as_ref(),
                     &self.model,
                     kv_cache_mgr,
                     &mut state.requests,
@@ -481,6 +491,16 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                         })
                         .unwrap_or(false)
                 });
+
+                // Carry the GPU tensor forward iff the active set is
+                // unchanged AND the helper produced one (GPU sampler
+                // path; CPU fallback returns None). On any divergence
+                // we drop it — next step rebuilds input_ids from host.
+                prev_sampled = if active_decode_ids.len() == active_size_before {
+                    next_sampled
+                } else {
+                    None
+                };
             }
         }
     }
