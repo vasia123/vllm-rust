@@ -1366,3 +1366,98 @@ this negative-result entry stay as the deliverables for the K
 milestone. Stage 13 closes here; the win path is captured for
 whoever picks up Stage 14-A.
 
+## Stage 14-C — honest decode-side profile
+
+**Question** answered here: does the AWQ-Marlin path dominate decode
+the same way Stage 14-B showed it dominates prefill, and does that
+dominance grow with concurrency? If yes, Stage 15 (Marlin tile-MMA
+kernel) lifts the right component. If decode is bottlenecked by
+something else (RoPE, sampling, cache_engine.write_batch, scheduler
+overhead), Stage 15 is mis-aimed.
+
+### Method
+
+`decode_profile` (gated on `VLLM_PROFILE_DECODE=1`, Stage 14-C.1
+event-based timing — see commit `8cd6dc1`) instrumented at every
+component of `forward_decode_batch_with_shared` + the surrounding
+decoder layer. `bench_decode.py` driving 256-prompt-word, 128-max-token
+streaming requests at `c=1/4/8` against the standard `--enforce-eager
+--max-model-len 6000` server. 142 windows × 100 layer-calls/window
+sampled across the run; bucketed by per-call wallclock (`<600 μs`
+= c=1, `600..1700 μs` = c=4, `≥1700 μs` = c=8). Reported numbers
+are medians.
+
+### Per-component breakdown (μs/layer-call, % of layer wallclock)
+
+| component       |     c=1      |     c=4      |     c=8      |
+| --------------- | -----------: | -----------: | -----------: |
+| **mlp**         | 261.3 (51.0%)| 762.5 (61.4%)| **1608.1 (66.4%)** |
+| **qkv**         |  67.6 (13.2%)| 193.5 (15.6%)|  366.8 (15.1%) |
+| **o_proj**      |  42.3  (8.3%)| 120.8  (9.7%)|  234.6  (9.7%) |
+| paged_attn      |  61.6 (12.0%)|  89.7  (7.2%)|  136.1  (5.6%) |
+| rope            |  47.4  (9.3%)|  45.0  (3.6%)|   45.0  (1.9%) |
+| cache_w         |  11.3  (2.2%)|  12.0  (1.0%)|   12.6  (0.5%) |
+| qk_norm         |   9.8  (1.9%)|   7.8  (0.6%)|    7.6  (0.3%) |
+| post_norm       |   5.8  (1.1%)|   5.5  (0.4%)|    5.0  (0.2%) |
+| in_norm         |   5.2  (1.0%)|   5.0  (0.4%)|    5.5  (0.2%) |
+| **sum**         |       512.2  |      1241.8  |       2421.8 |
+
+### AWQ-Marlin coverage
+
+Three components — mlp, qkv, o_proj — all dispatch through the same
+AWQ-Marlin INT4 GEMM kernel (`marlin_cuda::cuda_fwd_awq_gemv` and
+`fp16_dequant_matmul` fallback at large M). Their combined share grows
+with concurrency:
+
+| concurrency |  AWQ-Marlin share |  paged_attn share |
+| :---------: | ----------------: | ----------------: |
+|     c=1     |      **72.5 %**   |        12.0 %     |
+|     c=4     |      **86.7 %**   |         7.2 %     |
+|     c=8     |      **91.2 %**   |         5.6 %     |
+
+`paged_attn` shrinks with batch as expected (per-token KV traversal
+is independent across sequences while AWQ-Marlin GEMM grows with M).
+RoPE flattens at ~45 μs/call (constant fixed-shape kernel). MLP alone
+is 66 % of decode time at c=8 — the same direction as Stage 14-B
+prefill (40.3 %) but more concentrated, because batched decode pushes
+M from 1 to 32 (multi-step=4 × concurrency=8) and the dequant→matmul
+fallback path dominates over kt_mloop.
+
+### Implications for Stage 15
+
+Stage 15 (Marlin tile-MMA INT4 GEMM with tensor cores) lifts mlp +
+qkv + o_proj uniformly because they share the dispatch path. A 2×
+kernel speedup at c=8 yields:
+
+```
+old layer wallclock = 2421.8 μs
+AWQ-Marlin time     = 2210 μs (mlp + qkv + o_proj)
+non-Marlin time     =  212 μs
+
+new AWQ-Marlin time = 1105 μs  (2× kernel speedup)
+new layer wallclock = 1317 μs
+decode-level lift   = 2421.8 / 1317 = 1.84 ×
+```
+
+c=8 aggregate today is 63.6 tps; 1.84× = ~117 tps. vLLM Python at
+~351 tps is still ahead, but the gap closes from 5.5× to 3×. This
+matches the Stage 15 plan target ("c=8 expect 65.5 → ≥ 130 tps").
+
+A 3× kernel speedup (more aggressive but still within tensor-core
+INT4 envelope) would yield ~2.5× decode lift → ~160 tps aggregate at
+c=8, narrowing the gap to ~2.2×.
+
+### Decision
+
+**Stage 15 confirmed.** Decode is dominated by AWQ-Marlin paths
+(91 % at c=8); the Marlin tile-MMA kernel hits the right component.
+Proceed with substep 15.A (read reference Marlin kernel and produce
+markdown notes).
+
+A secondary observation: `cache_engine.write_batch` (cache_w slot)
+costs only 0.5 % of decode at c=8 — the FlashInfer plan-caching
+ambition from Stage 14-A would have at best chipped at this slice
+even if it had worked. Stage 14-A’s reverted state remains correct;
+no further engineering on plan-caching is warranted until Stage 15
+moves the AWQ-Marlin component below 30 % of layer wallclock.
+
