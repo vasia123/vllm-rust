@@ -34,7 +34,8 @@ path) starts from a clean foundation.
 | 15.D-body.3c | `63f97fa` | TC multi-group_size extension |
 | 15.D-body.3d | `03e5896` | TC small-M / multi-m-tile via masking — full production-shape contract on TC |
 | 15.D-body.4  | `b9bc05f` | TC microbench: 2-5× vs production marlin_gemm at M=4..8 |
-| 15.D-body.5  | (this commit) | **NEGATIVE: e2e 0% lift** (replay of 15.E.3 hypothesis 2) |
+| 15.D-body.5  | `ce162d6` | initial e2e bench: 0% lift (caused by 3D-shape gate bug) |
+| 15.D-body.5 fix | (this commit) | **+74% c=8, +23% c=4** after 3D-shape fix in awq_marlin gate |
 
 ## Current production behaviour
 

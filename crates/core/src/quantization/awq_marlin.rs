@@ -514,25 +514,55 @@ impl QuantizedLinear for AwqMarlinLinear {
         // deployments from the +2.2 GiB load-time cost.
         #[cfg(feature = "marlin")]
         {
+            // Stage 15.D-body.5 diag: log the first time we examine each
+            // possible hybrid outcome so we can verify the gate is open
+            // in production runs (microbench wins not realising in e2e).
+            static DIAG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            let log_first = || {
+                tracing::info!(
+                    target: "vllm_core::marlin_path",
+                    "AwqMarlinLinear::forward x_dims={:?} tile_b={} M={:?}",
+                    x.dims(),
+                    self.tile_b.is_some(),
+                    if x.dims().len() == 2 { Some(x.dims()[0]) } else { None }
+                );
+            };
+            DIAG.get_or_init(log_first);
+
             if let Some(tile_b) = self.tile_b.as_ref() {
-                if x.dims().len() == 2 {
-                    let m = x.dims()[0];
-                    if (HYBRID_M_MIN..=HYBRID_M_MAX).contains(&m) {
-                        let group_size_i = self.inner.config_ref().group_size;
-                        // Per-channel scales (group_size = -1) are
-                        // disallowed by the tile_mma_v1 dispatcher; drop
-                        // through to the existing path on those layers.
-                        if group_size_i > 0 {
-                            let group_size = group_size_i as usize;
-                            return super::marlin_tile_cuda::dispatch_marlin_tile_mma_v1(
-                                x,
-                                tile_b,
-                                self.inner.scales_ref(),
-                                self.inner.qzeros_ref(),
-                                self.out_features,
-                                group_size,
-                            );
-                        }
+                // Stage 15.D-body.5 fix: production passes 3D `[B, S, H]`
+                // (e.g. `[1, 1, 2560]` for c=1 decode); flatten leading
+                // dims to 2D `[B*S, H]` for the gate + dispatch, then
+                // reshape result back. Without this the
+                // `x.dims().len() == 2` guard rejected every real
+                // forward — diagnosed via tracing in production runs.
+                let dims = x.dims();
+                let (m, x_2d, restore_3d): (usize, Tensor, Option<Vec<usize>>) = if dims.len() == 2
+                {
+                    (dims[0], x.clone(), None)
+                } else if dims.len() == 3 {
+                    let m = dims[0] * dims[1];
+                    let x_flat = x.reshape((m, dims[2]))?;
+                    (m, x_flat, Some(vec![dims[0], dims[1], self.out_features]))
+                } else {
+                    return self.inner.forward(x);
+                };
+                if (HYBRID_M_MIN..=HYBRID_M_MAX).contains(&m) {
+                    let group_size_i = self.inner.config_ref().group_size;
+                    if group_size_i > 0 {
+                        let group_size = group_size_i as usize;
+                        let y = super::marlin_tile_cuda::dispatch_marlin_tile_mma_v1(
+                            &x_2d,
+                            tile_b,
+                            self.inner.scales_ref(),
+                            self.inner.qzeros_ref(),
+                            self.out_features,
+                            group_size,
+                        )?;
+                        return match restore_3d {
+                            Some(shape) => y.reshape(shape),
+                            None => Ok(y),
+                        };
                     }
                 }
             }
