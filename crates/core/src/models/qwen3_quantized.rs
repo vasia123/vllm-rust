@@ -18,19 +18,31 @@ use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 //
 // Diagnostic instrumentation: when env `VLLM_PROFILE_DECODE=1` is set at
 // process start, per-component wall-clock times inside the AWQ decoder hot
-// path are accumulated in microseconds and dumped via `tracing::info!` once
-// per `PROFILE_EVERY` forward calls. Each measured block ends with
-// `dev.synchronize()` so the timer captures actual GPU work rather than
-// kernel-launch latency.
+// path are accumulated in nanoseconds and dumped via `tracing::info!` once
+// per `PROFILE_EVERY` layer-calls.
+//
+// **Measurement model (Stage 14-C.1):** symmetric to `prefill_profile`. Each
+// `time(...)` call records a pair of CUDA events on the device stream — one
+// before the closure, one after — and queues the pair in a thread-local Vec.
+// No host sync per measurement; GPU pipeline overlap is preserved. At
+// `maybe_dump` time the Vec drains, each pair's `elapsed_ms` is queried
+// (one sync per pair, on the `end` event), and deltas accumulate into the
+// per-component slots. The previous `cuda_stream::synchronize()`-per-call
+// approach distorted ratios non-uniformly — see ADR 0015 § 3 and
+// Stage 14-B notes in `prefill_profile` for the post-mortem.
 //
 // All overhead lives behind a once-initialised flag — the fast path is a
 // single relaxed atomic load when profiling is off.
 
 #[cfg(feature = "cuda")]
 mod decode_profile {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::OnceLock;
     use std::time::Instant;
+
+    use candle_core::cuda::cudarc::driver::sys::CUevent_flags_enum;
+    use candle_core::cuda::cudarc::driver::CudaEvent;
 
     pub const PROFILE_EVERY: usize = 100;
 
@@ -38,6 +50,15 @@ mod decode_profile {
 
     pub fn enabled() -> bool {
         *ENABLED.get_or_init(|| std::env::var("VLLM_PROFILE_DECODE").is_ok())
+    }
+
+    // Thread-local queue of CUDA-event pairs awaiting elapsed-ms readout.
+    // A 36-layer Qwen3 forward queues ~9 × 36 = 324 pairs/forward; with
+    // PROFILE_EVERY=100 layer-calls (~3 forwards) ≈ ~900 pairs between
+    // flushes. Each pair: two `CudaEvent`s + static slot ptr.
+    type EventEntry = (CudaEvent, CudaEvent, &'static AtomicU64);
+    thread_local! {
+        static EVENT_QUEUE: RefCell<Vec<EventEntry>> = const { RefCell::new(Vec::new()) };
     }
 
     pub static QKV_NS: AtomicU64 = AtomicU64::new(0);
@@ -51,24 +72,62 @@ mod decode_profile {
     pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
     pub static LAYERS_DONE: AtomicUsize = AtomicUsize::new(0);
 
-    /// Time `f`, sync the device, and add the elapsed nanoseconds to `slot`.
+    /// Record a start event, run `f`, record an end event, queue the pair
+    /// against `slot`. `elapsed_ms` is queried later in `flush_events()`.
     pub fn time<T>(
         dev: &candle_core::Device,
-        slot: &AtomicU64,
+        slot: &'static AtomicU64,
         f: impl FnOnce() -> candle_core::Result<T>,
     ) -> candle_core::Result<T> {
         if !enabled() {
             return f();
         }
-        let t0 = Instant::now();
-        let out = f()?;
-        if let candle_core::Device::Cuda(cd) = dev {
-            cd.cuda_stream()
-                .synchronize()
-                .map_err(|e| candle_core::Error::Msg(format!("profile sync: {e}")))?;
+        match dev {
+            candle_core::Device::Cuda(cd) => {
+                let stream = cd.cuda_stream();
+                let start = stream
+                    .record_event(Some(CUevent_flags_enum::CU_EVENT_DEFAULT))
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("decode profile start event: {e}"))
+                    })?;
+                let out = f()?;
+                let end = stream
+                    .record_event(Some(CUevent_flags_enum::CU_EVENT_DEFAULT))
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("decode profile end event: {e}"))
+                    })?;
+                EVENT_QUEUE.with(|cell| cell.borrow_mut().push((start, end, slot)));
+                Ok(out)
+            }
+            _ => {
+                let t0 = Instant::now();
+                let out = f()?;
+                slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                Ok(out)
+            }
         }
-        slot.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Ok(out)
+    }
+
+    /// Drain queued event pairs, query elapsed_ms (one sync per pair via the
+    /// `end` event), and accumulate into the matching `*_NS` slot.
+    fn flush_events() {
+        EVENT_QUEUE.with(|cell| {
+            let pairs = std::mem::take(&mut *cell.borrow_mut());
+            for (start, end, slot) in pairs {
+                match start.elapsed_ms(&end) {
+                    Ok(ms) => {
+                        let ns = (ms as f64 * 1_000_000.0) as u64;
+                        slot.fetch_add(ns, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "vllm_core::decode_profile",
+                            "elapsed_ms query failed, dropping event pair: {e}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     pub fn maybe_dump() {
@@ -79,6 +138,9 @@ mod decode_profile {
         if !n.is_multiple_of(PROFILE_EVERY) {
             return;
         }
+        // Drain queued events into slots BEFORE snapshotting, so the dump
+        // window aligns with the accumulation window.
+        flush_events();
         // Snapshot-then-reset each slot so the dump and the subsequent
         // accumulation window stay independent.
         let snap = |a: &AtomicU64| (a.swap(0, Ordering::Relaxed) as f64) / 1_000.0;
