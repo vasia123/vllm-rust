@@ -6,7 +6,6 @@ publish = false
 
 [workspace]
 members = ["crates/*"]
-exclude = ["vendor"]
 resolver = "2"
 
 # Top-level convenience feature so `cargo clippy --all-targets --features cuda`
@@ -73,11 +72,6 @@ bitflags = "2"
 # non-default-stream patch was needed only for CUDA Graph capture, which
 # is independently blocked by cudarc 0.16 V3 (see memory note
 # `perf_cuda_graph_capture.md`), so dropping the patch costs nothing.
-#
-# `vendor/candle/` directory + `scripts/setup-vendor-candle.sh` are
-# no longer required by the build; they remain on disk pending a
-# follow-up cleanup commit. CI / Dockerfile have had the vendor step
-# removed.
 
 [[test]]
 name = "reference_comparison"

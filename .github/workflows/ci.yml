@@ -21,10 +21,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Vendor candle (pinned commit)
-        run: bash scripts/setup-vendor-candle.sh
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -67,10 +63,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Vendor candle (pinned commit)
-        run: bash scripts/setup-vendor-candle.sh
-
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -94,10 +86,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Vendor candle (pinned commit)
-        run: bash scripts/setup-vendor-candle.sh
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:

@@ -14,8 +14,3 @@ scripts/__pycache__/
 # isn't bloated with the ~5 GB of vLLM + torch + flashinfer wheels.
 .venv-vllm/
 
-# Vendored candle fork — populated by `scripts/setup-vendor-candle.sh`.
-# Kept out of the main repo to avoid committing ~1 GB of upstream candle
-# examples; the setup script reproduces the patched branch deterministically
-# on a fresh checkout.
-vendor/
