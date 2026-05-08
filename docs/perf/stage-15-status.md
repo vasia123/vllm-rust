@@ -27,6 +27,7 @@ path) starts from a clean foundation.
 | 15.E.3  | `7dd5aac` | env-gate; e2e bench: **0 % lift** (negative) |
 | 15.E.3 follow-up | `60ade04` | multi-shape sweep: software loses at M=1 on small-K layers |
 | 15.D-body.1 | `87c060e` | INT4→BF16 LOP3 dequant primitive + standalone GPU test |
+| 15.D-body.2a | `c286f0f` | bf16 mma.m16n8k16 single-tile probe (manual fragments, no ldmatrix) |
 
 ## Current production behaviour
 
