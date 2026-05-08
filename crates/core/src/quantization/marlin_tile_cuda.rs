@@ -201,15 +201,17 @@ pub fn dispatch_marlin_tile_mma_v1(
         );
     }
 
-    // Stage 15.D-body.3a/3b: route M=16, group_size=K (single group) shapes
-    // through the tensor-core kernel. Other shapes still use software.
-    if m == 16 && group_size == k {
+    // Stage 15.D-body.3a/3b/3c: route M=16 shapes through the tensor-core
+    // kernel (any K%16==0, any group_size that divides K). M != 16 still
+    // uses software (.3d will widen this).
+    if m == 16 {
         let op = MarlinTileMmaTcM16K16Op {
             b_tile: b_tile.clone(),
             scales: scales.clone(),
             qzeros: qzeros.clone(),
             k: k as i32,
             n: n as i32,
+            group_size: group_size as i32,
         };
         return a.apply_op1(op);
     }
@@ -233,6 +235,7 @@ struct MarlinTileMmaTcM16K16Op {
     qzeros: Tensor,
     k: i32,
     n: i32,
+    group_size: i32,
 }
 
 impl CustomOp1 for MarlinTileMmaTcM16K16Op {
@@ -295,7 +298,7 @@ impl CustomOp1 for MarlinTileMmaTcM16K16Op {
         builder.arg(&m_arg);
         builder.arg(&self.n);
         builder.arg(&self.k);
-        builder.arg(&self.k); // group_size = k (single group)
+        builder.arg(&self.group_size);
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("tc kernel launch: {e}")))?;
         Ok((

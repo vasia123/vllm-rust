@@ -339,18 +339,18 @@ extern "C" __global__ void marlin_test_mma_m16n8k16_bf16(
 // dequant_int4_bf16_lo4(q)        extracts bits {0, 16, 4, 20} → FragB#1
 // dequant_int4_bf16_lo4(q >> 8)   extracts bits {8, 24, 12, 28} → FragB#2
 
-// Stage 15.D-body.3b extends 3a from K=16 to any K%16==0 with the
-// constraint group_size = K (single group along K). Inner k-tile loop
-// loads A and dequants B per k-tile, accumulating into FragC across
-// k-tiles in FP32. Scale + zp are looked up ONCE outside the loop
-// (single group → constants per output column).
+// Stage 15.D-body.3b/3c extends 3a from K=16 to any K%16==0 with
+// any group_size that divides K and is a multiple of 16 (so each
+// k-tile fits in a single group). Inner k-tile loop loads A and
+// dequants B per k-tile, accumulating into FragC across k-tiles in
+// FP32. Scale + zp are looked up per k-tile (g = k_base / group_size).
 extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
     const __nv_bfloat16* __restrict__ a_ptr,    // [16, K] BF16 row-major
     const uint32_t*      __restrict__ b_ptr,    // [k_tiles * n_tiles * 128] u32
     const __nv_bfloat16* __restrict__ s_ptr,    // [1, N] BF16 (single group)
     const uint32_t*      __restrict__ z_ptr,    // [1, N/8] u32 (single group, GPTQ-seq.)
     __nv_bfloat16*       __restrict__ c_ptr,    // [16, N] BF16 row-major
-    int /*m=16*/, int n, int k, int /*g=k*/) {
+    int /*m=16*/, int n, int k, int group_size) {
     int lane = threadIdx.x;
     if (lane >= 32) return;
     int gid = lane / 4;
@@ -362,23 +362,20 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
     int n_base      = warp_global * 16;    // first N-col of this warp
     int n_tiles     = n / 64;
     int row_stride_u32 = n_tiles * 128;
+    int qz_stride_u32 = n / 8;
 
     auto pack_bf16x2 = [](__nv_bfloat16 lo, __nv_bfloat16 hi) {
         __nv_bfloat162 v = __halves2bfloat162(lo, hi);
         return *reinterpret_cast<uint32_t*>(&v);
     };
 
-    // Per-column scale + zp (single group → constants across k-tiles).
+    // Per-column zp shift is constant across groups (depends on n only).
     int col_lo = n_base + gid;
     int col_hi = n_base + gid + 8;
-    __nv_bfloat16 sc_lo = s_ptr[col_lo];
-    __nv_bfloat16 sc_hi = s_ptr[col_hi];
-    int zp_lo = (int)((z_ptr[col_lo / 8] >> gptq_zp_shift(col_lo)) & 0xF);
-    int zp_hi = (int)((z_ptr[col_hi / 8] >> gptq_zp_shift(col_hi)) & 0xF);
-    __nv_bfloat162 sc_lo2 = __halves2bfloat162(sc_lo, sc_lo);
-    __nv_bfloat162 sc_hi2 = __halves2bfloat162(sc_hi, sc_hi);
-    __nv_bfloat162 zp_lo2 = __halves2bfloat162(__float2bfloat16(zp_lo), __float2bfloat16(zp_lo));
-    __nv_bfloat162 zp_hi2 = __halves2bfloat162(__float2bfloat16(zp_hi), __float2bfloat16(zp_hi));
+    uint32_t zp_shift_lo = gptq_zp_shift(col_lo);
+    uint32_t zp_shift_hi = gptq_zp_shift(col_hi);
+    int zp_word_col_lo = col_lo / 8;
+    int zp_word_col_hi = col_hi / 8;
 
     float c_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float c_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -386,6 +383,17 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_tc_m16k16g16(
     int k_tiles = k / 16;
     for (int kt = 0; kt < k_tiles; kt++) {
         int k_base = kt * 16;
+        // The whole k-tile lies in a single group (group_size % 16 == 0).
+        int g = k_base / group_size;
+
+        __nv_bfloat16 sc_lo = s_ptr[g * n + col_lo];
+        __nv_bfloat16 sc_hi = s_ptr[g * n + col_hi];
+        int zp_lo = (int)((z_ptr[g * qz_stride_u32 + zp_word_col_lo] >> zp_shift_lo) & 0xF);
+        int zp_hi = (int)((z_ptr[g * qz_stride_u32 + zp_word_col_hi] >> zp_shift_hi) & 0xF);
+        __nv_bfloat162 sc_lo2 = __halves2bfloat162(sc_lo, sc_lo);
+        __nv_bfloat162 sc_hi2 = __halves2bfloat162(sc_hi, sc_hi);
+        __nv_bfloat162 zp_lo2 = __halves2bfloat162(__float2bfloat16(zp_lo), __float2bfloat16(zp_lo));
+        __nv_bfloat162 zp_hi2 = __halves2bfloat162(__float2bfloat16(zp_hi), __float2bfloat16(zp_hi));
 
         // FragA: 4 u32 per thread, m16n8k16 layout, advanced by k_base.
         uint32_t a[4];
