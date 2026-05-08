@@ -607,6 +607,152 @@ impl AttentionBackend for FlashInferBackend {
         Ok((output, Some(lse)))
     }
 
+    /// Stage 14-A — pre-build a `PrefillPlan` from the same metadata
+    /// every attention layer of one prefill will see, so layers 2..36
+    /// can replay it through `prefill_attention_with_plan`. Cache
+    /// lifetime is *per-forward* (engine drops the returned Arc when
+    /// the prefill returns) — that's what makes this safe; a static
+    /// cache (Stage 13-K-bis) was not.
+    fn prepare_prefill_plan(
+        &self,
+        cache_engine: &CacheEngine,
+        metadata: &PagedAttentionMetadata,
+        query_dtype: DType,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
+        let device = cache_engine.k_cache().device();
+        if !device.is_cuda() {
+            return Ok(None);
+        }
+
+        // Build FlashInfer paged KV metadata for this single sequence.
+        let fi_metadata = FlashInferMetadata::from_single_sequence(
+            metadata.block_ids,
+            metadata.seq_len,
+            self.block_size,
+            device,
+        )?;
+        let kv_indptr = fi_metadata.paged_kv_indptr.to_dtype(DType::U32)?;
+        let kv_indices = fi_metadata.paged_kv_indices.to_dtype(DType::U32)?;
+        let kv_last_page_len = fi_metadata.paged_kv_last_page_len.to_dtype(DType::U32)?;
+
+        // For prefill, total_tokens = seq_len - seqlen_offset. The
+        // engine ensures the per-layer Q tensor has this token count.
+        let total_tokens = metadata.seq_len.saturating_sub(metadata.seqlen_offset);
+        let qo_indptr_data: Vec<i32> = vec![0, total_tokens as i32];
+        let qo_indptr = tensor_bridge::alloc_gpu_i32(&qo_indptr_data, device)?;
+
+        let config = FlashInferConfig::new(
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            self.block_size as u32,
+        )
+        .with_kv_layout(cache_engine.layout());
+        let wrapper = wrapper::PrefillWrapper::new(config, device)?;
+
+        self.get_or_create_workspace(device)?;
+        let mut ws_guard = self
+            .workspace
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("workspace lock poisoned: {e}")))?;
+        let ws = ws_guard
+            .as_mut()
+            .ok_or_else(|| candle_core::Error::Msg("workspace not initialized".to_string()))?;
+
+        let plan = wrapper.build_plan(
+            ws,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            query_dtype,
+            1, // batch_size = 1 for single-sequence prefill
+            total_tokens,
+        )?;
+        drop(ws_guard);
+
+        Ok(Some(
+            std::sync::Arc::new(plan) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+        ))
+    }
+
+    fn prefill_attention_with_plan(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_mask: Option<&Tensor>,
+        cache_engine: &mut CacheEngine,
+        metadata: &PagedAttentionMetadata,
+        plan: Option<&(dyn std::any::Any + Send + Sync)>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let device = q.device();
+        if !device.is_cuda() {
+            return self.prefill_attention(
+                q,
+                k,
+                v,
+                attention_mask,
+                cache_engine,
+                metadata,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+        }
+
+        // Cache write happens unconditionally — same as the eager
+        // `prefill_attention` path, just without the plan rebuild after.
+        let k_for_cache = k.squeeze(0)?;
+        let v_for_cache = v.squeeze(0)?;
+        cache_engine
+            .write(&k_for_cache, &v_for_cache, metadata.slot_mapping)
+            .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+
+        // Downcast the opaque plan to our concrete `PrefillPlan`. If
+        // none was provided OR the downcast fails (different backend's
+        // plan threaded by mistake), fall through to eager — same cost
+        // as the legacy path, no regression.
+        if let Some(any_plan) = plan {
+            if let Some(prefill_plan) = any_plan.downcast_ref::<wrapper::PrefillPlan>() {
+                let (b_sz, _num_heads, q_len, _head_dim) = q.dims4()?;
+                let total_tokens = b_sz * q_len;
+                let q_flat = q
+                    .transpose(1, 2)?
+                    .reshape((total_tokens, num_heads, head_dim))?;
+
+                let config = FlashInferConfig::new(
+                    num_heads as u32,
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    self.block_size as u32,
+                )
+                .with_kv_layout(cache_engine.layout());
+                let wrapper = wrapper::PrefillWrapper::new(config, device)?;
+
+                let output = wrapper.run_with_plan(
+                    &q_flat,
+                    cache_engine.k_cache(),
+                    cache_engine.v_cache(),
+                    prefill_plan,
+                )?;
+                return output.reshape((b_sz, q_len, num_heads * head_dim));
+            }
+        }
+
+        // No plan or unrecognised plan type — eager path. We've already
+        // written the cache, so call `prefill_flashinfer` (which
+        // expects cache-already-written) directly rather than going
+        // through `prefill_attention` (which would write again).
+        self.prefill_flashinfer(q, cache_engine, metadata, num_heads, num_kv_heads, head_dim)
+    }
+
     fn prepare_decode_plan(
         &self,
         cache_engine: &CacheEngine,
@@ -1478,6 +1624,147 @@ mod gpu_tests {
         // FlashInfer split-K reduction. 1e-3 tolerance covers F16
         // round-trip without masking real drift.
         assert_tensors_close(&output_with_plan, &output_eager, 1e-3, "decode_with_plan");
+    }
+
+    /// Stage 14-A.0a — lock down the new `prepare_prefill_plan` +
+    /// `prefill_attention_with_plan` path. Builds the plan from the
+    /// metadata, runs the with-plan call, and asserts the output is
+    /// bit-equivalent to the eager `prefill_attention` path within F16
+    /// tolerance.
+    ///
+    /// This is the prefill mirror of `test_decode_with_plan_matches_eager_gpu`
+    /// and pins the contract that ADR 0015 will rely on.
+    #[test]
+    fn test_prefill_with_plan_matches_eager_gpu() {
+        let device = cuda_device();
+        let num_blocks = 4;
+
+        let config = test_cache_config(&device, num_blocks);
+        let mut cache_eager = CacheEngine::new(&config).unwrap();
+        let mut cache_plan = CacheEngine::new(&config).unwrap();
+
+        // Prefill 24 tokens — spans two 16-token blocks; exercises the
+        // last-page-len calculation in FlashInferMetadata.
+        let seq_len = 24;
+        let q = rand_f16(&[1, NUM_HEADS, seq_len, HEAD_DIM], &device, 900);
+        let k = rand_f16(&[1, NUM_KV_HEADS, seq_len, HEAD_DIM], &device, 901);
+        let v = rand_f16(&[1, NUM_KV_HEADS, seq_len, HEAD_DIM], &device, 902);
+
+        let block_ids: Vec<usize> = vec![0, 1];
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+        let metadata = PagedAttentionMetadata {
+            block_ids: &block_ids,
+            slot_mapping: &slot_mapping,
+            seq_len,
+            seqlen_offset: 0,
+        };
+
+        let backend = FlashInferBackend::with_block_size(BLOCK_SIZE);
+
+        // Eager path: builds plan inside, runs.
+        let output_eager = backend
+            .prefill_attention(
+                &q,
+                &k,
+                &v,
+                None,
+                &mut cache_eager,
+                &metadata,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+
+        // Plan-cached path: prepare plan once, replay via `with_plan`.
+        let plan = backend
+            .prepare_prefill_plan(
+                &cache_plan,
+                &metadata,
+                q.dtype(),
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap()
+            .expect("FlashInferBackend must produce a prefill plan");
+        let output_with_plan = backend
+            .prefill_attention_with_plan(
+                &q,
+                &k,
+                &v,
+                None,
+                &mut cache_plan,
+                &metadata,
+                Some(plan.as_ref()),
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+
+        assert_eq!(output_eager.dims(), output_with_plan.dims());
+        // Both paths run the same FlashInfer kernel through the same
+        // workspace; outputs should be bit-equivalent modulo
+        // non-determinism in split-K reduction. 1e-3 tolerance covers
+        // F16 round-trip without masking real drift.
+        assert_tensors_close(&output_with_plan, &output_eager, 1e-3, "prefill_with_plan");
+    }
+
+    /// Stage 14-A.0a — `prefill_attention_with_plan(plan: None)` must
+    /// fall through to the eager path bit-equivalently. This is the
+    /// contract that lets future engine code unconditionally pass
+    /// `Option<plan>` without checking which backend it has.
+    #[test]
+    fn test_prefill_with_plan_none_falls_through_gpu() {
+        let device = cuda_device();
+        let num_blocks = 4;
+        let config = test_cache_config(&device, num_blocks);
+        let mut cache_a = CacheEngine::new(&config).unwrap();
+        let mut cache_b = CacheEngine::new(&config).unwrap();
+
+        let seq_len = 12;
+        let q = rand_f16(&[1, NUM_HEADS, seq_len, HEAD_DIM], &device, 950);
+        let k = rand_f16(&[1, NUM_KV_HEADS, seq_len, HEAD_DIM], &device, 951);
+        let v = rand_f16(&[1, NUM_KV_HEADS, seq_len, HEAD_DIM], &device, 952);
+        let block_ids: Vec<usize> = vec![0];
+        let slot_mapping: Vec<usize> = (0..seq_len).collect();
+        let metadata = PagedAttentionMetadata {
+            block_ids: &block_ids,
+            slot_mapping: &slot_mapping,
+            seq_len,
+            seqlen_offset: 0,
+        };
+
+        let backend = FlashInferBackend::with_block_size(BLOCK_SIZE);
+        let eager = backend
+            .prefill_attention(
+                &q,
+                &k,
+                &v,
+                None,
+                &mut cache_a,
+                &metadata,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+        let with_none = backend
+            .prefill_attention_with_plan(
+                &q,
+                &k,
+                &v,
+                None,
+                &mut cache_b,
+                &metadata,
+                None,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )
+            .unwrap();
+        assert_tensors_close(&with_none, &eager, 1e-3, "prefill_with_plan_none");
     }
 
     /// Locks down that calling `batched_decode_attention_with_plan` with

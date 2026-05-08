@@ -85,6 +85,54 @@ pub struct PrefillWrapper {
     device: Device,
 }
 
+/// Pre-built FlashInfer prefill plan: mirror of [`DecodePlan`] for the
+/// prefill side.
+///
+/// Building the plan does CPU work-estimation, a page-locked metadata
+/// allocation, and a `cudaMemcpyAsync`. Replaying it via
+/// [`PrefillWrapper::run_with_plan`] does only device pointer extraction
+/// and the kernel launch.
+///
+/// In a model forward, every attention layer of one prefill sees an
+/// identical `(block_ids, seq_len, num_heads, num_kv_heads, head_dim,
+/// page_size, dtype)` tuple, so a single plan can replay across all 36
+/// layers of Qwen3-4B. The engine builds it once before
+/// `model.forward`, threads it through the per-layer attention calls
+/// via metadata, and drops it when the forward returns. The
+/// per-forward lifetime is what makes this safe — Stage 13-K-bis showed
+/// that a longer-lived (singleton/static) cache aliases workspace
+/// memory between prefills and crashes with `CUDA_ERROR_ILLEGAL_ADDRESS`.
+#[cfg(feature = "flashinfer")]
+pub struct PrefillPlan {
+    plan: flashinfer_rs::ffi::BatchPrefillPlan,
+    qo_indptr: Tensor,
+    kv_indptr: Tensor,
+    kv_indices: Tensor,
+    kv_last_page_len: Tensor,
+    batch_size: usize,
+    total_tokens: usize,
+    /// Page-locked scratch the plan writes its metadata into. Must stay
+    /// alive as long as `plan` may still be replayed.
+    _page_locked_buf: Box<[u8]>,
+}
+
+#[cfg(feature = "flashinfer")]
+impl PrefillPlan {
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+    pub fn total_tokens(&self) -> usize {
+        self.total_tokens
+    }
+}
+
+// SAFETY: same reasoning as DecodePlan above — opaque CUDA handles, no
+// thread-local state, page-locked Box never moves.
+#[cfg(feature = "flashinfer")]
+unsafe impl Send for PrefillPlan {}
+#[cfg(feature = "flashinfer")]
+unsafe impl Sync for PrefillPlan {}
+
 #[cfg(feature = "flashinfer")]
 impl PrefillWrapper {
     /// Create a new prefill wrapper.
@@ -214,6 +262,135 @@ impl PrefillWrapper {
             .map_err(|e| {
                 candle_core::Error::Msg(format!("FlashInfer prefill forward failed: {e}"))
             })?;
+        }
+
+        Ok(output)
+    }
+
+    /// Build a [`PrefillPlan`] that can be replayed across every
+    /// attention layer of one prefill forward. Stage 14-A entry point.
+    ///
+    /// The plan owns the indptr/indices/last_page_len GPU tensors so
+    /// they outlive the kernel launches; the caller can drop their
+    /// originals once this returns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_plan(
+        &self,
+        workspace: &mut WorkspaceBuffer,
+        qo_indptr: Tensor,
+        kv_indptr: Tensor,
+        kv_indices: Tensor,
+        kv_last_page_len: Tensor,
+        query_dtype: candle_core::DType,
+        batch_size: usize,
+        total_tokens: usize,
+    ) -> Result<PrefillPlan> {
+        let required_size = estimate_prefill_workspace(
+            batch_size,
+            total_tokens,
+            self.config.num_qo_heads as usize,
+            self.config.head_dim as usize,
+        );
+        workspace.ensure_size(required_size)?;
+
+        let workspace_ptr = workspace.as_ptr()?;
+        let ws_size = workspace.size();
+        let float_ws_size = ws_size / 2;
+        let int_ws_size = ws_size - float_ws_size;
+        let float_ws_ptr = workspace_ptr as *mut std::ffi::c_void;
+        let int_ws_ptr = unsafe { workspace_ptr.add(float_ws_size) } as *mut std::ffi::c_void;
+
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+        let dtype = tensor_bridge::candle_to_ffi_dtype(query_dtype)?;
+
+        let qo_indptr_ptr = tensor_bridge::tensor_to_device_ptr(&qo_indptr)? as *const i32;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(&kv_indptr)? as *const i32;
+
+        // Pinned scratch for plan metadata. `Box<[u8]>` keeps the
+        // address stable for the lifetime of the plan (no Vec realloc
+        // moves).
+        let mut page_locked_buf: Box<[u8]> = vec![0u8; int_ws_size].into_boxed_slice();
+
+        let plan = unsafe {
+            flashinfer_rs::ffi::BatchPrefillPlan::new(
+                float_ws_ptr,
+                float_ws_size,
+                int_ws_ptr,
+                int_ws_size,
+                page_locked_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                int_ws_size,
+                qo_indptr_ptr,
+                kv_indptr_ptr,
+                batch_size as i32,
+                self.config.num_qo_heads as i32,
+                self.config.num_kv_heads as i32,
+                self.config.head_dim as i32,
+                self.config.page_size as i32,
+                dtype,
+                flashinfer_rs::ffi::PosEncoding::None,
+                self.config.soft_cap,
+                self.config.window_left,
+                self.config.causal,
+                false, // enable_cuda_graph
+                stream_ptr,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("FlashInfer prefill plan failed: {e}")))?
+        };
+
+        Ok(PrefillPlan {
+            plan,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            batch_size,
+            total_tokens,
+            _page_locked_buf: page_locked_buf,
+        })
+    }
+
+    /// Replay a pre-built prefill plan. No host syncs — only device
+    /// pointer extraction and the kernel launch.
+    pub fn run_with_plan(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        plan: &PrefillPlan,
+    ) -> Result<Tensor> {
+        let q = tensor_bridge::ensure_contiguous(q)?;
+
+        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
+        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
+        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
+        let qo_indptr_ptr = tensor_bridge::tensor_to_device_ptr(&plan.qo_indptr)? as *const i32;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(&plan.kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(&plan.kv_indices)? as *const i32;
+        let kv_last_page_len_ptr =
+            tensor_bridge::tensor_to_device_ptr(&plan.kv_last_page_len)? as *const i32;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+
+        let output = Tensor::zeros_like(&q)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
+
+        unsafe {
+            plan.plan
+                .run(
+                    q_ptr,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    kv_indptr_ptr,
+                    kv_indices_ptr,
+                    kv_last_page_len_ptr,
+                    qo_indptr_ptr,
+                    output_ptr,
+                    std::ptr::null_mut(), // lse
+                    self.config.ffi_kv_layout(),
+                    stream_ptr,
+                )
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("FlashInfer prefill replay failed: {e}"))
+                })?;
         }
 
         Ok(output)

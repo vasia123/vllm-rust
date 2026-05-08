@@ -136,6 +136,73 @@ pub trait AttentionBackend: Send + Sync {
         Ok((out_3d, None))
     }
 
+    /// Pre-build a backend-specific prefill plan that can be replayed
+    /// across every attention layer of the same forward pass.
+    ///
+    /// Symmetric to [`Self::prepare_decode_plan`]. Backends that benefit
+    /// from caching (FlashInfer's `BatchPrefillPlan`, which otherwise
+    /// rebuilds CPU-side work-estimates + a page-locked allocation
+    /// ×36 per Qwen3-4B prefill) override this and return `Some(plan)`.
+    /// Other backends return `None` and `prefill_attention_with_plan`
+    /// falls back to the per-layer eager path.
+    ///
+    /// Engine usage (Stage 14-A): build once before `model.forward`,
+    /// pass to each layer's [`Self::prefill_attention_with_plan`] call
+    /// via the metadata struct, drop at end of forward.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_prefill_plan(
+        &self,
+        cache_engine: &CacheEngine,
+        metadata: &PagedAttentionMetadata,
+        query_dtype: candle_core::DType,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
+        let _ = (
+            cache_engine,
+            metadata,
+            query_dtype,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        );
+        Ok(None)
+    }
+
+    /// Replay a pre-built prefill plan returned by
+    /// [`Self::prepare_prefill_plan`]. Default implementation ignores the
+    /// plan and falls through to the regular `prefill_attention`, so
+    /// callers can pass a cached plan unconditionally without checking
+    /// which backend they have.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_attention_with_plan(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_mask: Option<&Tensor>,
+        cache_engine: &mut CacheEngine,
+        metadata: &PagedAttentionMetadata,
+        plan: Option<&(dyn std::any::Any + Send + Sync)>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Tensor> {
+        let _ = plan;
+        self.prefill_attention(
+            q,
+            k,
+            v,
+            attention_mask,
+            cache_engine,
+            metadata,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )
+    }
+
     /// Pre-build a backend-specific decode plan that can be replayed across
     /// every attention layer of the same forward pass.
     ///
