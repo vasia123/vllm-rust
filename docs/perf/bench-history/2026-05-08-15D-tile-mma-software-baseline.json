@@ -1,0 +1,29 @@
+{
+  "stage": "15.D — Marlin tile-MMA software scaffold baseline",
+  "date": "2026-05-08",
+  "commit": "27b0bef (Stage 15.D.4)",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU (sm_89)",
+  "shape": {
+    "K": 4096,
+    "N": 11008,
+    "group_size": 128,
+    "kernel": "marlin_tile_mma_int4_bf16 (software dot-product)",
+    "production_kernel_for_comparison": "marlin_gemm (kt_mloop family)"
+  },
+  "tile_mma_v1_software_dispatch_us": {
+    "M_1":   115,
+    "M_4":   415,
+    "M_8":   761,
+    "M_16":  1485,
+    "M_32":  2940,
+    "M_64":  5800,
+    "M_256": 23192,
+    "M_512": 46567
+  },
+  "notes": [
+    "v1 kernel is dormant in production. This bench imports it directly via dispatch_marlin_tile_mma_v1.",
+    "Linear scaling with M is expected: per-output-cell software dot product over K=4096 reductions, parallelism in M*N grid.",
+    "Surprise: M=1 (~115 us) is faster than the production awq_gemv at M=1 (~140 us per 13-D.4 baseline). Software path has zero kt_mloop / shmem overhead.",
+    "Stage 15.D-body (tensor-core mma.m16n8k16) replaces the per-cell software loop; this baseline is the 'before' measurement to beat."
+  ]
+}
