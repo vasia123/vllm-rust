@@ -125,6 +125,27 @@ mod decode_profile {
 // Naming: PA_NS includes the cache-write that `paged_attention()` performs
 // internally; we don't split it because the prefill path does not have a
 // separate `cache_engine.write_batch()` call (unlike the decode wrapper).
+//
+// **Measurement caveat (Stage 14-A.1, ADR 0015):** the `prefill_profile::time`
+// helper below issues a `cuda_stream::synchronize()` after every measurement,
+// which forces the host to wait for all queued GPU work in that closure to
+// complete. That serialises the GPU pipeline that would otherwise overlap
+// kernel launches with host code, so the absolute numbers reported by the
+// `dump_prefill` tracing line are **8–10× wallclock**.
+//
+// More importantly the **ratios** can mislead. Components that wait on lots
+// of in-flight kernel work (the attention block, with its 36-layer chain
+// queued ahead of the sync) appear larger relative to components that sit
+// on quiet GPU state (norms, projections that ran first). The Stage 13-K.1
+// audit read 67.8 % of forward as `paged_attn` and concluded plan-build was
+// the dominant cost; Stage 14-A.1 implemented the corresponding
+// optimization and measured a 240 → 336 ms TTFT *regression* — the kernel
+// itself dominates real wallclock, the sync-mode profile just made plan-
+// build look big.
+//
+// **Use this profile for "is this component even on the hot path?" not for
+// "how much wallclock does it cost?"**. Real wallclock breakdowns need
+// CUDA events (no host sync) — TODO future work, see ADR 0015 § 3.
 
 #[cfg(feature = "cuda")]
 mod prefill_profile {
