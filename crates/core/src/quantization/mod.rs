@@ -47,6 +47,8 @@ pub mod inc;
 pub mod marlin;
 #[cfg(feature = "marlin")]
 pub mod marlin_cuda;
+#[cfg(feature = "marlin")]
+pub mod marlin_tile_cuda;
 pub mod modelopt;
 pub mod moe_wna16;
 pub mod mxfp4;

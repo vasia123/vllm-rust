@@ -87,7 +87,10 @@ extern "C" __global__ void marlin_tile_mma_int4_bf16_m16n16k16(
         int i_inner = (k % 2) + (k / 8) * 2;
         int th_id = tc_row / 2 + tc_col * 4;  // 0..31
         int val_idx = i_inner + (val_high ? 4 : 0);
-        int u32_idx = th_id * 4;  // warp_id = 0
+        // v1 wrapper supplies only the warp_id=0 quarter (32 u32) compacted
+        // contiguously, so the array index here is `th_id`, NOT
+        // `th_id * 4 + warp_id` from the full 128-u32 tile.
+        int u32_idx = th_id;
         int bit_off = inv_pack_idx[val_idx] * 4;
 
         uint32_t packed = b_ptr[u32_idx];
