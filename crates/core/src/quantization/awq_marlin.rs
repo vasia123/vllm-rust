@@ -456,11 +456,28 @@ impl AwqMarlinLinear {
     }
 }
 
-/// Stage 15.E.2 hybrid dispatch threshold (ADR 0016). At M ≤ this value the
-/// software tile-MMA path beats production `marlin_gemm` by 1.10–1.24× on
-/// the canonical Qwen3-4B-AWQ MLP-up shape (commit `8dc4087` bench).
+/// Stage 15.E.2 hybrid dispatch range (ADR 0016, refined per the
+/// 15.E.3 follow-up shape sweep — `docs/perf/bench-history/
+/// 2026-05-08-15E-shape-sweep.json`).
+///
+/// **The single-shape microbench (commit `8dc4087`) misled the original
+/// design.** A multi-shape sweep across all Qwen3-4B-AWQ quantized
+/// linears at M ∈ {1, 4, 8} reveals:
+///
+/// - At **M=1**, production `awq_gemv_int4_kt_bf16` BEATS software on
+///   small-K layers: q_o (K=2560) by 2.13×, down (K=11008 / N=2560)
+///   by 2.98×. Software only wins at M=1 on the largest K=4096+ /
+///   N=11008+ shapes.
+/// - At **M ∈ {4, 8}**, software wins by 1.10–1.21× on 5/6 shapes;
+///   ties on the 6th (down M=8).
+///
+/// So the gate must EXCLUDE M=1 to avoid the q_o / down regression,
+/// even though a naive read of the original microbench would have
+/// kept it in.
 #[cfg(feature = "marlin")]
-pub(crate) const HYBRID_M_THRESHOLD: usize = 8;
+pub(crate) const HYBRID_M_MIN: usize = 4;
+#[cfg(feature = "marlin")]
+pub(crate) const HYBRID_M_MAX: usize = 8;
 
 /// Returns `true` if hybrid dispatch is enabled via env opt-in.
 /// **Default is OFF** — turning it on doubles the qweight footprint at
@@ -494,7 +511,7 @@ impl QuantizedLinear for AwqMarlinLinear {
             if let Some(tile_b) = self.tile_b.as_ref() {
                 if x.dims().len() == 2 {
                     let m = x.dims()[0];
-                    if m > 0 && m <= HYBRID_M_THRESHOLD {
+                    if (HYBRID_M_MIN..=HYBRID_M_MAX).contains(&m) {
                         let group_size_i = self.inner.config_ref().group_size;
                         // Per-channel scales (group_size = -1) are
                         // disallowed by the tile_mma_v1 dispatcher; drop

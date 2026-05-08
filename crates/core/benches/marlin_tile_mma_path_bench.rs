@@ -70,36 +70,57 @@ fn bench_dispatch_sweep(c: &mut Criterion) {
         return;
     }
 
-    // Same canonical Qwen3-4B-AWQ MLP-up shape as `awq_marlin_path_bench`,
-    // so the two cost curves can be diff'd directly.
-    const K: usize = 4096;
-    const N: usize = 11008;
     const GROUP_SIZE: usize = 128;
 
-    let mut group = c.benchmark_group("marlin_tile_mma_dispatch");
+    // All Qwen3-4B (Qwen3 4B Base) AWQ-quantized linear shapes — the model
+    // fires each of these ~36 times (one per layer) per decode token.
+    // Stage 15.E.3 negative result hypothesised that the microbench's
+    // single-shape sweep (K=4096 N=11008 MLP-up) didn't represent the real
+    // workload; this bench surfaces whether software wins on the smaller
+    // q/k/v_proj and o_proj shapes too, or only on the largest MLP layers.
+    //
+    // Shapes (hidden=2560, intermediate=11008, num_q_heads=20, num_kv_heads=8,
+    // head_dim=128):
+    //
+    //   q_proj         K=2560  N=2560   (q_heads * head_dim)
+    //   k_proj/v_proj  K=2560  N=1024   (kv_heads * head_dim)  — ALSO N % 64 == 0
+    //   o_proj         K=2560  N=2560
+    //   gate/up_proj   K=2560  N=11008
+    //   down_proj      K=11008 N=2560
+    //   lm_head        K=2560  N=151936 — non-quantized in Qwen3-4B-AWQ
+    //
+    // Skip k/v_proj (N=1024 still mult of 64 but small enough that
+    // q_proj = k_proj×2.5 is informative on its own). Skip lm_head (not
+    // quantized).
+    let shapes: &[(usize, usize, &str)] = &[
+        (2560, 2560, "q_o"),         // q_proj / o_proj
+        (2560, 11008, "gate_up"),    // gate_proj / up_proj
+        (11008, 2560, "down"),       // down_proj
+        (4096, 11008, "mlp_up_old"), // 15.D microbench shape (kept for trend reference)
+    ];
+
+    let mut group = c.benchmark_group("marlin_tile_mma_dispatch_qwen3");
     group.sample_size(10);
 
-    // Same M sweep as the production bench. The v1 software path will be
-    // slower than `marlin_gemm` everywhere — that gap is the work item
-    // for Stage 15.D-body / 15.E.
-    for &m in &[1usize, 4, 8, 16, 32, 64, 256, 512] {
-        let (input, b_tile, scales, qzeros) = make_inputs(m, K, N, GROUP_SIZE, &device);
-        // Warm the kernel cache; criterion's first sample otherwise eats
-        // the cudarc PTX-load cost.
-        run_one(&input, &b_tile, &scales, &qzeros, N, GROUP_SIZE);
-
-        group.bench_with_input(BenchmarkId::new("M", m), &m, |b, _| {
-            b.iter(|| {
-                run_one(
-                    black_box(&input),
-                    black_box(&b_tile),
-                    black_box(&scales),
-                    black_box(&qzeros),
-                    N,
-                    GROUP_SIZE,
-                );
+    for &(k, n, label) in shapes {
+        // Decode-side M values that hit the hybrid threshold.
+        for &m in &[1usize, 4, 8] {
+            let (input, b_tile, scales, qzeros) = make_inputs(m, k, n, GROUP_SIZE, &device);
+            run_one(&input, &b_tile, &scales, &qzeros, n, GROUP_SIZE);
+            let id = format!("{label}_K{k}_N{n}_M{m}");
+            group.bench_with_input(BenchmarkId::new("shape", id), &m, |b, _| {
+                b.iter(|| {
+                    run_one(
+                        black_box(&input),
+                        black_box(&b_tile),
+                        black_box(&scales),
+                        black_box(&qzeros),
+                        n,
+                        GROUP_SIZE,
+                    );
+                });
             });
-        });
+        }
     }
     group.finish();
 }

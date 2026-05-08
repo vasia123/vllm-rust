@@ -1,0 +1,39 @@
+{
+  "stage": "15.E.3 follow-up — software vs production across all Qwen3-4B-AWQ shapes",
+  "date": "2026-05-08",
+  "commit": "7dd5aac (15.E.3 negative-result framing) → bench extended",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU (sm_89)",
+  "harness": "criterion 10-sample median",
+  "group_size": 128,
+  "rows": [
+    {"shape": "q_o",        "K": 2560,  "N": 2560,  "M": 1, "prod_us": 25.3,  "sw_us": 53.9,  "winner": "prod (2.13x)"},
+    {"shape": "q_o",        "K": 2560,  "N": 2560,  "M": 4, "prod_us": 79.2,  "sw_us": 71.4,  "winner": "sw (1.11x)"},
+    {"shape": "q_o",        "K": 2560,  "N": 2560,  "M": 8, "prod_us": 148.7, "sw_us": 131.6, "winner": "sw (1.13x)"},
+    {"shape": "gate_up",    "K": 2560,  "N": 11008, "M": 1, "prod_us": 82.6,  "sw_us": 71.7,  "winner": "sw (1.15x)"},
+    {"shape": "gate_up",    "K": 2560,  "N": 11008, "M": 4, "prod_us": 279.0, "sw_us": 252.7, "winner": "sw (1.10x)"},
+    {"shape": "gate_up",    "K": 2560,  "N": 11008, "M": 8, "prod_us": 554.2, "sw_us": 456.6, "winner": "sw (1.21x)"},
+    {"shape": "down",       "K": 11008, "N": 2560,  "M": 1, "prod_us": 72.4,  "sw_us": 215.9, "winner": "prod (2.98x)"},
+    {"shape": "down",       "K": 11008, "N": 2560,  "M": 4, "prod_us": 317.6, "sw_us": 284.4, "winner": "sw (1.12x)"},
+    {"shape": "down",       "K": 11008, "N": 2560,  "M": 8, "prod_us": 558.4, "sw_us": 557.3, "winner": "tie"},
+    {"shape": "mlp_up_old", "K": 4096,  "N": 11008, "M": 1, "prod_us": 145.5, "sw_us": 114.1, "winner": "sw (1.27x)"},
+    {"shape": "mlp_up_old", "K": 4096,  "N": 11008, "M": 4, "prod_us": 456.6, "sw_us": 392.1, "winner": "sw (1.16x)"},
+    {"shape": "mlp_up_old", "K": 4096,  "N": 11008, "M": 8, "prod_us": 880.4, "sw_us": 732.5, "winner": "sw (1.20x)"}
+  ],
+  "summary": [
+    "9/12 cases at M in {4, 8}: software wins by 1.10-1.21x.",
+    "2/12 cases at M=1 on small-K layers: production WINS HARD: q_o by 2.13x, down by 2.98x. The awq_gemv kernel's GEMV-optimised access pattern beats the naive software dot-product when K is small (cache fits, kt_mloop's weight-reuse is in its sweet spot).",
+    "1/12 case (down M=8) is tie.",
+    "Stage 15.E.3 negative-result hypothesis 1 (microbench was a single-shape window into a multi-shape model) is CONFIRMED."
+  ],
+  "implications_for_threshold": [
+    "Original M <= 8 gate is wrong for c=1 decode (M=1). The two M=1 losses (q_o, down) per layer × 28 layers = enough negative drag to wipe out the wins on gate/up_proj at the same M=1.",
+    "Refined gate (informed by data): 4 <= M <= 8 enables hybrid; M=1 stays on production. This routes c=1 decode entirely through awq_gemv (current behaviour), and only c=4 / c=8 decode see the hybrid path.",
+    "But the e2e bench at c=4 / c=8 already showed ~0 % lift even though software wins per-call by 10-20 %. Hypothesis 2 from 15.E.3 (per-call launch overhead amortisation differs in microbench vs real workload) is the remaining unknown — ruling it out would need either (a) profiling tile_mma launches under nvprof, or (b) reducing per-call overhead in the dispatcher itself.",
+    "Net: even with the refined threshold the projected e2e win is at best ~5 % at c=4 (Amdahl: 0.91 slice × 1.15 layer-win = 1.14, but the c=4 slice may be smaller per Stage 14-C, giving 1.05-1.08 e2e). Not the 1.20x originally projected. Stage 15.D-body (tensor cores) remains the path that actually delivers."
+  ],
+  "decision": [
+    "Update ADR 0016 with this shape-aware data. Mark the M <= 8 threshold as PROVISIONALLY 4 <= M <= 8 (excluding M=1) for any future hybrid-on production deployment.",
+    "Keep VLLM_AWQ_HYBRID OFF by default (15.E.3). Real users may toggle it on once the threshold is correct; gain remains ~0-5 %.",
+    "Stage 15.D-body is still the priority: tensor cores beat both software AND production across the full M sweep."
+  ]
+}

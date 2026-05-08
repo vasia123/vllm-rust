@@ -133,5 +133,50 @@ fn bench_dispatch_sweep(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dispatch_sweep);
+/// Stage 15.E.3 follow-up: shape sweep across all Qwen3-4B-AWQ quantized
+/// linear shapes at decode-side M values, to surface whether the
+/// software-vs-production crossover is shape-dependent. Companion to
+/// `marlin_tile_mma_path_bench`'s `bench_dispatch_sweep_shapes`.
+fn bench_dispatch_sweep_shapes(c: &mut Criterion) {
+    let Ok(device) = Device::cuda_if_available(0) else {
+        return;
+    };
+    if !device.is_cuda() {
+        return;
+    }
+    const GROUP_SIZE: usize = 128;
+    let shapes: &[(usize, usize, &str)] = &[
+        (2560, 2560, "q_o"),
+        (2560, 11008, "gate_up"),
+        (11008, 2560, "down"),
+        (4096, 11008, "mlp_up_old"),
+    ];
+    let mut group = c.benchmark_group("awq_marlin_dispatch_qwen3");
+    group.sample_size(10);
+    for &(k, n, label) in shapes {
+        for &m in &[1usize, 4, 8] {
+            let (input, qweight, scales, qzeros, workspace) =
+                make_inputs(m, k, n, GROUP_SIZE, &device);
+            let _ = run_one(&input, &qweight, &scales, &qzeros, &workspace, k, n);
+            let id = format!("{label}_K{k}_N{n}_M{m}");
+            group.bench_with_input(BenchmarkId::new("shape", id), &m, |b, _| {
+                b.iter(|| {
+                    let y = run_one(
+                        black_box(&input),
+                        &qweight,
+                        &scales,
+                        &qzeros,
+                        &workspace,
+                        k,
+                        n,
+                    );
+                    black_box(y);
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_dispatch_sweep, bench_dispatch_sweep_shapes);
 criterion_main!(benches);
