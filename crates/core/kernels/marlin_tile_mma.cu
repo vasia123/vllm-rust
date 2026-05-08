@@ -306,3 +306,79 @@ extern "C" __global__ void marlin_test_mma_m16n8k16_bf16(
     c_ptr[(gid + 8) * 8 + gth * 2    ] = c[2];
     c_ptr[(gid + 8) * 8 + gth * 2 + 1] = c[3];
 }
+
+// ─── Stage 15.D-body.2b — INT4 dequant + scale/zp + mma in one kernel ───
+//
+// Single-warp single-tile (M=16, N=8, K=16) kernel that:
+//   1. Loads A [16, 16] BF16 fragment (manual, same as body.2a).
+//   2. Per-thread takes ONE u32 of packed INT4 weights (8 nibbles), runs
+//      `dequant_int4_bf16_lo4` to extract 4 nibbles in the FragB-aligned
+//      order, then applies (nibble - zp) * scale to produce FragB.
+//   3. Calls one mma.m16n8k16.bf16 → FragC FP32.
+//   4. Writes FragC to global.
+//
+// Per-thread q_pack convention (matches FragB layout per body.2a doc):
+//   Each thread (gid = lane/4, gth = lane%4) packs in its u32:
+//     bits  [3:0]   → B(gth*2,   gid)   = FragB.b[0].lo
+//     bits  [19:16] → B(gth*2+1, gid)   = FragB.b[0].hi
+//     bits  [7:4]   → B(gth*2+8, gid)   = FragB.b[1].lo
+//     bits  [23:20] → B(gth*2+9, gid)   = FragB.b[1].hi
+// (bits [11:8], [27:24], [15:12], [31:28] are unused for one m16n8k16
+// call but would feed a second mma call covering N=8..15.)
+//
+// scales [8] BF16, zp [8] u32 — one per gid (column 0..7 of B).
+// Dequant: out = (nibble - zp[gid]) * scale[gid].
+
+extern "C" __global__ void marlin_test_mma_m16n8k16_int4_bf16(
+    const __nv_bfloat16* __restrict__ a_ptr,    // [16, 16] BF16 row-major
+    const uint32_t*      __restrict__ q_ptr,    // [32] u32 — one per thread
+    const __nv_bfloat16* __restrict__ s_ptr,    // [8] BF16 scales (per gid)
+    const uint32_t*      __restrict__ zp_ptr,   // [8] u32 zp (per gid, ∈[0,15])
+    float*               __restrict__ c_ptr) {  // [16, 8] FP32 row-major
+    int lane = threadIdx.x;
+    if (lane >= 32) return;
+    int gid = lane / 4;
+    int gth = lane % 4;
+
+    auto pack = [](__nv_bfloat16 lo, __nv_bfloat16 hi) {
+        __nv_bfloat162 v = __halves2bfloat162(lo, hi);
+        return *reinterpret_cast<uint32_t*>(&v);
+    };
+
+    uint32_t a[4];
+    a[0] = pack(a_ptr[gid       * 16 + gth * 2    ], a_ptr[gid       * 16 + gth * 2 + 1]);
+    a[1] = pack(a_ptr[(gid + 8) * 16 + gth * 2    ], a_ptr[(gid + 8) * 16 + gth * 2 + 1]);
+    a[2] = pack(a_ptr[gid       * 16 + gth * 2 + 8], a_ptr[gid       * 16 + gth * 2 + 9]);
+    a[3] = pack(a_ptr[(gid + 8) * 16 + gth * 2 + 8], a_ptr[(gid + 8) * 16 + gth * 2 + 9]);
+
+    // Dequant: 1 u32 → 4 bf16 (nibbles {#0,#4,#1,#5}) via LOP3.
+    __nv_bfloat162 frag_b[2];
+    dequant_int4_bf16_lo4(q_ptr[lane], frag_b);
+
+    // Apply (nibble - zp[gid]) * scale[gid].
+    __nv_bfloat16 sc = s_ptr[gid];
+    __nv_bfloat16 zp_bf = __float2bfloat16(static_cast<float>(zp_ptr[gid]));
+    __nv_bfloat162 sc2  = __halves2bfloat162(sc, sc);
+    __nv_bfloat162 zp2  = __halves2bfloat162(zp_bf, zp_bf);
+    frag_b[0] = __hmul2(__hsub2(frag_b[0], zp2), sc2);
+    frag_b[1] = __hmul2(__hsub2(frag_b[1], zp2), sc2);
+
+    uint32_t b[2];
+    b[0] = *reinterpret_cast<uint32_t*>(&frag_b[0]);
+    b[1] = *reinterpret_cast<uint32_t*>(&frag_b[1]);
+
+    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+
+    c_ptr[gid       * 8 + gth * 2    ] = c[0];
+    c_ptr[gid       * 8 + gth * 2 + 1] = c[1];
+    c_ptr[(gid + 8) * 8 + gth * 2    ] = c[2];
+    c_ptr[(gid + 8) * 8 + gth * 2 + 1] = c[3];
+}

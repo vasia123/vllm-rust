@@ -389,6 +389,166 @@ mod gpu_tests {
         }
     }
 
+    /// Stage 15.D-body.2b — INT4 dequant + scale/zp + mma.m16n8k16.
+    /// A: [16,16] BF16; q_pack: [32] u32 (per-thread); scales: [8] BF16;
+    /// zp: [8] U32 (∈[0,15]). Output C: [16,8] FP32.
+    struct MmaInt4Bf16Op {
+        q_pack: Tensor,
+        scales: Tensor,
+        zp: Tensor,
+    }
+
+    impl CustomOp1 for MmaInt4Bf16Op {
+        fn name(&self) -> &'static str {
+            "marlin_test_mma_m16n8k16_int4_bf16"
+        }
+        fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+            candle_core::bail!("mma_int4_bf16: CUDA only")
+        }
+        fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+            use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+            let dev = &storage.device;
+            let a = match &storage.slice {
+                CudaStorageSlice::BF16(s) => s,
+                _ => candle_core::bail!("mma_int4_bf16: A must be BF16"),
+            };
+            let (q_g, _) = self.q_pack.storage_and_layout();
+            let q = match &*q_g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::U32(s) => s,
+                    _ => candle_core::bail!("mma_int4_bf16: q must be U32"),
+                },
+                _ => candle_core::bail!("mma_int4_bf16: q must be on CUDA"),
+            };
+            let (s_g, _) = self.scales.storage_and_layout();
+            let sc = match &*s_g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::BF16(s) => s,
+                    _ => candle_core::bail!("mma_int4_bf16: scales must be BF16"),
+                },
+                _ => candle_core::bail!("mma_int4_bf16: scales must be on CUDA"),
+            };
+            let (z_g, _) = self.zp.storage_and_layout();
+            let zp = match &*z_g {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::U32(s) => s,
+                    _ => candle_core::bail!("mma_int4_bf16: zp must be U32"),
+                },
+                _ => candle_core::bail!("mma_int4_bf16: zp must be on CUDA"),
+            };
+            let func = dev.get_or_load_custom_func(
+                "marlin_test_mma_m16n8k16_int4_bf16",
+                "marlin_tile_mma",
+                MARLIN_TILE_MMA_PTX,
+            )?;
+            let output = dev.alloc_zeros::<f32>(16 * 8)?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(a);
+            builder.arg(q);
+            builder.arg(sc);
+            builder.arg(zp);
+            builder.arg(&output);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| candle_core::Error::Msg(format!("mma_int4_bf16 launch: {e}")))?;
+            Ok((
+                CudaStorage {
+                    slice: CudaStorageSlice::F32(output),
+                    device: dev.clone(),
+                },
+                Shape::from_dims(&[16, 8]),
+            ))
+        }
+    }
+
+    fn dispatch_mma_int4_bf16(
+        a: &Tensor,
+        q_pack: &Tensor,
+        scales: &Tensor,
+        zp: &Tensor,
+    ) -> Result<Tensor> {
+        if a.dims() != [16, 16] || a.dtype() != DType::BF16 {
+            candle_core::bail!("mma_int4_bf16: A must be [16,16] BF16");
+        }
+        if q_pack.dims() != [32] || q_pack.dtype() != DType::U32 {
+            candle_core::bail!("mma_int4_bf16: q_pack must be [32] U32");
+        }
+        if scales.dims() != [8] || scales.dtype() != DType::BF16 {
+            candle_core::bail!("mma_int4_bf16: scales must be [8] BF16");
+        }
+        if zp.dims() != [8] || zp.dtype() != DType::U32 {
+            candle_core::bail!("mma_int4_bf16: zp must be [8] U32");
+        }
+        a.contiguous()?.apply_op1(MmaInt4Bf16Op {
+            q_pack: q_pack.contiguous()?,
+            scales: scales.contiguous()?,
+            zp: zp.contiguous()?,
+        })
+    }
+
+    #[test]
+    fn test_mma_m16n8k16_int4_bf16_correctness() {
+        let Ok(cuda) = Device::new_cuda(0) else {
+            eprintln!("no CUDA device — skipping");
+            return;
+        };
+        // Deterministic activations and per-(K,N) nibbles.
+        let a_vals: Vec<half::bf16> = (0..16 * 16)
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.073) % 2.0) - 1.0))
+            .collect();
+        let nibble = |k: usize, n: usize| -> u32 { ((k * 113 + n * 29 + 7) as u32) % 16 };
+        let scale_val = |n: usize| -> f32 { 0.05 + (n as f32) * 0.01 };
+        let zp_val = |n: usize| -> u32 { (n as u32 + 3) % 16 };
+
+        // Per-thread q_pack: thread (gid, gth) packs nibbles for B at:
+        //   bits  [3:0]  → (k=gth*2,   n=gid)
+        //   bits  [19:16]→ (k=gth*2+1, n=gid)
+        //   bits  [7:4]  → (k=gth*2+8, n=gid)
+        //   bits  [23:20]→ (k=gth*2+9, n=gid)
+        let mut q_vals = vec![0u32; 32];
+        for lane in 0..32 {
+            let gid = lane / 4;
+            let gth = lane % 4;
+            let n0 = nibble(gth * 2, gid);
+            let n1 = nibble(gth * 2 + 1, gid);
+            let n2 = nibble(gth * 2 + 8, gid);
+            let n3 = nibble(gth * 2 + 9, gid);
+            q_vals[lane] = n0 | (n1 << 16) | (n2 << 4) | (n3 << 20);
+        }
+        let scales_vals: Vec<half::bf16> =
+            (0..8).map(|n| half::bf16::from_f32(scale_val(n))).collect();
+        let zp_vals: Vec<u32> = (0..8).map(zp_val).collect();
+
+        let a = Tensor::from_vec(a_vals.clone(), (16, 16), &cuda).unwrap();
+        let q = Tensor::from_vec(q_vals, 32, &cuda).unwrap();
+        let s = Tensor::from_vec(scales_vals.clone(), 8, &cuda).unwrap();
+        let z = Tensor::from_vec(zp_vals.clone(), 8, &cuda).unwrap();
+
+        let c = dispatch_mma_int4_bf16(&a, &q, &s, &z).unwrap();
+        let c_host: Vec<f32> = c.flatten_all().unwrap().to_vec1().unwrap();
+
+        for m in 0..16 {
+            for n in 0..8 {
+                let mut acc = 0.0f32;
+                for k in 0..16 {
+                    let av = a_vals[m * 16 + k].to_f32();
+                    let w = (nibble(k, n) as f32 - zp_val(n) as f32) * scale_val(n);
+                    acc += av * w;
+                }
+                let got = c_host[m * 8 + n];
+                let diff = (got - acc).abs();
+                assert!(
+                    diff < 0.4,
+                    "mma int4 bf16 mismatch (m={m},n={n}): cpu={acc:.6} gpu={got:.6} diff={diff:.6}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_dequant_int4_bf16_lo4_primitive() {
         let Ok(cuda) = Device::new_cuda(0) else {

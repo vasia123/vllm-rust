@@ -526,4 +526,156 @@ $L__BB2_2:
 	ret;
 
 }
+	// .globl	marlin_test_mma_m16n8k16_int4_bf16
+.visible .entry marlin_test_mma_m16n8k16_int4_bf16(
+	.param .u64 marlin_test_mma_m16n8k16_int4_bf16_param_0,
+	.param .u64 marlin_test_mma_m16n8k16_int4_bf16_param_1,
+	.param .u64 marlin_test_mma_m16n8k16_int4_bf16_param_2,
+	.param .u64 marlin_test_mma_m16n8k16_int4_bf16_param_3,
+	.param .u64 marlin_test_mma_m16n8k16_int4_bf16_param_4
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b16 	%rs<14>;
+	.reg .f32 	%f<10>;
+	.reg .b32 	%r<52>;
+	.reg .b64 	%rd<21>;
+
+
+	ld.param.u64 	%rd1, [marlin_test_mma_m16n8k16_int4_bf16_param_0];
+	ld.param.u64 	%rd2, [marlin_test_mma_m16n8k16_int4_bf16_param_1];
+	ld.param.u64 	%rd3, [marlin_test_mma_m16n8k16_int4_bf16_param_2];
+	ld.param.u64 	%rd4, [marlin_test_mma_m16n8k16_int4_bf16_param_3];
+	ld.param.u64 	%rd5, [marlin_test_mma_m16n8k16_int4_bf16_param_4];
+	mov.u32 	%r1, %tid.x;
+	setp.gt.s32 	%p1, %r1, 31;
+	@%p1 bra 	$L__BB3_2;
+
+	cvta.to.global.u64 	%rd6, %rd2;
+	shr.s32 	%r40, %r1, 31;
+	shr.u32 	%r41, %r40, 30;
+	add.s32 	%r42, %r1, %r41;
+	shr.s32 	%r43, %r42, 2;
+	shl.b32 	%r44, %r43, 4;
+	and.b32  	%r45, %r42, 2147483644;
+	sub.s32 	%r46, %r1, %r45;
+	shl.b32 	%r47, %r46, 1;
+	add.s32 	%r48, %r44, %r47;
+	cvta.to.global.u64 	%rd7, %rd1;
+	mul.wide.s32 	%rd8, %r48, 2;
+	add.s64 	%rd9, %rd7, %rd8;
+	ld.global.nc.u16 	%rs1, [%rd9];
+	ld.global.nc.u16 	%rs2, [%rd9+2];
+	// begin inline asm
+	{  mov.b32 %r2, {%rs1,%rs2};}
+
+	// end inline asm
+	ld.global.nc.u16 	%rs3, [%rd9+256];
+	ld.global.nc.u16 	%rs4, [%rd9+258];
+	// begin inline asm
+	{  mov.b32 %r3, {%rs3,%rs4};}
+
+	// end inline asm
+	ld.global.nc.u16 	%rs5, [%rd9+16];
+	ld.global.nc.u16 	%rs6, [%rd9+18];
+	// begin inline asm
+	{  mov.b32 %r4, {%rs5,%rs6};}
+
+	// end inline asm
+	ld.global.nc.u16 	%rs7, [%rd9+272];
+	ld.global.nc.u16 	%rs8, [%rd9+274];
+	// begin inline asm
+	{  mov.b32 %r5, {%rs7,%rs8};}
+
+	// end inline asm
+	mul.wide.s32 	%rd10, %r1, 4;
+	add.s64 	%rd11, %rd6, %rd10;
+	ld.global.nc.u32 	%r7, [%rd11];
+	mov.u32 	%r12, 983055;
+	mov.u32 	%r19, 1124090624;
+	// begin inline asm
+	lop3.b32 %r6, %r7, %r12, %r19, 234;
+
+	// end inline asm
+	shr.u32 	%r11, %r7, 4;
+	// begin inline asm
+	lop3.b32 %r10, %r11, %r12, %r19, 234;
+
+	// end inline asm
+	// begin inline asm
+	{.reg .b32 c;
+  mov.b32 c, 0xbf80bf80U;
+  fma.rn.bf16x2 %r14,%r19,c,%r6;}
+
+	// end inline asm
+	// begin inline asm
+	{.reg .b32 c;
+  mov.b32 c, 0xbf80bf80U;
+  fma.rn.bf16x2 %r17,%r19,c,%r10;}
+
+	// end inline asm
+	cvta.to.global.u64 	%rd12, %rd3;
+	mul.wide.s32 	%rd13, %r43, 2;
+	add.s64 	%rd14, %rd12, %rd13;
+	ld.global.nc.u16 	%rs10, [%rd14];
+	cvta.to.global.u64 	%rd15, %rd4;
+	mul.wide.s32 	%rd16, %r43, 4;
+	add.s64 	%rd17, %rd15, %rd16;
+	ld.global.nc.u32 	%r49, [%rd17];
+	cvt.rn.f32.u32 	%f1, %r49;
+	// begin inline asm
+	{  cvt.rn.bf16.f32 %rs9, %f1;}
+
+	// end inline asm
+	// begin inline asm
+	{  mov.b32 %r20, {%rs10,%rs10};}
+
+	// end inline asm
+	// begin inline asm
+	{  mov.b32 %r21, {%rs9,%rs9};}
+
+	// end inline asm
+	// begin inline asm
+	{.reg .b32 c;
+  mov.b32 c, 0xbf80bf80U;
+  fma.rn.bf16x2 %r22,%r21,c,%r14;}
+
+	// end inline asm
+	// begin inline asm
+	{.reg .b32 c;
+  mov.b32 c, 0x80008000U;
+  fma.rn.bf16x2 %r25,%r22,%r20,c;}
+
+	// end inline asm
+	// begin inline asm
+	{.reg .b32 c;
+  mov.b32 c, 0xbf80bf80U;
+  fma.rn.bf16x2 %r28,%r21,c,%r17;}
+
+	// end inline asm
+	// begin inline asm
+	{.reg .b32 c;
+  mov.b32 c, 0x80008000U;
+  fma.rn.bf16x2 %r31,%r28,%r20,c;}
+
+	// end inline asm
+	mov.f32 	%f9, 0f00000000;
+	// begin inline asm
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f2,%f3,%f4,%f5}, {%r2,%r3,%r4,%r5}, {%r25,%r31}, {%f9,%f9,%f9,%f9};
+
+	// end inline asm
+	shl.b32 	%r50, %r43, 3;
+	sub.s32 	%r51, %r48, %r50;
+	cvta.to.global.u64 	%rd18, %rd5;
+	mul.wide.s32 	%rd19, %r51, 4;
+	add.s64 	%rd20, %rd18, %rd19;
+	st.global.f32 	[%rd20], %f2;
+	st.global.f32 	[%rd20+4], %f3;
+	st.global.f32 	[%rd20+256], %f4;
+	st.global.f32 	[%rd20+260], %f5;
+
+$L__BB3_2:
+	ret;
+
+}
 
