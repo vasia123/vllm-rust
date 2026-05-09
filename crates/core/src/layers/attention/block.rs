@@ -1013,7 +1013,13 @@ impl AttentionBlock {
         };
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_output = crate::cuda_kernels::paged_attention_cuda(
+        // 2026-05-09: route through `paged_attention_auto` instead of
+        // V1 directly — `paged_attention_bench` shows V2 wins at every
+        // measured seq_len (V1 is the legacy path; V2 split-K paginates
+        // the reduction). The auto-dispatcher picks the partition size
+        // based on max_seq_len so short / long contexts get the right
+        // tradeoff. See V2_SEQ_LEN_THRESHOLD = 0 in cuda_kernels.rs.
+        let attn_output = crate::cuda_kernels::paged_attention_auto(
             &q,
             cache_engine.k_cache(),
             cache_engine.v_cache(),
