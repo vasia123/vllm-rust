@@ -517,9 +517,17 @@ impl CudaGraphRunner {
             .map_err(|e| CudaGraphRunnerError::WarmupFailed(format!("Warmup forward: {e}")))?;
 
         let output_shape = warmup_output.dims().to_vec();
-        let output = Tensor::zeros(&output_shape[..], self.dtype, &self.device).map_err(|e| {
-            CudaGraphRunnerError::BufferAllocation(format!("Failed to allocate output buffer: {e}"))
-        })?;
+        // 2026-05-09: use the warmup forward's actual dtype, not `self.dtype`
+        // (which is the model's compute dtype, typically BF16). The forward
+        // returns logits in F32, and `cuda_memcpy_inplace` rejects dtype
+        // mismatches. Dormant before today because event-tracking blocked
+        // capture before the dtype check ever fired.
+        let output = Tensor::zeros(&output_shape[..], warmup_output.dtype(), &self.device)
+            .map_err(|e| {
+                CudaGraphRunnerError::BufferAllocation(format!(
+                    "Failed to allocate output buffer: {e}"
+                ))
+            })?;
 
         self.sync_device()?;
 

@@ -1353,7 +1353,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         max_parallel_loading_workers,
     )?;
 
-    let device = Device::new_cuda(0)?;
+    let device = create_cuda_device(0)?;
     let dtype_label = match dtype {
         DType::BF16 => "bf16",
         DType::F16 => "fp16",
@@ -2066,6 +2066,31 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 /// Queries total VRAM, estimates model size from config (taking quantization
 /// into account so AWQ INT4 weights aren't mis-priced as BF16), and returns
 /// the memory budget available for KV cache allocation.
+/// Create a CUDA device on a non-default (non-blocking) stream.
+///
+/// Uses candle's `Device::new_cuda_with_stream`, which goes through
+/// `CudaContext::new_stream()` instead of `default_stream()`. The
+/// legacy default stream cannot be captured by `cuStreamBeginCapture_v2`
+/// (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED = 900) — switching to a
+/// non-default stream is the minimum prerequisite for CUDA Graph
+/// capture work. Eager execution is unaffected.
+///
+/// CUDA Graph capture full activation also requires
+/// `unsafe { device.disable_event_tracking() }` to avoid
+/// `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` (905) on cross-slice event
+/// edges. Cudarc 0.17.0 (PR #436) fixed the disable path; we already
+/// use 0.19.4 via candle 0.10.2. **However:** even with capture
+/// succeeding at warmup, **replay fails with CUDA_ERROR_OUT_OF_MEMORY (2)
+/// → ILLEGAL_ADDRESS (700)** — the forward path allocates ad-hoc
+/// intermediate tensors (output_pool covers only GEMV today), so the
+/// captured graph's fixed buffer pointers go stale across forwards.
+/// Closing the gap requires pre-allocating every per-layer scratch
+/// tensor, which is multi-week refactor. See
+/// `memory/perf_cuda_graph_capture.md`.
+fn create_cuda_device(ordinal: usize) -> candle_core::Result<Device> {
+    Device::new_cuda_with_stream(ordinal)
+}
+
 fn estimate_kv_cache_budget(
     utilization: f32,
     config: &vllm_core::config::ModelConfig,
@@ -2252,7 +2277,7 @@ async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         cfg.max_parallel_loading_workers,
     )?;
 
-    let device = Device::new_cuda(dist_cfg.local_rank)?;
+    let device = create_cuda_device(dist_cfg.local_rank)?;
     let vb = if parsed_load_format == loader::LoadFormat::Dummy {
         loader::load_dummy_weights(cfg.dtype, &device)
     } else {
@@ -2343,7 +2368,7 @@ async fn run_tensor_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         cfg.max_parallel_loading_workers,
     )?;
 
-    let device = Device::new_cuda(dist_cfg.local_rank)?;
+    let device = create_cuda_device(dist_cfg.local_rank)?;
     let vb = if parsed_load_format == loader::LoadFormat::Dummy {
         loader::load_dummy_weights(cfg.dtype, &device)
     } else {
@@ -2440,7 +2465,7 @@ async fn run_generate(
         );
     }
 
-    let device = Device::new_cuda(0)?;
+    let device = create_cuda_device(0)?;
     let dtype = DType::BF16;
 
     // Compute dtype is BF16; per-tensor storage is picked by the
