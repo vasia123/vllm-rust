@@ -1,8 +1,8 @@
 #[cfg(feature = "cuda-fused-activations")]
 use candle_core::CustomOp2;
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, Layout, Result, Shape, Storage,
-    Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, InplaceOp2, Layout, Result, Shape,
+    Storage, Tensor,
 };
 
 /// Clone a CudaStorageSlice by pattern-matching each variant.
@@ -1739,6 +1739,182 @@ pub fn rms_norm_cuda(input: &Tensor, weight: &Tensor, epsilon: f32) -> Result<Te
         epsilon,
     };
     input.apply_op1_no_bwd(&op)
+}
+
+/// In-place sibling of [`RmsNormOp`] used by the pooled fast path.
+///
+/// `Tensor::inplace_op2(&input, &RmsNormInplaceOp { ... })` writes the
+/// normalised output into the receiver tensor's storage. The receiver is
+/// a buffer reserved from [`crate::engine::output_pool::OutputPool`] —
+/// it lives across forward passes, so the per-call `dev.alloc()` that
+/// `RmsNormOp::cuda_fwd` performs disappears. This is the precondition
+/// for CUDA Graph capture: the captured graph records the receiver's
+/// device pointer, which stays stable across replays.
+///
+/// The kernel launch logic mirrors [`RmsNormOp::cuda_fwd`] exactly
+/// (same dispatch table, same launch config); only the output pointer
+/// changes.
+#[cfg(feature = "cuda-layernorm")]
+struct RmsNormInplaceOp<'a> {
+    weight: &'a Tensor,
+    epsilon: f32,
+}
+
+#[cfg(feature = "cuda-layernorm")]
+impl<'a> InplaceOp2 for RmsNormInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "rms_norm_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("rms_norm_inplace requires CUDA")
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        in_storage: &CudaStorage,
+        in_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &in_storage.device;
+        let dims = in_layout.shape().dims();
+
+        if dims.is_empty() {
+            candle_core::bail!("rms_norm_inplace: input must have at least 1 dimension");
+        }
+
+        let hidden_size = dims[dims.len() - 1];
+        let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+
+        if num_tokens == 0 {
+            return Ok(());
+        }
+
+        let (weight_storage, _weight_layout) = self.weight.storage_and_layout();
+        let weight_storage = match &*weight_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("rms_norm_inplace: weight must be on CUDA device"),
+        };
+
+        let max_block_size: u32 = if num_tokens < 256 { 1024 } else { 256 };
+        let block_size = std::cmp::min(hidden_size as u32, max_block_size);
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let hidden_size_i32 = hidden_size as i32;
+
+        match (
+            &mut out_storage.slice,
+            &in_storage.slice,
+            &weight_storage.slice,
+        ) {
+            (
+                CudaStorageSlice::BF16(out_slice),
+                CudaStorageSlice::BF16(in_slice),
+                CudaStorageSlice::BF16(w_slice),
+            ) => {
+                let func =
+                    dev.get_or_load_custom_func("rms_norm_bf16", "layernorm", LAYERNORM_PTX)?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(in_slice);
+                builder.arg(w_slice);
+                builder.arg(&self.epsilon);
+                builder.arg(&hidden_size_i32);
+                // SAFETY: kernel launch with validated parameters; output buffer
+                // owned by the pool and exclusively held by `&mut out_storage`.
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("rms_norm_inplace launch: {e}"))
+                })?;
+            }
+            (
+                CudaStorageSlice::F16(out_slice),
+                CudaStorageSlice::F16(in_slice),
+                CudaStorageSlice::F16(w_slice),
+            ) => {
+                let func =
+                    dev.get_or_load_custom_func("rms_norm_fp16", "layernorm", LAYERNORM_PTX)?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(in_slice);
+                builder.arg(w_slice);
+                builder.arg(&self.epsilon);
+                builder.arg(&hidden_size_i32);
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("rms_norm_inplace launch: {e}"))
+                })?;
+            }
+            (
+                CudaStorageSlice::F32(out_slice),
+                CudaStorageSlice::F32(in_slice),
+                CudaStorageSlice::F32(w_slice),
+            ) => {
+                let func =
+                    dev.get_or_load_custom_func("rms_norm_f32", "layernorm", LAYERNORM_PTX)?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(in_slice);
+                builder.arg(w_slice);
+                builder.arg(&self.epsilon);
+                builder.arg(&hidden_size_i32);
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("rms_norm_inplace launch: {e}"))
+                })?;
+            }
+            _ => candle_core::bail!("rms_norm_inplace: unsupported dtype combination"),
+        }
+
+        Ok(())
+    }
+}
+
+/// Pool-backed RMSNorm for the decode hot path: reserves the output
+/// tensor from the process-global [`OutputPool`] and runs the kernel
+/// through the [`InplaceOp2`] path, eliminating the per-call
+/// `dev.alloc()` that the non-pooled [`rms_norm_cuda`] performs. The
+/// CUDA Graph capture path requires every per-layer scratch tensor to
+/// live at a stable device address — this is the migration target for
+/// `crate::layers::RmsNorm`.
+///
+/// Falls back to the non-pooled path on prefill-shape inputs:
+/// prefill's `num_tokens` varies per request (prompt length), and a
+/// 36-layer × 3-call/layer pass through the pool would allocate
+/// hundreds of multi-MB buffers per forward — fast OOM on small
+/// (8 GiB) GPUs. Decode is bounded by `MAX_DECODE_NUM_TOKENS`
+/// (= max captured batch size 32, with safety margin), where
+/// `num_tokens = batch_size × 1`.
+#[cfg(feature = "cuda-layernorm")]
+pub fn rms_norm_cuda_pooled(input: &Tensor, weight: &Tensor, epsilon: f32) -> Result<Tensor> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Inputs with up to this many tokens (= batch_size for decode) go
+    /// through the pool. Prefill (much larger) falls through to fresh
+    /// alloc to avoid pool memory pressure.
+    const POOL_MAX_NUM_TOKENS: usize = 64;
+
+    let input = input.contiguous()?;
+    let dims = input.dims();
+    let num_tokens: usize = dims[..dims.len().saturating_sub(1)].iter().product();
+    if num_tokens > POOL_MAX_NUM_TOKENS {
+        // Prefill or any non-hot-path caller — fall back to non-pooled.
+        return rms_norm_cuda(&input, weight, epsilon);
+    }
+
+    let shape: Vec<usize> = dims.to_vec();
+    let dtype = input.dtype();
+
+    let output = OutputPool::global().reserve(&shape, dtype, input.device())?;
+    let op = RmsNormInplaceOp { weight, epsilon };
+    output.inplace_op2(&input, &op)?;
+    Ok(output)
 }
 
 /// Check if CUDA RMSNorm kernel is available.

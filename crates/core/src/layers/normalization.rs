@@ -79,7 +79,17 @@ impl Module for RmsNorm {
                 {
                     if crate::cuda_kernels::rms_norm_cuda_available(xs) {
                         let xs = xs.contiguous()?;
-                        return crate::cuda_kernels::rms_norm_cuda(&xs, weight, self.eps as f32);
+                        // Pool-backed path: receiver buffer is reserved from the
+                        // process-global OutputPool so its device address is
+                        // stable across forward passes. This is a precondition
+                        // for CUDA Graph capture; it is also perf-neutral on
+                        // the eager path (the pool only saves the per-call
+                        // cuMemAlloc — kernel launch is unchanged).
+                        return crate::cuda_kernels::rms_norm_cuda_pooled(
+                            &xs,
+                            weight,
+                            self.eps as f32,
+                        );
                     }
                 }
 
