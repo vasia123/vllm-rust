@@ -1098,16 +1098,37 @@ impl QuantizedLinear for TiedEmbeddingHead {
         // The 2D path picks a markedly better algorithm for the tied
         // lm_head shape (M=B, K=hidden, N=vocab); +32 % e2e at c=8 on
         // Qwen3-4B-AWQ in side-by-side bench (118.8 → 157.1 tps).
+        //
+        // 2026-05-09 (Phase B.6): on the decode hot path
+        // `crate::cuda_kernels::bf16_matmul_pooled` reserves the output
+        // from the global OutputPool so its device address stays stable
+        // across forwards — required for CUDA Graph capture replay.
+        // Wrapper itself falls back to candle's matmul for prefill / non-BF16.
         match x.dims().len() {
             3 => {
                 let dims = x.dims();
                 let (b, s, h) = (dims[0], dims[1], dims[2]);
                 let v = self.weight.dims()[0];
                 let x_flat = x.reshape((b * s, h))?;
-                let y_flat = x_flat.matmul(&self.weight.t()?)?;
-                y_flat.reshape((b, s, v))
+                #[cfg(feature = "cuda-kernels")]
+                {
+                    let y_flat = crate::cuda_kernels::bf16_matmul_pooled(&x_flat, &self.weight)?;
+                    return y_flat.reshape((b, s, v));
+                }
+                #[allow(unreachable_code)]
+                {
+                    let y_flat = x_flat.matmul(&self.weight.t()?)?;
+                    y_flat.reshape((b, s, v))
+                }
             }
-            _ => x.matmul(&self.weight.t()?),
+            _ => {
+                #[cfg(feature = "cuda-kernels")]
+                {
+                    return crate::cuda_kernels::bf16_matmul_pooled(x, &self.weight);
+                }
+                #[allow(unreachable_code)]
+                x.matmul(&self.weight.t()?)
+            }
         }
     }
 

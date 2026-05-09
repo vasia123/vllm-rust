@@ -207,12 +207,41 @@ impl CacheEngine {
         let new_tokens = slot_mapping.len();
         let device = self.k_cache.device().clone();
 
-        // Build slot_mapping as U32 tensor on CUDA
-        let slot_tensor = Tensor::from_vec(
-            slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
-            (new_tokens,),
-            &device,
-        )?;
+        // Build slot_mapping as U32 tensor on CUDA. The kernel reads
+        // its device pointer; on the captured-graph replay path that
+        // pointer must stay stable across forwards. Reserve from
+        // OutputPool (decode-only gate) and memcpy current data in;
+        // pool gives the same device address on every replay because
+        // `engine/helpers.rs::execute_batched_decode_with_graph`
+        // resets the pool's per-shape cursors at the start of each
+        // forward.
+        const POOL_MAX_NEW_TOKENS: usize = 64;
+        let slot_tensor = if new_tokens <= POOL_MAX_NEW_TOKENS && device.is_cuda() {
+            let src = Tensor::from_vec(
+                slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
+                (new_tokens,),
+                &device,
+            )?;
+            let dst = crate::engine::output_pool::OutputPool::global()
+                .reserve(&[new_tokens], candle_core::DType::U32, &device)
+                .map_err(|e| {
+                    CacheError::Candle(candle_core::Error::Msg(format!(
+                        "scatter_into_cache_cuda: pool reserve failed: {e}"
+                    )))
+                })?;
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&dst, &src).map_err(|e| {
+                CacheError::Candle(candle_core::Error::Msg(format!(
+                    "scatter_into_cache_cuda: slot copy: {e}"
+                )))
+            })?;
+            dst
+        } else {
+            Tensor::from_vec(
+                slot_mapping.iter().map(|&s| s as u32).collect::<Vec<_>>(),
+                (new_tokens,),
+                &device,
+            )?
+        };
 
         let cuda_layout = match self.layout {
             KVCacheLayout::NHD => CudaCacheLayout::NHD,

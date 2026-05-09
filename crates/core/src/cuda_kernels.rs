@@ -2135,6 +2135,157 @@ impl<'a> InplaceOp2 for EmbeddingLookupInplaceOp<'a> {
     }
 }
 
+/// In-place BF16 matmul `Y = X @ W^T` where X is `[m, k]`, W is
+/// `[n, k]`, Y is `[m, n]`. Receiver = output Y; primary "input" =
+/// X. Weight W is held by the struct.
+///
+/// Uses cuBLAS HGEMM via cudarc to write into a pre-allocated pool
+/// buffer. Migration target for `TiedEmbeddingHead::forward` —
+/// candle's `Tensor::matmul` allocates the result fresh per call,
+/// which is the last unstable-address allocation on the Qwen3-AWQ
+/// decode hot path blocking CUDA Graph capture replay.
+#[cfg(feature = "cuda-kernels")]
+struct Bf16MatmulInplaceOp<'a> {
+    weight: &'a Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+#[cfg(feature = "cuda-kernels")]
+impl<'a> InplaceOp2 for Bf16MatmulInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "bf16_matmul_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("bf16_matmul_inplace requires CUDA")
+    }
+
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        x_storage: &CudaStorage,
+        _x_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::cublas::{sys, Gemm, GemmConfig};
+
+        let (w_storage, _w_layout) = self.weight.storage_and_layout();
+        let w_storage = match &*w_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("bf16_matmul_inplace: weight must be on CUDA"),
+        };
+
+        let device = match self.weight.device() {
+            candle_core::Device::Cuda(d) => d,
+            _ => candle_core::bail!("bf16_matmul_inplace: weight must be on CUDA"),
+        };
+        // Reuse candle's process-wide cuBLAS handle (bound to the
+        // device's default stream at startup). Constructing a fresh
+        // CudaBlas inside the captured stream invalidates the capture
+        // (cuBLAS init does host syncs / non-capture-safe state).
+        let blas = device.cublas_handle();
+
+        match (&mut out_storage.slice, &x_storage.slice, &w_storage.slice) {
+            (
+                CudaStorageSlice::BF16(out_slice),
+                CudaStorageSlice::BF16(x_slice),
+                CudaStorageSlice::BF16(w_slice),
+            ) => {
+                // Y = X @ W^T where row-major shapes: X=[m,k], W=[n,k], Y=[m,n].
+                // cuBLAS is column-major; treating row-major as transposed:
+                //   X (row-major [m,k]) ≡ column-major [k,m].
+                //   W (row-major [n,k]) ≡ column-major [k,n].
+                //   Y (row-major [m,n]) ≡ column-major [n,m].
+                // Compute Y_col = (W_col)^T @ X_col → [n,k]^T·[k,m] = [n,m]. ✓
+                let cfg = GemmConfig::<half::bf16> {
+                    transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: self.n as i32,
+                    n: self.m as i32,
+                    k: self.k as i32,
+                    alpha: half::bf16::from_f32(1.0),
+                    lda: self.k as i32,
+                    ldb: self.k as i32,
+                    beta: half::bf16::from_f32(0.0),
+                    ldc: self.n as i32,
+                };
+                // SAFETY: shapes validated; cuBLAS BF16 GEMM into pool buffer.
+                unsafe {
+                    blas.gemm(cfg, w_slice, x_slice, out_slice).map_err(|e| {
+                        candle_core::Error::Msg(format!("bf16_matmul_inplace gemm: {e}"))
+                    })?;
+                }
+            }
+            _ => candle_core::bail!("bf16_matmul_inplace: only BF16 supported"),
+        }
+
+        Ok(())
+    }
+}
+
+/// Pool-backed BF16 matmul `Y = X @ W^T`. Reserves Y from
+/// [`OutputPool`] (decode-only gate `m ≤ 64`) and runs cuBLAS HGEMM
+/// into the receiver. Falls back to candle's `Tensor::matmul` for
+/// prefill, non-BF16 dtypes, or non-CUDA devices.
+#[cfg(feature = "cuda-kernels")]
+pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Decode-shape budget; matches the other pool wrappers.
+    const POOL_MAX_M: usize = 64;
+
+    if input.dtype() != candle_core::DType::BF16 || weight.dtype() != candle_core::DType::BF16 {
+        return input.matmul(&weight.t()?);
+    }
+    if !input.device().is_cuda() {
+        return input.matmul(&weight.t()?);
+    }
+
+    let in_dims = input.dims();
+    if in_dims.len() < 2 {
+        candle_core::bail!("bf16_matmul_pooled: input must have ≥ 2 dims");
+    }
+    let k = in_dims[in_dims.len() - 1];
+    let m: usize = in_dims[..in_dims.len() - 1].iter().product();
+
+    let w_dims = weight.dims();
+    if w_dims.len() != 2 || w_dims[1] != k {
+        return input.matmul(&weight.t()?);
+    }
+    let n = w_dims[0];
+
+    if m > POOL_MAX_M {
+        return input.matmul(&weight.t()?);
+    }
+
+    let input = input.contiguous()?;
+    let weight_c = weight.contiguous()?;
+
+    let mut out_shape: Vec<usize> = in_dims[..in_dims.len() - 1].to_vec();
+    out_shape.push(n);
+    let output =
+        OutputPool::global().reserve(&out_shape, candle_core::DType::BF16, input.device())?;
+
+    let input_2d = input.reshape((m, k))?;
+    let output_2d = output.reshape((m, n))?;
+
+    let op = Bf16MatmulInplaceOp {
+        weight: &weight_c,
+        m,
+        n,
+        k,
+    };
+    output_2d.inplace_op2(&input_2d, &op)?;
+
+    if in_dims.len() == 2 {
+        Ok(output)
+    } else {
+        output.reshape(out_shape)
+    }
+}
+
 /// Pool-backed embedding lookup: gather rows of `weight` indexed by
 /// `input_ids` into a stable-address pool buffer. Replaces
 /// `Embedding::forward` on the decode hot path so the captured CUDA
