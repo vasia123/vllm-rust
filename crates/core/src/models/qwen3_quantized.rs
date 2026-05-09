@@ -815,12 +815,18 @@ impl QuantizedQwen3Attention {
             // `paged_attention_auto` allocates output + tmp_out + exp_sums +
             // max_logits internally per call (fresh device addresses each
             // forward); captured CUDA graph requires stable addresses.
-            // Worst-case `max_seq_len` matches the engine's `--max-model-len`
-            // (1024 for Qwen3-4B-AWQ default); partition_size derived from
-            // worst-case bound so pool buffer dims stay constant per shape.
-            const WORST_CASE_MAX_SEQ_LEN: usize = 1024;
-            let worst = WORST_CASE_MAX_SEQ_LEN.max(max_seq_len);
-            let partition_size = crate::cuda_kernels::select_v2_partition_size(max_seq_len);
+            //
+            // Worst-case sizing comes from the engine-wide `--max-model-len`
+            // (Phase D.1: see `engine::engine_limits`). Falls back to 1024
+            // for crates that use vllm-core without setting the limit
+            // (tests, benches). The .max() floor handles ad-hoc callers
+            // that exceed the registered limit; capture is gated to ≤ this
+            // bound and replay correctness is only guaranteed when actual
+            // seq_len ≤ worst.
+            let worst = crate::engine::engine_limits::max_model_len()
+                .unwrap_or(1024)
+                .max(max_seq_len);
+            let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
             let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
                 crate::cuda_kernels::paged_attention_v2_cuda_pooled(
                     &q,

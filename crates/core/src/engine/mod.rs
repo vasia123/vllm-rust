@@ -24,6 +24,7 @@ pub mod cuda_graph;
 pub mod cuda_graph_runner;
 mod embedding_forward;
 mod encoder_decoder;
+pub mod engine_limits;
 mod handle;
 mod helpers;
 mod model_forward;

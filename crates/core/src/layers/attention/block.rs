@@ -162,15 +162,19 @@ pub fn build_decode_batch_shared(
 ) -> Result<DecodeBatchShared> {
     use crate::engine::output_pool::OutputPool;
 
-    /// Worst-case blocks per sequence — derived from
-    /// `max_model_len / block_size` for Qwen3-4B-AWQ defaults
-    /// (1024 / 16 = 64). Padding `block_tables` to this stride keeps
-    /// the device pointer + row stride stable across forwards
-    /// (precondition for CUDA Graph capture replay).
-    const WORST_CASE_MAX_BLOCKS_PER_SEQ: usize = 64;
-
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_BATCH_SIZE: usize = 64;
+
+    // Worst-case blocks per sequence is derived from `--max-model-len`
+    // and the cache `block_size`. `engine_limits` is set by the server
+    // at startup (Phase D.1); fallback 1024 / 16 = 64 preserves
+    // historical behaviour for tests / benches.
+    let max_model_len = crate::engine::engine_limits::max_model_len().unwrap_or(1024);
+    // Conservative block_size = 16 fallback covers the common path; the
+    // value is also threaded through the actual scatter site, so a
+    // mismatch here only affects pool capacity, not correctness.
+    const FALLBACK_BLOCK_SIZE: usize = 16;
+    let worst_case_max_blocks_per_seq = max_model_len.div_ceil(FALLBACK_BLOCK_SIZE);
 
     let batch_size = sequences.len();
     if batch_size == 0 {
@@ -201,7 +205,7 @@ pub fn build_decode_batch_shared(
     // fresh allocation — same gate as other Phase A pool migrations.
     let use_pool = device.is_cuda()
         && batch_size <= POOL_MAX_BATCH_SIZE
-        && actual_max_blocks_per_seq <= WORST_CASE_MAX_BLOCKS_PER_SEQ;
+        && actual_max_blocks_per_seq <= worst_case_max_blocks_per_seq;
 
     // Pool-backed positions and slot_mapping device tensors. These are
     // read inside the captured forward by RoPE and reshape_and_cache
@@ -241,7 +245,7 @@ pub fn build_decode_batch_shared(
         // of every forward replays the same slot indices in same order),
         // so the captured CUDA graph's recorded reads find valid data on
         // each replay.
-        let stride = WORST_CASE_MAX_BLOCKS_PER_SEQ;
+        let stride = worst_case_max_blocks_per_seq;
         let mut bt_data = vec![0u32; batch_size * stride];
         for (i, seq) in sequences.iter().enumerate() {
             for (j, &block_id) in seq.block_ids.iter().enumerate() {
@@ -1209,17 +1213,15 @@ impl AttentionBlock {
         };
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        // 2026-05-09: V2 paged_attention via the pooled wrapper. Worst-case
-        // sizing for the scratch buffers (`tmp_out`, `exp_sums`,
-        // `max_logits`, output) so device addresses stay stable across
-        // forwards — required for CUDA Graph capture replay.
-        // `WORST_CASE_MAX_SEQ_LEN` matches the engine's max_model_len for
-        // Qwen3-4B-AWQ default (1024). Larger configs need this lifted —
-        // tracked in the Direction D plan as a follow-up to thread the
-        // value from `cache_engine`/engine config.
-        const WORST_CASE_MAX_SEQ_LEN: usize = 1024;
-        let partition_size = crate::cuda_kernels::select_v2_partition_size(max_seq_len);
-        let worst = WORST_CASE_MAX_SEQ_LEN.max(max_seq_len);
+        // V2 paged_attention via the pooled wrapper. Worst-case sizing for
+        // the scratch buffers (`tmp_out`, `exp_sums`, `max_logits`, output)
+        // so device addresses stay stable across forwards — required for
+        // CUDA Graph capture replay. Worst-case bound comes from the
+        // engine-wide `--max-model-len` (Phase D.1).
+        let worst = crate::engine::engine_limits::max_model_len()
+            .unwrap_or(1024)
+            .max(max_seq_len);
+        let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
         let attn_output = crate::cuda_kernels::paged_attention_v2_cuda_pooled(
             &q,
             cache_engine.k_cache(),

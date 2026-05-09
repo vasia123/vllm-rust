@@ -1920,6 +1920,10 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         files.config.max_position_embeddings,
     );
     let max_model_len = max_model_len_override.unwrap_or(default_max_model_len);
+    // Phase D.1: publish max_model_len to vllm-core's process-global
+    // engine_limits so pool-backed paged_attention V2 + block_tables
+    // strides size their captured-graph buffers correctly. Idempotent.
+    vllm_core::engine::engine_limits::set_max_model_len(max_model_len);
     let state = AppState::new(
         atomic_engine.clone(),
         served_model_name,
