@@ -2196,6 +2196,213 @@ pub fn rotary_embedding_cuda_available(_tensor: &Tensor) -> bool {
     false
 }
 
+/// In-place sibling of [`RopeOp`] used by the pooled fast path.
+///
+/// `out.inplace_op2(&input, &RopeInplaceOp { ... })` first copies the
+/// input bytes into the receiver via `memcpy_dtod`, then launches the
+/// in-place RoPE kernel against the receiver. Receiver is a buffer
+/// reserved from the global [`OutputPool`]; its device pointer stays
+/// stable across forwards, which is what CUDA Graph capture needs.
+#[cfg(feature = "cuda-kernels")]
+struct RopeInplaceOp<'a> {
+    positions: &'a Tensor,
+    cos_sin_cache: &'a Tensor,
+    rot_dim: usize,
+    head_size: usize,
+    num_heads: usize,
+    is_neox: bool,
+}
+
+#[cfg(feature = "cuda-kernels")]
+impl<'a> InplaceOp2 for RopeInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "rope_fused_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("rope_fused_inplace requires CUDA")
+    }
+
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        in_storage: &CudaStorage,
+        in_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &in_storage.device;
+        let shape = in_layout.shape();
+        let num_tokens = shape.dims()[0];
+
+        if num_tokens == 0 {
+            return Ok(());
+        }
+
+        let total_elems = shape.elem_count();
+        let query_stride = (self.num_heads * self.head_size) as i32;
+        let rot_dim_i32 = self.rot_dim as i32;
+        let head_size_i32 = self.head_size as i32;
+        let num_heads_i32 = self.num_heads as i32;
+        let num_kv_heads_i32 = 0i32;
+        let key_stride = 0i32;
+
+        let block_dim = std::cmp::min(self.num_heads * self.rot_dim / 2, 512) as u32;
+        let block_dim = std::cmp::max(block_dim, 1);
+
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let kernel_name = if self.is_neox {
+            "rotary_embedding_neox_bf16"
+        } else {
+            "rotary_embedding_gptj_bf16"
+        };
+
+        let (pos_storage, _) = self.positions.storage_and_layout();
+        let pos_storage = match &*pos_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("rope_inplace: positions must be on CUDA"),
+        };
+
+        let (cache_storage, _) = self.cos_sin_cache.storage_and_layout();
+        let cache_storage = match &*cache_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("rope_inplace: cos_sin_cache must be on CUDA"),
+        };
+        let cache_slice = match &cache_storage.slice {
+            CudaStorageSlice::F32(s) => s,
+            _ => candle_core::bail!("rope_inplace: cos_sin_cache must be f32"),
+        };
+
+        match (&mut out_storage.slice, &in_storage.slice) {
+            (CudaStorageSlice::BF16(out_slice), CudaStorageSlice::BF16(in_slice)) => {
+                // Copy input into receiver — kernel modifies receiver in place.
+                let in_view = in_slice.slice(0..total_elems);
+                let mut out_view = out_slice.slice_mut(0..total_elems);
+                dev.memcpy_dtod(&in_view, &mut out_view)?;
+
+                let func = dev.get_or_load_custom_func(kernel_name, "rope", ROPE_PTX)?;
+
+                let mut builder = func.builder();
+                if let CudaStorageSlice::U32(s) = &pos_storage.slice {
+                    builder.arg(s);
+                } else {
+                    candle_core::bail!(
+                        "rope_inplace: positions must be U32 (got {:?})",
+                        self.positions.dtype()
+                    );
+                }
+                builder.arg(out_slice);
+                builder.arg(&0u64); // key = nullptr
+                builder.arg(cache_slice);
+                builder.arg(&rot_dim_i32);
+                builder.arg(&query_stride);
+                builder.arg(&key_stride);
+                builder.arg(&head_size_i32);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+
+                // SAFETY: kernel launch with validated params; out_slice exclusively
+                // held via &mut out_storage and just overwritten by memcpy_dtod.
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("rope_inplace launch: {e}")))?;
+            }
+            _ => candle_core::bail!("rope_inplace: only bf16 supported"),
+        }
+        Ok(())
+    }
+}
+
+/// Pool-backed RoPE for the decode hot path. Wraps Q and K each through
+/// the pool — output tensors live at stable device addresses so the
+/// captured CUDA graph's recorded memcpy_dtod + rotary_embedding kernel
+/// reads/writes consistent pointers across replays.
+///
+/// Falls back to the non-pooled path when num_tokens exceeds the
+/// decode-shape budget (prefill etc.) — same rationale as
+/// `rms_norm_cuda_pooled`.
+#[cfg(feature = "cuda-kernels")]
+#[allow(clippy::too_many_arguments)]
+pub fn rotary_embedding_cuda_pooled(
+    q: &Tensor,
+    k: &Tensor,
+    positions: &Tensor,
+    cos_sin_cache: &Tensor,
+    rot_dim: usize,
+    head_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    is_neox: bool,
+) -> Result<(Tensor, Tensor)> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Same threshold as `rms_norm_cuda_pooled` (decode-shape budget).
+    const POOL_MAX_NUM_TOKENS: usize = 64;
+
+    let num_tokens = positions.dim(0)?;
+    if num_tokens == 0 {
+        return Ok((q.clone(), k.clone()));
+    }
+
+    if num_tokens > POOL_MAX_NUM_TOKENS {
+        return rotary_embedding_cuda(
+            q,
+            k,
+            positions,
+            cos_sin_cache,
+            rot_dim,
+            head_size,
+            num_heads,
+            num_kv_heads,
+            is_neox,
+        );
+    }
+
+    // Reshape to flat [num_tokens, n_heads * head_size] like the non-pooled path.
+    let q_flat = q
+        .reshape((num_tokens, num_heads * head_size))?
+        .contiguous()?;
+    let k_flat = k
+        .reshape((num_tokens, num_kv_heads * head_size))?
+        .contiguous()?;
+
+    let q_shape = q_flat.dims().to_vec();
+    let k_shape = k_flat.dims().to_vec();
+    let dtype = q_flat.dtype();
+    let device = q_flat.device();
+
+    let q_out = OutputPool::global().reserve(&q_shape, dtype, device)?;
+    let q_op = RopeInplaceOp {
+        positions,
+        cos_sin_cache,
+        rot_dim,
+        head_size,
+        num_heads,
+        is_neox,
+    };
+    q_out.inplace_op2(&q_flat, &q_op)?;
+
+    let k_out = OutputPool::global().reserve(&k_shape, dtype, device)?;
+    let k_op = RopeInplaceOp {
+        positions,
+        cos_sin_cache,
+        rot_dim,
+        head_size,
+        num_heads: num_kv_heads,
+        is_neox,
+    };
+    k_out.inplace_op2(&k_flat, &k_op)?;
+
+    let q_out = q_out.reshape(q.shape())?;
+    let k_out = k_out.reshape(k.shape())?;
+    Ok((q_out, k_out))
+}
+
 // ============================================================================
 // GELU/GeGLU Activation CUDA Kernels
 // ============================================================================

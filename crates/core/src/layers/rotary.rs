@@ -437,7 +437,7 @@ impl RotaryEmbedding {
                 q.device(),
             )?;
 
-            return crate::cuda_kernels::rotary_embedding_cuda(
+            return crate::cuda_kernels::rotary_embedding_cuda_pooled(
                 q,
                 k,
                 &pos_tensor,
