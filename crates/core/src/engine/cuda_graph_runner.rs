@@ -513,6 +513,14 @@ impl CudaGraphRunner {
         // First call is JIT warmup (allocates internal buffers, compiles
         // any per-shape kernels) — running it inside capture would record
         // the allocation, which is illegal.
+        // 2026-05-09 (Phase B.5): rewind pool cursors before BOTH the
+        // warmup and captured passes. The warmup pass primes JIT
+        // compilation + grows the pool to whatever maximum the forward
+        // needs; the captured pass reuses those slots from cursor 0.
+        // Real runtime forwards (engine/helpers.rs) also reset cursors
+        // at the start, so they reuse the same slot 0..N buffers as
+        // the captured pass — addresses match.
+        super::output_pool::OutputPool::global().reset_cursors();
         let warmup_output = capture_fn(&input_ids)
             .map_err(|e| CudaGraphRunnerError::WarmupFailed(format!("Warmup forward: {e}")))?;
 
