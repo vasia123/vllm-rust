@@ -38,8 +38,9 @@ pub mod naive;
 mod ops;
 
 pub use block::{
-    build_decode_batch_shared, sliding_window_mask, soft_cap, AttentionBias, AttentionBlock,
-    AttentionConfig, DecodeBatchShared, ProjNames, QkNormVariant,
+    build_decode_batch_shared, build_decode_batch_shared_with_options, sliding_window_mask,
+    soft_cap, AttentionBias, AttentionBlock, AttentionConfig, DecodeBatchShared, ProjNames,
+    QkNormVariant,
 };
 
 // Re-export public types

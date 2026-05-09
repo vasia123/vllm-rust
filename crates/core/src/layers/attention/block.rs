@@ -148,6 +148,16 @@ pub struct DecodeBatchShared {
     pub decode_plan: std::sync::Arc<
         std::sync::OnceLock<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
     >,
+    /// Should the attention layer route through pool-backed
+    /// `paged_attention_v2_cuda_pooled` (worst-case sized,
+    /// CUDA-Graph-friendly) instead of `paged_attention_auto` (sized to
+    /// actual `max_seq_len`)? `true` only when capture is engaged for
+    /// this forward — eager / no-runner builds keep `paged_attention_auto`
+    /// because the pooled path's worst-case partition count is up to
+    /// 3× more work per kernel call (Phase D.3). The Phase B.8 fixes
+    /// (positions_device, slot_mapping_device, write_batch_with_slot_tensor)
+    /// remain unconditional perf wins and are not gated by this flag.
+    pub prefer_pooled_attention: bool,
 }
 
 /// Build the per-forward shared decode state on `device`.
@@ -159,6 +169,23 @@ pub struct DecodeBatchShared {
 pub fn build_decode_batch_shared(
     sequences: &[DecodeSequenceMetadata],
     device: &Device,
+) -> Result<DecodeBatchShared> {
+    build_decode_batch_shared_with_options(sequences, device, false)
+}
+
+/// Same as [`build_decode_batch_shared`], but lets the caller signal
+/// that this forward is capture-eligible (warmup pass or replay
+/// dispatch from `helpers::execute_batched_decode_with_graph`). When
+/// `prefer_pooled_attention=true`, attention layers route through the
+/// pool-backed worst-case-sized `paged_attention_v2_cuda_pooled` for
+/// stable device addresses across replays. When `false` (pure eager /
+/// no graph_runner attached), attention falls back to
+/// `paged_attention_auto` whose actual-max_seq_len partition sizing
+/// is significantly faster for short generations (Phase D.3).
+pub fn build_decode_batch_shared_with_options(
+    sequences: &[DecodeSequenceMetadata],
+    device: &Device,
+    prefer_pooled_attention: bool,
 ) -> Result<DecodeBatchShared> {
     use crate::engine::output_pool::OutputPool;
 
@@ -290,6 +317,7 @@ pub fn build_decode_batch_shared(
         max_blocks_per_seq,
         max_seq_len,
         decode_plan: std::sync::Arc::new(std::sync::OnceLock::new()),
+        prefer_pooled_attention,
     })
 }
 
@@ -1213,31 +1241,49 @@ impl AttentionBlock {
         };
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        // V2 paged_attention via the pooled wrapper. Worst-case sizing for
-        // the scratch buffers (`tmp_out`, `exp_sums`, `max_logits`, output)
-        // so device addresses stay stable across forwards — required for
-        // CUDA Graph capture replay. Worst-case bound comes from the
-        // engine-wide `--max-model-len` (Phase D.1).
-        let worst = crate::engine::engine_limits::max_model_len()
-            .unwrap_or(1024)
-            .max(max_seq_len);
-        let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
-        let attn_output = crate::cuda_kernels::paged_attention_v2_cuda_pooled(
-            &q,
-            cache_engine.k_cache(),
-            cache_engine.v_cache(),
-            &block_tables,
-            &seq_lens,
-            scale,
-            self.num_heads,
-            self.num_kv_heads,
-            max_blocks_per_seq,
-            max_seq_len,
-            worst,
-            self.head_dim,
-            cache_engine.block_size(),
-            partition_size,
-        )?;
+        // Phase D.3: pooled V2 only when capture is engaged for this
+        // forward; eager paths route through `paged_attention_auto`
+        // whose actual-max_seq_len partition sizing is significantly
+        // faster for short generations (worst-case sizing iterates over
+        // ~3× more empty partitions).
+        let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
+        let attn_output = if prefer_pool {
+            let worst = crate::engine::engine_limits::max_model_len()
+                .unwrap_or(1024)
+                .max(max_seq_len);
+            let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
+            crate::cuda_kernels::paged_attention_v2_cuda_pooled(
+                &q,
+                cache_engine.k_cache(),
+                cache_engine.v_cache(),
+                &block_tables,
+                &seq_lens,
+                scale,
+                self.num_heads,
+                self.num_kv_heads,
+                max_blocks_per_seq,
+                max_seq_len,
+                worst,
+                self.head_dim,
+                cache_engine.block_size(),
+                partition_size,
+            )?
+        } else {
+            crate::cuda_kernels::paged_attention_auto(
+                &q,
+                cache_engine.k_cache(),
+                cache_engine.v_cache(),
+                &block_tables,
+                &seq_lens,
+                scale,
+                self.num_heads,
+                self.num_kv_heads,
+                max_blocks_per_seq,
+                max_seq_len,
+                self.head_dim,
+                cache_engine.block_size(),
+            )?
+        };
 
         // [batch, hidden] → [batch, 1, hidden] to match residual shape.
         self.o_proj.forward(&attn_output, tp_ctx)?.unsqueeze(1)

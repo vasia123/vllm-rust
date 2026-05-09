@@ -811,39 +811,52 @@ impl QuantizedQwen3Attention {
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-            // Phase B.8: route through the pool-backed V2 path on decode.
-            // `paged_attention_auto` allocates output + tmp_out + exp_sums +
-            // max_logits internally per call (fresh device addresses each
-            // forward); captured CUDA graph requires stable addresses.
-            //
-            // Worst-case sizing comes from the engine-wide `--max-model-len`
-            // (Phase D.1: see `engine::engine_limits`). Falls back to 1024
-            // for crates that use vllm-core without setting the limit
-            // (tests, benches). The .max() floor handles ad-hoc callers
-            // that exceed the registered limit; capture is gated to ≤ this
-            // bound and replay correctness is only guaranteed when actual
-            // seq_len ≤ worst.
-            let worst = crate::engine::engine_limits::max_model_len()
-                .unwrap_or(1024)
-                .max(max_seq_len);
-            let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
+            // Phase D.3: pool-backed V2 only when capture is engaged for
+            // this forward; eager paths route through `paged_attention_auto`
+            // (sized to actual max_seq_len, not the engine-wide
+            // `--max-model-len` worst case). Worst-case sizing iterates
+            // over ~3× more empty partitions for short decode positions —
+            // a 5-10× per-call slowdown at c=8 with prompt=256, observed
+            // empirically in the eager-bench head-to-head.
+            let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
             let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
-                crate::cuda_kernels::paged_attention_v2_cuda_pooled(
-                    &q,
-                    cache_engine.k_cache(),
-                    cache_engine.v_cache(),
-                    &block_tables,
-                    &seq_lens,
-                    scale,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    max_blocks_per_seq,
-                    max_seq_len,
-                    worst,
-                    self.head_dim,
-                    cache_engine.block_size(),
-                    partition_size,
-                )
+                if prefer_pool {
+                    let worst = crate::engine::engine_limits::max_model_len()
+                        .unwrap_or(1024)
+                        .max(max_seq_len);
+                    let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
+                    crate::cuda_kernels::paged_attention_v2_cuda_pooled(
+                        &q,
+                        cache_engine.k_cache(),
+                        cache_engine.v_cache(),
+                        &block_tables,
+                        &seq_lens,
+                        scale,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        max_blocks_per_seq,
+                        max_seq_len,
+                        worst,
+                        self.head_dim,
+                        cache_engine.block_size(),
+                        partition_size,
+                    )
+                } else {
+                    crate::cuda_kernels::paged_attention_auto(
+                        &q,
+                        cache_engine.k_cache(),
+                        cache_engine.v_cache(),
+                        &block_tables,
+                        &seq_lens,
+                        scale,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        max_blocks_per_seq,
+                        max_seq_len,
+                        self.head_dim,
+                        cache_engine.block_size(),
+                    )
+                }
             })?;
 
             decode_profile::time(dev, &decode_profile::O_PROJ_NS, || {

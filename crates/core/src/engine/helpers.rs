@@ -1015,7 +1015,19 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         // route through `forward_decode_batch_with_ctx` and propagate
         // `ctx.decode_shared` to their attention layers will reuse this
         // bundle 36× per Qwen3 token instead of rebuilding it per layer.
-        match crate::layers::attention::build_decode_batch_shared(&sequences, model.device()) {
+        // Phase D.3: signal pool-backed attention only when capture is
+        // engaged. With a graph_runner attached, replay reads from
+        // pool-backed device pointers and the worst-case partition
+        // sizing is required for shape stability. Without a runner
+        // (pure eager mode), `paged_attention_auto` with actual
+        // max_seq_len partitioning is significantly faster — pool
+        // sizing iterates over up to 3× more empty partitions per call.
+        let prefer_pooled = graph_runner.is_some();
+        match crate::layers::attention::build_decode_batch_shared_with_options(
+            &sequences,
+            model.device(),
+            prefer_pooled,
+        ) {
             Ok(shared) => {
                 forward_ctx = forward_ctx.with_decode_shared(std::sync::Arc::new(shared));
             }

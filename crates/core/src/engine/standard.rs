@@ -240,8 +240,12 @@ impl<M: ModelForward> StandardExecution<M> {
         // this, captured graphs encode addresses for non-pooled (fresh
         // per-call) tensors and replays dereference stale pointers.
         let device = self.model.device().clone();
-        let shared = match crate::layers::attention::build_decode_batch_shared(&sequences, &device)
-        {
+        // Phase D.3: capture warmup always wants pool-backed attention
+        // — replay reads from the captured pool addresses, so the
+        // worst-case-sized buffers are mandatory.
+        let shared = match crate::layers::attention::build_decode_batch_shared_with_options(
+            &sequences, &device, true,
+        ) {
             Ok(s) => Some(std::sync::Arc::new(s)),
             Err(e) => {
                 tracing::warn!(
