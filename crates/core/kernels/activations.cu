@@ -94,6 +94,33 @@ extern "C" __global__ void silu_and_mul_bf16(
     }
 }
 
+// SiLU+Mul gated activation with SEPARATE gate/up tensors (not packed).
+// Hot-path callers like `QuantizedSwiGluMlp` compute gate and up from
+// independent gate_proj/up_proj GEMVs, so the standard `silu_and_mul_bf16`
+// (which expects packed [N, 2*d] input) requires a redundant cat or copy.
+// This variant takes gate and up as separate strided pointers, eliminating
+// the materialisation and producing exactly the same scalar result as
+// `silu(gate) * up` op-by-op.
+//
+// Layout: gate, up, out are all `[num_tokens, d]`, contiguous, same dtype.
+extern "C" __global__ void silu_and_mul_separate_bf16(
+    __nv_bfloat16* __restrict__ out,           // [num_tokens, d]
+    const __nv_bfloat16* __restrict__ gate,    // [num_tokens, d]
+    const __nv_bfloat16* __restrict__ up,      // [num_tokens, d]
+    const int d
+) {
+    const int token_idx = blockIdx.x;
+    const __nv_bfloat16* gate_ptr = gate + token_idx * d;
+    const __nv_bfloat16* up_ptr = up + token_idx * d;
+    __nv_bfloat16* out_ptr = out + token_idx * d;
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float g = __bfloat162float(gate_ptr[i]);
+        float u = __bfloat162float(up_ptr[i]);
+        out_ptr[i] = __float2bfloat16(silu(g) * u);
+    }
+}
+
 // ==========================================================================
 // FP16 variants of gated activations
 // ==========================================================================

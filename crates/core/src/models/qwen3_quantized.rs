@@ -519,6 +519,21 @@ impl QuantizedSwiGluMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
+
+        // Pool-backed silu(gate) * up — replaces 2-allocation candle path
+        // (`silu(&gate)? * up` materialises both the silu intermediate and
+        // the multiplication output) with a single stable-address receiver
+        // from the global OutputPool. Decode-only fast path; prefill and
+        // non-BF16 dtypes fall through to the candle fallback inside the
+        // wrapper.
+        #[cfg(feature = "cuda-fused-activations")]
+        {
+            if gate.device().is_cuda() {
+                let activated = crate::cuda_kernels::silu_and_mul_separate_pooled(&gate, &up)?;
+                return self.down_proj.forward(&activated);
+            }
+        }
+
         let activated = candle_nn::ops::silu(&gate)? * up;
         self.down_proj.forward(&activated?)
     }

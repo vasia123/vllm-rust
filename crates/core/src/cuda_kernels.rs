@@ -1548,6 +1548,141 @@ pub fn fused_swiglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     gate.apply_op2_no_bwd(&up, &FusedSwiGluOp)
 }
 
+/// In-place sibling for the pooled SiLU+Mul fast path on **separate**
+/// gate/up tensors (not packed). Receiver = pre-allocated output
+/// buffer; `up` is read via the struct ref. Uses kernel
+/// `silu_and_mul_separate_bf16`.
+///
+/// Migration target for `QuantizedSwiGluMlp::forward`, which today
+/// does `candle_nn::ops::silu(&gate)? * up` (two ad-hoc allocations:
+/// silu intermediate + multiplication output) — a 6.3 MB-per-forward
+/// hot-path slot. Pool replaces both with one stable-address receiver
+/// buffer.
+#[cfg(feature = "cuda-fused-activations")]
+struct SiluAndMulSeparateInplaceOp<'a> {
+    up: &'a Tensor,
+}
+
+#[cfg(feature = "cuda-fused-activations")]
+impl<'a> InplaceOp2 for SiluAndMulSeparateInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "silu_and_mul_separate_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("silu_and_mul_separate_inplace requires CUDA")
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        gate_storage: &CudaStorage,
+        gate_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &gate_storage.device;
+        let dims = gate_layout.shape().dims();
+        if dims.is_empty() {
+            candle_core::bail!("silu_and_mul_separate_inplace: gate must have ≥ 1 dim");
+        }
+        let d = dims[dims.len() - 1];
+        let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+        if num_tokens == 0 {
+            return Ok(());
+        }
+
+        let (up_storage, _up_layout) = self.up.storage_and_layout();
+        let up_storage = match &*up_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("silu_and_mul_separate_inplace: up must be on CUDA"),
+        };
+
+        let block_size = std::cmp::min(d, 1024) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let d_i32 = d as i32;
+
+        match (
+            &mut out_storage.slice,
+            &gate_storage.slice,
+            &up_storage.slice,
+        ) {
+            (
+                CudaStorageSlice::BF16(out_slice),
+                CudaStorageSlice::BF16(gate_slice),
+                CudaStorageSlice::BF16(up_slice),
+            ) => {
+                let func = dev.get_or_load_custom_func(
+                    "silu_and_mul_separate_bf16",
+                    "activations",
+                    ACTIVATIONS_PTX,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(gate_slice);
+                builder.arg(up_slice);
+                builder.arg(&d_i32);
+                // SAFETY: kernel writes every output element; receiver is
+                // exclusively held via &mut out_storage.
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("silu_and_mul_separate_inplace launch: {e}"))
+                })?;
+            }
+            _ => candle_core::bail!(
+                "silu_and_mul_separate_inplace: only bf16 supported (out/gate/up dtype mismatch)"
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Pool-backed `silu(gate) * up` for the decode hot path. Reserves
+/// the output from [`OutputPool`] so device addresses stay stable
+/// across forwards. Decode-only gate (num_tokens ≤ 64) — prefill
+/// falls through to the candle `silu()? * up` path (broadcast_mul).
+#[cfg(feature = "cuda-fused-activations")]
+pub fn silu_and_mul_separate_pooled(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Decode-shape budget; matches the other pool wrappers.
+    const POOL_MAX_NUM_TOKENS: usize = 64;
+
+    if gate.shape() != up.shape() {
+        candle_core::bail!(
+            "silu_and_mul_separate_pooled: gate {:?} and up {:?} shape mismatch",
+            gate.shape(),
+            up.shape()
+        );
+    }
+    if gate.dtype() != candle_core::DType::BF16 {
+        // Fallback for non-bf16 dtypes — kernel only has bf16 variant.
+        let activated = candle_nn::ops::silu(gate)?;
+        return activated.broadcast_mul(up);
+    }
+
+    let gate = gate.contiguous()?;
+    let up = up.contiguous()?;
+    let dims = gate.dims();
+    let num_tokens: usize = dims[..dims.len().saturating_sub(1)].iter().product();
+    if num_tokens > POOL_MAX_NUM_TOKENS {
+        let activated = candle_nn::ops::silu(&gate)?;
+        return activated.broadcast_mul(&up);
+    }
+
+    let shape: Vec<usize> = dims.to_vec();
+    let dtype = gate.dtype();
+    let output = OutputPool::global().reserve(&shape, dtype, gate.device())?;
+    let op = SiluAndMulSeparateInplaceOp { up: &up };
+    output.inplace_op2(&gate, &op)?;
+    Ok(output)
+}
+
 /// Check if fused SwiGLU CUDA kernel is available.
 ///
 /// Returns true if:
