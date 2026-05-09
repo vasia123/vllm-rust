@@ -418,6 +418,33 @@ impl RotaryEmbedding {
         k: &Tensor,
         positions: &[usize],
     ) -> Result<(Tensor, Tensor)> {
+        self.apply_varlen_inner(q, k, positions, None)
+    }
+
+    /// Same as [`apply_varlen`], but with a pre-built device positions
+    /// tensor. The caller is responsible for ensuring `pos_tensor` is
+    /// `[total_tokens]` U32 on the same device as `q/k`.
+    ///
+    /// Used by the captured-graph decode hot path to avoid the per-layer
+    /// `Tensor::from_vec(positions)` whose fresh device address breaks
+    /// CUDA Graph replay (Phase B.8).
+    pub fn apply_varlen_with_pos_tensor(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &[usize],
+        pos_tensor: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        self.apply_varlen_inner(q, k, positions, Some(pos_tensor))
+    }
+
+    fn apply_varlen_inner(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &[usize],
+        pos_tensor_pre: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         let total_tokens = positions.len();
 
         // CUDA fast path: fused kernel for bf16 neox-style (most common LLM case)
@@ -431,16 +458,24 @@ impl RotaryEmbedding {
 
             let cos_sin_cache = self.get_or_build_cos_sin_cache()?;
 
-            let pos_tensor = Tensor::from_vec(
-                positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
-                (total_tokens,),
-                q.device(),
-            )?;
+            // Prefer the pre-built pool-backed pos_tensor when provided;
+            // otherwise materialise a fresh device tensor (eager / non-
+            // captured paths).
+            let owned: Option<Tensor> = if pos_tensor_pre.is_some() {
+                None
+            } else {
+                Some(Tensor::from_vec(
+                    positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
+                    (total_tokens,),
+                    q.device(),
+                )?)
+            };
+            let pos_ref = pos_tensor_pre.unwrap_or_else(|| owned.as_ref().unwrap());
 
             return crate::cuda_kernels::rotary_embedding_cuda_pooled(
                 q,
                 k,
-                &pos_tensor,
+                pos_ref,
                 &cos_sin_cache,
                 self.rotary_dim,
                 self.head_dim,
@@ -450,6 +485,11 @@ impl RotaryEmbedding {
             );
         }
 
+        // The slow path doesn't benefit from a pre-built device tensor
+        // (it indexes cos/sin via host positions through index_select on
+        // a freshly-uploaded scalar tensor); accept the param for API
+        // uniformity but don't use it here.
+        let _ = pos_tensor_pre;
         let pos_tensor = Tensor::from_vec(
             positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
             (total_tokens,),

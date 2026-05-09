@@ -122,6 +122,19 @@ pub struct DecodeBatchShared {
     pub block_tables: Tensor,
     /// `[batch_size]` U32 sequence lengths (current decode position + 1).
     pub seq_lens: Tensor,
+    /// `[total_tokens]` U32 query positions on device — pool-backed so
+    /// the address is stable across forwards. Required for CUDA Graph
+    /// capture: the per-layer RoPE kernel reads `positions` from the
+    /// captured pointer, so this tensor must outlive the captured graph
+    /// and live at a stable address. `None` means the shared bundle was
+    /// built on a non-CUDA device or batch exceeds the pool budget;
+    /// callers fall back to `Tensor::from_vec` per layer.
+    pub positions_device: Option<Tensor>,
+    /// `[total_tokens]` U32 slot indices on device — pool-backed, same
+    /// rationale as `positions_device`. Used by `cache_engine.write_batch`
+    /// to skip the per-layer `Tensor::from_vec(slot_mapping)` (whose
+    /// fresh device address breaks captured `cuda_memcpy_inplace`).
+    pub slot_mapping_device: Option<Tensor>,
     /// Padding extent of `block_tables` along axis 1.
     pub max_blocks_per_seq: usize,
     /// `max(seq_lens)` — used as the kernel's upper bound.
@@ -190,6 +203,37 @@ pub fn build_decode_batch_shared(
         && batch_size <= POOL_MAX_BATCH_SIZE
         && actual_max_blocks_per_seq <= WORST_CASE_MAX_BLOCKS_PER_SEQ;
 
+    // Pool-backed positions and slot_mapping device tensors. These are
+    // read inside the captured forward by RoPE and reshape_and_cache
+    // respectively; allocating them per-call via `Tensor::from_vec`
+    // produces a fresh device address each forward, which captured
+    // kernels dereference as a stale pointer (Phase B.8 root cause).
+    let (positions_device, slot_mapping_device) = if device.is_cuda()
+        && batch_size <= POOL_MAX_BATCH_SIZE
+    {
+        let total_tokens = positions.len();
+        let pos_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let pos_src = Tensor::from_vec(pos_data, (total_tokens,), device)?;
+        let pos_dst =
+            OutputPool::global().reserve(&[total_tokens], candle_core::DType::U32, device)?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&pos_dst, &pos_src).map_err(|e| {
+            candle_core::Error::Msg(format!("build_decode_batch_shared: positions copy: {e}"))
+        })?;
+
+        let slot_total = all_slot_mapping.len();
+        let slot_data: Vec<u32> = all_slot_mapping.iter().map(|&s| s as u32).collect();
+        let slot_src = Tensor::from_vec(slot_data, (slot_total,), device)?;
+        let slot_dst =
+            OutputPool::global().reserve(&[slot_total], candle_core::DType::U32, device)?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&slot_dst, &slot_src).map_err(
+            |e| candle_core::Error::Msg(format!("build_decode_batch_shared: slot copy: {e}")),
+        )?;
+
+        (Some(pos_dst), Some(slot_dst))
+    } else {
+        (None, None)
+    };
+
     let (block_tables, seq_lens, max_blocks_per_seq) = if use_pool {
         // Pool path: reserve fixed-stride buffers, write current data via
         // memcpy from an ephemeral source tensor. The pool buffers retain
@@ -237,6 +281,8 @@ pub fn build_decode_batch_shared(
         all_slot_mapping: std::sync::Arc::new(all_slot_mapping),
         block_tables,
         seq_lens,
+        positions_device,
+        slot_mapping_device,
         max_blocks_per_seq,
         max_seq_len,
         decode_plan: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1014,7 +1060,17 @@ impl AttentionBlock {
         let (q, k) = if self.bypass_rope {
             (q, k)
         } else {
-            self.rotary_emb.apply_varlen(&q, &k, positions)?
+            // Prefer the pre-built pool-backed positions tensor from the
+            // shared bundle when available — captured CUDA graph requires
+            // the device pointer for `positions` to be stable across
+            // forwards (Phase B.8). Falls back to per-call `Tensor::from_vec`
+            // on the eager / non-pooled path.
+            match shared.and_then(|s| s.positions_device.as_ref()) {
+                Some(pos_t) => self
+                    .rotary_emb
+                    .apply_varlen_with_pos_tensor(&q, &k, positions, pos_t)?,
+                None => self.rotary_emb.apply_varlen(&q, &k, positions)?,
+            }
         };
 
         // KV write — slot_mapping is also constant across layers; reuse.
@@ -1094,9 +1150,21 @@ impl AttentionBlock {
             }
         }
 
-        cache_engine
-            .write_batch(&k, &v, all_slot_mapping)
-            .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+        // Prefer pool-backed slot_mapping device tensor from shared (Phase
+        // B.8): without it, `write_batch` calls `Tensor::from_vec` per layer,
+        // creating a fresh device address each call. Captured graph holds
+        // the warmup-time pointer, replay reads stale memory → ILLEGAL_ADDRESS.
+        match shared.and_then(|s| s.slot_mapping_device.as_ref()) {
+            #[cfg(feature = "cuda-kernels")]
+            Some(slot_t) => cache_engine
+                .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t)
+                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?,
+            #[cfg(not(feature = "cuda-kernels"))]
+            Some(_) => unreachable!("slot_mapping_device requires cuda-kernels feature"),
+            None => cache_engine
+                .write_batch(&k, &v, all_slot_mapping)
+                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?,
+        }
 
         // block_tables / seq_lens — same shape and contents for every
         // attention layer of one forward, so the GPU upload happens once

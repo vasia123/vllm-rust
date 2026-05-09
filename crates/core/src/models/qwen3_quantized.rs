@@ -731,8 +731,18 @@ impl QuantizedQwen3Attention {
                     &positions_owned
                 }
             };
+            // Phase B.8: prefer pool-backed positions tensor from shared so
+            // captured CUDA graph reads from a stable device address. Without
+            // it, `apply_varlen` builds a fresh `Tensor::from_vec(positions)`
+            // each layer; that pointer is dropped after the warmup capture
+            // and replays read freed memory → ILLEGAL_ADDRESS on forward 2+.
             let (q, k) = decode_profile::time(dev, &decode_profile::ROPE_NS, || {
-                self.rotary_emb.apply_varlen(&q, &k, positions)
+                match shared.and_then(|s| s.positions_device.as_ref()) {
+                    Some(pos_t) => self
+                        .rotary_emb
+                        .apply_varlen_with_pos_tensor(&q, &k, positions, pos_t),
+                    None => self.rotary_emb.apply_varlen(&q, &k, positions),
+                }
             })?;
 
             let slot_mapping_owned: Vec<usize>;
@@ -746,10 +756,19 @@ impl QuantizedQwen3Attention {
                     &slot_mapping_owned
                 }
             };
+            // Phase B.8: same rationale — use the pool-backed slot tensor
+            // from shared; the host-vec path internally allocates a fresh
+            // device tensor each layer (36×) and breaks captured graph
+            // replay.
             decode_profile::time(dev, &decode_profile::CACHE_WRITE_NS, || {
-                cache_engine
-                    .write_batch(&k, &v, all_slot_mapping)
-                    .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))
+                match shared.and_then(|s| s.slot_mapping_device.as_ref()) {
+                    Some(slot_t) => cache_engine
+                        .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t)
+                        .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}"))),
+                    None => cache_engine
+                        .write_batch(&k, &v, all_slot_mapping)
+                        .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}"))),
+                }
             })?;
 
             let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len): (
@@ -792,8 +811,18 @@ impl QuantizedQwen3Attention {
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
 
+            // Phase B.8: route through the pool-backed V2 path on decode.
+            // `paged_attention_auto` allocates output + tmp_out + exp_sums +
+            // max_logits internally per call (fresh device addresses each
+            // forward); captured CUDA graph requires stable addresses.
+            // Worst-case `max_seq_len` matches the engine's `--max-model-len`
+            // (1024 for Qwen3-4B-AWQ default); partition_size derived from
+            // worst-case bound so pool buffer dims stay constant per shape.
+            const WORST_CASE_MAX_SEQ_LEN: usize = 1024;
+            let worst = WORST_CASE_MAX_SEQ_LEN.max(max_seq_len);
+            let partition_size = crate::cuda_kernels::select_v2_partition_size(max_seq_len);
             let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
-                crate::cuda_kernels::paged_attention_auto(
+                crate::cuda_kernels::paged_attention_v2_cuda_pooled(
                     &q,
                     cache_engine.k_cache(),
                     cache_engine.v_cache(),
@@ -804,8 +833,10 @@ impl QuantizedQwen3Attention {
                     self.num_kv_heads,
                     max_blocks_per_seq,
                     max_seq_len,
+                    worst,
                     self.head_dim,
                     cache_engine.block_size(),
+                    partition_size,
                 )
             })?;
 

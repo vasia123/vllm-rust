@@ -194,6 +194,35 @@ impl CacheEngine {
         self.scatter_into_cache_candle(k_src, v_src, slot_mapping)
     }
 
+    /// CUDA scatter using a pre-built U32 device slot tensor. Skips the
+    /// per-call `Tensor::from_vec` whose fresh device address breaks
+    /// CUDA Graph replay (Phase B.8).
+    #[cfg(feature = "cuda-kernels")]
+    fn scatter_into_cache_cuda_with_slot_tensor(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        slot_tensor: &Tensor,
+    ) -> Result<(), CacheError> {
+        use crate::cuda_kernels::{reshape_and_cache_cuda, CudaCacheLayout};
+        let cuda_layout = match self.layout {
+            KVCacheLayout::NHD => CudaCacheLayout::NHD,
+            KVCacheLayout::HND => CudaCacheLayout::HND,
+        };
+        reshape_and_cache_cuda(
+            &k_src.contiguous()?,
+            &v_src.contiguous()?,
+            &self.k_cache,
+            &self.v_cache,
+            slot_tensor,
+            self.num_kv_heads,
+            self.head_dim,
+            self.block_size,
+            cuda_layout,
+        )?;
+        Ok(())
+    }
+
     /// CUDA kernel fast path for scatter.
     #[cfg(feature = "cuda-kernels")]
     fn scatter_into_cache_cuda(
@@ -468,6 +497,40 @@ impl CacheEngine {
             self.quantize_write_data(&k_contiguous, &v_contiguous, k, v, new_tokens)?;
 
         self.scatter_into_cache(&k_src, &v_src, slot_mapping)?;
+
+        Ok(())
+    }
+
+    /// Variant of [`write_batch`] that consumes a pre-built U32 device
+    /// `slot_tensor` instead of a host slice. Required by the captured-
+    /// graph decode hot path so the kernel reads from a stable device
+    /// pointer (the host-slice path internally allocates a fresh
+    /// `Tensor::from_vec` per layer, whose address shifts each forward
+    /// and breaks CUDA Graph replay — Phase B.8).
+    ///
+    /// `slot_tensor`: `[new_tokens]` U32 on the same device as the cache.
+    /// `slot_mapping`: same data, host-side. Used only for non-CUDA
+    /// fallback (CPU / quantized scatter path) and length validation.
+    #[cfg(feature = "cuda-kernels")]
+    pub fn write_batch_with_slot_tensor(
+        &mut self,
+        k: &Tensor,
+        v: &Tensor,
+        slot_mapping: &[usize],
+        slot_tensor: &Tensor,
+    ) -> Result<(), CacheError> {
+        let new_tokens = slot_mapping.len();
+        let k_contiguous = k.contiguous()?;
+        let v_contiguous = v.contiguous()?;
+
+        let (k_src, v_src) =
+            self.quantize_write_data(&k_contiguous, &v_contiguous, k, v, new_tokens)?;
+
+        if self.k_cache.device().is_cuda() && !self.is_quantized() {
+            self.scatter_into_cache_cuda_with_slot_tensor(&k_src, &v_src, slot_tensor)?;
+        } else {
+            self.scatter_into_cache_candle(&k_src, &v_src, slot_mapping)?;
+        }
 
         Ok(())
     }
