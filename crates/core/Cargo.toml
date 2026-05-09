@@ -130,3 +130,8 @@ required-features = ["cuda-kernels", "marlin"]
 name = "lm_head_matmul_bench"
 harness = false
 required-features = ["cuda"]
+
+[[bench]]
+name = "flashinfer_decode_bench"
+harness = false
+required-features = ["cuda-kernels", "flashinfer"]

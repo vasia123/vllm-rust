@@ -126,6 +126,15 @@ pub struct DecodeBatchShared {
     pub max_blocks_per_seq: usize,
     /// `max(seq_lens)` — used as the kernel's upper bound.
     pub max_seq_len: usize,
+    /// Decode plan from the active `AttentionBackend`, lazily built on
+    /// the first attention layer's `cuda_decode_batch` call and
+    /// replayed across every subsequent layer of the same forward.
+    /// `Some(None)` means: build was attempted and the backend has no
+    /// plan abstraction (or the build failed) — caller falls through to
+    /// the per-layer `paged_attention_auto` path.
+    pub decode_plan: std::sync::Arc<
+        std::sync::OnceLock<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
+    >,
 }
 
 /// Build the per-forward shared decode state on `device`.
@@ -177,6 +186,7 @@ pub fn build_decode_batch_shared(
         seq_lens,
         max_blocks_per_seq,
         max_seq_len,
+        decode_plan: std::sync::Arc::new(std::sync::OnceLock::new()),
     })
 }
 
@@ -966,6 +976,71 @@ impl AttentionBlock {
                 &slot_mapping_owned
             }
         };
+
+        // Direction A (2026-05-09): env-gated FlashInfer decode path.
+        // Microbench (`flashinfer_decode_bench`) shows FI replay 2-2.9× faster
+        // than paged_attention V2 on Qwen3-4B-AWQ shape; plan is built once
+        // per forward and amortised across all attention layers.
+        // Routes through `AttentionBackend::batched_decode_attention_with_plan`
+        // which does its own `cache_engine.write_batch` — so we MUST return
+        // before the V2 path's write_batch below to avoid a double-write.
+        #[cfg(feature = "flashinfer")]
+        if std::env::var("VLLM_FLASHINFER_DECODE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            if let Some(s) = shared {
+                let kv_lengths_owned: Vec<usize> =
+                    sequences.iter().map(|sq| sq.seqlen_offset + 1).collect();
+                let block_ids_owned: Vec<&[crate::kv_cache::BlockId]> =
+                    sequences.iter().map(|sq| sq.block_ids.as_slice()).collect();
+                let metadata = super::backend::BatchedDecodeMetadata {
+                    seq_block_ids: &block_ids_owned,
+                    all_slot_mapping,
+                    kv_lengths: &kv_lengths_owned,
+                };
+                let plan_slot = s.decode_plan.clone();
+                let backend = super::backend::select_backend();
+                let plan_opt = plan_slot.get_or_init(|| {
+                    match backend.prepare_decode_plan(
+                        cache_engine,
+                        &metadata,
+                        q.dtype(),
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "FlashInfer prepare_decode_plan failed; falling back to V2 path"
+                            );
+                            None
+                        }
+                    }
+                });
+                if let Some(plan_arc) = plan_opt.as_ref() {
+                    // Trait method does write_batch + replay internally.
+                    let attn_2d = backend.batched_decode_attention_with_plan(
+                        &q,
+                        &k,
+                        &v,
+                        cache_engine,
+                        &metadata,
+                        Some(plan_arc.as_ref()),
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    )?;
+                    // attn_2d: [batch, num_heads * head_dim] — same shape that
+                    // paged_attention_auto produces, so o_proj forward is identical.
+                    return self.o_proj.forward(&attn_2d, tp_ctx)?.unsqueeze(1);
+                }
+                // plan==None: backend declined / build failed → fall through.
+            }
+        }
+
         cache_engine
             .write_batch(&k, &v, all_slot_mapping)
             .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
