@@ -965,13 +965,31 @@ impl QuantizedQwen3DecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             shared,
         )?;
+        // Pool-backed residual adds — captured-graph replay needs the
+        // residual sum's device address to be stable across forwards;
+        // candle's `Tensor::add` allocates fresh per call.
+        #[cfg(feature = "cuda-fused-activations")]
+        let xs = if xs.device().is_cuda() && xs.dtype() == DType::BF16 {
+            crate::cuda_kernels::bf16_add_pooled(&xs, residual)?
+        } else {
+            (xs + residual)?
+        };
+        #[cfg(not(feature = "cuda-fused-activations"))]
         let xs = (xs + residual)?;
+
         let residual = &xs;
         let normed = decode_profile::time(dev, &decode_profile::POST_NORM_NS, || {
             self.post_attention_layernorm.forward(&xs)
         })?;
         let xs = decode_profile::time(dev, &decode_profile::MLP_NS, || self.mlp.forward(&normed))?;
         decode_profile::maybe_dump();
+
+        #[cfg(feature = "cuda-fused-activations")]
+        {
+            if xs.device().is_cuda() && xs.dtype() == DType::BF16 {
+                return crate::cuda_kernels::bf16_add_pooled(residual, &xs);
+            }
+        }
         residual + xs
     }
 }

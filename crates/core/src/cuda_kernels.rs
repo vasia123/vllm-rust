@@ -2135,6 +2135,128 @@ impl<'a> InplaceOp2 for EmbeddingLookupInplaceOp<'a> {
     }
 }
 
+/// In-place sibling for the pool-backed BF16 element-wise add.
+/// Receiver = pre-allocated `[..., hidden]` BF16 output. The first
+/// addend (`a`) is passed via inplace_op2; the second (`b`) is held
+/// by the struct.
+#[cfg(feature = "cuda-fused-activations")]
+struct Bf16AddInplaceOp<'a> {
+    b: &'a Tensor,
+}
+
+#[cfg(feature = "cuda-fused-activations")]
+impl<'a> InplaceOp2 for Bf16AddInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "bf16_add_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("bf16_add_inplace requires CUDA")
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        a_storage: &CudaStorage,
+        a_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &a_storage.device;
+        let dims = a_layout.shape().dims();
+        if dims.is_empty() {
+            candle_core::bail!("bf16_add_inplace: input must have ≥ 1 dim");
+        }
+        let hidden_size = dims[dims.len() - 1];
+        let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+        let num_tokens = if num_tokens == 0 { 1 } else { num_tokens };
+
+        let (b_storage, _b_layout) = self.b.storage_and_layout();
+        let b_storage = match &*b_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("bf16_add_inplace: b must be on CUDA"),
+        };
+
+        let block_size = std::cmp::min(hidden_size, 1024) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hidden_i32 = hidden_size as i32;
+
+        match (&mut out_storage.slice, &a_storage.slice, &b_storage.slice) {
+            (
+                CudaStorageSlice::BF16(out_slice),
+                CudaStorageSlice::BF16(a_slice),
+                CudaStorageSlice::BF16(b_slice),
+            ) => {
+                let func =
+                    dev.get_or_load_custom_func("add_bf16", "activations", ACTIVATIONS_PTX)?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(a_slice);
+                builder.arg(b_slice);
+                builder.arg(&hidden_i32);
+                // SAFETY: kernel writes every output element; receiver held mutably.
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("bf16_add_inplace launch: {e}"))
+                })?;
+            }
+            _ => candle_core::bail!("bf16_add_inplace: only BF16 supported"),
+        }
+        Ok(())
+    }
+}
+
+/// Pool-backed element-wise BF16 add `c = a + b`. Reserves the
+/// output from [`OutputPool`] (decode-only gate, num_tokens ≤ 64) and
+/// runs the `add_bf16` kernel into the receiver. Falls back to
+/// candle's `Tensor::add` for prefill / non-BF16 / non-CUDA.
+///
+/// Migration target for the residual-add sites in the per-layer
+/// decoder: `(xs + residual)?` and `residual + xs`. Candle's `+`
+/// allocates a fresh output each call — 72 fresh allocations per
+/// Qwen3-4B decode forward, all of which leaked unstable device
+/// pointers into the captured CUDA graph.
+#[cfg(feature = "cuda-fused-activations")]
+pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Decode-shape budget; matches the other pool wrappers.
+    const POOL_MAX_NUM_TOKENS: usize = 64;
+
+    if a.dtype() != candle_core::DType::BF16 || b.dtype() != candle_core::DType::BF16 {
+        return (a + b)?.contiguous();
+    }
+    if !a.device().is_cuda() {
+        return (a + b)?.contiguous();
+    }
+    if a.shape() != b.shape() {
+        candle_core::bail!(
+            "bf16_add_pooled: shape mismatch {:?} vs {:?}",
+            a.shape(),
+            b.shape()
+        );
+    }
+
+    let a = a.contiguous()?;
+    let b_c = b.contiguous()?;
+    let dims = a.dims();
+    let num_tokens: usize = dims[..dims.len().saturating_sub(1)].iter().product();
+    if num_tokens > POOL_MAX_NUM_TOKENS {
+        return (&a + &b_c)?.contiguous();
+    }
+
+    let shape: Vec<usize> = dims.to_vec();
+    let output = OutputPool::global().reserve(&shape, candle_core::DType::BF16, a.device())?;
+    let op = Bf16AddInplaceOp { b: &b_c };
+    output.inplace_op2(&a, &op)?;
+    Ok(output)
+}
+
 /// In-place BF16 matmul `Y = X @ W^T` where X is `[m, k]`, W is
 /// `[n, k]`, Y is `[m, n]`. Receiver = output Y; primary "input" =
 /// X. Weight W is held by the struct.

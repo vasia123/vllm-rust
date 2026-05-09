@@ -94,6 +94,26 @@ extern "C" __global__ void silu_and_mul_bf16(
     }
 }
 
+// Element-wise add: out[i] = a[i] + b[i] for BF16 tensors.
+// One block per token; threads cooperate on the row-wise sum.
+extern "C" __global__ void add_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const int hidden_size
+) {
+    const int token_idx = blockIdx.x;
+    const __nv_bfloat16* a_ptr = a + token_idx * hidden_size;
+    const __nv_bfloat16* b_ptr = b + token_idx * hidden_size;
+    __nv_bfloat16* out_ptr = out + token_idx * hidden_size;
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float av = __bfloat162float(a_ptr[i]);
+        float bv = __bfloat162float(b_ptr[i]);
+        out_ptr[i] = __float2bfloat16(av + bv);
+    }
+}
+
 // Embedding lookup (gather): out[i, h] = weight[input_ids[i], h].
 // One block per token; threads cooperate on the row-wise copy.
 //
