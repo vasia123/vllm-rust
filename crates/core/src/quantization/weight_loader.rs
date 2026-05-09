@@ -157,15 +157,32 @@ struct LoadedUnquantizedLinear {
 
 impl QuantizedLinear for LoadedUnquantizedLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Handle 3D inputs by broadcasting weight to add batch dimension
-        let w = match x.dims().len() {
-            3 => self.weight.broadcast_left(x.dim(0)?)?,
-            _ => self.weight.clone(),
-        };
-        let y = x.matmul(&w.t()?)?;
-        match &self.bias {
-            Some(b) => y.broadcast_add(b),
-            None => Ok(y),
+        // 2026-05-09: for 3D `[B, S, H]` inputs, FLATTEN to 2D and do a
+        // single GEMM instead of `weight.broadcast_left(B) → batched
+        // matmul with stride_b=0`. cuBLAS picks a markedly better
+        // algorithm for the 2D path on small-M, large-N shapes (e.g.
+        // an unquantized lm_head). +32 % e2e at c=8 on Qwen3-4B-AWQ
+        // in side-by-side bench (118.8 → 157.1 tps); see
+        // `docs/perf/2026-05-09-lm-head-flatten-win.md`.
+        match x.dims().len() {
+            3 => {
+                let dims = x.dims();
+                let (b, s, h) = (dims[0], dims[1], dims[2]);
+                let x_flat = x.reshape((b * s, h))?;
+                let y_flat = x_flat.matmul(&self.weight.t()?)?;
+                let y = y_flat.reshape((b, s, self.out_features))?;
+                match &self.bias {
+                    Some(bias) => y.broadcast_add(bias),
+                    None => Ok(y),
+                }
+            }
+            _ => {
+                let y = x.matmul(&self.weight.t()?)?;
+                match &self.bias {
+                    Some(bias) => y.broadcast_add(bias),
+                    None => Ok(y),
+                }
+            }
         }
     }
 

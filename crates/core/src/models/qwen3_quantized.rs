@@ -1077,12 +1077,23 @@ struct TiedEmbeddingHead {
 
 impl QuantizedLinear for TiedEmbeddingHead {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Handle 3D inputs by broadcasting weight to add batch dimension
-        let w = match x.dims().len() {
-            3 => self.weight.broadcast_left(x.dim(0)?)?,
-            _ => self.weight.clone(),
-        };
-        x.matmul(&w.t()?)
+        // 2026-05-09: for 3D `[B, S, H]` inputs, flatten to 2D so the
+        // call lands on cuBLAS's plain GEMM `[B*S, H] @ [H, V]` instead
+        // of `weight.broadcast_left(B) → batched GEMM with stride_b=0`.
+        // The 2D path picks a markedly better algorithm for the tied
+        // lm_head shape (M=B, K=hidden, N=vocab); +32 % e2e at c=8 on
+        // Qwen3-4B-AWQ in side-by-side bench (118.8 → 157.1 tps).
+        match x.dims().len() {
+            3 => {
+                let dims = x.dims();
+                let (b, s, h) = (dims[0], dims[1], dims[2]);
+                let v = self.weight.dims()[0];
+                let x_flat = x.reshape((b * s, h))?;
+                let y_flat = x_flat.matmul(&self.weight.t()?)?;
+                y_flat.reshape((b, s, v))
+            }
+            _ => x.matmul(&self.weight.t()?),
+        }
     }
 
     fn load_weights(&mut self, _weights: &std::collections::HashMap<String, Tensor>) -> Result<()> {
