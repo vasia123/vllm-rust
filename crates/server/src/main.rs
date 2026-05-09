@@ -2070,38 +2070,49 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 ///
 /// Uses `Device::new_cuda_with_stream` (non-default non-blocking stream
 /// — the legacy default stream cannot be captured by
-/// `cuStreamBeginCapture_v2`). When `VLLM_DISABLE_EVENT_TRACKING=1`,
-/// also calls `disable_event_tracking()` so newly allocated tensors
+/// `cuStreamBeginCapture_v2`).
+///
+/// Calls `disable_event_tracking()` by default so newly allocated tensors
 /// don't carry per-slice `read`/`write` events. Without that, cudarc's
 /// auto-event-tracking inserts `cuStreamWaitEvent` cross-slice
 /// dependencies during capture which the driver rejects with
-/// `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` (905).
-///
-/// Cudarc 0.17.0 (PR #436) fixed the disable_event_tracking method to
-/// also stop wait()/record() on existing slices; we use 0.19.4 via
-/// candle 0.10.2. With Phase A's hot-path pool migrations
-/// (RMSNorm/RoPE/SiLU+Mul/PagedAttn V2/Marlin GEMV/FlashInfer)
-/// landed, the captured graph's recorded device pointers stay stable
-/// across replays.
+/// `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` (905). Cudarc 0.17.0 (PR #436)
+/// fixed `disable_event_tracking` to also stop wait/record on existing
+/// slices; we use 0.19.4 via candle 0.10.2.
 ///
 /// Safety: requires the engine to issue all device work serially on a
-/// single stream — true for the vllm-rust forward path. Async
-/// sampling (`VLLM_ASYNC_SAMPLING=1`) opens a second stream and is
-/// incompatible with this gate; runtime warning is logged.
+/// single stream — true for the vllm-rust forward path. Async sampling
+/// (`VLLM_ASYNC_SAMPLING=1`) opens a second stream and is incompatible
+/// with this default; in that case event tracking stays on (and CUDA
+/// Graph capture is automatically disabled by `--enforce-eager` or by
+/// runtime fallback). The opt-out `VLLM_ENABLE_EVENT_TRACKING=1` exists
+/// for diagnostics or any future code path that needs cross-stream
+/// safety guarantees from cudarc.
 fn create_cuda_device(ordinal: usize) -> candle_core::Result<Device> {
     let device = Device::new_cuda_with_stream(ordinal)?;
-    if std::env::var("VLLM_DISABLE_EVENT_TRACKING")
+
+    let async_sampling_on = std::env::var("VLLM_ASYNC_SAMPLING").is_ok();
+    let opt_out = std::env::var("VLLM_ENABLE_EVENT_TRACKING")
         .map(|v| v == "1")
-        .unwrap_or(false)
-    {
-        if let Device::Cuda(cuda) = &device {
-            // SAFETY: see doc-comment — engine forward is single-stream.
-            unsafe { cuda.disable_event_tracking() };
-            tracing::warn!(
-                "VLLM_DISABLE_EVENT_TRACKING=1 — cudarc event tracking disabled \
-                 (required for CUDA Graph capture; assumes single-stream forward)"
-            );
-        }
+        .unwrap_or(false);
+
+    if async_sampling_on {
+        tracing::info!(
+            "VLLM_ASYNC_SAMPLING=1 detected — keeping cudarc event tracking enabled \
+             (multi-stream cross-slice safety); CUDA Graph capture will be disabled"
+        );
+    } else if opt_out {
+        tracing::info!(
+            "VLLM_ENABLE_EVENT_TRACKING=1 — keeping cudarc event tracking enabled; \
+             CUDA Graph capture will be disabled"
+        );
+    } else if let Device::Cuda(cuda) = &device {
+        // SAFETY: see doc-comment — engine forward is single-stream.
+        unsafe { cuda.disable_event_tracking() };
+        tracing::debug!(
+            "cudarc event tracking disabled (default for single-stream forward; \
+             enables CUDA Graph capture)"
+        );
     }
     Ok(device)
 }
