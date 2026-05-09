@@ -595,35 +595,48 @@ impl MarlinLinear {
 
         let is_k_full = !self.config.desc_act || self.g_idx_sort_indices.is_none();
 
-        // NOTE — Stage 12 wired a pool-backed AWQ-INT4-ZP fast path here
-        // (`marlin_cuda::marlin_gemm_pooled`).  It was originally motivated
-        // as infrastructure for CUDA Graph capture, but Stage 13-A
-        // classified the capture failure as V3 (cudarc auto-event isolation)
-        // — a blocker the pool can't address.  In sustained-load testing
-        // the pool also introduced an OOM regression: prefill forwards have
-        // varying M (= prompt token count), so each new prompt length adds
-        // ~250 unique-shape buffer slots that never get reclaimed.  Bounded
-        // pool growth and `reset_cursors()` calls on every forward
-        // mitigated but did not eliminate the leak.  The Stage 12 bench
-        // also showed ≤ 1.5 tok/s gain (within run-to-run noise) on the
-        // eager hot path.  Until capture is unblocked or the pool gains a
-        // proper LRU/size cap, the dispatcher routes through the plain
-        // `marlin_gemm` allocator path; the pool implementation
-        // (`marlin_gemm_pooled`, `OutputPool`) stays in tree as dormant
-        // infrastructure for the future.
+        // 2026-05-09: re-enabled the pool-backed AWQ-INT4-ZP fast path
+        // (`marlin_cuda::marlin_gemm_pooled`) on the **decode hot path**
+        // only. The earlier Stage 12 attempt blew the pool up with
+        // per-prompt-length prefill shapes; the pooled wrapper now gates
+        // on `m ≤ POOL_MAX_M` (= 64) and falls through to the
+        // non-pooled `marlin_gemm` allocator path for prefill, so pool
+        // memory is bounded by decode-batch sizes only. This matches
+        // the same gate applied to every other Phase A pool migration
+        // (RMSNorm, RoPE, SiLU+Mul, PagedAttn V2). Necessary for CUDA
+        // Graph capture — a captured graph reads from fixed device
+        // pointers across replays.
+        //
+        // The pool path only handles AWQ INT4-ZP: scalar_type =
+        // `Uint4` AND qzeros has data AND no g_idx (the live decode
+        // hot path on Qwen3-AWQ). Other cases fall through to the
+        // legacy allocator path.
+        let qzeros_some = if self.qzeros.elem_count() > 0 {
+            Some(&self.qzeros)
+        } else {
+            None
+        };
+        let use_pool = matches!(self.config.scalar_type, MarlinScalarType::Uint4)
+            && qzeros_some.is_some()
+            && self.g_idx.is_none();
+
+        if use_pool {
+            return marlin_cuda::marlin_gemm_pooled(
+                x,
+                &self.qweight,
+                &self.scales,
+                &self.qzeros,
+                self.bias.as_ref(),
+                self.in_features,
+                self.out_features,
+            );
+        }
 
         marlin_cuda::marlin_gemm(
             x,
             &self.qweight,
             &self.scales,
-            // qzeros lives as a 0-element placeholder for symmetric (GPTQ)
-            // configs and only carries data for asymmetric (AWQ) ones — pass
-            // `Some(&tensor)` only when there's actual data behind it.
-            if self.qzeros.elem_count() > 0 {
-                Some(&self.qzeros)
-            } else {
-                None
-            },
+            qzeros_some,
             self.g_idx.as_ref(),
             self.g_idx_sort_indices.as_ref(),
             &self.workspace,

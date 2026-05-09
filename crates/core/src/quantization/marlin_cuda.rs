@@ -1661,6 +1661,13 @@ pub fn marlin_gemm_pooled(
     size_k: usize,
     size_n: usize,
 ) -> Result<Tensor> {
+    /// Decode-shape budget. M = num_tokens (= batch_size for decode);
+    /// prefill has M = prompt_len which varies per request and would
+    /// blow up the pool with hundreds of unique-shape buffers (the
+    /// regression that disabled this path historically — see
+    /// `marlin.rs::forward_marlin` Stage 12 note).
+    const POOL_MAX_M: usize = 64;
+
     let input = input.contiguous()?;
     let dims = input.dims();
     let (m, k) = match dims.len() {
@@ -1674,6 +1681,28 @@ pub fn marlin_gemm_pooled(
     if k != size_k {
         candle_core::bail!("marlin_gemm_pooled: input K ({k}) does not match size_k ({size_k})");
     }
+
+    if m > POOL_MAX_M {
+        // Prefill / oversized batch: fall through to non-pooled path
+        // (full marlin_gemm with internal alloc) to avoid pool memory
+        // bloat from per-prompt-length unique-shape buffers.
+        return marlin_gemm(
+            &input,
+            qweight,
+            scales,
+            Some(qzeros),
+            None,                                                            // g_idx
+            None,                                                            // g_idx_sort_indices
+            &Tensor::zeros((64,), candle_core::DType::U32, input.device())?, // unused workspace
+            bias,
+            super::marlin::MarlinScalarType::Uint4,
+            size_k,
+            size_n,
+            true, // is_k_full
+            false,
+        );
+    }
+
     let num_groups = scales.dims()[0];
 
     // Reserve the output buffer from the global pool.  The pool keeps
