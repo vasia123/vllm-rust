@@ -936,6 +936,23 @@ fn run_alloc_only_capture_probe_once(
     };
     use std::sync::Once;
 
+    // Phase D.2: this probe is diagnostic-only (used at Stage 13-A to
+    // classify capture failures as V1/V2/V3) and has a *side effect*:
+    // the in-capture `Tensor::zeros` records a `cuMemAllocAsync` that
+    // is never replayed, then the Tensor drops and emits a stranded
+    // `cuMemFreeAsync` that pollutes the stream mempool. The first
+    // `Tensor::zeros` AFTER the probe (which is the batch=32 capture
+    // attempt — biggest-first ordering) fails with INVALID_VALUE.
+    // Phase B.8 + Phase D.1 resolved the original capture failures, so
+    // the probe is only useful for forensic re-classification — gate it
+    // behind an explicit env var.
+    if std::env::var("VLLM_CAPTURE_ALLOC_PROBE")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
+        return;
+    }
+
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // Best-effort sync; ignore errors here — purely diagnostic.
