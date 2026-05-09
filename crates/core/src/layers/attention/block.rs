@@ -147,6 +147,18 @@ pub fn build_decode_batch_shared(
     sequences: &[DecodeSequenceMetadata],
     device: &Device,
 ) -> Result<DecodeBatchShared> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Worst-case blocks per sequence — derived from
+    /// `max_model_len / block_size` for Qwen3-4B-AWQ defaults
+    /// (1024 / 16 = 64). Padding `block_tables` to this stride keeps
+    /// the device pointer + row stride stable across forwards
+    /// (precondition for CUDA Graph capture replay).
+    const WORST_CASE_MAX_BLOCKS_PER_SEQ: usize = 64;
+
+    /// Decode-shape budget; matches the other pool wrappers.
+    const POOL_MAX_BATCH_SIZE: usize = 64;
+
     let batch_size = sequences.len();
     if batch_size == 0 {
         candle_core::bail!("build_decode_batch_shared: empty sequences");
@@ -159,25 +171,66 @@ pub fn build_decode_batch_shared(
         .flat_map(|s| s.slot_mapping.iter().copied())
         .collect();
 
-    let max_blocks_per_seq = sequences
+    let actual_max_blocks_per_seq = sequences
         .iter()
         .map(|s| s.block_ids.len())
         .max()
         .unwrap_or(1);
-    let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-    for (i, seq) in sequences.iter().enumerate() {
-        for (j, &block_id) in seq.block_ids.iter().enumerate() {
-            bt_data[i * max_blocks_per_seq + j] = block_id as u32;
-        }
-    }
-    let block_tables = Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), device)?;
 
     let seq_lens_data: Vec<u32> = sequences
         .iter()
         .map(|s| (s.seqlen_offset + 1) as u32)
         .collect();
     let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-    let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), device)?;
+
+    // Pool path only applies on the decode hot path (small batch +
+    // bounded blocks-per-sequence). Larger inputs fall through to
+    // fresh allocation — same gate as other Phase A pool migrations.
+    let use_pool = device.is_cuda()
+        && batch_size <= POOL_MAX_BATCH_SIZE
+        && actual_max_blocks_per_seq <= WORST_CASE_MAX_BLOCKS_PER_SEQ;
+
+    let (block_tables, seq_lens, max_blocks_per_seq) = if use_pool {
+        // Pool path: reserve fixed-stride buffers, write current data via
+        // memcpy from an ephemeral source tensor. The pool buffers retain
+        // their device addresses across forwards (reset_cursors at start
+        // of every forward replays the same slot indices in same order),
+        // so the captured CUDA graph's recorded reads find valid data on
+        // each replay.
+        let stride = WORST_CASE_MAX_BLOCKS_PER_SEQ;
+        let mut bt_data = vec![0u32; batch_size * stride];
+        for (i, seq) in sequences.iter().enumerate() {
+            for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                bt_data[i * stride + j] = block_id as u32;
+            }
+        }
+
+        let bt_src = Tensor::from_vec(bt_data, (batch_size, stride), device)?;
+        let bt_dst =
+            OutputPool::global().reserve(&[batch_size, stride], candle_core::DType::U32, device)?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&bt_dst, &bt_src).map_err(|e| {
+            candle_core::Error::Msg(format!("build_decode_batch_shared: bt copy: {e}"))
+        })?;
+
+        let sl_src = Tensor::from_vec(seq_lens_data.clone(), (batch_size,), device)?;
+        let sl_dst =
+            OutputPool::global().reserve(&[batch_size], candle_core::DType::U32, device)?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&sl_dst, &sl_src).map_err(|e| {
+            candle_core::Error::Msg(format!("build_decode_batch_shared: sl copy: {e}"))
+        })?;
+
+        (bt_dst, sl_dst, stride)
+    } else {
+        let mut bt_data = vec![0u32; batch_size * actual_max_blocks_per_seq];
+        for (i, seq) in sequences.iter().enumerate() {
+            for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                bt_data[i * actual_max_blocks_per_seq + j] = block_id as u32;
+            }
+        }
+        let bt = Tensor::from_vec(bt_data, (batch_size, actual_max_blocks_per_seq), device)?;
+        let sl = Tensor::from_vec(seq_lens_data, (batch_size,), device)?;
+        (bt, sl, actual_max_blocks_per_seq)
+    };
 
     Ok(DecodeBatchShared {
         positions: std::sync::Arc::new(positions),

@@ -2066,29 +2066,44 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 /// Queries total VRAM, estimates model size from config (taking quantization
 /// into account so AWQ INT4 weights aren't mis-priced as BF16), and returns
 /// the memory budget available for KV cache allocation.
-/// Create a CUDA device on a non-default (non-blocking) stream.
+/// Create a CUDA device suitable for CUDA Graph capture.
 ///
-/// Uses candle's `Device::new_cuda_with_stream`, which goes through
-/// `CudaContext::new_stream()` instead of `default_stream()`. The
-/// legacy default stream cannot be captured by `cuStreamBeginCapture_v2`
-/// (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED = 900) — switching to a
-/// non-default stream is the minimum prerequisite for CUDA Graph
-/// capture work. Eager execution is unaffected.
+/// Uses `Device::new_cuda_with_stream` (non-default non-blocking stream
+/// — the legacy default stream cannot be captured by
+/// `cuStreamBeginCapture_v2`). When `VLLM_DISABLE_EVENT_TRACKING=1`,
+/// also calls `disable_event_tracking()` so newly allocated tensors
+/// don't carry per-slice `read`/`write` events. Without that, cudarc's
+/// auto-event-tracking inserts `cuStreamWaitEvent` cross-slice
+/// dependencies during capture which the driver rejects with
+/// `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` (905).
 ///
-/// CUDA Graph capture full activation also requires
-/// `unsafe { device.disable_event_tracking() }` to avoid
-/// `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` (905) on cross-slice event
-/// edges. Cudarc 0.17.0 (PR #436) fixed the disable path; we already
-/// use 0.19.4 via candle 0.10.2. **However:** even with capture
-/// succeeding at warmup, **replay fails with CUDA_ERROR_OUT_OF_MEMORY (2)
-/// → ILLEGAL_ADDRESS (700)** — the forward path allocates ad-hoc
-/// intermediate tensors (output_pool covers only GEMV today), so the
-/// captured graph's fixed buffer pointers go stale across forwards.
-/// Closing the gap requires pre-allocating every per-layer scratch
-/// tensor, which is multi-week refactor. See
-/// `memory/perf_cuda_graph_capture.md`.
+/// Cudarc 0.17.0 (PR #436) fixed the disable_event_tracking method to
+/// also stop wait()/record() on existing slices; we use 0.19.4 via
+/// candle 0.10.2. With Phase A's hot-path pool migrations
+/// (RMSNorm/RoPE/SiLU+Mul/PagedAttn V2/Marlin GEMV/FlashInfer)
+/// landed, the captured graph's recorded device pointers stay stable
+/// across replays.
+///
+/// Safety: requires the engine to issue all device work serially on a
+/// single stream — true for the vllm-rust forward path. Async
+/// sampling (`VLLM_ASYNC_SAMPLING=1`) opens a second stream and is
+/// incompatible with this gate; runtime warning is logged.
 fn create_cuda_device(ordinal: usize) -> candle_core::Result<Device> {
-    Device::new_cuda_with_stream(ordinal)
+    let device = Device::new_cuda_with_stream(ordinal)?;
+    if std::env::var("VLLM_DISABLE_EVENT_TRACKING")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        if let Device::Cuda(cuda) = &device {
+            // SAFETY: see doc-comment — engine forward is single-stream.
+            unsafe { cuda.disable_event_tracking() };
+            tracing::warn!(
+                "VLLM_DISABLE_EVENT_TRACKING=1 — cudarc event tracking disabled \
+                 (required for CUDA Graph capture; assumes single-stream forward)"
+            );
+        }
+    }
+    Ok(device)
 }
 
 fn estimate_kv_cache_budget(
