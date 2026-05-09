@@ -1194,6 +1194,24 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
 
         let dev = input_ids.device();
         let mut xs = decode_profile::time(dev, &decode_profile::EMBED_NS, || {
+            // Pool-backed embedding lookup on the decode hot path:
+            // captured CUDA graphs need a stable-address output buffer
+            // here so replay reads from a consistent device pointer.
+            // Decode-only fast path: num_tokens = batch_size × 1 ≤ 64.
+            #[cfg(feature = "cuda-fused-activations")]
+            {
+                let n: usize = input_ids.dims().iter().product();
+                if n <= 64
+                    && input_ids.device().is_cuda()
+                    && self.embed_tokens.embeddings().dtype() == DType::BF16
+                    && input_ids.dtype() == DType::U32
+                {
+                    return crate::cuda_kernels::embedding_pooled(
+                        input_ids,
+                        self.embed_tokens.embeddings(),
+                    );
+                }
+            }
             self.embed_tokens.forward(input_ids)
         })?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {

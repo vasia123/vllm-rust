@@ -531,6 +531,18 @@ impl CudaGraphRunner {
 
         self.sync_device()?;
 
+        // 2026-05-09: rewind the global OutputPool's per-shape cursors before
+        // the captured forward pass. The captured graph encodes the device
+        // addresses of pool slots used inside it; replays at runtime call
+        // `reset_cursors()` at the start of every decode forward
+        // (engine/helpers.rs) — to make replay addresses match capture
+        // addresses, the captured pass must also start from cursor=0.
+        // The earlier `warmup_output` invocation may have advanced the
+        // cursors; without this reset, captured slot indices were N+1, N+2
+        // etc. while replay used 0, 1, 2, … and the graph dereferenced
+        // stale pool slots.
+        super::output_pool::OutputPool::global().reset_cursors();
+
         // RELAXED capture mode: GLOBAL aborts the capture the moment any
         // op inside it touches a buffer that still has outstanding work on
         // a stream other than the captured one. With cudarc's auto event

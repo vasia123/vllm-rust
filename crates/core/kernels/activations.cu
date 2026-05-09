@@ -94,6 +94,28 @@ extern "C" __global__ void silu_and_mul_bf16(
     }
 }
 
+// Embedding lookup (gather): out[i, h] = weight[input_ids[i], h].
+// One block per token; threads cooperate on the row-wise copy.
+//
+// out      : [num_tokens, hidden_size]   bf16
+// weight   : [vocab_size, hidden_size]   bf16
+// input_ids: [num_tokens]                int  (treated as i32; u32 bit pattern matches for vocab_size ≤ 2^31)
+extern "C" __global__ void embedding_lookup_bf16(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ weight,
+    const int* __restrict__ input_ids,
+    const int hidden_size
+) {
+    const int token_idx = blockIdx.x;
+    const int row_id = input_ids[token_idx];
+    const __nv_bfloat16* src = weight + row_id * hidden_size;
+    __nv_bfloat16* dst = out + token_idx * hidden_size;
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
 // SiLU+Mul gated activation with SEPARATE gate/up tensors (not packed).
 // Hot-path callers like `QuantizedSwiGluMlp` compute gate and up from
 // independent gate_proj/up_proj GEMVs, so the standard `silu_and_mul_bf16`

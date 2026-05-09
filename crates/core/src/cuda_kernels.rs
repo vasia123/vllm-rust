@@ -2050,6 +2050,144 @@ pub fn silu_and_mul_separate_pooled(gate: &Tensor, up: &Tensor) -> Result<Tensor
     Ok(output)
 }
 
+/// In-place sibling for the pool-backed embedding lookup. Receiver =
+/// pre-allocated `[num_tokens, hidden_size]` BF16 output; primary
+/// "input" passed via inplace_op2 is the int32-shaped `input_ids`
+/// (U32 storage; bit-pattern matches int for vocab ≤ 2^31). Weight
+/// matrix is held by the struct.
+///
+/// Backs `embedding_pooled` — captures the embedding output into a
+/// stable-address pool buffer so the captured CUDA graph reads from
+/// a consistent device pointer across replays.
+#[cfg(feature = "cuda-fused-activations")]
+struct EmbeddingLookupInplaceOp<'a> {
+    weight: &'a Tensor,
+    hidden_size: usize,
+}
+
+#[cfg(feature = "cuda-fused-activations")]
+impl<'a> InplaceOp2 for EmbeddingLookupInplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "embedding_lookup_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("embedding_lookup_inplace requires CUDA")
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        ids_storage: &CudaStorage,
+        ids_layout: &Layout,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &ids_storage.device;
+        let dims = ids_layout.shape().dims();
+        let num_tokens: usize = dims.iter().product();
+        if num_tokens == 0 {
+            return Ok(());
+        }
+
+        let (w_storage, _w_layout) = self.weight.storage_and_layout();
+        let w_storage = match &*w_storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("embedding_lookup_inplace: weight must be on CUDA"),
+        };
+
+        let block_size = std::cmp::min(self.hidden_size, 1024) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hidden_i32 = self.hidden_size as i32;
+
+        match (&mut out_storage.slice, &w_storage.slice, &ids_storage.slice) {
+            (
+                CudaStorageSlice::BF16(out_slice),
+                CudaStorageSlice::BF16(w_slice),
+                CudaStorageSlice::U32(ids_slice),
+            ) => {
+                let func = dev.get_or_load_custom_func(
+                    "embedding_lookup_bf16",
+                    "activations",
+                    ACTIVATIONS_PTX,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(w_slice);
+                builder.arg(ids_slice);
+                builder.arg(&hidden_i32);
+                // SAFETY: kernel writes every element of out; receiver held mutably.
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("embedding_lookup_inplace launch: {e}"))
+                })?;
+            }
+            _ => {
+                candle_core::bail!("embedding_lookup_inplace: only BF16 weight + U32 ids supported")
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Pool-backed embedding lookup: gather rows of `weight` indexed by
+/// `input_ids` into a stable-address pool buffer. Replaces
+/// `Embedding::forward` on the decode hot path so the captured CUDA
+/// graph's recorded device pointer to the embedding output stays
+/// consistent across replays.
+///
+/// Decode-only gate (num_tokens ≤ 64); larger inputs fall through to
+/// the candle `Embedding::forward` path inside the caller.
+#[cfg(feature = "cuda-fused-activations")]
+pub fn embedding_pooled(input_ids: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Decode-shape budget; matches the other pool wrappers.
+    const POOL_MAX_NUM_TOKENS: usize = 64;
+
+    if !input_ids.device().is_cuda() {
+        candle_core::bail!("embedding_pooled: requires CUDA device");
+    }
+    if weight.dtype() != candle_core::DType::BF16 {
+        candle_core::bail!("embedding_pooled: weight must be BF16");
+    }
+    if input_ids.dtype() != candle_core::DType::U32 {
+        candle_core::bail!("embedding_pooled: input_ids must be U32");
+    }
+
+    let ids_dims = input_ids.dims();
+    let num_tokens: usize = ids_dims.iter().product();
+    if num_tokens == 0 || num_tokens > POOL_MAX_NUM_TOKENS {
+        candle_core::bail!(
+            "embedding_pooled: num_tokens {num_tokens} out of decode budget [1, {POOL_MAX_NUM_TOKENS}]"
+        );
+    }
+
+    let weight_dims = weight.dims();
+    if weight_dims.len() != 2 {
+        candle_core::bail!("embedding_pooled: weight must be 2D [vocab, hidden]");
+    }
+    let hidden_size = weight_dims[1];
+
+    let mut out_shape: Vec<usize> = ids_dims.to_vec();
+    out_shape.push(hidden_size);
+
+    let input_ids = input_ids.contiguous()?;
+    let output =
+        OutputPool::global().reserve(&out_shape, candle_core::DType::BF16, input_ids.device())?;
+    let op = EmbeddingLookupInplaceOp {
+        weight,
+        hidden_size,
+    };
+    output.inplace_op2(&input_ids, &op)?;
+    Ok(output)
+}
+
 /// Check if fused SwiGLU CUDA kernel is available.
 ///
 /// Returns true if:

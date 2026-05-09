@@ -233,11 +233,36 @@ impl<M: ModelForward> StandardExecution<M> {
         // caller. The runner is wrapped in `Arc`; capture only succeeds
         // when nothing else holds a clone yet (which is guaranteed during
         // single-threaded warmup).
+        // Build a per-forward `DecodeBatchShared` (block_tables / seq_lens
+        // pooled at stable addresses) so the captured forward exercises
+        // the same pool path real production forwards do via
+        // `engine/helpers.rs::execute_batched_decode_with_graph`. Without
+        // this, captured graphs encode addresses for non-pooled (fresh
+        // per-call) tensors and replays dereference stale pointers.
+        let device = self.model.device().clone();
+        let shared = match crate::layers::attention::build_decode_batch_shared(&sequences, &device)
+        {
+            Ok(s) => Some(std::sync::Arc::new(s)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "build_decode_batch_shared failed during graph warmup; \
+                     falling back to per-layer non-shared path (capture may not replay correctly)"
+                );
+                None
+            }
+        };
+        let mut warmup_ctx = super::cuda_graph::ForwardContext::eager();
+        if let Some(s) = shared {
+            warmup_ctx =
+                warmup_ctx.with_decode_shared(s as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        }
+
         let model = &self.model;
         let runner_arc = self.graph_runner.as_mut().unwrap();
         let captured = match Arc::get_mut(runner_arc) {
             Some(runner) => runner.try_capture_decode_step(batch_size, |input| {
-                model.forward_decode_batch(input, &sequences, kv_cache_mgr)
+                model.forward_decode_batch_with_ctx(input, &sequences, kv_cache_mgr, &warmup_ctx)
             }),
             None => Ok(false),
         };
