@@ -711,6 +711,373 @@ pub fn paged_attention_v2_cuda_with_partition_size(
     output.reshape((num_seqs, num_heads * head_dim))
 }
 
+/// In-place sibling of [`PagedAttnV2Op`] used by the pooled fast path.
+///
+/// All four working buffers (final output + tmp_out + exp_sums +
+/// max_logits) are reserved from the global [`OutputPool`] **before**
+/// `inplace_op2` is called, so device addresses stay stable across
+/// forwards — the precondition for CUDA Graph capture replay.
+///
+/// Worst-case sizing: callers pass the **maximum possible**
+/// `max_num_partitions` (derived from `--max-model-len / partition_size`)
+/// rather than the per-call value. The Stage-1 kernel still receives
+/// the actual seq_lens array and only does meaningful work on
+/// partitions covering each sequence's real KV length; partitions
+/// beyond actual length write zero/skip-identity (alloc_zeros init in
+/// the original path masked this — pool reuse needs the kernel itself
+/// to be correct for un-touched partitions, which it is).
+struct PagedAttnV2InplaceOp<'a> {
+    k_cache: &'a Tensor,
+    v_cache: &'a Tensor,
+    block_tables: &'a Tensor,
+    seq_lens: &'a Tensor,
+    tmp_out: &'a Tensor,
+    exp_sums: &'a Tensor,
+    max_logits: &'a Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    head_dim: usize,
+    block_size: usize,
+    partition_size: usize,
+    max_num_partitions: usize,
+}
+
+impl<'a> InplaceOp2 for PagedAttnV2InplaceOp<'a> {
+    fn name(&self) -> &'static str {
+        "paged_attention_v2_inplace"
+    }
+
+    fn cpu_fwd(&self, _: &mut CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<()> {
+        candle_core::bail!("paged_attention_v2_inplace requires CUDA")
+    }
+
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        q_storage: &CudaStorage,
+        q_layout: &Layout,
+    ) -> Result<()> {
+        if q_layout.start_offset() != 0 {
+            candle_core::bail!("paged_attention_v2_inplace: Q must be contiguous from offset 0");
+        }
+        let num_seqs = q_layout.dims()[0];
+        match &q_storage.slice {
+            CudaStorageSlice::BF16(_) => {
+                self.run_v2_inplace::<half::bf16>(out_storage, q_storage, num_seqs)
+            }
+            CudaStorageSlice::F16(_) => {
+                self.run_v2_inplace::<half::f16>(out_storage, q_storage, num_seqs)
+            }
+            _ => candle_core::bail!("paged_attention_v2_inplace expects bf16 or f16 Q tensor"),
+        }
+    }
+}
+
+impl<'a> PagedAttnV2InplaceOp<'a> {
+    fn run_v2_inplace<T: PagedAttnDtype>(
+        &self,
+        out_storage: &mut CudaStorage,
+        q_storage: &CudaStorage,
+        num_seqs: usize,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &q_storage.device;
+        let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "paged_attention_v2_inplace: Q dtype mismatch ({})",
+                T::NAME
+            ))
+        })?;
+        let out_slice = match &mut out_storage.slice {
+            CudaStorageSlice::BF16(s) => {
+                if T::NAME != "bf16" {
+                    candle_core::bail!(
+                        "paged_attention_v2_inplace: out is BF16 but Q is {}",
+                        T::NAME
+                    );
+                }
+                // SAFETY: T == bf16 by NAME match.
+                unsafe {
+                    &mut *(s as *mut candle_core::cuda::cudarc::driver::CudaSlice<half::bf16>
+                        as *mut candle_core::cuda::cudarc::driver::CudaSlice<T>)
+                }
+            }
+            CudaStorageSlice::F16(s) => {
+                if T::NAME != "f16" {
+                    candle_core::bail!(
+                        "paged_attention_v2_inplace: out is F16 but Q is {}",
+                        T::NAME
+                    );
+                }
+                // SAFETY: T == f16 by NAME match.
+                unsafe {
+                    &mut *(s as *mut candle_core::cuda::cudarc::driver::CudaSlice<half::f16>
+                        as *mut candle_core::cuda::cudarc::driver::CudaSlice<T>)
+                }
+            }
+            _ => candle_core::bail!("paged_attention_v2_inplace: out must be BF16 or F16"),
+        };
+
+        let (k_guard, _) = self.k_cache.storage_and_layout();
+        let k_slice = match &*k_guard {
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v2_inplace: K cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
+            _ => candle_core::bail!("paged_attention_v2_inplace: K cache must be on CUDA"),
+        };
+
+        let (v_guard, _) = self.v_cache.storage_and_layout();
+        let v_slice = match &*v_guard {
+            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "paged_attention_v2_inplace: V cache dtype must match Q ({})",
+                    T::NAME
+                ))
+            })?,
+            _ => candle_core::bail!("paged_attention_v2_inplace: V cache must be on CUDA"),
+        };
+
+        let (bt_guard, _) = self.block_tables.storage_and_layout();
+        let bt_slice = match &*bt_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("block_tables must be U32"),
+            },
+            _ => candle_core::bail!("block_tables must be on CUDA"),
+        };
+
+        let (sl_guard, _) = self.seq_lens.storage_and_layout();
+        let sl_slice = match &*sl_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::U32(s) => s,
+                _ => candle_core::bail!("seq_lens must be U32"),
+            },
+            _ => candle_core::bail!("seq_lens must be on CUDA"),
+        };
+
+        let (tmp_guard, _) = self.tmp_out.storage_and_layout();
+        let tmp_out_slice = match &*tmp_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F32(s) => s,
+                _ => candle_core::bail!("tmp_out must be F32"),
+            },
+            _ => candle_core::bail!("tmp_out must be on CUDA"),
+        };
+        let (es_guard, _) = self.exp_sums.storage_and_layout();
+        let exp_sums_slice = match &*es_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F32(s) => s,
+                _ => candle_core::bail!("exp_sums must be F32"),
+            },
+            _ => candle_core::bail!("exp_sums must be on CUDA"),
+        };
+        let (ml_guard, _) = self.max_logits.storage_and_layout();
+        let max_logits_slice = match &*ml_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F32(s) => s,
+                _ => candle_core::bail!("max_logits must be F32"),
+            },
+            _ => candle_core::bail!("max_logits must be on CUDA"),
+        };
+
+        let head_dim = self.head_dim;
+        let max_num_partitions = self.max_num_partitions;
+
+        // Stage 1: partitioned attention kernel
+        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2, "paged_attention", PTX)?;
+        let shared_mem_bytes =
+            ((head_dim + NUM_WARPS + self.partition_size) * std::mem::size_of::<f32>()) as u32;
+        let v2_cfg = LaunchConfig {
+            grid_dim: (
+                self.num_heads as u32,
+                num_seqs as u32,
+                max_num_partitions as u32,
+            ),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes,
+        };
+
+        let num_heads_i32 = self.num_heads as i32;
+        let num_kv_heads_i32 = self.num_kv_heads as i32;
+        let max_blocks_i32 = self.max_blocks_per_seq as i32;
+        let head_dim_i32 = head_dim as i32;
+        let block_size_i32 = self.block_size as i32;
+        let partition_size_i32 = self.partition_size as i32;
+        let max_partitions_i32 = max_num_partitions as i32;
+
+        {
+            let mut builder = v2_func.builder();
+            builder.arg(tmp_out_slice);
+            builder.arg(exp_sums_slice);
+            builder.arg(max_logits_slice);
+            builder.arg(q_slice);
+            builder.arg(k_slice);
+            builder.arg(v_slice);
+            builder.arg(bt_slice);
+            builder.arg(sl_slice);
+            builder.arg(&self.scale);
+            builder.arg(&num_heads_i32);
+            builder.arg(&num_kv_heads_i32);
+            builder.arg(&max_blocks_i32);
+            builder.arg(&head_dim_i32);
+            builder.arg(&block_size_i32);
+            builder.arg(&partition_size_i32);
+            builder.arg(&max_partitions_i32);
+            // SAFETY: validated kernel params; pooled scratch buffers are
+            // exclusively held by this op for the duration of the launch.
+            unsafe { builder.launch(v2_cfg) }.map_err(|e| {
+                candle_core::Error::Msg(format!("paged_attention_v2_inplace stage1: {e}"))
+            })?;
+        }
+
+        // Stage 2: reduce kernel
+        let reduce_func =
+            dev.get_or_load_custom_func(T::KERNEL_V2_REDUCE, "paged_attention", PTX)?;
+        let reduce_shared_bytes =
+            ((2 * max_num_partitions + NUM_WARPS) * std::mem::size_of::<f32>()) as u32;
+        let reduce_cfg = LaunchConfig {
+            grid_dim: (self.num_heads as u32, num_seqs as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: reduce_shared_bytes,
+        };
+        {
+            let mut builder = reduce_func.builder();
+            builder.arg(out_slice);
+            builder.arg(tmp_out_slice);
+            builder.arg(exp_sums_slice);
+            builder.arg(max_logits_slice);
+            builder.arg(sl_slice);
+            builder.arg(&num_heads_i32);
+            builder.arg(&head_dim_i32);
+            builder.arg(&partition_size_i32);
+            builder.arg(&max_partitions_i32);
+            unsafe { builder.launch(reduce_cfg) }.map_err(|e| {
+                candle_core::Error::Msg(format!("paged_attention_v2_inplace reduce: {e}"))
+            })?;
+        }
+
+        drop(k_guard);
+        drop(v_guard);
+        drop(bt_guard);
+        drop(sl_guard);
+        drop(tmp_guard);
+        drop(es_guard);
+        drop(ml_guard);
+        Ok(())
+    }
+}
+
+/// Pool-backed PagedAttention V2 for the decode hot path. Reserves the
+/// final output and the three intermediate buffers (tmp_out, exp_sums,
+/// max_logits) from [`OutputPool`] at **worst-case** size derived from
+/// `worst_case_max_seq_len` so device addresses stay stable across
+/// forwards.
+///
+/// Decode-only gate (num_seqs ≤ 64) — prefill or any batch larger
+/// than the captured budget falls through to the non-pooled
+/// [`paged_attention_v2_cuda_with_partition_size`].
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_v2_cuda_pooled(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    worst_case_max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    partition_size: usize,
+) -> Result<Tensor> {
+    use crate::engine::output_pool::OutputPool;
+
+    /// Decode-shape budget; matches the other pool wrappers.
+    const POOL_MAX_NUM_SEQS: usize = 64;
+
+    if partition_size == 0 {
+        candle_core::bail!("paged_attention_v2_pooled: partition_size must be > 0");
+    }
+
+    let q = q.contiguous()?;
+    let num_seqs = q.dim(0)?;
+    if num_seqs > POOL_MAX_NUM_SEQS {
+        return paged_attention_v2_cuda_with_partition_size(
+            &q,
+            k_cache,
+            v_cache,
+            block_tables,
+            seq_lens,
+            scale,
+            num_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            max_seq_len,
+            head_dim,
+            block_size,
+            partition_size,
+        );
+    }
+
+    let max_num_partitions = worst_case_max_seq_len.div_ceil(partition_size).max(1);
+
+    let seq_lens_c = seq_lens.contiguous()?;
+    debug_assert_seq_lens_within_bound(&seq_lens_c, worst_case_max_seq_len)?;
+    let block_tables_c = block_tables.contiguous()?;
+
+    // Reserve output + scratch buffers from the pool. Worst-case sizes
+    // → fixed addresses across forwards regardless of actual seq_len.
+    let dtype = q.dtype();
+    let device = q.device();
+    let output = OutputPool::global().reserve(&[num_seqs, num_heads, head_dim], dtype, device)?;
+    let tmp_out = OutputPool::global().reserve(
+        &[num_seqs, num_heads, max_num_partitions, head_dim],
+        candle_core::DType::F32,
+        device,
+    )?;
+    let exp_sums = OutputPool::global().reserve(
+        &[num_seqs, num_heads, max_num_partitions],
+        candle_core::DType::F32,
+        device,
+    )?;
+    let max_logits = OutputPool::global().reserve(
+        &[num_seqs, num_heads, max_num_partitions],
+        candle_core::DType::F32,
+        device,
+    )?;
+
+    let op = PagedAttnV2InplaceOp {
+        k_cache,
+        v_cache,
+        block_tables: &block_tables_c,
+        seq_lens: &seq_lens_c,
+        tmp_out: &tmp_out,
+        exp_sums: &exp_sums,
+        max_logits: &max_logits,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        head_dim,
+        block_size,
+        partition_size,
+        max_num_partitions,
+    };
+
+    output.inplace_op2(&q, &op)?;
+    output.reshape((num_seqs, num_heads * head_dim))
+}
+
 /// Auto-selecting paged attention: uses V1 for short sequences, V2 for long.
 ///
 /// The threshold is 512 tokens (one partition). Below this, V1 has lower

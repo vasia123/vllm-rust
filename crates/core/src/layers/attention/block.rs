@@ -1088,13 +1088,18 @@ impl AttentionBlock {
         };
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        // 2026-05-09: route through `paged_attention_auto` instead of
-        // V1 directly — `paged_attention_bench` shows V2 wins at every
-        // measured seq_len (V1 is the legacy path; V2 split-K paginates
-        // the reduction). The auto-dispatcher picks the partition size
-        // based on max_seq_len so short / long contexts get the right
-        // tradeoff. See V2_SEQ_LEN_THRESHOLD = 0 in cuda_kernels.rs.
-        let attn_output = crate::cuda_kernels::paged_attention_auto(
+        // 2026-05-09: V2 paged_attention via the pooled wrapper. Worst-case
+        // sizing for the scratch buffers (`tmp_out`, `exp_sums`,
+        // `max_logits`, output) so device addresses stay stable across
+        // forwards — required for CUDA Graph capture replay.
+        // `WORST_CASE_MAX_SEQ_LEN` matches the engine's max_model_len for
+        // Qwen3-4B-AWQ default (1024). Larger configs need this lifted —
+        // tracked in the Direction D plan as a follow-up to thread the
+        // value from `cache_engine`/engine config.
+        const WORST_CASE_MAX_SEQ_LEN: usize = 1024;
+        let partition_size = crate::cuda_kernels::select_v2_partition_size(max_seq_len);
+        let worst = WORST_CASE_MAX_SEQ_LEN.max(max_seq_len);
+        let attn_output = crate::cuda_kernels::paged_attention_v2_cuda_pooled(
             &q,
             cache_engine.k_cache(),
             cache_engine.v_cache(),
@@ -1105,8 +1110,10 @@ impl AttentionBlock {
             self.num_kv_heads,
             max_blocks_per_seq,
             max_seq_len,
+            worst,
             self.head_dim,
             cache_engine.block_size(),
+            partition_size,
         )?;
 
         // [batch, hidden] → [batch, 1, hidden] to match residual shape.
