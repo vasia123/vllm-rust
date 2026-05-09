@@ -267,6 +267,8 @@ impl FlashInferBackend {
         num_heads: usize,
         head_dim: usize,
     ) -> Result<Tensor> {
+        use crate::engine::output_pool::OutputPool;
+
         let device = q.device();
 
         // Minimal config: only `kv_layout` is read by `run_with_plan`.
@@ -281,8 +283,31 @@ impl FlashInferBackend {
         .with_kv_layout(cache_engine.layout());
         let wrapper = DecodeWrapper::new(config, device)?;
 
-        let output =
-            wrapper.run_with_plan(q, cache_engine.k_cache(), cache_engine.v_cache(), plan)?;
+        // Pool-backed output: receiver buffer reserved from the
+        // process-global OutputPool so its device address stays stable
+        // across forwards. CUDA Graph capture replay reads from this
+        // address each replay; without the pool, every call would
+        // `Tensor::zeros_like(&q)` to a different address and replay
+        // would corrupt. Decode-only gate (num_seqs ≤ 64) — prefill /
+        // larger batches fall through to fresh-alloc via plain
+        // `run_with_plan`.
+        const POOL_MAX_NUM_SEQS: usize = 64;
+        let q_dims = q.dims().to_vec();
+        let num_seqs = q_dims.first().copied().unwrap_or(0);
+
+        let output = if num_seqs <= POOL_MAX_NUM_SEQS {
+            let out = OutputPool::global().reserve(&q_dims, q.dtype(), device)?;
+            wrapper.run_with_plan_into(
+                q,
+                cache_engine.k_cache(),
+                cache_engine.v_cache(),
+                plan,
+                &out,
+            )?;
+            out
+        } else {
+            wrapper.run_with_plan(q, cache_engine.k_cache(), cache_engine.v_cache(), plan)?
+        };
 
         let bs = output.dim(0)?;
         output.reshape((bs, num_heads * head_dim))

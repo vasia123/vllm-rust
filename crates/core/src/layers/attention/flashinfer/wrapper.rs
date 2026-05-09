@@ -565,6 +565,40 @@ impl DecodeWrapper {
         plan: &DecodePlan,
     ) -> Result<Tensor> {
         let q = tensor_bridge::ensure_contiguous(q)?;
+        let output = Tensor::zeros_like(&q)?;
+        self.run_with_plan_into(&q, k_cache, v_cache, plan, &output)?;
+        Ok(output)
+    }
+
+    /// Replay a pre-built decode plan into a caller-provided output
+    /// buffer. Allocates nothing — the receiver tensor's storage must
+    /// already match `q.dims()` and `q.dtype()`. Used by the pooled
+    /// fast path in `flashinfer/mod.rs::decode_flashinfer_with_plan`
+    /// to reuse a stable-address output buffer across forwards
+    /// (precondition for CUDA Graph capture replay).
+    pub fn run_with_plan_into(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        plan: &DecodePlan,
+        output: &Tensor,
+    ) -> Result<()> {
+        let q = tensor_bridge::ensure_contiguous(q)?;
+        if output.dtype() != q.dtype() {
+            return Err(candle_core::Error::Msg(format!(
+                "FlashInfer decode: output dtype {:?} does not match Q dtype {:?}",
+                output.dtype(),
+                q.dtype()
+            )));
+        }
+        if output.dims() != q.dims() {
+            return Err(candle_core::Error::Msg(format!(
+                "FlashInfer decode: output shape {:?} does not match Q shape {:?}",
+                output.dims(),
+                q.dims()
+            )));
+        }
 
         let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
         let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
@@ -575,8 +609,7 @@ impl DecodeWrapper {
             tensor_bridge::tensor_to_device_ptr(&plan.kv_last_page_len)? as *const i32;
         let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
 
-        let output = Tensor::zeros_like(&q)?;
-        let output_ptr = tensor_bridge::tensor_to_device_ptr(&output)? as *mut std::ffi::c_void;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(output)? as *mut std::ffi::c_void;
 
         unsafe {
             plan.plan
@@ -597,7 +630,7 @@ impl DecodeWrapper {
                 })?;
         }
 
-        Ok(output)
+        Ok(())
     }
 
     /// Convenience wrapper: build a one-shot plan and run it.
