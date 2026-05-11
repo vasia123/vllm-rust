@@ -999,6 +999,58 @@ mod tests {
         }
 
         #[test]
+        fn exl3_gemm_launches_on_synthetic_inputs() {
+            // Smoke test: 4-bit trellis, Llama-3.1-8B attention proj shape.
+            // We don't have real EXL3 weights here, so we use all-zero
+            // trellis + ones suh/svh. The kernel must launch and return
+            // the right shape (and not produce NaN/Inf).
+            let Some(dev) = cuda_device() else { return };
+
+            let m = 1usize;
+            let k = 4096usize;
+            let n = 4096usize;
+            let bpw = 4u32;
+
+            // x = small random fp16
+            let mut x_data = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.0017).sin() * 0.1).clamp(-1.0, 1.0);
+                x_data.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&x_data, (m, k), &dev).unwrap();
+
+            // trellis = zeros (synthetic), shape [k/16, n/16, 16*bpw] I16.
+            let trellis =
+                Tensor::zeros((k / 16, n / 16, 16 * bpw as usize), DType::I16, &dev).unwrap();
+            // suh, svh = ones fp16
+            let suh = Tensor::ones(k, DType::F16, &dev).unwrap();
+            let svh = Tensor::ones(n, DType::F16, &dev).unwrap();
+
+            let y = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("exl3_gemm launch ok");
+
+            assert_eq!(y.dims(), &[m, n]);
+            assert_eq!(y.dtype(), DType::F16);
+
+            // Output should be finite (no NaN/Inf). Check sum is finite.
+            let s = y
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(s.is_finite(), "exl3_gemm produced non-finite sum: {s}");
+        }
+
+        #[test]
         fn had_r_128_fp16_no_scale_launches_and_produces_orthogonal_norm() {
             // The 128-point Hadamard matrix is orthogonal up to a factor
             // of √128, and the kernel divides by √128 internally.

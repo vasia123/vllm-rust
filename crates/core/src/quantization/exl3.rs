@@ -187,12 +187,11 @@ impl QuantizationConfig for Exl3Config {
     }
 }
 
-/// EXL3 quantized linear layer (Phase-1 stub).
+/// EXL3 quantized linear layer.
 ///
-/// Phase 4 fills in `forward` with the Hadamard + trellis-GEMM pipeline.
-/// For now this only holds the loaded tensors so the loader can produce
-/// `Box<dyn QuantizedLinear>` values that satisfy the trait, while still
-/// erroring on a real forward call.
+/// Forward (Phase 4b.5): `y = exl3_gemm(x, trellis, suh, svh)` — the
+/// Hadamard transforms and trellis-decode GEMM are fused inside the
+/// kernel; the dispatcher allocates output + A_had scratch + locks.
 #[derive(Debug)]
 pub struct Exl3Linear {
     pub trellis: Tensor,
@@ -207,10 +206,75 @@ pub struct Exl3Linear {
 }
 
 impl QuantizedLinear for Exl3Linear {
-    fn forward(&self, _x: &Tensor) -> Result<Tensor> {
-        Err(candle_core::Error::Msg(
-            "Exl3Linear::forward is not implemented yet (Phase 4)".to_string(),
-        ))
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda-kernels")]
+        {
+            use super::exl3_cuda::{exl3_gemm, Exl3Codebook};
+
+            // Accept fp16 or bf16/fp32 input; cast to fp16 since the
+            // EXL3 kernels are fp16-only.
+            let x_fp16 = if x.dtype() == DType::F16 {
+                x.clone()
+            } else {
+                x.to_dtype(DType::F16)?
+            };
+
+            // Flatten leading dims to 2D [M, K]. Restore on the way out.
+            let dims = x_fp16.dims().to_vec();
+            let k = self.in_features;
+            if *dims.last().unwrap_or(&0) != k {
+                candle_core::bail!(
+                    "Exl3Linear::forward: input last dim ({:?}) must equal in_features ({})",
+                    dims.last(),
+                    k
+                );
+            }
+            let leading: usize = dims[..dims.len() - 1].iter().product();
+            let x2 = if dims.len() == 2 {
+                x_fp16
+            } else {
+                x_fp16.reshape((leading, k))?
+            };
+
+            let codebook = Exl3Codebook::from_flags(self.mcg, self.mul1);
+            let y2 = exl3_gemm(
+                &x2,
+                &self.trellis,
+                Some(&self.suh),
+                Some(&self.svh),
+                self.bits_per_weight,
+                codebook,
+            )?;
+
+            // Restore the leading dims.
+            let mut out_dims: Vec<usize> = dims[..dims.len() - 1].to_vec();
+            out_dims.push(self.out_features);
+            let y = if dims.len() == 2 {
+                y2
+            } else {
+                y2.reshape(out_dims.as_slice())?
+            };
+
+            // Bias addition. EXL3 bias is fp16.
+            let y = match &self.bias {
+                Some(b) => y.broadcast_add(b)?,
+                None => y,
+            };
+
+            // Cast back to the activation dtype if it wasn't fp16.
+            if x.dtype() != DType::F16 {
+                y.to_dtype(x.dtype())
+            } else {
+                Ok(y)
+            }
+        }
+        #[cfg(not(feature = "cuda-kernels"))]
+        {
+            let _ = x;
+            Err(candle_core::Error::Msg(
+                "Exl3Linear::forward requires the cuda-kernels feature".to_string(),
+            ))
+        }
     }
 
     fn load_weights(&mut self, _weights: &HashMap<String, Tensor>) -> Result<()> {
@@ -304,12 +368,12 @@ mod tests {
     }
 
     #[test]
-    fn linear_forward_is_unimplemented_in_phase_1() {
-        // Phase-1 invariant: the linear exists but its forward errors out.
-        // Phase 4 replaces this test with a correctness check.
+    fn linear_forward_errors_on_cpu() {
+        // Forward dispatches to the CUDA kernel; on CPU it must fail
+        // gracefully (the underlying CustomOp1::cpu_fwd bails).
         let trellis = Tensor::zeros((1, 1, 64), DType::I16, &Device::Cpu).unwrap();
-        let suh = Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap();
-        let svh = Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap();
+        let suh = Tensor::zeros(16, DType::F16, &Device::Cpu).unwrap();
+        let svh = Tensor::zeros(16, DType::F16, &Device::Cpu).unwrap();
         let lin = Exl3Linear {
             trellis,
             suh,
@@ -323,5 +387,27 @@ mod tests {
         };
         let x = Tensor::zeros((1, 16), DType::F16, &Device::Cpu).unwrap();
         assert!(lin.forward(&x).is_err());
+    }
+
+    #[test]
+    fn linear_forward_validates_input_shape() {
+        // Wrong K dim must error before we touch the kernel.
+        let trellis = Tensor::zeros((1, 1, 64), DType::I16, &Device::Cpu).unwrap();
+        let suh = Tensor::zeros(16, DType::F16, &Device::Cpu).unwrap();
+        let svh = Tensor::zeros(16, DType::F16, &Device::Cpu).unwrap();
+        let lin = Exl3Linear {
+            trellis,
+            suh,
+            svh,
+            mcg: false,
+            mul1: false,
+            bias: None,
+            in_features: 16,
+            out_features: 16,
+            bits_per_weight: 4,
+        };
+        let x = Tensor::zeros((1, 32), DType::F16, &Device::Cpu).unwrap();
+        let err = lin.forward(&x).err().unwrap();
+        assert!(format!("{err}").contains("in_features"));
     }
 }
