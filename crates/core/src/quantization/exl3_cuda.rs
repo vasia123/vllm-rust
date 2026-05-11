@@ -12,8 +12,8 @@
 //! ephemeral `dev.alloc()`.
 
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, InplaceOp1, Layout, Result,
-    Shape, Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, IndexOp, InplaceOp1, Layout,
+    Result, Shape, Tensor,
 };
 
 const HADAMARD_PTX: &str = include_str!("../../kernels/exl3/hadamard.ptx");
@@ -216,16 +216,20 @@ const EXL3_LOCKS_ELEMS: usize = (1024 * 1024) + (1024 * 2);
 
 /// Dispatch the EXL3 GEMM kernel.
 ///
-/// `out = had(a * suh) @ decode(trellis); out = had(out) * svh`
-/// all fused into the cooperative kernel. The Hadamard scratch buffer
-/// `a_had` is provided by the dispatcher; the kernel writes the
-/// transformed activation into it before the matmul phase.
+/// Computes
+///   `out = had_r_128(had_r_128(a * suh) @ decode(trellis)) * svh`
+/// — both Hadamard butterflies are **always** applied. The wrapper
+/// kernel hardcodes `shmem_out_had=true`, so the output goes through
+/// an `output_had_sh_gl` pass that reads `svh` unconditionally. Both
+/// `suh` and `svh` are therefore required; pass all-ones vectors when
+/// the sign-vector scaling step is mathematically a no-op (e.g. in
+/// correctness tests).
 ///
 /// # Arguments
 /// * `a` — `[M, K]` fp16 row-major activations
 /// * `trellis` — `[K/16, N/16, 16*bpw]` I16 packed weights
-/// * `suh` — optional `[K]` fp16 input Hadamard sign vector
-/// * `svh` — optional `[N]` fp16 output Hadamard sign vector
+/// * `suh` — `[K]` fp16 input Hadamard sign vector (required)
+/// * `svh` — `[N]` fp16 output Hadamard sign vector (required)
 /// * `bpw` — bits-per-weight in `2..=8`
 /// * `codebook` — `Default` / `Mcg` / `Mul1`
 ///
@@ -275,7 +279,7 @@ pub fn exl3_gemm(
         );
     }
 
-    // Validate (and clone for capture inside the Op) the optional scales.
+    // The upstream kernel always reads `suh` — caller must provide.
     let suh_t = match suh {
         Some(s) => {
             if s.dtype() != DType::F16 {
@@ -285,9 +289,13 @@ pub fn exl3_gemm(
             if len != k {
                 candle_core::bail!("exl3_gemm: suh len ({}) must equal K ({})", len, k);
             }
-            Some(s.clone())
+            s.clone()
         }
-        None => None,
+        None => candle_core::bail!(
+            "exl3_gemm: suh is required (the kernel's `if (suh)` guard is \
+             commented out — see exl3_gemm_kernel.cuh:14). Pass an \
+             all-ones vector to mathematically disable the sign step."
+        ),
     };
     let svh_t = match svh {
         Some(s) => {
@@ -298,9 +306,13 @@ pub fn exl3_gemm(
             if len != n {
                 candle_core::bail!("exl3_gemm: svh len ({}) must equal N ({})", len, n);
             }
-            Some(s.clone())
+            s.clone()
         }
-        None => None,
+        None => candle_core::bail!(
+            "exl3_gemm: svh is required — the kernel hardcodes `shmem_out_had=true`, \
+             so an output Hadamard pass reads svh unconditionally. Pass an all-ones \
+             vector to mathematically disable the sign step."
+        ),
     };
 
     let op = Exl3GemmOp {
@@ -314,6 +326,14 @@ pub fn exl3_gemm(
         codebook,
     };
     a.apply_op1(op)
+}
+
+#[doc(hidden)]
+/// Public helper for Exl3Linear::forward when the layer was loaded
+/// without an explicit svh — we treat that as "no-op sign vector"
+/// and allocate an ones-filled buffer on demand.
+pub fn ones_f16_vec(len: usize, dev: &candle_core::Device) -> Result<Tensor> {
+    Tensor::ones(len, DType::F16, dev)
 }
 
 /// Returns true if the M=1..=8 GEMV fast path is available for the
@@ -463,8 +483,8 @@ impl CustomOp1 for Exl3GemvOp {
 
 struct Exl3GemmOp {
     trellis: Tensor,
-    suh: Option<Tensor>,
-    svh: Option<Tensor>,
+    suh: Tensor, // required — see exl3_gemm() docs
+    svh: Tensor, // required — kernel hardcodes shmem_out_had=true
     m: usize,
     k: usize,
     n: usize,
@@ -580,45 +600,24 @@ impl CustomOp1 for Exl3GemmOp {
             .alloc_zeros::<i32>(EXL3_LOCKS_ELEMS)
             .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm locks alloc: {e}")))?;
 
-        // Optional Hadamard scale vectors. Use a 1-element placeholder
-        // when not provided — the kernel branches on `nullptr`-equivalent
-        // by checking the pointer, but in our case the template flag
-        // `c_fp32` is unrelated and the kernel always reads `suh/svh`;
-        // however, the runtime path only dereferences them when the
-        // corresponding non-null path was selected at compile time, so
-        // an unused dummy buffer is safe.
-        let suh_storage_guard;
-        let svh_storage_guard;
-        let null_buf = dev
-            .alloc_zeros::<half::f16>(1)
-            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm null buf alloc: {e}")))?;
-        let suh_ref: &candle_core::cuda::cudarc::driver::CudaSlice<half::f16> = match &self.suh {
-            Some(s) => {
-                suh_storage_guard = s.storage_and_layout().0;
-                match &*suh_storage_guard {
-                    Storage::Cuda(cs) => match &cs.slice {
-                        CudaStorageSlice::F16(slice) => slice,
-                        _ => candle_core::bail!("exl3_gemm: suh must be F16"),
-                    },
-                    _ => candle_core::bail!("exl3_gemm: suh must be on CUDA"),
-                }
-            }
-            None => &null_buf,
+        // Both `suh` and `svh` are mandatory — the kernel hardcodes
+        // shmem_out_had=true and unconditionally dereferences both.
+        let suh_storage_guard = self.suh.storage_and_layout().0;
+        let suh_slice = match &*suh_storage_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F16(slice) => slice,
+                _ => candle_core::bail!("exl3_gemm: suh must be F16"),
+            },
+            _ => candle_core::bail!("exl3_gemm: suh must be on CUDA"),
         };
-        let svh_ref: &candle_core::cuda::cudarc::driver::CudaSlice<half::f16> = match &self.svh {
-            Some(s) => {
-                svh_storage_guard = s.storage_and_layout().0;
-                match &*svh_storage_guard {
-                    Storage::Cuda(cs) => match &cs.slice {
-                        CudaStorageSlice::F16(slice) => slice,
-                        _ => candle_core::bail!("exl3_gemm: svh must be F16"),
-                    },
-                    _ => candle_core::bail!("exl3_gemm: svh must be on CUDA"),
-                }
-            }
-            None => &null_buf,
+        let svh_storage_guard = self.svh.storage_and_layout().0;
+        let svh_slice = match &*svh_storage_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F16(slice) => slice,
+                _ => candle_core::bail!("exl3_gemm: svh must be F16"),
+            },
+            _ => candle_core::bail!("exl3_gemm: svh must be on CUDA"),
         };
-
         let size_m = self.m as i32;
         let size_k = self.k as i32;
         let size_n = self.n as i32;
@@ -637,9 +636,9 @@ impl CustomOp1 for Exl3GemmOp {
         builder.arg(&size_k);
         builder.arg(&size_n);
         builder.arg(&locks);
-        builder.arg(suh_ref);
+        builder.arg(suh_slice);
         builder.arg(&a_had);
-        builder.arg(svh_ref);
+        builder.arg(svh_slice);
 
         // Cooperative launch: the kernel uses `cg::this_grid().sync()`
         // for inter-CTA coordination of tile assignment.
@@ -1117,10 +1116,21 @@ mod tests {
     fn gemm_rejects_wrong_dtypes() {
         let a = Tensor::zeros((1, 16), DType::F32, &Device::Cpu).unwrap();
         let t = Tensor::zeros((1, 1, 48), DType::I16, &Device::Cpu).unwrap();
-        let err = exl3_gemm(&a, &t, None, None, 3, Exl3Codebook::Default)
+        let suh = Tensor::zeros(16, DType::F16, &Device::Cpu).unwrap();
+        let err = exl3_gemm(&a, &t, Some(&suh), None, 3, Exl3Codebook::Default)
             .err()
             .unwrap();
         assert!(format!("{err}").contains("F16"));
+    }
+
+    #[test]
+    fn gemm_requires_suh() {
+        let a = Tensor::zeros((1, 4096), DType::F16, &Device::Cpu).unwrap();
+        let t = Tensor::zeros((256, 256, 48), DType::I16, &Device::Cpu).unwrap();
+        let err = exl3_gemm(&a, &t, None, None, 3, Exl3Codebook::Default)
+            .err()
+            .unwrap();
+        assert!(format!("{err}").contains("suh is required"));
     }
 
     #[test]
@@ -1166,6 +1176,244 @@ mod tests {
 
         fn cuda_device() -> Option<Device> {
             Device::cuda_if_available(0).ok().filter(|d| d.is_cuda())
+        }
+
+        #[test]
+        fn reconstruct_zero_trellis_is_constant() {
+            // Diagnostic: for zero trellis, decode_3inst<cb=0>(0) is a
+            // specific constant v0; every element of `reconstruct` must
+            // equal v0. If we get a non-constant result, the dq layout
+            // shuffle is wrong — that's our bug, not the matmul kernel.
+            let Some(dev) = cuda_device() else { return };
+            let k = 32usize;
+            let n = 128usize;
+            let bpw = 4u32;
+            let trellis =
+                Tensor::zeros((k / 16, n / 16, 16 * bpw as usize), DType::I16, &dev).unwrap();
+            let w = exl3_reconstruct(&trellis, bpw, Exl3Codebook::Default).unwrap();
+            assert_eq!(w.dims(), &[k, n]);
+            let w_f32 = w.to_dtype(DType::F32).unwrap();
+            let min_v = w_f32
+                .min(0)
+                .unwrap()
+                .min(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let max_v = w_f32
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let mean = w_f32.mean_all().unwrap().to_scalar::<f32>().unwrap();
+            eprintln!("RECONSTRUCT(0): min={min_v}, max={max_v}, mean={mean}");
+            assert!(
+                (max_v - min_v).abs() < 1e-3,
+                "reconstruct(0) is not constant: min={min_v}, max={max_v}"
+            );
+        }
+
+        #[test]
+        fn exl3_gemm_matches_reconstruct_on_zero_trellis() {
+            // Deterministic kernel-vs-reconstruct cross-check using
+            // all-zero trellis. Both paths route through the same
+            // codebook decoder; zero bytes give a constant decoded
+            // value v0 per element, so reconstruct→[K,N] is uniformly
+            // v0 and the matmul reduces to v0·sum(had(x)) per column.
+            //
+            // If this test PASSES but the random-trellis variant fails,
+            // the bug is in tile-layout interpretation rather than the
+            // decoder itself.
+            let Some(dev) = cuda_device() else { return };
+
+            let m = 2usize;
+            let k = 512usize;
+            let n = 128usize;
+            let bpw = 4u32;
+
+            let trellis =
+                Tensor::zeros((k / 16, n / 16, 16 * bpw as usize), DType::I16, &dev).unwrap();
+            let mut x_data = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.013).sin() * 0.05) as f32;
+                x_data.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&x_data, (m, k), &dev).unwrap();
+            let ones_suh = Tensor::ones(k, DType::F16, &dev).unwrap();
+            let ones_svh = Tensor::ones(n, DType::F16, &dev).unwrap();
+
+            // Kernel does:
+            //   xh = had_r_128(x * suh)
+            //   y_pre = xh @ decode(trellis)
+            //   y    = had_r_128(y_pre) * svh
+            // With suh=svh=ones, that's:
+            //   y = had(had(x) @ reconstruct(trellis))
+            let xh = had_r_128_fp16(&x, Some(&ones_suh), HadScale::Pre).unwrap();
+            let w_dense = exl3_reconstruct(&trellis, bpw, Exl3Codebook::Default).unwrap();
+            let y_pre = xh.matmul(&w_dense).unwrap();
+            let y_ref = had_r_128_fp16(&y_pre, Some(&ones_svh), HadScale::Post).unwrap();
+
+            let y_act = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .unwrap();
+
+            let diff = (&y_act - &y_ref).unwrap();
+            let max_abs = diff
+                .abs()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let ref_max = y_ref
+                .abs()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            // Per-row sanity: every column of y_act must equal v0 *
+            // sum(xh per row), where v0 = decode_3inst<0>(0) ≈ 0.768.
+            let act_f32 = y_act.to_dtype(DType::F32).unwrap();
+            let row0 = act_f32.i(0).unwrap();
+            let vals: Vec<f32> = row0.to_vec1().unwrap();
+            let col0_val = vals[0];
+            let row0_uniform_max = vals.iter().cloned().fold(f32::MIN, f32::max);
+            let row0_uniform_min = vals.iter().cloned().fold(f32::MAX, f32::min);
+            // dump first 16 cols
+            eprintln!("ACT row0 cols[0..16]: {:?}", &vals[0..16]);
+            let nonzero_count = vals.iter().filter(|&&v| v.abs() > 1e-6).count();
+            eprintln!("ACT row0 nonzero count: {}/128", nonzero_count);
+            let xh_row0_sum = xh
+                .i(0)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            eprintln!(
+                "ACT row0: col0={col0_val}, row_min={row0_uniform_min}, row_max={row0_uniform_max}; expected = 0.768 * sum(xh[0])= {}",
+                0.768 * xh_row0_sum
+            );
+            eprintln!("ZERO-TRELLIS: ref_max={ref_max}, max_abs_diff={max_abs}");
+            // Loose-but-meaningful: with deterministic all-zero
+            // codebook decode, any layout/decode disagreement shows up
+            // as a relative diff >> fp16 noise (~1e-3).
+            assert!(
+                max_abs < 1e-2 || (max_abs / ref_max.max(1e-6)) < 0.01,
+                "zero-trellis kernel/reconstruct disagree: ref_max={ref_max}, diff={max_abs}"
+            );
+        }
+
+        #[test]
+        fn exl3_gemm_matches_hadamard_then_matmul() {
+            // Cross-check: both `exl3_reconstruct` and the GEMM kernel
+            // route through the same `dq_dispatch<bits, cb>` per-tile
+            // decoder (see exl3_dq.cuh + exl3_gemm_inner.cuh:280 +
+            // reconstruct.cu:37). With suh=ones the kernel computes
+            //   y_kernel = had_r_128(x) @ decode(trellis)
+            // We build the same on the Rust side:
+            //   y_ref = had_r_128_fp16(x, ones, Pre) @ reconstruct(trellis)
+            //
+            // K=4 (bpw=4), shape_idx=2 compatible: M=2, K=512, N=128.
+            let Some(dev) = cuda_device() else { return };
+
+            let m = 2usize;
+            let k = 512usize;
+            let n = 128usize;
+            let bpw = 4u32;
+
+            // Deterministic pseudo-random trellis.
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut t_data: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0x1234_5678;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                t_data.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&t_data, (k / 16, n / 16, 16 * bpw as usize), &dev).unwrap();
+
+            // Small random x (avoid fp16 saturation).
+            let mut x_data = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.013).sin() * 0.05) as f32;
+                x_data.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&x_data, (m, k), &dev).unwrap();
+            let ones_suh = Tensor::ones(k, DType::F16, &dev).unwrap();
+            let ones_svh = Tensor::ones(n, DType::F16, &dev).unwrap();
+
+            // Reference math (matches the kernel pipeline):
+            //   xh   = had_r_128(x * suh)
+            //   ypre = xh @ reconstruct(trellis)
+            //   y    = had_r_128(ypre) * svh
+            let xh = had_r_128_fp16(&x, Some(&ones_suh), HadScale::Pre).expect("had ok");
+            let w_dense =
+                exl3_reconstruct(&trellis, bpw, Exl3Codebook::Default).expect("reconstruct ok");
+            assert_eq!(w_dense.dims(), &[k, n]);
+            let y_pre = xh.matmul(&w_dense).expect("ref matmul ok");
+            let y_ref =
+                had_r_128_fp16(&y_pre, Some(&ones_svh), HadScale::Post).expect("had post ok");
+
+            let y_act = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("gemm ok");
+            assert_eq!(y_act.dims(), &[m, n]);
+
+            let diff = (&y_act - &y_ref).unwrap();
+            let abs = diff.abs().unwrap().to_dtype(DType::F32).unwrap();
+            let max_abs = abs
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let ref_abs_max = y_ref
+                .abs()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            // Random-trellis stress test: outputs span large magnitudes
+            // from accumulation over 512 fp16 mac ops + an additional
+            // 128-point Hadamard butterfly. Tolerance is relative —
+            // diff must be at most 10% of the reference norm.
+            let rel = max_abs / ref_abs_max.max(1e-6);
+            assert!(
+                rel < 0.10,
+                "exl3_gemm diverges: max_abs={max_abs}, ref_max={ref_abs_max}, rel={rel}"
+            );
         }
 
         #[test]

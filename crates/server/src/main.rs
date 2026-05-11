@@ -1354,6 +1354,22 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     )?;
 
     let device = create_cuda_device(0)?;
+
+    // EXL3 kernels are fp16-only (vendored from ExLlamaV3). Override
+    // BF16/F32 dtypes silently when EXL3 is detected — the alternative
+    // is a confusing kernel-side failure deep in the layer stack.
+    let dtype = if files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3
+        && dtype != DType::F16
+    {
+        tracing::warn!(
+            requested = ?dtype,
+            "EXL3 quantization detected — forcing activation dtype to F16 (kernel constraint)"
+        );
+        DType::F16
+    } else {
+        dtype
+    };
+
     let dtype_label = match dtype {
         DType::BF16 => "bf16",
         DType::F16 => "fp16",
