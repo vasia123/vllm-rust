@@ -12,8 +12,8 @@
 //! ephemeral `dev.alloc()`.
 
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, IndexOp, InplaceOp1, Layout,
-    Result, Shape, Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, InplaceOp2, Layout, Result,
+    Shape, Tensor,
 };
 
 const HADAMARD_PTX: &str = include_str!("../../kernels/exl3/hadamard.ptx");
@@ -310,17 +310,32 @@ pub fn exl3_gemm(
         ),
     };
 
-    let op = Exl3GemmOp {
+    // Pool-backed output + A_had scratch. The pool keeps device addresses
+    // stable across forwards (Phase 8.2 — eliminates two of three per-call
+    // `dev.alloc_zeros` allocations in the EXL3 hot path; the third was
+    // killed in 8.1). The op writes through both — `output` via the
+    // `&mut self_storage` receiver, `a_had` via the kernel's device-pointer
+    // arg (immutable host ref, mutable device write — same pattern as
+    // existing `silu_and_mul_separate_inplace`).
+    let device = a.device();
+    let output =
+        crate::engine::output_pool::OutputPool::global().reserve(&[m, n], DType::F16, device)?;
+    let a_had =
+        crate::engine::output_pool::OutputPool::global().reserve(&[m, k], DType::F16, device)?;
+
+    let op = Exl3GemmInplaceOp {
         trellis: trellis.clone(),
         suh: suh_t,
         svh: svh_t,
+        a_had,
         m,
         k,
         n,
         bpw,
         codebook,
     };
-    a.apply_op1(op)
+    output.inplace_op2(a, &op)?;
+    Ok(output)
 }
 
 #[doc(hidden)]
@@ -387,17 +402,21 @@ pub fn exl3_gemv(a: &Tensor, trellis: &Tensor, bpw: u32, codebook: Exl3Codebook)
             16 * bpw
         );
     }
-    let op = Exl3GemvOp {
+    let device = a.device();
+    let output =
+        crate::engine::output_pool::OutputPool::global().reserve(&[m, n], DType::F16, device)?;
+    let op = Exl3GemvInplaceOp {
         trellis: trellis.clone(),
         m,
         k,
         n,
         codebook,
     };
-    a.apply_op1(op)
+    output.inplace_op2(a, &op)?;
+    Ok(output)
 }
 
-struct Exl3GemvOp {
+struct Exl3GemvInplaceOp {
     trellis: Tensor,
     m: usize,
     k: usize,
@@ -405,18 +424,30 @@ struct Exl3GemvOp {
     codebook: Exl3Codebook,
 }
 
-impl CustomOp1 for Exl3GemvOp {
+impl InplaceOp2 for Exl3GemvInplaceOp {
     fn name(&self) -> &'static str {
-        "exl3_gemv"
+        "exl3_gemv_inplace"
     }
-    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        _s1: &mut CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<()> {
         candle_core::bail!("exl3_gemv: CUDA only")
     }
-    fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        a_storage: &CudaStorage,
+        _a_layout: &Layout,
+    ) -> Result<()> {
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use candle_core::Storage;
 
-        let dev = &storage.device;
+        let dev = &a_storage.device;
         // `_Z16exl3_gemv_kernelILi4ELb<c_fp32>ELi<cb>ELi1EEvPK6__halfPKtPviii`
         let kernel_name = format!(
             "_Z16exl3_gemv_kernelILi4ELb0ELi{}ELi1EEvPK6__halfPKtPviii",
@@ -428,7 +459,7 @@ impl CustomOp1 for Exl3GemvOp {
             EXL3_GEMV_PTX,
         )?;
 
-        let a = match &storage.slice {
+        let a = match &a_storage.slice {
             CudaStorageSlice::F16(s) => s,
             _ => candle_core::bail!("exl3_gemv: A must be F16"),
         };
@@ -441,9 +472,10 @@ impl CustomOp1 for Exl3GemvOp {
             _ => candle_core::bail!("exl3_gemv: trellis must be on CUDA"),
         };
 
-        let output = dev
-            .alloc_zeros::<half::f16>(self.m * self.n)
-            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemv output alloc: {e}")))?;
+        let output = match &mut out_storage.slice {
+            CudaStorageSlice::F16(s) => s,
+            _ => candle_core::bail!("exl3_gemv: output must be F16"),
+        };
 
         // Grid + block per the kernel header comment:
         //   grid:  (1, size_n / TILESIZE_N, 1)
@@ -461,25 +493,29 @@ impl CustomOp1 for Exl3GemvOp {
         let mut builder = func.builder();
         builder.arg(a);
         builder.arg(trellis);
-        builder.arg(&output);
+        builder.arg(output);
         builder.arg(&size_m);
         builder.arg(&size_k);
         builder.arg(&size_n);
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("exl3_gemv launch: {e}")))?;
 
-        let out_storage = CudaStorage {
-            slice: CudaStorageSlice::F16(output),
-            device: dev.clone(),
-        };
-        Ok((out_storage, Shape::from_dims(&[self.m, self.n])))
+        Ok(())
     }
 }
 
-struct Exl3GemmOp {
+/// EXL3 GEMM op. Output is the InplaceOp2 receiver (pool-backed),
+/// activations `A` are the second arg, and trellis/suh/svh/a_had are
+/// captured in the struct.
+struct Exl3GemmInplaceOp {
     trellis: Tensor,
     suh: Tensor, // required — see exl3_gemm() docs
     svh: Tensor, // required — kernel hardcodes shmem_out_had=true
+    /// Pool-reserved `[M, K]` F16 scratch — Hadamard-transformed A. The
+    /// kernel writes then reads it within a single launch; the device
+    /// pointer is passed via `builder.arg(&CudaSlice<f16>)` (host-ref
+    /// is immutable; device kernel writes through it freely).
+    a_had: Tensor,
     m: usize,
     k: usize,
     n: usize,
@@ -487,21 +523,33 @@ struct Exl3GemmOp {
     codebook: Exl3Codebook,
 }
 
-impl CustomOp1 for Exl3GemmOp {
+impl InplaceOp2 for Exl3GemmInplaceOp {
     fn name(&self) -> &'static str {
-        "exl3_gemm"
+        "exl3_gemm_inplace"
     }
-    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        _s1: &mut CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<()> {
         candle_core::bail!("exl3_gemm: CUDA only")
     }
-    fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        a_storage: &CudaStorage,
+        _a_layout: &Layout,
+    ) -> Result<()> {
         use candle_core::cuda::cudarc::driver::sys::{
             CUdevice_attribute, CUfunction_attribute_enum,
         };
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use candle_core::Storage;
 
-        let dev = &storage.device;
+        let dev = &a_storage.device;
 
         // Query device properties for shape selection + grid sizing.
         let stream = dev.cuda_stream();
@@ -564,7 +612,7 @@ impl CustomOp1 for Exl3GemmOp {
         );
 
         // ─── Buffers ──────────────────────────────────────────────────
-        let a = match &storage.slice {
+        let a = match &a_storage.slice {
             CudaStorageSlice::F16(s) => s,
             _ => candle_core::bail!("exl3_gemm: A must be F16"),
         };
@@ -578,15 +626,23 @@ impl CustomOp1 for Exl3GemmOp {
             _ => candle_core::bail!("exl3_gemm: trellis must be on CUDA"),
         };
 
-        // Output [M, N] fp16. Pool integration follows in Phase 4b.6.
-        let output = dev
-            .alloc_zeros::<half::f16>(self.m * self.n)
-            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm output alloc: {e}")))?;
+        // Output [M, N] fp16 — receiver, pool-backed by the caller.
+        let output = match &mut out_storage.slice {
+            CudaStorageSlice::F16(s) => s,
+            _ => candle_core::bail!("exl3_gemm: output must be F16"),
+        };
 
-        // A_had scratch [M, K] fp16.
-        let a_had = dev
-            .alloc_zeros::<half::f16>(self.m * self.k)
-            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm A_had alloc: {e}")))?;
+        // A_had scratch [M, K] fp16 — pool-backed by the caller. The
+        // device pointer is shared via the immutable host ref; the
+        // kernel writes/reads its memory within one launch.
+        let a_had_storage_guard = self.a_had.storage_and_layout().0;
+        let a_had = match &*a_had_storage_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F16(s) => s,
+                _ => candle_core::bail!("exl3_gemm: a_had scratch must be F16"),
+            },
+            _ => candle_core::bail!("exl3_gemm: a_had scratch must be on CUDA"),
+        };
 
         // Per-device locks workspace. Cached for the life of the process
         // — the barrier protocol is self-restoring across launches
@@ -627,13 +683,13 @@ impl CustomOp1 for Exl3GemmOp {
         let mut builder = func.builder();
         builder.arg(a);
         builder.arg(trellis);
-        builder.arg(&output);
+        builder.arg(output);
         builder.arg(&size_m);
         builder.arg(&size_k);
         builder.arg(&size_n);
         builder.arg(&*locks);
         builder.arg(suh_slice);
-        builder.arg(&a_had);
+        builder.arg(a_had);
         builder.arg(svh_slice);
 
         // Cooperative launch: the kernel uses `cg::this_grid().sync()`
@@ -641,11 +697,7 @@ impl CustomOp1 for Exl3GemmOp {
         unsafe { builder.launch_cooperative(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm launch: {e}")))?;
 
-        let out_storage = CudaStorage {
-            slice: CudaStorageSlice::F16(output),
-            device: dev.clone(),
-        };
-        Ok((out_storage, Shape::from_dims(&[self.m, self.n])))
+        Ok(())
     }
 }
 
@@ -874,49 +926,66 @@ pub fn had_r_128_fp16(input: &Tensor, scale: Option<&Tensor>, mode: HadScale) ->
         }
     }
 
-    let op = HadR128Fp16Op {
+    let device = input.device();
+    let output = crate::engine::output_pool::OutputPool::global().reserve(
+        &[rows, cols],
+        DType::F16,
+        device,
+    )?;
+    let op = HadR128Fp16InplaceOp {
         scale: scale.cloned(),
         mode,
         rows: rows as i32,
         cols: cols as i32,
     };
-    input.apply_op1(op)
+    output.inplace_op2(input, &op)?;
+    Ok(output)
 }
 
-struct HadR128Fp16Op {
+struct HadR128Fp16InplaceOp {
     scale: Option<Tensor>,
     mode: HadScale,
     rows: i32,
     cols: i32,
 }
 
-impl CustomOp1 for HadR128Fp16Op {
+impl InplaceOp2 for HadR128Fp16InplaceOp {
     fn name(&self) -> &'static str {
-        "exl3_had_r_128_fp16"
+        "exl3_had_r_128_fp16_inplace"
     }
 
-    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        _s1: &mut CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<()> {
         candle_core::bail!("exl3_had_r_128_fp16: CUDA only")
     }
 
-    fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+    fn cuda_fwd(
+        &self,
+        out_storage: &mut CudaStorage,
+        _out_layout: &Layout,
+        in_storage: &CudaStorage,
+        _in_layout: &Layout,
+    ) -> Result<()> {
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
         use candle_core::Storage;
 
-        let dev = &storage.device;
+        let dev = &in_storage.device;
         let kernel_name = self.mode.fp16_kernel();
         let func = dev.get_or_load_custom_func(kernel_name, "exl3_hadamard", HADAMARD_PTX)?;
 
-        let input = match &storage.slice {
+        let input = match &in_storage.slice {
             CudaStorageSlice::F16(s) => s,
             _ => candle_core::bail!("exl3_had_r_128: input must be F16"),
         };
-
-        // Output is freshly allocated (zeroed; the kernel overwrites
-        // every element, so the zero init is wasted but cheap). When
-        // we wire OutputPool in Phase 4, replace with `reserve()`.
-        let elem_count = (self.rows as usize) * (self.cols as usize);
-        let output = dev.alloc_zeros::<half::f16>(elem_count)?;
+        let output = match &mut out_storage.slice {
+            CudaStorageSlice::F16(s) => s,
+            _ => candle_core::bail!("exl3_had_r_128: output must be F16"),
+        };
 
         // Build a "null" device pointer for the no-scale variant by
         // allocating a 1-element placeholder. Cleaner than nullable
@@ -960,46 +1029,13 @@ impl CustomOp1 for HadR128Fp16Op {
 
         let mut builder = func.builder();
         builder.arg(input);
-        builder.arg(&output);
+        builder.arg(output);
         builder.arg(scale_ref);
         builder.arg(&r_scale);
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("had_r_128 launch: {e}")))?;
 
-        let out_storage = CudaStorage {
-            slice: CudaStorageSlice::F16(output),
-            device: dev.clone(),
-        };
-        Ok((
-            out_storage,
-            Shape::from_dims(&[self.rows as usize, self.cols as usize]),
-        ))
-    }
-}
-
-// `InplaceOp1` variant used when the caller already owns the output
-// buffer (e.g. pool-reserved tensor). Not used in Phase 3 yet — leave
-// the type declared so the wire-up in Phase 4 is a one-line addition.
-#[allow(dead_code)]
-struct HadR128Fp16InplaceOp<'a> {
-    input: &'a Tensor,
-    scale: Option<&'a Tensor>,
-    mode: HadScale,
-    rows: i32,
-    cols: i32,
-}
-
-#[allow(dead_code)]
-impl<'a> InplaceOp1 for HadR128Fp16InplaceOp<'a> {
-    fn name(&self) -> &'static str {
-        "exl3_had_r_128_fp16_inplace"
-    }
-    fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
-        candle_core::bail!("exl3_had_r_128_fp16_inplace: CUDA only")
-    }
-    fn cuda_fwd(&self, _s: &mut CudaStorage, _l: &Layout) -> Result<()> {
-        // Will be implemented in Phase 4 alongside OutputPool wiring.
-        candle_core::bail!("exl3_had_r_128_fp16_inplace: pending Phase 4")
+        Ok(())
     }
 }
 
@@ -1168,7 +1204,7 @@ mod tests {
     #[cfg(feature = "gpu-test-small")]
     mod gpu_tests {
         use super::*;
-        use candle_core::Device;
+        use candle_core::{Device, IndexOp};
 
         fn cuda_device() -> Option<Device> {
             Device::cuda_if_available(0).ok().filter(|d| d.is_cuda())
