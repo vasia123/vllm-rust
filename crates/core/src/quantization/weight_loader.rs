@@ -461,14 +461,18 @@ impl QuantizedWeightLoader for Exl3WeightLoader {
         // n = out_features, K = bpw. We don't know the exact bpw for this
         // layer until we read the tensor's last dim — `bits_per_weight`
         // in the config is the dominant value, not authoritative per-layer.
+        // The on-disk dtype is int16; candle 0.10.2 has native I16 which
+        // preserves byte layout (each i16 is 2 bytes on GPU as well), so
+        // we can pass the slice directly to the kernel which interprets
+        // it as `uint16_t*` — the bit pattern is identical.
         let k_blocks = in_features / 16;
         let n_blocks = out_features / 16;
         let last_dim = 16 * self.config.bits_per_weight as usize;
-        let trellis = vb_get_as(
-            &vb,
+        let trellis = vb.get_with_hints_dtype(
             (k_blocks, n_blocks, last_dim),
             "trellis",
-            DType::U32, /* uint16 on disk; candle promotes to U32 storage */
+            Init::Const(0.0),
+            DType::I16,
         )?;
         // Bits-per-weight from the actual tensor shape, in case the config
         // value disagrees.

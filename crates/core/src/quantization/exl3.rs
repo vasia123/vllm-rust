@@ -307,7 +307,7 @@ mod tests {
     fn linear_forward_is_unimplemented_in_phase_1() {
         // Phase-1 invariant: the linear exists but its forward errors out.
         // Phase 4 replaces this test with a correctness check.
-        let trellis = Tensor::zeros((1, 1, 64), DType::U32, &Device::Cpu).unwrap();
+        let trellis = Tensor::zeros((1, 1, 64), DType::I16, &Device::Cpu).unwrap();
         let suh = Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap();
         let svh = Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap();
         let lin = Exl3Linear {
