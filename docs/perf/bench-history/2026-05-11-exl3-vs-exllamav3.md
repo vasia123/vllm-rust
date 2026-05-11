@@ -20,15 +20,18 @@
 ```
                        c=1 decode tps   c=1 ttft ms
 ---------------------- --------------- -------------
-vllm-rust                       42.6           272.9
+vllm-rust (Phase 7)             42.6           272.9
+vllm-rust (Phase 8)             83.4            63.4
 ExLlamaV3                      107.9            40.0   (median of 3 runs)
-ratio                          2.53×           0.15×
+gap (Phase 7)                  2.53×
+gap (Phase 8)                  1.29×          ← gate ≤ 1.30× met
 ```
 
 ```
                        c=4 aggregate tps   c=4 per-req tps
 ---------------------- ------------------ -----------------
-vllm-rust                         125.9              31.5
+vllm-rust (Phase 7)              125.9              31.5
+vllm-rust (Phase 8)              261.4              66.2
 ExLlamaV3                        n/a* (low-level harness is single-stream)
 ```
 
@@ -111,10 +114,43 @@ torch-sdpa path.
 ## Bottom line
 
 EXL3 inference in vllm-rust **works end-to-end and is correct**, at
-~40 % of ExLlamaV3's single-stream throughput on this hardware. The
-gap is dominated by allocator pressure and missing CUDA Graph capture
-on the cooperative-launch path — both have well-defined follow-up
-work items (OutputPool integration; per-device locks cache; pool-
-backed `A_had` scratch). At c=4 vllm-rust's batching pulls the
-aggregate above per-stream ExLlamaV3 (125.9 vs 107.9), but that's a
-different axis of comparison.
+**~77 % of ExLlamaV3's single-stream throughput** on this hardware
+after Phase 8 (commits `3a7de17`, `c1e03b2`). The two-commit
+allocator-pressure cleanup nearly doubled c=1 throughput (42.6 →
+83.4 tps) and closed the gap from 2.53× to **1.29×** — within
+the planned ≤ 1.30× gate.
+
+What Phase 8 did:
+- **8.1 — per-device locks cache** (`exl3_scratch::exl3_locks`):
+  cache the ~4 MiB `int32[1 MiB + 2 KiB]` cooperative-GEMM lock
+  workspace at process-level, mirroring ExLlamaV3's
+  `DevCtx::get_locks`. The barrier protocol self-restores between
+  launches (sense-reversal + `barrier_release(reset=true)`), so
+  no per-call memset is needed. Killed ~112 cuMemAllocAsync /
+  token on Llama-3.2-1B decode.
+- **8.2 — OutputPool for output + A_had**: convert
+  `Exl3GemmOp` / `Exl3GemvOp` / `HadR128Fp16Op` from `CustomOp1`
+  to `InplaceOp2`. Caller pre-reserves the output Tensor from
+  `OutputPool::global()` and passes activations via
+  `inplace_op2`. Eliminated the remaining 2 of 3 hot-path
+  allocations per launch. Steady-state decode now issues **zero**
+  CUDA memory allocations after warmup.
+
+7/7 sanity-prompt sweep
+(`scripts/test_exl3_correctness.sh`) shows identical factually-
+correct generations (Paris / Jupiter / Washington / 0°C) — kernel
+math unchanged, only buffer ownership moved.
+
+At c=4 vllm-rust's batching pulls aggregate to **261.4 tps** —
+**2.42× single-stream ExLlamaV3** (107.9). Both numbers are on the
+same RTX 4060 Laptop, same model checkpoint, same prompt/decode
+budget.
+
+Deferred (low-value polish):
+- Phase 8.3 (`null_scale_buf` per-call alloc in `HadR128Fp16Op`)
+  — kernel has no production callers; only tests exercise this path.
+- Phase 8.4 (`Box::leak` mangled kernel names) — amortized to
+  zero after warmup via `dev.get_or_load_custom_func` cache.
+
+Both can be picked up if/when the EXL3 path gets a kernel-rewrite
+(Phase 11; would unblock CUDA Graph capture and add another 30-60%).
