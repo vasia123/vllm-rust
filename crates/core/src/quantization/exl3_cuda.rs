@@ -18,6 +18,7 @@ use candle_core::{
 
 const HADAMARD_PTX: &str = include_str!("../../kernels/exl3/hadamard.ptx");
 const RECONSTRUCT_PTX: &str = include_str!("../../kernels/exl3/reconstruct.ptx");
+const EXL3_GEMV_PTX: &str = include_str!("../../kernels/exl3/exl3_gemv.ptx");
 
 // Per-K GEMM comp_unit PTX. Each unit defines `exl3_gemm_kernel<K, ...>`
 // across the full (c_fp32, codebook, shape) cross-product — 48 kernel
@@ -313,6 +314,151 @@ pub fn exl3_gemm(
         codebook,
     };
     a.apply_op1(op)
+}
+
+/// Returns true if the M=1..=8 GEMV fast path is available for the
+/// given bpw. Upstream ExLlamaV3 only instantiates the GEMV template
+/// for K=4 (4-bit weights); other bpw values must fall through to the
+/// cooperative GEMM kernel. See `quant/exl3_gemv.cu`.
+pub const fn exl3_gemv_supports_bpw(bpw: u32) -> bool {
+    bpw == 4
+}
+
+const EXL3_GEMV_TILESIZE_K: usize = 512;
+const EXL3_GEMV_TILESIZE_N: usize = 32;
+
+/// EXL3 GEMV fast path for M ≤ 8 and bpw=4.
+///
+/// Same `out = had(x*suh) @ decode(trellis); out = had(out) * svh`
+/// math as `exl3_gemm`, but uses the simpler non-cooperative kernel
+/// that doesn't need locks / A_had scratch. Only available for 4-bit
+/// weights — call `exl3_gemv_supports_bpw(bpw)` to gate.
+///
+/// Requires `K % 512 == 0` and `N % 32 == 0`.
+pub fn exl3_gemv(a: &Tensor, trellis: &Tensor, bpw: u32, codebook: Exl3Codebook) -> Result<Tensor> {
+    if !exl3_gemv_supports_bpw(bpw) {
+        candle_core::bail!("exl3_gemv: only bpw=4 is available upstream, got {}", bpw);
+    }
+    if a.dtype() != DType::F16 || trellis.dtype() != DType::I16 {
+        candle_core::bail!("exl3_gemv: A must be F16, trellis must be I16");
+    }
+    if a.dims().len() != 2 {
+        candle_core::bail!("exl3_gemv: A must be 2D [M, K]");
+    }
+    let (m, k) = (a.dims()[0], a.dims()[1]);
+    let (_kb, n_blocks, last) = (trellis.dims()[0], trellis.dims()[1], trellis.dims()[2]);
+    let n = n_blocks * 16;
+    if m == 0 || m > 8 {
+        candle_core::bail!("exl3_gemv: M must be in 1..=8, got {}", m);
+    }
+    if !k.is_multiple_of(EXL3_GEMV_TILESIZE_K) {
+        candle_core::bail!(
+            "exl3_gemv: K ({}) must be a multiple of {}",
+            k,
+            EXL3_GEMV_TILESIZE_K
+        );
+    }
+    if !n.is_multiple_of(EXL3_GEMV_TILESIZE_N) {
+        candle_core::bail!(
+            "exl3_gemv: N ({}) must be a multiple of {}",
+            n,
+            EXL3_GEMV_TILESIZE_N
+        );
+    }
+    if last != 16 * bpw as usize {
+        candle_core::bail!(
+            "exl3_gemv: trellis last dim ({}) must be 16*bpw ({})",
+            last,
+            16 * bpw
+        );
+    }
+    let op = Exl3GemvOp {
+        trellis: trellis.clone(),
+        m,
+        k,
+        n,
+        codebook,
+    };
+    a.apply_op1(op)
+}
+
+struct Exl3GemvOp {
+    trellis: Tensor,
+    m: usize,
+    k: usize,
+    n: usize,
+    codebook: Exl3Codebook,
+}
+
+impl CustomOp1 for Exl3GemvOp {
+    fn name(&self) -> &'static str {
+        "exl3_gemv"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("exl3_gemv: CUDA only")
+    }
+    fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::Storage;
+
+        let dev = &storage.device;
+        // `_Z16exl3_gemv_kernelILi4ELb<c_fp32>ELi<cb>ELi1EEvPK6__halfPKtPviii`
+        let kernel_name = format!(
+            "_Z16exl3_gemv_kernelILi4ELb0ELi{}ELi1EEvPK6__halfPKtPviii",
+            self.codebook.as_u32()
+        );
+        let func = dev.get_or_load_custom_func(
+            Box::leak(kernel_name.into_boxed_str()),
+            "exl3_gemv",
+            EXL3_GEMV_PTX,
+        )?;
+
+        let a = match &storage.slice {
+            CudaStorageSlice::F16(s) => s,
+            _ => candle_core::bail!("exl3_gemv: A must be F16"),
+        };
+        let (tg, _) = self.trellis.storage_and_layout();
+        let trellis = match &*tg {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::I16(s) => s,
+                _ => candle_core::bail!("exl3_gemv: trellis must be I16"),
+            },
+            _ => candle_core::bail!("exl3_gemv: trellis must be on CUDA"),
+        };
+
+        let output = dev
+            .alloc_zeros::<half::f16>(self.m * self.n)
+            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemv output alloc: {e}")))?;
+
+        // Grid + block per the kernel header comment:
+        //   grid:  (1, size_n / TILESIZE_N, 1)
+        //   block: (32, TILESIZE_N/16, TILESIZE_K/16) → 32 × 2 × 32 = 2048
+        // but the implementation uses (1, N/TILESIZE_N) and block
+        // (32, 1, TILESIZE_K / 16) = (32, 1, 32) = 1024 threads.
+        let cfg = LaunchConfig {
+            grid_dim: (1, (self.n / EXL3_GEMV_TILESIZE_N) as u32, 1),
+            block_dim: (32, 1, (EXL3_GEMV_TILESIZE_K / 16) as u32),
+            shared_mem_bytes: 0,
+        };
+        let size_m = self.m as i32;
+        let size_k = self.k as i32;
+        let size_n = self.n as i32;
+        let mut builder = func.builder();
+        builder.arg(a);
+        builder.arg(trellis);
+        builder.arg(&output);
+        builder.arg(&size_m);
+        builder.arg(&size_k);
+        builder.arg(&size_n);
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemv launch: {e}")))?;
+
+        let out_storage = CudaStorage {
+            slice: CudaStorageSlice::F16(output),
+            device: dev.clone(),
+        };
+        Ok((out_storage, Shape::from_dims(&[self.m, self.n])))
+    }
 }
 
 struct Exl3GemmOp {
@@ -944,6 +1090,30 @@ mod tests {
     }
 
     #[test]
+    fn gemv_only_supports_bpw_4() {
+        assert!(exl3_gemv_supports_bpw(4));
+        for k in [2u32, 3, 5, 6, 7, 8] {
+            assert!(!exl3_gemv_supports_bpw(k), "bpw {k} must be unsupported");
+        }
+    }
+
+    #[test]
+    fn gemv_rejects_non_4bit() {
+        let a = Tensor::zeros((1, 512), DType::F16, &Device::Cpu).unwrap();
+        let t = Tensor::zeros((32, 2, 48), DType::I16, &Device::Cpu).unwrap();
+        let err = exl3_gemv(&a, &t, 3, Exl3Codebook::Default).err().unwrap();
+        assert!(format!("{err}").contains("bpw=4"));
+    }
+
+    #[test]
+    fn gemv_rejects_large_m() {
+        let a = Tensor::zeros((16, 512), DType::F16, &Device::Cpu).unwrap();
+        let t = Tensor::zeros((32, 2, 64), DType::I16, &Device::Cpu).unwrap();
+        let err = exl3_gemv(&a, &t, 4, Exl3Codebook::Default).err().unwrap();
+        assert!(format!("{err}").contains("M must be"));
+    }
+
+    #[test]
     fn gemm_rejects_wrong_dtypes() {
         let a = Tensor::zeros((1, 16), DType::F32, &Device::Cpu).unwrap();
         let t = Tensor::zeros((1, 1, 48), DType::I16, &Device::Cpu).unwrap();
@@ -996,6 +1166,38 @@ mod tests {
 
         fn cuda_device() -> Option<Device> {
             Device::cuda_if_available(0).ok().filter(|d| d.is_cuda())
+        }
+
+        #[test]
+        fn exl3_gemv_launches_on_synthetic_inputs() {
+            // bpw=4 path: M=1, K=4096, N=4096 — Llama-style attention proj
+            // dimensions. We expect the dedicated GEMV kernel to launch
+            // and return a finite [1, 4096] fp16 output.
+            let Some(dev) = cuda_device() else { return };
+
+            let m = 1usize;
+            let k = 4096usize;
+            let n = 4096usize;
+            let bpw = 4u32;
+
+            let mut x_data = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.0017).sin() * 0.1).clamp(-1.0, 1.0);
+                x_data.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&x_data, (m, k), &dev).unwrap();
+            let trellis =
+                Tensor::zeros((k / 16, n / 16, 16 * bpw as usize), DType::I16, &dev).unwrap();
+            let y = exl3_gemv(&x, &trellis, bpw, Exl3Codebook::Default).expect("gemv launch ok");
+            assert_eq!(y.dims(), &[m, n]);
+            let s = y
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(s.is_finite(), "exl3_gemv produced non-finite sum: {s}");
         }
 
         #[test]
