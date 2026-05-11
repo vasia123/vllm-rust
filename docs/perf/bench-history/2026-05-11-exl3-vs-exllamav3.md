@@ -146,11 +146,42 @@ At c=4 vllm-rust's batching pulls aggregate to **261.4 tps** —
 same RTX 4060 Laptop, same model checkpoint, same prompt/decode
 budget.
 
-Deferred (low-value polish):
-- Phase 8.3 (`null_scale_buf` per-call alloc in `HadR128Fp16Op`)
-  — kernel has no production callers; only tests exercise this path.
-- Phase 8.4 (`Box::leak` mangled kernel names) — amortized to
-  zero after warmup via `dev.get_or_load_custom_func` cache.
+Polish (Phase 8.3 / 8.4, commit `8c618e6`):
+- `exl3_scratch::exl3_had_null_scale` — per-device 1-element fp16
+  sentinel for the no-scale Hadamard kernel, eliminates the
+  remaining per-call 2-byte `cudaMallocAsync`.
+- `exl3_scratch::intern_kernel_name` — interns mangled PTX symbol
+  names so the `Box::leak` cost is bounded by the number of unique
+  template instantiations (≤ ~200) instead of growing with launch
+  count. Was a slow leak, not a perf issue; closed for hygiene.
 
-Both can be picked up if/when the EXL3 path gets a kernel-rewrite
-(Phase 11; would unblock CUDA Graph capture and add another 30-60%).
+## Phase 9 — multi-step compatibility sweep (commit pending)
+
+The cooperative-launch EXL3 path coexists with multi-step batching
+without modification. Sweep at the Phase-8 setup:
+
+```
+multi-step    c=1 tps   c=4 agg tps   c=4 per-req tps
+----------- --------- ------------- -----------------
+        1       84.4         248.6              65.0
+        4       83.4         261.4              66.2
+        8       81.6         289.9              72.6
+```
+
+Findings:
+- c=1 is **kernel-bound** — multi-step makes no measurable
+  difference (84 ± 1.5 tps across all values). The cooperative
+  GEMM dominates per-token wall time; scheduler-loop overhead is
+  already negligible.
+- c=4 aggregate scales with multi-step: ms=8 wins (+17 % over
+  ms=1). Worth keeping the default at 4 — 8 is marginal for the
+  small model and may regress at higher concurrency where the
+  larger batch pulls more from the pool.
+- No deadlock, hang, or correctness regression observed at any
+  multi-step value. Multi-step did **not** require an EXL3
+  auto-disable analogous to the `--enforce-eager` override.
+
+Bottom line: gap closed (1.29× ≤ 1.30× gate), Phase 8 + 9 polish
+complete. Further perf requires kernel rewrite (Phase 11) — only
+remaining path is unblocking CUDA Graph capture by removing
+`cg::this_grid().sync()` from the cooperative kernel.
