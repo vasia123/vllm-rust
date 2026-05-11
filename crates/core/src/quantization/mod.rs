@@ -36,6 +36,8 @@ mod detection;
 pub mod exl3;
 #[cfg(feature = "cuda-kernels")]
 pub mod exl3_cuda;
+#[cfg(feature = "cuda-kernels")]
+pub mod exl3_scratch;
 pub mod experts_int8;
 pub mod fbgemm_fp8;
 pub mod fp8;

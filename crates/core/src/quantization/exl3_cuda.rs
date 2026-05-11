@@ -209,11 +209,6 @@ fn mangled_gemm_symbol(bpw: u32, c_fp32: bool, cb: u32, shape: GemmShape) -> Str
 /// `SMEM_MAX` in `exl3_gemm_inner.cuh` (90 KiB).
 const EXL3_GEMM_SMEM_MAX: i32 = 90 * 1024;
 
-/// Per-device locks workspace used by `exl3_gemm` for cooperative tile
-/// scheduling. See `quant/exl3_devctx.cu::get_locks`:
-/// `(MAX_TILES_C + MAX_BARRIERS * 2) * sizeof(int)`.
-const EXL3_LOCKS_ELEMS: usize = (1024 * 1024) + (1024 * 2);
-
 /// Dispatch the EXL3 GEMM kernel.
 ///
 /// Computes
@@ -593,12 +588,13 @@ impl CustomOp1 for Exl3GemmOp {
             .alloc_zeros::<half::f16>(self.m * self.k)
             .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm A_had alloc: {e}")))?;
 
-        // Per-device locks workspace, zero-initialised. Re-allocated
-        // every call until a per-device cache lands (Phase 4b.6
-        // alongside the OutputPool wiring).
-        let locks = dev
-            .alloc_zeros::<i32>(EXL3_LOCKS_ELEMS)
-            .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm locks alloc: {e}")))?;
+        // Per-device locks workspace. Cached for the life of the process
+        // — the barrier protocol is self-restoring across launches
+        // (`barrier_release(reset=true)` zeroes locks, `group_barrier`
+        // uses sense-reversal so the sense bit value is irrelevant
+        // between launches). See `quantization::exl3_scratch` for the
+        // ownership model, which mirrors ExLlamaV3's `DevCtx::get_locks`.
+        let locks = crate::quantization::exl3_scratch::exl3_locks(dev)?;
 
         // Both `suh` and `svh` are mandatory — the kernel hardcodes
         // shmem_out_had=true and unconditionally dereferences both.
@@ -635,7 +631,7 @@ impl CustomOp1 for Exl3GemmOp {
         builder.arg(&size_m);
         builder.arg(&size_k);
         builder.arg(&size_n);
-        builder.arg(&locks);
+        builder.arg(&*locks);
         builder.arg(suh_slice);
         builder.arg(&a_had);
         builder.arg(svh_slice);
