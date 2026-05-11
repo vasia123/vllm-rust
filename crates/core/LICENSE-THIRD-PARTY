@@ -1,0 +1,45 @@
+Third-party code vendored into this crate.
+
+================================================================================
+ExLlamaV3 (https://github.com/turboderp-org/exllamav3)
+================================================================================
+
+The files under `kernels/exl3/` are derived from ExLlamaV3, copyright (c) 2025
+Turboderp, released under the MIT License. Vendored at commit fa9e6802
+(2026-04-03 snapshot in `reference/vllm` is unrelated; ExLlamaV3 is a separate
+project). Modifications:
+
+  - Host launcher functions (`void exl3_gemm(at::Tensor ...)` etc.) are left
+    in place but no longer called — Rust drives launches via cudarc.
+  - `<ATen/...>` and `<c10/...>` includes are replaced by the local
+    `exl3_torch_stub.h`, which provides no-op replacements so vendored .cu
+    files parse and compile to PTX without a libtorch dependency.
+  - Training/quantization-only sources (`pack.cu`, `quantize.cu`,
+    `coop_autotune.cu`, MoE-specific files) are removed.
+  - `util.cuh` extended with explicit `#include <cuda_fp16.h>` and
+    `<cuda_bf16.h>`; cuBLAS error helpers stripped (host-only).
+
+Original ExLlamaV3 license:
+
+    MIT License
+
+    Copyright (c) 2025 Turboderp
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

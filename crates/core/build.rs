@@ -156,6 +156,60 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/ssd_scan.ptx",
         min_sm: 75,
     },
+    // EXL3 (ExLlamaV3) — vendored MIT-licensed kernels (Turboderp).
+    // Trellis-coded vector quantization (QTIP-style) with separate
+    // Hadamard pre/post transforms. Each comp_unit specialises the
+    // GEMM template for a particular bits-per-weight (K=2..8).
+    KernelDef {
+        source: "kernels/exl3/hadamard.cu",
+        output: "kernels/exl3/hadamard.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/reconstruct.cu",
+        output: "kernels/exl3/reconstruct.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/exl3_gemv.cu",
+        output: "kernels/exl3/exl3_gemv.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_2.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_2.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_3.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_3.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_4.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_4.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_5.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_5.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_6.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_6.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_7.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_7.ptx",
+        min_sm: 80,
+    },
+    KernelDef {
+        source: "kernels/exl3/comp_units/exl3_comp_unit_8.cu",
+        output: "kernels/exl3/comp_units/exl3_comp_unit_8.ptx",
+        min_sm: 80,
+    },
 ];
 
 fn parse_sm_version(arch: &str) -> u32 {
@@ -253,15 +307,25 @@ fn main() {
         let compile_sm = std::cmp::max(target_sm, kernel.min_sm);
         let compile_arch = format!("sm_{compile_sm}");
 
-        let args = vec![
+        // EXL3 vendored kernels need C++17 (std::array of kernel ptrs)
+        // and may emit warnings we don't own. Carry the same flags for
+        // all kernels — vendored ones get the extras only.
+        let mut args: Vec<String> = vec![
             "--ptx".to_string(),
             format!("-arch={compile_arch}"),
             "-O3".to_string(),
             "--use_fast_math".to_string(),
+        ];
+        if kernel.source.contains("/exl3/") {
+            args.push("-std=c++17".to_string());
+            args.push("--diag-suppress=174".to_string()); // "expression has no effect"
+            args.push("--diag-suppress=550".to_string()); // "variable was set but never used"
+        }
+        args.extend([
             "-o".to_string(),
             kernel.output.to_string(),
             kernel.source.to_string(),
-        ];
+        ]);
 
         let status = Command::new("nvcc").args(&args).status();
 
