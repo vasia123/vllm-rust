@@ -1744,5 +1744,240 @@ mod tests {
                 "Hadamard norm-preservation broken: ‖y‖²/‖x‖² = {ratio}"
             );
         }
+
+        /// Phase 11.2 diagnostic: drive `exl3_gemm` through the decode
+        /// fast path inside an explicit `cuStreamBeginCapture_v2` /
+        /// `cuStreamEndCapture` window and report whether the captured
+        /// graph instantiates cleanly. The full-engine warmup at
+        /// `engine/standard.rs` fails with `CUDA_ERROR_INVALID_VALUE`
+        /// when capture is enabled for EXL3-Llama, but in that context
+        /// it's hard to tell whether the EXL3 op itself is the offender
+        /// or some downstream layer (attention / MLP / lm_head) corrupts
+        /// the stream first. This test isolates the EXL3 path so a
+        /// failure here unambiguously points at one of:
+        ///   - kernel-internal allocation (locks / null-scale-buf cache
+        ///     cold miss inside capture),
+        ///   - pool-growth `cuMemAllocAsync` inside the captured stream,
+        ///   - `cuFuncSetAttribute` interaction with capture state,
+        ///   - the two-launch Hadamard+GEMM sequence itself.
+        ///
+        /// The test pre-warms every per-device EXL3 cache + the pool
+        /// before BeginCapture. If `cuStreamEndCapture` returns SUCCESS
+        /// here, EXL3 is capture-clean and the production failure is
+        /// elsewhere in the forward.
+        #[test]
+        fn exl3_gemm_decode_path_inside_cuda_capture_window() {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
+                CUstreamCaptureMode,
+            };
+
+            // Production engine uses a NON-default stream so that
+            // `cuStreamBeginCapture_v2` works. The default null stream
+            // returns `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` and would
+            // make this test useless. Match production by constructing
+            // the device via `Device::new_cuda_with_stream`.
+            let dev_t = match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return,
+            };
+            let cuda_dev = match &dev_t {
+                Device::Cuda(c) => c.clone(),
+                _ => unreachable!(),
+            };
+            // Production engine disables event tracking via `create_cuda_device`
+            // in main.rs; without this every `CudaSlice` carries a
+            // per-slice event chain that creates cross-stream dependencies
+            // when touched inside capture (CUDA_ERROR_STREAM_CAPTURE_ISOLATION).
+            // Mirror that here.
+            // SAFETY: this test issues all work on a single stream — exactly
+            // the constraint `disable_event_tracking` requires.
+            unsafe {
+                cuda_dev.disable_event_tracking();
+            }
+
+            // Llama-3.2-1B attention-proj shape, bpw=3 (production target).
+            let m = 1usize;
+            let k = 2048usize;
+            let n = 2048usize;
+            let bpw = 3u32;
+
+            // Synthetic inputs.
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut t_data: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0xDEAD_BEEF;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                t_data.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&t_data, (k / 16, n / 16, 16 * bpw as usize), &dev_t).unwrap();
+            let mut x_data = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.0017).sin() * 0.05) as f32;
+                x_data.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&x_data, (m, k), &dev_t).unwrap();
+            let ones_suh = Tensor::ones(k, DType::F16, &dev_t).unwrap();
+            let ones_svh = Tensor::ones(n, DType::F16, &dev_t).unwrap();
+
+            // ─── Pre-warm everything that lazy-initialises ──────────────
+            // Per-device EXL3 scratch caches.
+            let _ = crate::quantization::exl3_scratch::exl3_locks(&cuda_dev).expect("locks warm");
+            let _ = crate::quantization::exl3_scratch::exl3_had_null_scale(&cuda_dev)
+                .expect("null-scale warm");
+
+            // Pool growth: run the SAME gemm twice eagerly so pool grows
+            // to the steady-state slot count; reset cursors so the
+            // captured forward starts from slot 0 of a fully-grown pool.
+            let _y0 = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("warmup gemm 1");
+            let _y1 = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("warmup gemm 2");
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+
+            // Sync so no warmup work is in-flight when we start capture.
+            unsafe {
+                let r = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+                assert_eq!(
+                    r,
+                    candle_core::cuda::cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "pre-capture cuCtxSynchronize failed"
+                );
+            }
+
+            // ─── Capture window ──────────────────────────────────────
+            let stream_ref = cuda_dev.cuda_stream();
+            let stream = stream_ref.cu_stream();
+
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(
+                begin,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamBeginCapture_v2 failed: {begin:?}"
+            );
+
+            // Run the actual decode path inside the capture window.
+            let captured = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            );
+
+            // Always end capture (even on error) to release the stream.
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            if !graph.is_null() {
+                unsafe {
+                    cuGraphDestroy(graph);
+                }
+            }
+
+            // ─── Assertions ──────────────────────────────────────────
+            assert!(
+                captured.is_ok(),
+                "exl3_gemm errored inside capture: {:?}",
+                captured.err()
+            );
+            assert_eq!(
+                end,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamEndCapture failed with {end:?} — EXL3 decode path \
+                 is NOT capture-clean: a kernel did a non-captureable \
+                 operation (cuMemAllocAsync inside the stream, host pull, \
+                 sync, etc.). This is the smoking gun the full-engine \
+                 warmup was hitting."
+            );
+            let _ = captured;
+        }
+
+        /// Phase 11.2 diagnostic: run the standalone Hadamard launch
+        /// (`had_r_128_fp16`, which is exactly Launch 1 of the EXL3
+        /// decode fast path) inside a capture window. Same setup as the
+        /// gemm test but only the Hadamard step — narrows down further
+        /// if the gemm test were to ever start failing.
+        #[test]
+        fn had_r_128_fp16_inside_cuda_capture_window() {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
+                CUstreamCaptureMode,
+            };
+
+            let dev_t = match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return,
+            };
+            let cuda_dev = match &dev_t {
+                Device::Cuda(c) => c.clone(),
+                _ => unreachable!(),
+            };
+            unsafe {
+                cuda_dev.disable_event_tracking();
+            }
+
+            // Warm pool: one eager run + reset cursors.
+            let m = 1usize;
+            let k = 2048usize;
+            let mut xd = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                xd.push(half::f16::from_f32(
+                    ((i as f32 * 0.013).sin() * 0.05) as f32,
+                ));
+            }
+            let x = Tensor::from_slice(&xd, (m, k), &dev_t).unwrap();
+            let suh = Tensor::ones(k, DType::F16, &dev_t).unwrap();
+            let _ = had_r_128_fp16(&x, Some(&suh), HadScale::Pre).expect("warmup had");
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            unsafe {
+                let _ = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            let stream_ref = cuda_dev.cuda_stream();
+            let stream = stream_ref.cu_stream();
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS);
+
+            let captured = had_r_128_fp16(&x, Some(&suh), HadScale::Pre);
+
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            if !graph.is_null() {
+                unsafe {
+                    cuGraphDestroy(graph);
+                }
+            }
+
+            assert!(
+                captured.is_ok(),
+                "had_r_128_fp16 errored inside capture: {:?}",
+                captured.err()
+            );
+            assert_eq!(
+                end,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamEndCapture after had_r_128_fp16 failed: {end:?}"
+            );
+        }
     }
 }

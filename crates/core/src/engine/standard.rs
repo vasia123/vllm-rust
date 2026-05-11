@@ -354,6 +354,26 @@ impl<M: ModelForward> StandardExecution<M> {
             ..Default::default()
         };
 
+        // Phase 11.2.A — eagerly populate every per-device scratch cache
+        // that the EXL3 kernels lazy-initialise on first use. The cuMemAlloc
+        // for the 4 MiB locks workspace (and the 2-byte HadScale::None
+        // sentinel) cannot be issued inside a captured stream — if it
+        // happens during the first capture warmup the graph fails to
+        // instantiate with CUDA_ERROR_INVALID_VALUE. Calling here is a
+        // no-op for models that don't use EXL3 and idempotent for those
+        // that do (cache hit on every subsequent call).
+        #[cfg(feature = "cuda-kernels")]
+        if let candle_core::Device::Cuda(cuda_dev) = &device {
+            // Errors here are non-fatal — capture will still try to warm
+            // and we'd rather see the original failure mode than mask it.
+            if let Err(e) = crate::quantization::exl3_scratch::exl3_locks(cuda_dev) {
+                tracing::warn!(error = %e, "exl3_locks warm-up failed (continuing)");
+            }
+            if let Err(e) = crate::quantization::exl3_scratch::exl3_had_null_scale(cuda_dev) {
+                tracing::warn!(error = %e, "exl3_had_null_scale warm-up failed (continuing)");
+            }
+        }
+
         // Create runner
         let runner = CudaGraphRunner::new(graph_config, device, vocab_size, DType::F32);
         self.graph_runner = Some(Arc::new(runner));

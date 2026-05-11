@@ -1356,31 +1356,41 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let device = create_cuda_device(0)?;
 
     // EXL3 needs two adjustments vs the default path:
-    //   1. fp16 activations (kernels are fp16-only)
-    //   2. enforce_eager — Phase 11.1 made the EXL3 GEMM kernel itself
-    //      capture-eligible (split + non-cooperative for M ≤ 16) and
-    //      Phase 11.2 wired `LlamaForCausalLM::forward_decode_batch_with_ctx`
-    //      to propagate `DecodeBatchShared` (mirrors Qwen3 pattern).
-    //      That's the necessary kernel + dispatch foundation, but
-    //      capture replay still fails with INVALID_VALUE during
-    //      EndCapture: the rest of the Llama decode path (RMSNorm,
-    //      RoPE, SwiGLU/SiLU+Mul, paged-attention V2, residual add,
-    //      lm_head matmul) has not yet been pool-migrated the way
-    //      Qwen3's Phase A/B/B.8 did (memory:
-    //      perf_cuda_graph_capture.md). Until that broader Llama
-    //      capture-readiness work lands, keep the auto-eager override.
+    //   1. fp16 activations (kernels are fp16-only).
+    //   2. capture_sizes clipped to ≤ EXL3_GEMM_DECODE_MAX_M (= 16) —
+    //      the Phase-11.1 GEMM split that makes the kernel capturable
+    //      only kicks in for M ≤ 16; larger batches fall through to
+    //      the cooperative `exl3_gemm_kernel` which uses
+    //      `cuLaunchCooperativeKernel` and cannot be captured. Trying
+    //      to capture bs > 16 silently invalidates the CUDA stream
+    //      (EndCapture returns INVALID_VALUE) and then *subsequent*
+    //      eager forwards in the warmup loop fail with the same
+    //      INVALID_VALUE because the stream/context is hosed. Clip
+    //      preemptively so the warmup only attempts capturable sizes.
     let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
-    let enforce_eager = if is_exl3 && !enforce_eager {
-        tracing::info!(
-            "EXL3 quantization detected — forcing --enforce-eager \
-             (Llama decode path needs broader pool migration before \
-             capture can replay; kernel + dispatch foundation in place)"
-        );
-        cuda_graph_config.enabled = false;
-        true
-    } else {
-        enforce_eager
-    };
+    if is_exl3 {
+        // EXL3_GEMM_DECODE_MAX_M lives in vllm-core; keep this constant
+        // in sync with `crates/core/src/quantization/exl3_cuda.rs`.
+        // Diagnostic override: VLLM_EXL3_CAPTURE_MAX_M lets a developer
+        // pin the cap for capture-failure bisecting.
+        let cap: usize = std::env::var("VLLM_EXL3_CAPTURE_MAX_M")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let before = cuda_graph_config.capture_sizes.len();
+        cuda_graph_config.capture_sizes.retain(|&s| s <= cap);
+        let after = cuda_graph_config.capture_sizes.len();
+        if after < before {
+            tracing::info!(
+                "EXL3 quantization detected — capture sizes clipped to ≤ {} \
+                 ({} of {} dropped, larger batches go through the cooperative \
+                 GEMM kernel and cannot be captured)",
+                cap,
+                before - after,
+                before
+            );
+        }
+    }
     let dtype = if is_exl3 && dtype != DType::F16 {
         tracing::warn!(
             requested = ?dtype,
