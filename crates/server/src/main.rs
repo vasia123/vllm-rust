@@ -1357,19 +1357,22 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     // EXL3 needs two adjustments vs the default path:
     //   1. fp16 activations (kernels are fp16-only)
-    //   2. enforce_eager (cooperative GEMM kernel can't be captured
-    //      into a CUDA graph — the runtime tile-scheduling barrier
-    //      isn't replayable)
-    // We apply both transparently with info/warn-level logs so users
-    // see the override and aren't confused by a kernel-side failure.
+    //   2. enforce_eager — Phase 11.1 made the EXL3 GEMM decode path
+    //      itself capture-eligible (kernel split, non-cooperative
+    //      launch), but the rest of the Llama-3.2 decode forward is
+    //      NOT yet pool-migrated end-to-end (positions, slot_mapping,
+    //      RoPE/SiLU/PagedAttn intermediates have unstable device
+    //      addresses across forwards). Until the Llama decode path
+    //      receives the same Phase-A/B/B.8 pool wiring that landed for
+    //      Qwen3-AWQ (memory: perf_cuda_graph_capture.md), capture
+    //      replay errors with ILLEGAL_ADDRESS on forward #2. Keep the
+    //      auto-eager override until that refactor lands.
     let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
     let enforce_eager = if is_exl3 && !enforce_eager {
         tracing::info!(
             "EXL3 quantization detected — forcing --enforce-eager \
-             (cooperative GEMM kernel cannot be captured into a CUDA graph)"
+             (Llama decode path not yet capture-ready end-to-end)"
         );
-        // The cuda_graph_config was sized for the user's CLI choice
-        // earlier; disable capture now that we've decided to override.
         cuda_graph_config.enabled = false;
         true
     } else {

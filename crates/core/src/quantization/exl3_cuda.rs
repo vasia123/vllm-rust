@@ -205,6 +205,33 @@ fn mangled_gemm_symbol(bpw: u32, c_fp32: bool, cb: u32, shape: GemmShape) -> Str
     )
 }
 
+/// Mangled PTX symbol for an `exl3_gemm_decode_kernel` template instance
+/// (Phase 11.1). Same template args as `mangled_gemm_symbol`; the prefix
+/// changes from `16exl3_gemm_kernel` to `23exl3_gemm_decode_kernel`
+/// (Itanium length-prefixed identifiers — "exl3_gemm_decode_kernel" is
+/// 23 characters).
+fn mangled_gemm_decode_symbol(bpw: u32, c_fp32: bool, cb: u32, shape: GemmShape) -> String {
+    format!(
+        "_Z23exl3_gemm_decode_kernelILi{}ELb{}ELi{}ELi{}ELi{}ELi{}ELi{}ELi{}EEvPK6__halfPKtPviiiPiS2_PS0_S2_",
+        bpw,
+        if c_fp32 { 1 } else { 0 },
+        cb,
+        shape.tilesize_m,
+        shape.tilesize_k,
+        shape.tilesize_n,
+        shape.sh_stages,
+        shape.frag_stages,
+    )
+}
+
+/// M-threshold below which `Exl3GemmInplaceOp` takes the split fast
+/// path: standalone Hadamard launch + non-cooperative GEMM. At this
+/// threshold the original kernel's M-tile loop runs at most once
+/// anyway, so the trailing `grid.sync()` is dead weight and dropping
+/// it costs nothing. Larger M values fall back to the cooperative
+/// kernel where inter-iteration sync is load-bearing.
+const EXL3_GEMM_DECODE_MAX_M: usize = 16;
+
 /// EXL3 max dynamic shared memory request per kernel, mirroring
 /// `SMEM_MAX` in `exl3_gemm_inner.cuh` (90 KiB).
 const EXL3_GEMM_SMEM_MAX: i32 = 90 * 1024;
@@ -593,17 +620,30 @@ impl InplaceOp2 for Exl3GemmInplaceOp {
             .max(1) as u32;
         let grid_sms = num_sms.min(max_slices).max(1);
 
-        // Resolve the kernel.
-        let kernel_name = mangled_gemm_symbol(
-            self.bpw,
-            false, /* c_fp32 = false → fp16 output */
-            self.codebook.as_u32(),
-            shape,
-        );
+        // Resolve the kernel. For M ≤ EXL3_GEMM_DECODE_MAX_M we use the
+        // Phase-11 decode variant (no cooperative launch, capture-friendly,
+        // split input-Hadamard into a separate prior launch). For larger
+        // M (prefill batches) we keep the original cooperative kernel —
+        // its inter-iteration `grid.sync()` is load-bearing there.
+        let use_decode_fast_path = self.m <= EXL3_GEMM_DECODE_MAX_M;
+        let kernel_name = if use_decode_fast_path {
+            mangled_gemm_decode_symbol(
+                self.bpw,
+                false, /* c_fp32 = false → fp16 output */
+                self.codebook.as_u32(),
+                shape,
+            )
+        } else {
+            mangled_gemm_symbol(self.bpw, false, self.codebook.as_u32(), shape)
+        };
         let ptx = gemm_ptx_for_bpw(self.bpw)?;
         let func = dev.get_or_load_custom_func(
             crate::quantization::exl3_scratch::intern_kernel_name(kernel_name),
-            "exl3_gemm",
+            if use_decode_fast_path {
+                "exl3_gemm_decode"
+            } else {
+                "exl3_gemm"
+            },
             ptx,
         )?;
 
@@ -683,6 +723,55 @@ impl InplaceOp2 for Exl3GemmInplaceOp {
             shared_mem_bytes: EXL3_GEMM_SMEM_MAX as u32,
         };
 
+        // Phase 11.1 fast path: pre-launch the standalone Hadamard kernel
+        // into `a_had`, then dispatch the non-cooperative decode GEMM
+        // which reads `a_had` as its A. Stream serialisation between
+        // launches gives the same happens-before as the old in-kernel
+        // `grid.sync()`. Both launches are capture-eligible.
+        if use_decode_fast_path {
+            let had_func = dev.get_or_load_custom_func(
+                HadScale::Pre.fp16_kernel(),
+                "exl3_hadamard",
+                HADAMARD_PTX,
+            )?;
+            // had_hf_r_128_kernel grid layout: (rows, cols/128, 1), block (32, 1, 1).
+            let had_cfg = LaunchConfig {
+                grid_dim: (self.m as u32, (self.k as u32) / 128, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // Match the in-kernel constant: r_scale = 1 / sqrt(128).
+            let r_scale: f32 = 1.0_f32 / 11.313708498984761_f32;
+            let mut hb = had_func.builder();
+            hb.arg(a);
+            hb.arg(a_had);
+            hb.arg(suh_slice);
+            hb.arg(&r_scale);
+            unsafe { hb.launch(had_cfg) }.map_err(|e| {
+                candle_core::Error::Msg(format!("exl3_gemm_decode hadamard launch: {e}"))
+            })?;
+
+            // Decode GEMM reads `a_had` (Hadamard-transformed input) and
+            // writes `output` directly. `suh`/A_had args are kept in the
+            // ABI for signature parity with the cooperative kernel but
+            // are ignored inside `exl3_gemm_decode_kernel`.
+            let mut builder = func.builder();
+            builder.arg(a_had); // A := a_had
+            builder.arg(trellis);
+            builder.arg(output);
+            builder.arg(&size_m);
+            builder.arg(&size_k);
+            builder.arg(&size_n);
+            builder.arg(&*locks);
+            builder.arg(suh_slice); // unused inside the decode kernel
+            builder.arg(a_had); // unused (A_had param) — kernel ignores
+            builder.arg(svh_slice);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| candle_core::Error::Msg(format!("exl3_gemm_decode launch: {e}")))?;
+            return Ok(());
+        }
+
+        // Cooperative path (prefill, M > EXL3_GEMM_DECODE_MAX_M).
         let mut builder = func.builder();
         builder.arg(a);
         builder.arg(trellis);
@@ -1442,6 +1531,83 @@ mod tests {
             assert!(
                 rel < 0.10,
                 "exl3_gemm diverges: max_abs={max_abs}, ref_max={ref_abs_max}, rel={rel}"
+            );
+        }
+
+        #[test]
+        fn exl3_gemm_cooperative_path_matches_reference_when_m_above_threshold() {
+            // Phase 11.1: exercises the M > EXL3_GEMM_DECODE_MAX_M branch
+            // (cooperative kernel). Same reference pipeline as
+            // `exl3_gemm_matches_hadamard_then_matmul` but with M=32 so we
+            // skip the new fast path and validate that the unchanged
+            // cooperative kernel still matches the reference. Catches
+            // regressions if the dispatch gate or symbol resolution for
+            // the legacy path silently breaks.
+            let Some(dev) = cuda_device() else { return };
+
+            let m = 32usize; // > EXL3_GEMM_DECODE_MAX_M (16)
+            let k = 512usize;
+            let n = 128usize;
+            let bpw = 4u32;
+
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut t_data: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0x9E37_79B1;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                t_data.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&t_data, (k / 16, n / 16, 16 * bpw as usize), &dev).unwrap();
+            let mut x_data = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.013).sin() * 0.05) as f32;
+                x_data.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&x_data, (m, k), &dev).unwrap();
+            let ones_suh = Tensor::ones(k, DType::F16, &dev).unwrap();
+            let ones_svh = Tensor::ones(n, DType::F16, &dev).unwrap();
+
+            let xh = had_r_128_fp16(&x, Some(&ones_suh), HadScale::Pre).expect("had ok");
+            let w_dense =
+                exl3_reconstruct(&trellis, bpw, Exl3Codebook::Default).expect("reconstruct ok");
+            let y_pre = xh.matmul(&w_dense).expect("ref matmul ok");
+            let y_ref =
+                had_r_128_fp16(&y_pre, Some(&ones_svh), HadScale::Post).expect("had post ok");
+
+            let y_act = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("cooperative gemm ok");
+            let diff = (&y_act - &y_ref).unwrap();
+            let abs = diff.abs().unwrap().to_dtype(DType::F32).unwrap();
+            let max_abs = abs
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let ref_abs_max = y_ref
+                .abs()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            let rel = max_abs / ref_abs_max.max(1e-6);
+            assert!(
+                rel < 0.10,
+                "exl3_gemm cooperative path diverges: max_abs={max_abs}, ref_max={ref_abs_max}, rel={rel}"
             );
         }
 

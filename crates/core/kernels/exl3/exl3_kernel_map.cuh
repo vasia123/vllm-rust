@@ -73,6 +73,18 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
+// Decode fast path (M <= 16, capture-friendly — no cooperative launch).
+// Same signature as `exl3_gemm_kernel`; defined in
+// `exl3_gemm_decode_kernel.cuh`. The instance arrays exist purely to
+// pin the template instantiations so nvcc emits PTX entries — Rust
+// dispatch resolves the symbols by mangled name via cudarc.
+#define EXL3_GEMM_DECODE_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
+    nullptr, \
+    exl3_gemm_decode_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+    exl3_gemm_decode_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    exl3_gemm_decode_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    exl3_gemm_decode_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+
 #define EXL3_GEMM_BASE_THREADS 256
 
 #define ALL_EXL3_KERNEL_EXTERNS(K) \
@@ -80,6 +92,8 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K[]; \
     extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K[]; \
     extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_decode_kernel_fp32_b##K[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_decode_kernel_fp16_b##K[]; \
 
 #define ALL_EXL3_KERNEL_INSTANCES(K) \
     fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K[] = { \
@@ -104,6 +118,18 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, 0), \
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, 1), \
         EXL3_MGEMM_KERNEL_INSTANCES(K, false, 2) \
+    }; \
+    \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_decode_kernel_fp32_b##K[] = { \
+        EXL3_GEMM_DECODE_KERNEL_INSTANCES(K, true, 0), \
+        EXL3_GEMM_DECODE_KERNEL_INSTANCES(K, true, 1), \
+        EXL3_GEMM_DECODE_KERNEL_INSTANCES(K, true, 2) \
+    }; \
+    \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_decode_kernel_fp16_b##K[] = { \
+        EXL3_GEMM_DECODE_KERNEL_INSTANCES(K, false, 0), \
+        EXL3_GEMM_DECODE_KERNEL_INSTANCES(K, false, 1), \
+        EXL3_GEMM_DECODE_KERNEL_INSTANCES(K, false, 2) \
     };
 
 fp_exl3_gemm_kernel select_exl3_gemm_kernel

@@ -7,6 +7,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "../ptx.cuh"
 #include "../exl3_gemm_kernel.cuh"
+#include "../exl3_gemm_decode_kernel.cuh"
 #include "exl3_comp_unit_2.cuh"
 
 ALL_EXL3_KERNEL_INSTANCES(2)
