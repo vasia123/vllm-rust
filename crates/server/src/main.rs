@@ -1184,7 +1184,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // enforce_eager=true disables CUDA graphs (eager execution for every forward pass).
     // max_seq_len_to_capture caps the batch sizes pre-captured during warmup; batches
     // exceeding this threshold fall back to eager execution.
-    let cuda_graph_config = if enforce_eager {
+    let mut cuda_graph_config = if enforce_eager {
         CudaGraphConfig::default() // enabled: false — pure eager execution
     } else {
         CudaGraphConfig {
@@ -1355,12 +1355,27 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     let device = create_cuda_device(0)?;
 
-    // EXL3 kernels are fp16-only (vendored from ExLlamaV3). Override
-    // BF16/F32 dtypes silently when EXL3 is detected — the alternative
-    // is a confusing kernel-side failure deep in the layer stack.
-    let dtype = if files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3
-        && dtype != DType::F16
-    {
+    // EXL3 needs two adjustments vs the default path:
+    //   1. fp16 activations (kernels are fp16-only)
+    //   2. enforce_eager (cooperative GEMM kernel can't be captured
+    //      into a CUDA graph — the runtime tile-scheduling barrier
+    //      isn't replayable)
+    // We apply both transparently with info/warn-level logs so users
+    // see the override and aren't confused by a kernel-side failure.
+    let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
+    let enforce_eager = if is_exl3 && !enforce_eager {
+        tracing::info!(
+            "EXL3 quantization detected — forcing --enforce-eager \
+             (cooperative GEMM kernel cannot be captured into a CUDA graph)"
+        );
+        // The cuda_graph_config was sized for the user's CLI choice
+        // earlier; disable capture now that we've decided to override.
+        cuda_graph_config.enabled = false;
+        true
+    } else {
+        enforce_eager
+    };
+    let dtype = if is_exl3 && dtype != DType::F16 {
         tracing::warn!(
             requested = ?dtype,
             "EXL3 quantization detected — forcing activation dtype to F16 (kernel constraint)"
