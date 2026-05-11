@@ -68,12 +68,18 @@ pub struct Exl3Config {
 impl Exl3Config {
     /// Build a config from `quantization_config` raw JSON.
     pub fn from_detected(raw: &HashMap<String, Value>) -> Self {
-        let bits_per_weight = raw
-            .get("bits_per_weight")
-            .and_then(|v| v.as_u64())
-            .map(|b| b as u32)
-            // Fall back to `bits` for forward compatibility.
-            .or_else(|| raw.get("bits").and_then(|v| v.as_u64()).map(|b| b as u32))
+        // EXL3 checkpoints encode `bits` as float (e.g. 3.0, 3.5, 4.0)
+        // and `bits_per_weight` may be either int or absent. We round
+        // down because the kernel selects K=floor(bits), with the
+        // actual stored bit-width carried by the trellis tensor's
+        // last dim (validated at load time).
+        let read_numeric = |key: &str| -> Option<u32> {
+            raw.get(key)
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+                .map(|n| n as u32)
+        };
+        let bits_per_weight = read_numeric("bits_per_weight")
+            .or_else(|| read_numeric("bits"))
             .unwrap_or(4);
 
         let mcg_default = raw

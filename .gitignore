@@ -14,3 +14,7 @@ scripts/__pycache__/
 # isn't bloated with the ~5 GB of vLLM + torch + flashinfer wheels.
 .venv-vllm/
 
+
+# Phase 5 EXL3 smoke test scratch
+.venv-tmp/
+model_cache/
