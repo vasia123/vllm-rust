@@ -137,6 +137,7 @@ fn detect_from_config_json(path: &Path) -> Option<DetectedQuantConfig> {
         Some("inc") | Some("auto-round") => QuantizationMethod::Inc,
         Some("fp_quant") => QuantizationMethod::FpQuant,
         Some("quark") => QuantizationMethod::Quark,
+        Some("exl3") => QuantizationMethod::Exl3,
         // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
         Some("gptq_marlin") => QuantizationMethod::Marlin,
         Some("modelopt") => {
@@ -256,6 +257,7 @@ pub fn detect_from_json(config: &Value) -> DetectedQuantConfig {
                 // INC (Intel Neural Compressor) and auto-round format route to GPTQ/AWQ delegate
                 "inc" | "auto-round" => QuantizationMethod::Inc,
                 "fp_quant" => QuantizationMethod::FpQuant,
+                "exl3" => QuantizationMethod::Exl3,
                 // gptq_marlin uses GPTQ-format weights with Marlin kernels — route to Marlin
                 "gptq_marlin" => QuantizationMethod::Marlin,
                 "modelopt" => {
@@ -528,6 +530,18 @@ mod tests {
         assert_eq!(detected.method, QuantizationMethod::CpuWna16);
         assert_eq!(detected.bits, Some(4));
         assert_eq!(detected.group_size, Some(128));
+    }
+
+    #[test]
+    fn test_detect_exl3_from_json() {
+        let config = json!({
+            "quantization_config": {
+                "quant_method": "exl3",
+                "bits_per_weight": 3
+            }
+        });
+        let detected = detect_from_json(&config);
+        assert_eq!(detected.method, QuantizationMethod::Exl3);
     }
 
     #[test]

@@ -45,6 +45,7 @@ use super::awq::{AwqConfig, AwqLinear};
 use super::awq_marlin::{repack_awq_nibbles, AwqMarlinConfig, AwqMarlinLinear};
 use super::bitsandbytes::{BitsAndBytesConfig, BitsAndBytesLinear, BnbQuantType};
 use super::config::{QuantizationConfig, QuantizedLinear};
+use super::exl3::{Exl3Config, Exl3Linear};
 use super::fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
 use super::fp8::{Fp8Config, Fp8Linear};
 use super::gptq::{GptqConfig, GptqLinear};
@@ -402,6 +403,101 @@ impl QuantizedWeightLoader for Fp8WeightLoader {
 
     fn method(&self) -> QuantizationMethod {
         QuantizationMethod::Fp8
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+/// Weight loader for EXL3 (ExLlamaV3) quantized models.
+///
+/// Phase-1 stub: `load_linear` parses the on-disk tensors and produces an
+/// `Exl3Linear` whose `forward` errors out. Phase 4 lands the GEMM/Hadamard
+/// kernels and unblocks real inference. We still load the tensors here so
+/// Phase-5 model wiring can be exercised on CPU without crashing on
+/// missing keys.
+pub struct Exl3WeightLoader {
+    vb: VarBuilder<'static>,
+    config: Exl3Config,
+    device: Device,
+    dtype: DType,
+}
+
+impl Exl3WeightLoader {
+    pub fn new(vb: VarBuilder<'static>, config: Exl3Config) -> Self {
+        let device = vb.device().clone();
+        // EXL3 forces fp16 on the activation path regardless of what the
+        // VarBuilder advertises — backbone weights (embed/lm_head/norm)
+        // are also fp16 in published EXL3 checkpoints.
+        Self {
+            vb,
+            config,
+            device,
+            dtype: DType::F16,
+        }
+    }
+
+    pub fn config(&self) -> &Exl3Config {
+        &self.config
+    }
+}
+
+impl QuantizedWeightLoader for Exl3WeightLoader {
+    fn load_linear(
+        &self,
+        prefix: &str,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Box<dyn QuantizedLinear>> {
+        let vb = self.vb.pp(prefix);
+
+        // `trellis` shape is `(k/16, n/16, 16*K)` with k = in_features,
+        // n = out_features, K = bpw. We don't know the exact bpw for this
+        // layer until we read the tensor's last dim — `bits_per_weight`
+        // in the config is the dominant value, not authoritative per-layer.
+        let k_blocks = in_features / 16;
+        let n_blocks = out_features / 16;
+        let last_dim = 16 * self.config.bits_per_weight as usize;
+        let trellis = vb_get_as(
+            &vb,
+            (k_blocks, n_blocks, last_dim),
+            "trellis",
+            DType::U32, /* uint16 on disk; candle promotes to U32 storage */
+        )?;
+        // Bits-per-weight from the actual tensor shape, in case the config
+        // value disagrees.
+        let bits_per_weight = (trellis.dims()[2] / 16) as u32;
+
+        let suh = vb.get_with_hints_dtype(in_features, "suh", Init::Const(0.0), DType::F16)?;
+        let svh = vb.get_with_hints_dtype(out_features, "svh", Init::Const(0.0), DType::F16)?;
+
+        let bias_tensor = if bias {
+            Some(vb.get_with_hints_dtype(out_features, "bias", Init::Const(0.0), DType::F16)?)
+        } else {
+            None
+        };
+
+        Ok(Box::new(Exl3Linear {
+            trellis,
+            suh,
+            svh,
+            mcg: self.config.mcg_default,
+            mul1: self.config.mul1_default,
+            bias: bias_tensor,
+            in_features,
+            out_features,
+            bits_per_weight,
+        }))
+    }
+
+    fn method(&self) -> QuantizationMethod {
+        QuantizationMethod::Exl3
     }
 
     fn device(&self) -> &Device {
@@ -1541,6 +1637,10 @@ pub fn create_weight_loader_with_params(
                 &detected.raw_config,
             );
             Box::new(GptqWeightLoader::new(vb, gptq_config))
+        }
+        QuantizationMethod::Exl3 => {
+            let exl3_config = Exl3Config::from_detected(&detected.raw_config);
+            Box::new(Exl3WeightLoader::new(vb, exl3_config))
         }
         other => {
             // Anything else (Gguf / Torchao / Quark / FpQuant / ModelOptFull

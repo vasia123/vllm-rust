@@ -33,6 +33,7 @@ pub mod compressed_tensors;
 mod config;
 pub mod cpu_wna16;
 mod detection;
+pub mod exl3;
 pub mod experts_int8;
 pub mod fbgemm_fp8;
 pub mod fp8;
@@ -75,6 +76,7 @@ pub use config::{
 };
 pub use cpu_wna16::CpuWna16Config;
 pub use detection::{detect_from_directory, detect_from_json, DetectedQuantConfig};
+pub use exl3::{Exl3Config, Exl3Linear, Exl3TensorInfo, EXL3_MCG_MULTIPLIER, EXL3_MUL1_MULTIPLIER};
 pub use experts_int8::{ExpertsInt8Config, ExpertsInt8Linear};
 pub use fbgemm_fp8::{FbgemmFp8Config, FbgemmFp8Linear};
 pub use fp8::Fp8Config;
@@ -110,9 +112,9 @@ pub use torchao::TorchaoConfig;
 pub use weight_loader::{
     create_weight_loader, create_weight_loader_from_detected, create_weight_loader_with_params,
     AwqMarlinWeightLoader, AwqWeightLoader, BitsAndBytesWeightLoader,
-    CompressedTensorsWeightLoader, ExpertsInt8WeightLoader, FbgemmFp8WeightLoader, Fp8WeightLoader,
-    GptqWeightLoader, MoeWNA16WeightLoader, MxFp8WeightLoader, QuantizedWeightLoader,
-    UnquantizedWeightLoader,
+    CompressedTensorsWeightLoader, Exl3WeightLoader, ExpertsInt8WeightLoader,
+    FbgemmFp8WeightLoader, Fp8WeightLoader, GptqWeightLoader, MoeWNA16WeightLoader,
+    MxFp8WeightLoader, QuantizedWeightLoader, UnquantizedWeightLoader,
 };
 
 use std::path::Path;
@@ -199,6 +201,7 @@ pub fn create_config(detected: &DetectedQuantConfig) -> Box<dyn QuantizationConf
         QuantizationMethod::Quark => QuarkConfig::from_detected(&detected.raw_config)
             .map(|c| Box::new(c) as Box<dyn QuantizationConfig>)
             .unwrap_or_else(|| Box::new(NoQuantizationConfig::default())),
+        QuantizationMethod::Exl3 => Box::new(Exl3Config::from_detected(&detected.raw_config)),
         _ => Box::new(NoQuantizationConfig::default()),
     }
 }
@@ -249,6 +252,7 @@ pub fn is_supported(capability: u32, method: QuantizationMethod) -> bool {
         QuantizationMethod::Inc => 70,          // Volta minimum (delegates to GPTQ/AWQ)
         QuantizationMethod::FpQuant => 0,       // CPU dequant path works anywhere
         QuantizationMethod::Quark => 75,        // W8A8-INT8 minimum; W8A8-FP8 needs 89
+        QuantizationMethod::Exl3 => 80,         // ExLlamaV3 ships sm_80+ kernels
     };
     capability >= min_cap
 }

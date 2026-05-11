@@ -58,6 +58,8 @@ pub enum QuantizationMethod {
     FpQuant,
     /// QUARK quantization (AMD/Qualcomm): W8A8-FP8, W8A8-INT8, or OCP-MX schemes
     Quark,
+    /// EXL3 (ExLlamaV3): trellis-coded vector quantization with Hadamard transforms
+    Exl3,
 }
 
 impl std::fmt::Display for QuantizationMethod {
@@ -85,6 +87,7 @@ impl std::fmt::Display for QuantizationMethod {
             Self::Inc => write!(f, "inc"),
             Self::FpQuant => write!(f, "fp_quant"),
             Self::Quark => write!(f, "quark"),
+            Self::Exl3 => write!(f, "exl3"),
         }
     }
 }

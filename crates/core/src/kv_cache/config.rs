@@ -120,6 +120,12 @@ pub fn bytes_per_param_for_quant(
             Some(b) if b > 0 => (b as f32 / 8.0) * 1.10 + 0.05,
             _ => 0.55,
         },
+        // EXL3: trellis bits + small per-block Hadamard sign vectors;
+        // overhead matches AWQ/GPTQ in practice.
+        Q::Exl3 => match bits {
+            Some(b) if b > 0 => (b as f32 / 8.0) * 1.10 + 0.05,
+            _ => 0.45, /* ~3 bpw typical */
+        },
         // Weight-only INT8 / FP8 schemes (~1 byte/param + 5% overhead).
         Q::Fp8
         | Q::FbgemmFp8

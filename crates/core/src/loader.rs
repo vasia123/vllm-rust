@@ -371,6 +371,10 @@ pub fn quantization_info(files: &ModelFiles) -> String {
         }
         QuantizationMethod::FpQuant => "FP-Quant (FP4 E2M1 + Hadamard rotation)".to_string(),
         QuantizationMethod::Quark => "QUARK (W8A8-FP8 / W8A8-INT8)".to_string(),
+        QuantizationMethod::Exl3 => {
+            let bits = files.quantization.bits.unwrap_or(3);
+            format!("EXL3 (ExLlamaV3 trellis VQ, bits_per_weight: {})", bits)
+        }
     }
 }
 
