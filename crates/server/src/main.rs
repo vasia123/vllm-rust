@@ -1357,21 +1357,24 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     // EXL3 needs two adjustments vs the default path:
     //   1. fp16 activations (kernels are fp16-only)
-    //   2. enforce_eager — Phase 11.1 made the EXL3 GEMM decode path
-    //      itself capture-eligible (kernel split, non-cooperative
-    //      launch), but the rest of the Llama-3.2 decode forward is
-    //      NOT yet pool-migrated end-to-end (positions, slot_mapping,
-    //      RoPE/SiLU/PagedAttn intermediates have unstable device
-    //      addresses across forwards). Until the Llama decode path
-    //      receives the same Phase-A/B/B.8 pool wiring that landed for
-    //      Qwen3-AWQ (memory: perf_cuda_graph_capture.md), capture
-    //      replay errors with ILLEGAL_ADDRESS on forward #2. Keep the
-    //      auto-eager override until that refactor lands.
+    //   2. enforce_eager — Phase 11.1 made the EXL3 GEMM kernel itself
+    //      capture-eligible (split + non-cooperative for M ≤ 16) and
+    //      Phase 11.2 wired `LlamaForCausalLM::forward_decode_batch_with_ctx`
+    //      to propagate `DecodeBatchShared` (mirrors Qwen3 pattern).
+    //      That's the necessary kernel + dispatch foundation, but
+    //      capture replay still fails with INVALID_VALUE during
+    //      EndCapture: the rest of the Llama decode path (RMSNorm,
+    //      RoPE, SwiGLU/SiLU+Mul, paged-attention V2, residual add,
+    //      lm_head matmul) has not yet been pool-migrated the way
+    //      Qwen3's Phase A/B/B.8 did (memory:
+    //      perf_cuda_graph_capture.md). Until that broader Llama
+    //      capture-readiness work lands, keep the auto-eager override.
     let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
     let enforce_eager = if is_exl3 && !enforce_eager {
         tracing::info!(
             "EXL3 quantization detected — forcing --enforce-eager \
-             (Llama decode path not yet capture-ready end-to-end)"
+             (Llama decode path needs broader pool migration before \
+             capture can replay; kernel + dispatch foundation in place)"
         );
         cuda_graph_config.enabled = false;
         true
