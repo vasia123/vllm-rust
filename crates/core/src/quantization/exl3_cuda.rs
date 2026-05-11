@@ -17,6 +17,163 @@ use candle_core::{
 };
 
 const HADAMARD_PTX: &str = include_str!("../../kernels/exl3/hadamard.ptx");
+const RECONSTRUCT_PTX: &str = include_str!("../../kernels/exl3/reconstruct.ptx");
+
+/// Codebook variant used by the EXL3 trellis decoder.
+///
+/// - `Default` (cb=0): the canonical 3INST procedural codebook
+/// - `Mcg` (cb=1): multiplied by `0xCBAC1FED`
+/// - `Mul1` (cb=2): multiplied by `0x83DCD12D`
+///
+/// The variant is encoded in the trellis weights at quantization time and
+/// is reported by the checkpoint's `mcg_multiplier` / `mul1_multiplier`
+/// fields. See `quantization::exl3::EXL3_MCG_MULTIPLIER` for the constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exl3Codebook {
+    Default,
+    Mcg,
+    Mul1,
+}
+
+impl Exl3Codebook {
+    pub const fn from_flags(mcg: bool, mul1: bool) -> Self {
+        if mcg {
+            Self::Mcg
+        } else if mul1 {
+            Self::Mul1
+        } else {
+            Self::Default
+        }
+    }
+
+    const fn as_u32(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::Mcg => 1,
+            Self::Mul1 => 2,
+        }
+    }
+}
+
+/// Decode an EXL3-packed trellis tensor to a dense fp16 weight matrix.
+///
+/// This is the inverse of EXL3 quantization, used as a correctness anchor
+/// against ExLlamaV3's reference Python implementation. It's also the
+/// fallback path for non-aligned shapes that the GEMM dispatcher can't
+/// handle.
+///
+/// # Arguments
+/// * `trellis` — `[k/16, n/16, X]` U32, where `X = 8 * bpw` (i.e. the
+///   on-disk shape `[..., 16*bpw]` of uint16 packed into u32 storage).
+///   The Rust-side count is half the on-disk uint16 count.
+/// * `bpw` — bits-per-weight (2..=8).
+/// * `codebook` — `Default` / `Mcg` / `Mul1`.
+///
+/// Returns `[k, n]` fp16 row-major dense weights on the same device.
+pub fn exl3_reconstruct(trellis: &Tensor, bpw: u32, codebook: Exl3Codebook) -> Result<Tensor> {
+    if trellis.dtype() != DType::U32 {
+        candle_core::bail!(
+            "exl3_reconstruct: trellis must be U32 (raw uint16 storage), got {:?}",
+            trellis.dtype()
+        );
+    }
+    let dims = trellis.dims();
+    if dims.len() != 3 {
+        candle_core::bail!("exl3_reconstruct: trellis must be 3D, got {:?}", dims);
+    }
+    let (k_blocks, n_blocks, last) = (dims[0], dims[1], dims[2]);
+    if !(2..=8).contains(&bpw) {
+        candle_core::bail!("exl3_reconstruct: bpw must be in 2..=8, got {}", bpw);
+    }
+    let expected_last = 8 * bpw as usize; // u32 view of `16*bpw` u16
+    if last != expected_last {
+        candle_core::bail!(
+            "exl3_reconstruct: trellis last dim ({}) must be 8*bpw ({})",
+            last,
+            expected_last
+        );
+    }
+
+    let op = ReconstructOp {
+        k: k_blocks * 16,
+        n: n_blocks * 16,
+        k_blocks,
+        n_blocks,
+        bpw,
+        codebook,
+    };
+    trellis.apply_op1(op)
+}
+
+struct ReconstructOp {
+    k: usize,
+    n: usize,
+    k_blocks: usize,
+    n_blocks: usize,
+    bpw: u32,
+    codebook: Exl3Codebook,
+}
+
+impl CustomOp1 for ReconstructOp {
+    fn name(&self) -> &'static str {
+        "exl3_reconstruct"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("exl3_reconstruct: CUDA only")
+    }
+    fn cuda_fwd(&self, storage: &CudaStorage, _l: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        let dev = &storage.device;
+        // `_Z18reconstruct_kernelILi<K>ELi<cb>EEvP6__halfPKt`
+        let kernel_name = format!(
+            "_Z18reconstruct_kernelILi{}ELi{}EEvP6__halfPKt",
+            self.bpw,
+            self.codebook.as_u32()
+        );
+        let func = dev.get_or_load_custom_func(
+            // `get_or_load_custom_func` wants &'static str; leak the
+            // small kernel-name string (one allocation per (bpw, cb)
+            // pair per device, amortised across the full session).
+            Box::leak(kernel_name.into_boxed_str()),
+            "exl3_reconstruct",
+            RECONSTRUCT_PTX,
+        )?;
+
+        let trellis = match &storage.slice {
+            CudaStorageSlice::U32(s) => s,
+            _ => candle_core::bail!("exl3_reconstruct: trellis must be U32"),
+        };
+
+        let output = dev.alloc_zeros::<half::f16>(self.k * self.n)?;
+
+        // Block 256, grid (n_blocks / 8, k_blocks). The kernel processes
+        // an (8 n-blocks × 1 k-block) tile per CTA.
+        if !self.n_blocks.is_multiple_of(8) {
+            candle_core::bail!(
+                "exl3_reconstruct: n_blocks ({}) must be a multiple of 8 (i.e. n must be a multiple of 128)",
+                self.n_blocks
+            );
+        }
+        let cfg = LaunchConfig {
+            grid_dim: ((self.n_blocks / 8) as u32, self.k_blocks as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&output);
+        builder.arg(trellis);
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("exl3_reconstruct launch: {e}")))?;
+
+        let out_storage = CudaStorage {
+            slice: CudaStorageSlice::F16(output),
+            device: dev.clone(),
+        };
+        Ok((out_storage, Shape::from_dims(&[self.k, self.n])))
+    }
+}
 
 /// Which side carries the Hadamard sign-vector scaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +402,35 @@ mod tests {
         let x = Tensor::zeros((1, 64), DType::F16, &Device::Cpu).unwrap();
         let err = had_r_128_fp16(&x, None, HadScale::None).err().unwrap();
         assert!(format!("{err}").contains("multiple of 128"));
+    }
+
+    #[test]
+    fn reconstruct_rejects_wrong_trellis_dtype() {
+        let t = Tensor::zeros((1, 1, 24), DType::F16, &Device::Cpu).unwrap();
+        let err = exl3_reconstruct(&t, 3, Exl3Codebook::Default)
+            .err()
+            .unwrap();
+        assert!(format!("{err}").contains("U32"));
+    }
+
+    #[test]
+    fn reconstruct_rejects_inconsistent_bpw() {
+        // trellis last-dim = 8*bpw (in u32). last=24 → bpw=3 is fine; last=24 with bpw=4 is bad.
+        let t = Tensor::zeros((1, 1, 24), DType::U32, &Device::Cpu).unwrap();
+        let err = exl3_reconstruct(&t, 4, Exl3Codebook::Default)
+            .err()
+            .unwrap();
+        assert!(format!("{err}").contains("8*bpw"));
+    }
+
+    #[test]
+    fn codebook_from_flags_priorities_mcg_over_mul1() {
+        assert_eq!(Exl3Codebook::from_flags(true, true), Exl3Codebook::Mcg);
+        assert_eq!(Exl3Codebook::from_flags(false, true), Exl3Codebook::Mul1);
+        assert_eq!(
+            Exl3Codebook::from_flags(false, false),
+            Exl3Codebook::Default
+        );
     }
 
     #[test]
