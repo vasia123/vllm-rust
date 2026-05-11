@@ -1910,6 +1910,118 @@ mod tests {
             let _ = captured;
         }
 
+        /// Phase 11.2 diagnostic: verify that a complete capture cycle
+        /// (BeginCapture → forward → EndCapture) does NOT corrupt the
+        /// CUDA context for subsequent eager forwards. The engine
+        /// warmup symptom was exactly this: capture for bs=N succeeded
+        /// silently, then the next eager forward for bs=N-1 errored
+        /// with INVALID_VALUE. If reproducible outside the engine,
+        /// this test will reproduce it.
+        #[test]
+        fn eager_exl3_gemm_after_capture_cycle_still_works() {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
+                CUstreamCaptureMode,
+            };
+
+            let dev_t = match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return,
+            };
+            let cuda_dev = match &dev_t {
+                Device::Cuda(c) => c.clone(),
+                _ => unreachable!(),
+            };
+            unsafe {
+                cuda_dev.disable_event_tracking();
+            }
+
+            let m = 1usize;
+            let k = 2048usize;
+            let n = 2048usize;
+            let bpw = 3u32;
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut td: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0xC0FF_EE;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                td.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&td, (k / 16, n / 16, 16 * bpw as usize), &dev_t).unwrap();
+            let mut xd = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                xd.push(half::f16::from_f32(
+                    ((i as f32 * 0.013).sin() * 0.05) as f32,
+                ));
+            }
+            let x = Tensor::from_slice(&xd, (m, k), &dev_t).unwrap();
+            let suh = Tensor::ones(k, DType::F16, &dev_t).unwrap();
+            let svh = Tensor::ones(n, DType::F16, &dev_t).unwrap();
+
+            // Pre-warm
+            let _ = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("pre-warm");
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            unsafe {
+                let _ = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            // Capture cycle
+            let stream = cuda_dev.cuda_stream().cu_stream();
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS, "BeginCapture: {begin:?}");
+            let cap_y = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("captured gemm");
+            // Drop captured output before EndCapture so its destructor's
+            // potential cuMemFreeAsync doesn't land inside capture.
+            drop(cap_y);
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            if !graph.is_null() {
+                unsafe {
+                    cuGraphDestroy(graph);
+                }
+            }
+            assert_eq!(end, CUresult::CUDA_SUCCESS, "EndCapture: {end:?}");
+
+            // Smoking gun: after a clean capture cycle, can we still do
+            // eager forwards? If this fails, capture leaves the stream
+            // in a state hostile to subsequent eager kernels — same
+            // symptom as the engine warmup.
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            let post_y = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            );
+            assert!(
+                post_y.is_ok(),
+                "eager exl3_gemm AFTER capture cycle failed: {:?} — \
+                 this is the engine warmup symptom",
+                post_y.err()
+            );
+        }
+
         /// Phase 11.2 diagnostic: run the standalone Hadamard launch
         /// (`had_r_128_fp16`, which is exactly Launch 1 of the EXL3
         /// decode fast path) inside a capture window. Same setup as the
