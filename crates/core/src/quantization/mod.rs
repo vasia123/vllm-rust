@@ -34,6 +34,8 @@ mod config;
 pub mod cpu_wna16;
 mod detection;
 pub mod exl3;
+#[cfg(feature = "cuda-kernels")]
+pub mod exl3_cuda;
 pub mod experts_int8;
 pub mod fbgemm_fp8;
 pub mod fp8;
