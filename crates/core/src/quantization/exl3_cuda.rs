@@ -454,7 +454,7 @@ impl InplaceOp2 for Exl3GemvInplaceOp {
             self.codebook.as_u32()
         );
         let func = dev.get_or_load_custom_func(
-            Box::leak(kernel_name.into_boxed_str()),
+            crate::quantization::exl3_scratch::intern_kernel_name(kernel_name),
             "exl3_gemv",
             EXL3_GEMV_PTX,
         )?;
@@ -601,8 +601,11 @@ impl InplaceOp2 for Exl3GemmInplaceOp {
             shape,
         );
         let ptx = gemm_ptx_for_bpw(self.bpw)?;
-        let func =
-            dev.get_or_load_custom_func(Box::leak(kernel_name.into_boxed_str()), "exl3_gemm", ptx)?;
+        let func = dev.get_or_load_custom_func(
+            crate::quantization::exl3_scratch::intern_kernel_name(kernel_name),
+            "exl3_gemm",
+            ptx,
+        )?;
 
         // Bump dynamic shared memory cap. cuFuncSetAttribute is idempotent
         // per-function; we set it on every dispatch for safety (low-cost).
@@ -813,10 +816,7 @@ impl CustomOp1 for ReconstructOp {
             self.codebook.as_u32()
         );
         let func = dev.get_or_load_custom_func(
-            // `get_or_load_custom_func` wants &'static str; leak the
-            // small kernel-name string (one allocation per (bpw, cb)
-            // pair per device, amortised across the full session).
-            Box::leak(kernel_name.into_boxed_str()),
+            crate::quantization::exl3_scratch::intern_kernel_name(kernel_name),
             "exl3_reconstruct",
             RECONSTRUCT_PTX,
         )?;
@@ -987,11 +987,14 @@ impl InplaceOp2 for HadR128Fp16InplaceOp {
             _ => candle_core::bail!("exl3_had_r_128: output must be F16"),
         };
 
-        // Build a "null" device pointer for the no-scale variant by
-        // allocating a 1-element placeholder. Cleaner than nullable
-        // pointers in the cudarc builder.
-        let null_scale_buf;
+        // Resolve `scale` to a device pointer. In scaled modes the
+        // caller's tensor is forwarded. In `HadScale::None` mode the
+        // <false,false> kernel template instance never dereferences
+        // the pointer — we pass a cached per-device 1-element sentinel
+        // (`exl3_had_null_scale`), eliminating what was a 2-byte
+        // per-call `cudaMallocAsync`.
         let scale_storage_guard;
+        let null_scale_sentinel;
         let scale_ref: &candle_core::cuda::cudarc::driver::CudaSlice<half::f16> =
             match (&self.scale, self.mode) {
                 (Some(s), HadScale::Pre | HadScale::Post) => {
@@ -1005,15 +1008,9 @@ impl InplaceOp2 for HadR128Fp16InplaceOp {
                     }
                 }
                 _ => {
-                    null_scale_buf = dev.alloc_zeros::<half::f16>(1)?;
-                    // Build a leaked reference: cudarc takes a slice ref;
-                    // null_scale_buf lives for the rest of the function.
-                    // Workaround: rebind via shadowing below.
-                    // The kernel ignores `scale` in the <false,false> case.
-                    #[allow(clippy::needless_borrow)]
-                    {
-                        &null_scale_buf
-                    }
+                    null_scale_sentinel =
+                        crate::quantization::exl3_scratch::exl3_had_null_scale(dev)?;
+                    &*null_scale_sentinel
                 }
             };
 

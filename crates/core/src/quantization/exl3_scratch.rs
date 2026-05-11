@@ -24,8 +24,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_core::cuda::cudarc::driver::CudaSlice;
-use candle_core::cuda_backend::CudaDevice;
-use candle_core::cuda_backend::DeviceId;
+use candle_core::cuda_backend::{CudaDevice, DeviceId};
 use candle_core::Result;
 
 /// Length of the EXL3 GEMM locks workspace, in `int32` elements.
@@ -34,6 +33,8 @@ use candle_core::Result;
 pub const EXL3_LOCKS_ELEMS: usize = (1024 * 1024) + (1024 * 2);
 
 static LOCKS_CACHE: OnceLock<Mutex<HashMap<DeviceId, Arc<CudaSlice<i32>>>>> = OnceLock::new();
+static NULL_SCALE_CACHE: OnceLock<Mutex<HashMap<DeviceId, Arc<CudaSlice<half::f16>>>>> =
+    OnceLock::new();
 
 /// Get (or lazily allocate) the per-device EXL3 GEMM locks buffer.
 ///
@@ -62,6 +63,59 @@ pub fn exl3_locks(dev: &CudaDevice) -> Result<Arc<CudaSlice<i32>>> {
     let mut guard = cache.lock().expect("exl3_locks: cache mutex poisoned");
     // Re-check: another thread may have populated between our drop+reacquire.
     Ok(guard.entry(id).or_insert(arc).clone())
+}
+
+/// Get (or lazily allocate) a per-device 1-element fp16 sentinel buffer.
+///
+/// `HadR128Fp16InplaceOp` passes a non-NULL `scale` device pointer to
+/// the Hadamard kernel even in `HadScale::None` mode (the kernel
+/// dereferences the pointer unconditionally; the dereference is then
+/// gated by a compile-time `Lb<has_scale>` template flag). Without
+/// caching we'd issue a 2-byte `cudaMallocAsync` every call. The
+/// content is irrelevant — the kernel never reads through this pointer
+/// in the `<false,false>` template instance — so a single zero-init
+/// buffer per device is enough.
+pub fn exl3_had_null_scale(dev: &CudaDevice) -> Result<Arc<CudaSlice<half::f16>>> {
+    let cache = NULL_SCALE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let id = dev.id();
+    {
+        let guard = cache
+            .lock()
+            .expect("exl3_had_null_scale: cache mutex poisoned");
+        if let Some(buf) = guard.get(&id) {
+            return Ok(buf.clone());
+        }
+    }
+    let fresh = dev
+        .alloc_zeros::<half::f16>(1)
+        .map_err(|e| candle_core::Error::Msg(format!("exl3_had_null_scale alloc: {e}")))?;
+    let arc = Arc::new(fresh);
+    let mut guard = cache
+        .lock()
+        .expect("exl3_had_null_scale: cache mutex poisoned");
+    Ok(guard.entry(id).or_insert(arc).clone())
+}
+
+static KERNEL_NAME_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+
+/// Intern a kernel name string for `dev.get_or_load_custom_func`, which
+/// takes a `&'static str` key. Without interning every `cuda_fwd` call
+/// `Box::leak`s a fresh copy of the same mangled symbol — small (~1 KB)
+/// but grows unbounded with launch count. Interning leaks each unique
+/// string at most once.
+///
+/// Usage: `let name = intern_kernel_name(format!("...", ...));`
+pub fn intern_kernel_name(name: String) -> &'static str {
+    let cache = KERNEL_NAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .expect("intern_kernel_name: cache mutex poisoned");
+    if let Some(&s) = guard.get(&name) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+    guard.insert(name, leaked);
+    leaked
 }
 
 #[cfg(test)]
