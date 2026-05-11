@@ -525,7 +525,6 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
         kv_cache_mgr: &mut KVCacheManager,
     ) -> Result<Tensor> {
         let mut xs = self.embed_tokens.forward(input_ids, &self.tp_ctx)?;
-
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch(
                 &xs,
@@ -535,10 +534,8 @@ impl crate::engine::ModelForward for LlamaForCausalLM {
                 &self.tp_ctx,
             )?;
         }
-
         let xs = self.norm.forward(&xs)?;
-        let logits = self.lm_head.forward(&xs, &self.tp_ctx)?;
-        Ok(logits)
+        self.lm_head.forward(&xs, &self.tp_ctx)
     }
 
     /// Override the default `forward_decode_batch_with_ctx` so the

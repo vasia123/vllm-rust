@@ -11,6 +11,7 @@ use candle_nn::{embedding, Embedding, VarBuilder};
 use crate::config::ModelConfig;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine, KVCacheManager};
+use crate::layers::attention::DecodeBatchShared;
 use crate::layers::{paged_attention, RotaryEmbedding};
 use crate::quantization::{QuantizedLinear, QuantizedWeightLoader};
 
@@ -173,11 +174,39 @@ impl QuantizedLlamaAttention {
         self.o_proj.forward(&attn_output)
     }
 
+    #[allow(dead_code)]
     fn forward_decode_batch(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
+    ) -> Result<Tensor> {
+        self.forward_decode_batch_with_shared(xs, sequences, cache_engine, None)
+    }
+
+    /// Phase 11.2.B (root-cause fix): the capture-friendly decode path
+    /// for the *quantized* Llama (EXL3, AWQ, GPTQ — anything routed
+    /// through `QuantizedLlamaForCausalLM`). When `shared` is `Some`,
+    /// every per-layer device allocation (`positions`, `slot_mapping`,
+    /// `block_tables`, `seq_lens`) is read from the pool-backed bundle
+    /// the engine built ONCE per forward, mirroring the Qwen3 Phase
+    /// A/B/B.8 pattern. When `shared` is `None`, falls back to the
+    /// pre-existing eager path (per-layer `Tensor::from_vec`), so
+    /// non-capture builds are unaffected.
+    ///
+    /// Without this method, the engine warmup with capture enabled
+    /// failed at the *eager* JIT forward of the next-smaller batch
+    /// after a capture cycle — because the captured graph held device
+    /// pointers from `Tensor::from_vec(block_tables)` /
+    /// `Tensor::from_vec(seq_lens)` that the freshly-allocated next
+    /// forward's `Tensor::from_vec` reused, hosing the stream with
+    /// `CUDA_ERROR_INVALID_VALUE`.
+    fn forward_decode_batch_with_shared(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        cache_engine: &mut CacheEngine,
+        shared: Option<&DecodeBatchShared>,
     ) -> Result<Tensor> {
         let batch_size = sequences.len();
 
@@ -201,60 +230,125 @@ impl QuantizedLlamaAttention {
             let k = k.squeeze(2)?;
             let v = v.squeeze(2)?;
 
-            let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
-            let (q, k) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
-
-            let all_slot_mapping: Vec<usize> = sequences
-                .iter()
-                .flat_map(|s| s.slot_mapping.iter().copied())
-                .collect();
-            cache_engine
-                .write_batch(&k, &v, &all_slot_mapping)
-                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
-
-            let max_blocks_per_seq = sequences
-                .iter()
-                .map(|s| s.block_ids.len())
-                .max()
-                .unwrap_or(1);
-            let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
-            for (i, seq) in sequences.iter().enumerate() {
-                for (j, &block_id) in seq.block_ids.iter().enumerate() {
-                    bt_data[i * max_blocks_per_seq + j] = block_id as u32;
+            // RoPE positions — pool-backed when `shared` is present.
+            let positions_owned: Vec<usize>;
+            let positions: &[usize] = match shared {
+                Some(s) => &s.positions,
+                None => {
+                    positions_owned = sequences.iter().map(|s| s.seqlen_offset).collect();
+                    &positions_owned
                 }
-            }
-            let block_tables =
-                Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), q.device())?;
+            };
+            let (q, k) = match shared.and_then(|s| s.positions_device.as_ref()) {
+                Some(pos_t) => self
+                    .rotary_emb
+                    .apply_varlen_with_pos_tensor(&q, &k, positions, pos_t)?,
+                None => self.rotary_emb.apply_varlen(&q, &k, positions)?,
+            };
 
-            let seq_lens_data: Vec<u32> = sequences
-                .iter()
-                .map(|s| (s.seqlen_offset + 1) as u32)
-                .collect();
-            let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
-            let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+            // KV write — pool-backed slot_mapping when present.
+            let slot_mapping_owned: Vec<usize>;
+            let all_slot_mapping: &[usize] = match shared {
+                Some(s) => &s.all_slot_mapping,
+                None => {
+                    slot_mapping_owned = sequences
+                        .iter()
+                        .flat_map(|s| s.slot_mapping.iter().copied())
+                        .collect();
+                    &slot_mapping_owned
+                }
+            };
+            match shared.and_then(|s| s.slot_mapping_device.as_ref()) {
+                Some(slot_t) => cache_engine
+                    .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t)
+                    .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?,
+                None => cache_engine
+                    .write_batch(&k, &v, all_slot_mapping)
+                    .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?,
+            }
+
+            // block_tables / seq_lens — reuse from shared (built once
+            // per forward) instead of per-layer `Tensor::from_vec` (the
+            // failure mode root cause).
+            let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len) = if let Some(s) = shared
+            {
+                (
+                    s.block_tables.clone(),
+                    s.seq_lens.clone(),
+                    s.max_blocks_per_seq,
+                    s.max_seq_len,
+                )
+            } else {
+                let max_blocks = sequences
+                    .iter()
+                    .map(|s| s.block_ids.len())
+                    .max()
+                    .unwrap_or(1);
+                let mut bt_data = vec![0u32; batch_size * max_blocks];
+                for (i, seq) in sequences.iter().enumerate() {
+                    for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                        bt_data[i * max_blocks + j] = block_id as u32;
+                    }
+                }
+                let bt = Tensor::from_vec(bt_data, (batch_size, max_blocks), q.device())?;
+                let seq_lens_data: Vec<u32> = sequences
+                    .iter()
+                    .map(|s| (s.seqlen_offset + 1) as u32)
+                    .collect();
+                let max_seq = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
+                let sl = Tensor::from_vec(seq_lens_data, (batch_size,), q.device())?;
+                (bt, sl, max_blocks, max_seq)
+            };
 
             let scale = 1.0 / (self.head_dim as f32).sqrt();
-
-            let attn_output = crate::cuda_kernels::paged_attention_cuda(
-                &q,
-                cache_engine.k_cache(),
-                cache_engine.v_cache(),
-                &block_tables,
-                &seq_lens,
-                scale,
-                self.num_heads,
-                self.num_kv_heads,
-                max_blocks_per_seq,
-                max_seq_len,
-                self.head_dim,
-                cache_engine.block_size(),
-            )?;
+            let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
+            let attn_output = if prefer_pool {
+                // Pooled paged_attention with worst-case sizing — stable
+                // device addresses across forwards (required for
+                // CUDA-Graph-captured decode replays).
+                let worst = crate::engine::engine_limits::max_model_len()
+                    .unwrap_or(1024)
+                    .max(max_seq_len);
+                let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
+                crate::cuda_kernels::paged_attention_v2_cuda_pooled(
+                    &q,
+                    cache_engine.k_cache(),
+                    cache_engine.v_cache(),
+                    &block_tables,
+                    &seq_lens,
+                    scale,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    max_blocks_per_seq,
+                    max_seq_len,
+                    worst,
+                    self.head_dim,
+                    cache_engine.block_size(),
+                    partition_size,
+                )?
+            } else {
+                crate::cuda_kernels::paged_attention_cuda(
+                    &q,
+                    cache_engine.k_cache(),
+                    cache_engine.v_cache(),
+                    &block_tables,
+                    &seq_lens,
+                    scale,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    max_blocks_per_seq,
+                    max_seq_len,
+                    self.head_dim,
+                    cache_engine.block_size(),
+                )?
+            };
 
             self.o_proj.forward(&attn_output.unsqueeze(1)?)
         }
 
         #[cfg(not(feature = "cuda-kernels"))]
         {
+            let _ = shared;
             let mut outputs = Vec::with_capacity(batch_size);
             for (i, seq) in sequences.iter().enumerate() {
                 let q_i = q.narrow(0, i, 1)?;
@@ -366,12 +460,24 @@ impl QuantizedLlamaDecoderLayer {
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
     ) -> Result<Tensor> {
+        self.forward_decode_batch_with_shared(xs, sequences, kv_cache_mgr, layer_idx, None)
+    }
+
+    fn forward_decode_batch_with_shared(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        layer_idx: usize,
+        shared: Option<&DecodeBatchShared>,
+    ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward_decode_batch(
+        let xs = self.self_attn.forward_decode_batch_with_shared(
             &xs,
             sequences,
             kv_cache_mgr.engine_mut(layer_idx),
+            shared,
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
@@ -555,6 +661,48 @@ impl crate::engine::ModelForward for QuantizedLlamaForCausalLM {
             xs = layer.forward_decode_batch(&xs, sequences, kv_cache_mgr, layer_idx)?;
         }
 
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs)
+    }
+
+    /// Phase 11.2.B (root-cause fix): override the default
+    /// `forward_decode_batch_with_ctx` so the per-forward
+    /// `DecodeBatchShared` bundle (pool-backed positions, slot_mapping,
+    /// block_tables, seq_lens — built once by
+    /// `engine::helpers::execute_batched_decode_with_graph` /
+    /// `standard::capture_decode_graph` and stashed in `ctx.decode_shared`)
+    /// reaches every attention layer. Without this override, the default
+    /// trait impl discards the ctx → attention rebuilds the device
+    /// tensors per layer via `Tensor::from_vec` → captured graph holds
+    /// stale pointers → subsequent forwards trip
+    /// `CUDA_ERROR_INVALID_VALUE` on the eager fallback.
+    ///
+    /// This is the missing companion to the
+    /// `LlamaForCausalLM::forward_decode_batch_with_ctx` we wired in
+    /// Phase 11.2 foundation (commit 5162936) — applied to the
+    /// *quantized* path which EXL3 (and AWQ, GPTQ, …) routes through.
+    fn forward_decode_batch_with_ctx(
+        &self,
+        input_ids: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        ctx: &crate::engine::cuda_graph::ForwardContext,
+    ) -> Result<Tensor> {
+        let shared: Option<&DecodeBatchShared> = ctx
+            .decode_shared
+            .as_ref()
+            .and_then(|arc| arc.downcast_ref::<DecodeBatchShared>());
+
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward_decode_batch_with_shared(
+                &xs,
+                sequences,
+                kv_cache_mgr,
+                layer_idx,
+                shared,
+            )?;
+        }
         let xs = self.norm.forward(&xs)?;
         self.lm_head.forward(&xs)
     }

@@ -1765,7 +1765,13 @@ mod tests {
         /// before BeginCapture. If `cuStreamEndCapture` returns SUCCESS
         /// here, EXL3 is capture-clean and the production failure is
         /// elsewhere in the forward.
+        // Capture-window tests share the GPU's default cuMemPool, so
+        // running them in parallel (cargo test default) deadlocks the
+        // first BeginCapture against another test's in-flight kernels.
+        // Ignored by default; run via
+        //   cargo test --features cuda-default,gpu-test-small -- --ignored --test-threads=1 capture
         #[test]
+        #[ignore]
         fn exl3_gemm_decode_path_inside_cuda_capture_window() {
             use candle_core::cuda::cudarc::driver::sys::{
                 cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
@@ -1910,6 +1916,248 @@ mod tests {
             let _ = captured;
         }
 
+        /// Phase 11.2 diagnostic: same as the M=1 capture test but at
+        /// M=16, the boundary of `EXL3_GEMM_DECODE_MAX_M`. The engine
+        /// warmup uses batch_size=16 (largest of the default capture
+        /// sizes after EXL3 clipping), which means M=16 hits the
+        /// decode fast path. The production INVALID_VALUE failure
+        /// starts at (or after) this batch — covers the boundary case
+        /// explicitly.
+        #[test]
+        #[ignore]
+        fn exl3_gemm_decode_path_at_m_16_inside_cuda_capture_window() {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
+                CUstreamCaptureMode,
+            };
+
+            let dev_t = match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return,
+            };
+            let cuda_dev = match &dev_t {
+                Device::Cuda(c) => c.clone(),
+                _ => unreachable!(),
+            };
+            unsafe {
+                cuda_dev.disable_event_tracking();
+            }
+
+            let m = 16usize; // boundary case for the fast path gate
+            let k = 2048usize;
+            let n = 2048usize;
+            let bpw = 3u32;
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut td: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0xBEEF_1234;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                td.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&td, (k / 16, n / 16, 16 * bpw as usize), &dev_t).unwrap();
+            let mut xd = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                xd.push(half::f16::from_f32(
+                    ((i as f32 * 0.0017).sin() * 0.05) as f32,
+                ));
+            }
+            let x = Tensor::from_slice(&xd, (m, k), &dev_t).unwrap();
+            let suh = Tensor::ones(k, DType::F16, &dev_t).unwrap();
+            let svh = Tensor::ones(n, DType::F16, &dev_t).unwrap();
+
+            let _ = crate::quantization::exl3_scratch::exl3_locks(&cuda_dev).unwrap();
+            let _ = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("warmup gemm M=16");
+            let _ = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("warmup gemm M=16 #2");
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            unsafe {
+                let _ = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            let stream = cuda_dev.cuda_stream().cu_stream();
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(
+                begin,
+                CUresult::CUDA_SUCCESS,
+                "BeginCapture M=16: {begin:?}"
+            );
+
+            let captured = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            );
+
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            if !graph.is_null() {
+                unsafe {
+                    cuGraphDestroy(graph);
+                }
+            }
+
+            assert!(
+                captured.is_ok(),
+                "exl3_gemm M=16 errored inside capture: {:?}",
+                captured.err()
+            );
+            assert_eq!(
+                end,
+                CUresult::CUDA_SUCCESS,
+                "cuStreamEndCapture failed at M=16 with {end:?} — \
+                 the fast-path boundary case is the actual capture blocker"
+            );
+        }
+
+        /// Phase 11.2 diagnostic: reproduce the engine warmup pattern.
+        /// Engine does: capture for bs=16 (success), then eager for
+        /// bs=8 (FAILS with INVALID_VALUE). This test mirrors that
+        /// EXACT cross-shape transition: capture at M=16 then eager
+        /// at M=8 (different shape — different pool slots, different
+        /// kernel-tile selection).
+        #[test]
+        #[ignore]
+        fn eager_at_m_8_after_capture_at_m_16_reproduces_engine_pattern() {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
+                CUstreamCaptureMode,
+            };
+
+            let dev_t = match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return,
+            };
+            let cuda_dev = match &dev_t {
+                Device::Cuda(c) => c.clone(),
+                _ => unreachable!(),
+            };
+            unsafe {
+                cuda_dev.disable_event_tracking();
+            }
+
+            let k = 2048usize;
+            let n = 2048usize;
+            let bpw = 3u32;
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut td: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0xACE0_FACE;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                td.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&td, (k / 16, n / 16, 16 * bpw as usize), &dev_t).unwrap();
+            let suh = Tensor::ones(k, DType::F16, &dev_t).unwrap();
+            let svh = Tensor::ones(n, DType::F16, &dev_t).unwrap();
+
+            // Build input tensors for both M=16 and M=8.
+            let mut xd16 = Vec::with_capacity(16 * k);
+            for i in 0..(16 * k) {
+                xd16.push(half::f16::from_f32(
+                    ((i as f32 * 0.011).sin() * 0.05) as f32,
+                ));
+            }
+            let x16 = Tensor::from_slice(&xd16, (16, k), &dev_t).unwrap();
+            let mut xd8 = Vec::with_capacity(8 * k);
+            for i in 0..(8 * k) {
+                xd8.push(half::f16::from_f32(
+                    ((i as f32 * 0.013).sin() * 0.05) as f32,
+                ));
+            }
+            let x8 = Tensor::from_slice(&xd8, (8, k), &dev_t).unwrap();
+
+            // Mimic engine: JIT warmup for bs=16 (eager) then bs=8 (eager).
+            // This pre-grows pool for BOTH shapes.
+            let _ = exl3_gemm(
+                &x16,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("eager warm M=16");
+            let _ = exl3_gemm(
+                &x8,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("eager warm M=8");
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            unsafe {
+                let _ = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            // Now: capture at M=16 (mimics engine's Phase 2 for bs=16).
+            let stream = cuda_dev.cuda_stream().cu_stream();
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS);
+            let cap = exl3_gemm(
+                &x16,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .expect("captured gemm M=16");
+            drop(cap);
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            if !graph.is_null() {
+                unsafe {
+                    cuGraphDestroy(graph);
+                }
+            }
+            assert_eq!(end, CUresult::CUDA_SUCCESS, "EndCapture M=16: {end:?}");
+
+            // Now: eager at M=8 (mimics engine's Phase 1 for bs=8).
+            // This is the exact transition the engine warmup performs
+            // and fails on with INVALID_VALUE.
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            let post = exl3_gemm(
+                &x8,
+                &trellis,
+                Some(&suh),
+                Some(&svh),
+                bpw,
+                Exl3Codebook::Default,
+            );
+            assert!(
+                post.is_ok(),
+                "eager exl3_gemm M=8 AFTER capture cycle M=16 failed: {:?} — \
+                 ROOT CAUSE FOUND: cross-shape eager-after-capture is the \
+                 specific engine failure mode",
+                post.err()
+            );
+        }
+
         /// Phase 11.2 diagnostic: verify that a complete capture cycle
         /// (BeginCapture → forward → EndCapture) does NOT corrupt the
         /// CUDA context for subsequent eager forwards. The engine
@@ -1918,6 +2166,7 @@ mod tests {
         /// with INVALID_VALUE. If reproducible outside the engine,
         /// this test will reproduce it.
         #[test]
+        #[ignore]
         fn eager_exl3_gemm_after_capture_cycle_still_works() {
             use candle_core::cuda::cudarc::driver::sys::{
                 cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,
@@ -2028,6 +2277,7 @@ mod tests {
         /// gemm test but only the Hadamard step — narrows down further
         /// if the gemm test were to ever start failing.
         #[test]
+        #[ignore]
         fn had_r_128_fp16_inside_cuda_capture_window() {
             use candle_core::cuda::cudarc::driver::sys::{
                 cuGraphDestroy, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUresult,

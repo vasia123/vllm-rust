@@ -133,6 +133,17 @@ impl<M: ModelForward> StandardExecution<M> {
     }
 
     /// Run a dummy decode pass for JIT warmup.
+    ///
+    /// Phase 11.2.B (root-cause fix): routes through
+    /// `forward_decode_batch_with_ctx` with a pool-backed
+    /// `DecodeBatchShared` bundle (same as the capture warmup path).
+    /// The legacy `forward_decode_batch` (no ctx) allocated per-layer
+    /// `block_tables` / `seq_lens` via `Tensor::from_vec` — fresh device
+    /// pointers that, after a capture cycle, leave the CUDA mempool in
+    /// a state hostile to subsequent eager kernels (the engine warmup
+    /// symptom: bs=N capture succeeds → bs=N-1 JIT fails with
+    /// INVALID_VALUE). Using `_with_ctx` everywhere keeps the engine on
+    /// the pool-backed path uniformly.
     fn run_dummy_decode(
         &self,
         batch_size: usize,
@@ -169,10 +180,34 @@ impl<M: ModelForward> StandardExecution<M> {
             })
             .collect();
 
+        // Build the pool-backed shared bundle — same one capture_decode_graph
+        // builds — so the eager JIT forward uses identical pool slots /
+        // device tensors as the captured one. Without this, JIT calls
+        // `Tensor::from_vec` per layer, which after capture is registered
+        // fails with INVALID_VALUE.
+        #[cfg_attr(not(feature = "cuda-kernels"), allow(unused_mut))]
+        let mut warmup_ctx = super::cuda_graph::ForwardContext::eager();
+        #[cfg(feature = "cuda-kernels")]
+        {
+            let device = self.model.device().clone();
+            if device.is_cuda() {
+                if let Ok(s) = crate::layers::attention::build_decode_batch_shared_with_options(
+                    &sequences, &device, true,
+                ) {
+                    warmup_ctx = warmup_ctx
+                        .with_decode_shared(std::sync::Arc::new(s)
+                            as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+                }
+            }
+        }
+
         // Run forward pass (this triggers JIT compilation)
-        let _logits = self
-            .model
-            .forward_decode_batch(&input, &sequences, kv_cache_mgr)?;
+        let _logits = self.model.forward_decode_batch_with_ctx(
+            &input,
+            &sequences,
+            kv_cache_mgr,
+            &warmup_ctx,
+        )?;
 
         // Clean up
         self.cleanup_dummy_sequences(dummy_seqs, kv_cache_mgr)?;

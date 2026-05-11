@@ -1367,30 +1367,38 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     //      eager forwards in the warmup loop fail with the same
     //      INVALID_VALUE because the stream/context is hosed. Clip
     //      preemptively so the warmup only attempts capturable sizes.
+    // EXL3 needs two adjustments vs the default path:
+    //   1. fp16 activations (kernels are fp16-only).
+    //   2. enforce_eager — Phase 11 makes the EXL3 *kernel* + dispatch
+    //      capture-eligible (Phase 11.1 split + non-cooperative for
+    //      M ≤ 16; Phase 11.2.B Llama-quantized wiring through
+    //      `forward_decode_batch_with_ctx`), but the rest of the
+    //      `QuantizedLlamaForCausalLM` decode forward still allocates
+    //      fresh memory inside the captured stream (RmsNorm output,
+    //      candle SiLU+Mul, residual `+`, lm_head matmul, embedding
+    //      output, paged_attention scratch). Each becomes a graph-owned
+    //      `cuMemAllocAsync` node; after `cuGraphInstantiateWithFlags`,
+    //      the next `Tensor::zeros((bs,1), U32, dev)` for the next
+    //      batch-size warmup fails with `CUDA_ERROR_INVALID_VALUE`
+    //      because the pinned graph-owned allocations conflict with new
+    //      mempool requests. Diagnostic test:
+    //      `exl3_gemm_decode_path_inside_cuda_capture_window` shows the
+    //      EXL3 ops alone capture cleanly — proves the issue is in the
+    //      surrounding components, which would need the Qwen3-style
+    //      Phase A/B pool migration applied to llama_quantized to
+    //      eliminate. Until that lands, keep auto-eager for EXL3.
     let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
-    if is_exl3 {
-        // EXL3_GEMM_DECODE_MAX_M lives in vllm-core; keep this constant
-        // in sync with `crates/core/src/quantization/exl3_cuda.rs`.
-        // Diagnostic override: VLLM_EXL3_CAPTURE_MAX_M lets a developer
-        // pin the cap for capture-failure bisecting.
-        let cap: usize = std::env::var("VLLM_EXL3_CAPTURE_MAX_M")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16);
-        let before = cuda_graph_config.capture_sizes.len();
-        cuda_graph_config.capture_sizes.retain(|&s| s <= cap);
-        let after = cuda_graph_config.capture_sizes.len();
-        if after < before {
-            tracing::info!(
-                "EXL3 quantization detected — capture sizes clipped to ≤ {} \
-                 ({} of {} dropped, larger batches go through the cooperative \
-                 GEMM kernel and cannot be captured)",
-                cap,
-                before - after,
-                before
-            );
-        }
-    }
+    let enforce_eager = if is_exl3 && !enforce_eager {
+        tracing::info!(
+            "EXL3 quantization detected — forcing --enforce-eager \
+             (llama_quantized decode path needs broader pool migration \
+             for CUDA Graph capture; see Phase 11.2.B root-cause analysis)"
+        );
+        cuda_graph_config.enabled = false;
+        true
+    } else {
+        enforce_eager
+    };
     let dtype = if is_exl3 && dtype != DType::F16 {
         tracing::warn!(
             requested = ?dtype,
