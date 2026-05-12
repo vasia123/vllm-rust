@@ -447,9 +447,14 @@ impl RotaryEmbedding {
     ) -> Result<(Tensor, Tensor)> {
         let total_tokens = positions.len();
 
-        // CUDA fast path: fused kernel for bf16 neox-style (most common LLM case)
+        // CUDA fast path: fused kernel for bf16/fp16 neox-style.
+        // Phase 11.2.C: F16 added so EXL3 (which forces F16 activations)
+        // hits the pool-backed fast path instead of the candle slow path
+        // (which allocates positional `Tensor::from_vec` + `index_select`
+        // fresh per call — the source of the ILLEGAL_ADDRESS at capture
+        // replay).
         #[cfg(feature = "cuda-kernels")]
-        if q.dtype() == DType::BF16
+        if matches!(q.dtype(), DType::BF16 | DType::F16)
             && crate::cuda_kernels::rotary_embedding_cuda_available(q)
             && self.is_neox_style
         {

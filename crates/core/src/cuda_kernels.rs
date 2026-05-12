@@ -3269,10 +3269,22 @@ impl<'a> InplaceOp2 for RopeInplaceOp<'a> {
             shared_mem_bytes: 0,
         };
 
-        let kernel_name = if self.is_neox {
+        // Phase 11.2.C: pick the kernel variant by output dtype so the
+        // EXL3 F16 path uses the F16 RoPE kernel instead of falling
+        // through to the slow candle path (which allocates positional
+        // index_select tensors fresh per layer — the source of the
+        // ILLEGAL_ADDRESS at capture replay).
+        let kernel_name_bf16 = if self.is_neox {
             "rotary_embedding_neox_bf16"
         } else {
             "rotary_embedding_gptj_bf16"
+        };
+        let kernel_name_fp16 = if self.is_neox {
+            "rotary_embedding_neox_fp16"
+        } else {
+            // No GPT-J fp16 kernel — fall back to neox-style for any
+            // F16 user (Llama-EXL3 is neox-style).
+            "rotary_embedding_neox_fp16"
         };
 
         let (pos_storage, _) = self.positions.storage_and_layout();
@@ -3298,7 +3310,7 @@ impl<'a> InplaceOp2 for RopeInplaceOp<'a> {
                 let mut out_view = out_slice.slice_mut(0..total_elems);
                 dev.memcpy_dtod(&in_view, &mut out_view)?;
 
-                let func = dev.get_or_load_custom_func(kernel_name, "rope", ROPE_PTX)?;
+                let func = dev.get_or_load_custom_func(kernel_name_bf16, "rope", ROPE_PTX)?;
 
                 let mut builder = func.builder();
                 if let CudaStorageSlice::U32(s) = &pos_storage.slice {
@@ -3324,7 +3336,37 @@ impl<'a> InplaceOp2 for RopeInplaceOp<'a> {
                 unsafe { builder.launch(cfg) }
                     .map_err(|e| candle_core::Error::Msg(format!("rope_inplace launch: {e}")))?;
             }
-            _ => candle_core::bail!("rope_inplace: only bf16 supported"),
+            (CudaStorageSlice::F16(out_slice), CudaStorageSlice::F16(in_slice)) => {
+                // Phase 11.2.C: F16 RoPE for the EXL3 path.
+                let in_view = in_slice.slice(0..total_elems);
+                let mut out_view = out_slice.slice_mut(0..total_elems);
+                dev.memcpy_dtod(&in_view, &mut out_view)?;
+
+                let func = dev.get_or_load_custom_func(kernel_name_fp16, "rope", ROPE_PTX)?;
+
+                let mut builder = func.builder();
+                if let CudaStorageSlice::U32(s) = &pos_storage.slice {
+                    builder.arg(s);
+                } else {
+                    candle_core::bail!(
+                        "rope_inplace: positions must be U32 (got {:?})",
+                        self.positions.dtype()
+                    );
+                }
+                builder.arg(out_slice);
+                builder.arg(&0u64);
+                builder.arg(cache_slice);
+                builder.arg(&rot_dim_i32);
+                builder.arg(&query_stride);
+                builder.arg(&key_stride);
+                builder.arg(&head_size_i32);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("rope_inplace launch: {e}")))?;
+            }
+            _ => candle_core::bail!("rope_inplace: only bf16/f16 supported"),
         }
         Ok(())
     }

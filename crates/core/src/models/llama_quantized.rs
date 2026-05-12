@@ -728,42 +728,25 @@ impl crate::engine::ModelForward for QuantizedLlamaForCausalLM {
             .as_ref()
             .and_then(|arc| arc.downcast_ref::<DecodeBatchShared>());
 
-        // Phase 11.2.C: pool-backed embedding lookup. Falls back to the
-        // candle `Embedding::forward` path when CUDA is unavailable,
-        // num_tokens exceeds the pool budget (prefill), or the weight
-        // dtype isn't BF16/F16.
-        let xs = {
-            #[cfg(feature = "cuda-fused-activations")]
+        // Phase 11.2.C: pool-backed embedding lookup mirrors the
+        // Qwen3-quantized pattern (qwen3_quantized.rs:1290-1302) — no
+        // flatten, callsite-level gate.
+        #[cfg(feature = "cuda-fused-activations")]
+        let mut xs = {
+            let n: usize = input_ids.dims().iter().product();
+            let w_dt = self.embed_tokens.embeddings().dtype();
+            if n <= 64
+                && input_ids.device().is_cuda()
+                && matches!(w_dt, candle_core::DType::BF16 | candle_core::DType::F16)
+                && input_ids.dtype() == candle_core::DType::U32
             {
-                let weight = self.embed_tokens.embeddings();
-                let ids_dims = input_ids.dims();
-                let num_tokens: usize = ids_dims.iter().product();
-                let dtype_ok = matches!(
-                    weight.dtype(),
-                    candle_core::DType::BF16 | candle_core::DType::F16
-                );
-                let in_pool_budget = (1..=64).contains(&num_tokens);
-                if input_ids.device().is_cuda()
-                    && dtype_ok
-                    && in_pool_budget
-                    && weight.dims().len() == 2
-                {
-                    let ids_flat = input_ids.flatten_all()?;
-                    let out_flat = crate::cuda_kernels::embedding_pooled(&ids_flat, weight)?;
-                    let mut out_shape: Vec<usize> = ids_dims.to_vec();
-                    out_shape.push(weight.dims()[1]);
-                    out_flat.reshape(out_shape)?
-                } else {
-                    self.embed_tokens.forward(input_ids)?
-                }
-            }
-            #[cfg(not(feature = "cuda-fused-activations"))]
-            {
+                crate::cuda_kernels::embedding_pooled(input_ids, self.embed_tokens.embeddings())?
+            } else {
                 self.embed_tokens.forward(input_ids)?
             }
         };
-
-        let mut xs = xs;
+        #[cfg(not(feature = "cuda-fused-activations"))]
+        let mut xs = self.embed_tokens.forward(input_ids)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch_with_shared(
                 &xs,
