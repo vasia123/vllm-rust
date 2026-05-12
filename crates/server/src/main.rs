@@ -1819,21 +1819,22 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // replay dereferenced the stale 64-entry one for sequences that
     // crossed the first block boundary. Idempotent: OnceLock::set is a
     // no-op on subsequent calls.
-    {
+    // Publish engine limits BEFORE start_engine via the witness builder.
+    // The returned `EngineLimits` is threaded into every start_engine*
+    // call below — the type system now refuses to spawn the engine
+    // without these values having been published first.
+    let engine_limits = {
         let default_max_model_len = std::cmp::min(
             num_blocks * block_size,
             files.config.max_position_embeddings,
         );
         let mml = max_model_len_override.unwrap_or(default_max_model_len);
-        vllm_core::engine::engine_limits::set_max_model_len(mml);
-        // Separately publish the capture-only sequence cap so pool
-        // sizing (paged_attn V2 partitions, block_tables stride) stays
-        // cheap when --max-model-len is large but actual workloads
-        // don't approach it. We clamp to mml so we never advertise a
+        // The builder clamps capture_cap <= mml so we never advertise a
         // larger capture window than the model actually supports.
-        let capture_cap = std::cmp::min(max_seq_len_to_capture, mml);
-        vllm_core::engine::engine_limits::set_max_seq_len_to_capture(capture_cap);
-    }
+        vllm_core::engine::EngineLimitsBuilder::new(mml)
+            .max_seq_len_to_capture(max_seq_len_to_capture)
+            .build()
+    };
 
     // `eos_token_id` may be absent in the config.json (Qwen3, Mistral
     // base). Fall back to 0; stop logic still honors stop_strings +
@@ -1893,6 +1894,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 engine_tokenizer,
                 kv_cache_mgr,
                 engine_config,
+                engine_limits,
             )
         } else {
             eprintln!(
@@ -1939,6 +1941,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 kv_cache_mgr,
                 draft_kv_cache,
                 engine_config,
+                engine_limits,
             )
         }
     } else if let Some(max_n) = ngram_prompt_lookup_max {
@@ -1964,6 +1967,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             engine_tokenizer,
             kv_cache_mgr,
             engine_config,
+            engine_limits,
         )
     } else {
         let engine_config = EngineConfig::builder(scheduler_config, None)
@@ -1973,7 +1977,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             .build();
 
         eprintln!("Starting engine (multi-step={multi_step_count})...");
-        start_engine(model, engine_tokenizer, kv_cache_mgr, engine_config)
+        start_engine(
+            model,
+            engine_tokenizer,
+            kv_cache_mgr,
+            engine_config,
+            engine_limits,
+        )
     };
 
     let (atomic_engine, engine_controller) = AtomicEngineHandle::new(handle);
@@ -2006,16 +2016,10 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         });
     }
 
-    // max_model_len: CLI override > model's max_position_embeddings > blocks * block_size
-    let default_max_model_len = std::cmp::min(
-        num_blocks * block_size,
-        files.config.max_position_embeddings,
-    );
-    let max_model_len = max_model_len_override.unwrap_or(default_max_model_len);
-    // Phase D.1: publish max_model_len to vllm-core's process-global
-    // engine_limits so pool-backed paged_attention V2 + block_tables
-    // strides size their captured-graph buffers correctly. Idempotent.
-    vllm_core::engine::engine_limits::set_max_model_len(max_model_len);
+    // Same value computed by the earlier `engine_limits` builder block —
+    // reuse it here so AppState and the engine's pool sizing observe a
+    // single source of truth.
+    let max_model_len = engine_limits.max_model_len();
     let state = AppState::new(
         atomic_engine.clone(),
         served_model_name,
@@ -2633,6 +2637,14 @@ async fn run_generate(
     );
     let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
 
+    // Publish engine limits BEFORE start_engine so pool-backed paged
+    // attention V2 + block_tables stride size correctly for capture
+    // warmup (see Bug B.2 / commit 2614dd7 for the rationale).
+    let engine_limits = {
+        let mml = std::cmp::min(num_blocks * 16, files.config.max_position_embeddings);
+        vllm_core::engine::EngineLimitsBuilder::new(mml).build()
+    };
+
     // Fall back to 0 when missing (Qwen3-style configs); stop logic is
     // also driven by stop_strings + max_tokens.
     let eos_token_id = files.config.eos_token_id.unwrap_or(0);
@@ -2684,6 +2696,7 @@ async fn run_generate(
                 tokenizer,
                 kv_cache_mgr,
                 engine_config,
+                engine_limits,
             )
         } else {
             eprintln!(
@@ -2749,6 +2762,7 @@ async fn run_generate(
                 kv_cache_mgr,
                 draft_kv_cache,
                 engine_config,
+                engine_limits,
             )
         }
     } else {
@@ -2772,7 +2786,7 @@ async fn run_generate(
             max_tokens,
             multi_step_count
         );
-        start_engine(model, tokenizer, kv_cache_mgr, engine_config)
+        start_engine(model, tokenizer, kv_cache_mgr, engine_config, engine_limits)
     };
 
     let mut tasks = Vec::new();

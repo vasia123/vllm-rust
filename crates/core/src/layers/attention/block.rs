@@ -120,15 +120,18 @@ pub struct DecodeBatchShared {
     pub all_slot_mapping: std::sync::Arc<Vec<usize>>,
     /// `[batch_size, max_blocks_per_seq]` U32 block IDs on the same
     /// device as the model. Pool-backed on CUDA (stable address across
-    /// forwards); `PooledTensor` enforces this invariant in the type.
-    /// On non-CUDA or when batch exceeds the pool budget, a fallback
-    /// `Tensor::from_vec` is wrapped unsafe via `from_pool_unchecked`
-    /// (its storage lives at least one forward; non-captured paths
-    /// don't care about capture-replay stability).
-    pub block_tables: PooledTensor,
+    /// forwards); the `TaggedSlot<BlockTables>` phantom guarantees this
+    /// field cannot be replaced with a generic pool slot at compile
+    /// time. On non-CUDA or when batch exceeds the pool budget, a
+    /// fallback `Tensor::from_vec` is wrapped via `from_pool_unchecked`
+    /// and re-tagged; eager paths never feed it into a captured graph
+    /// so the storage just needs to outlive the consumer's forward
+    /// call.
+    pub block_tables:
+        crate::engine::output_pool::TaggedSlot<crate::engine::output_pool::BlockTables>,
     /// `[batch_size]` U32 sequence lengths (current decode position + 1).
     /// Pool-backed; see [`Self::block_tables`].
-    pub seq_lens: PooledTensor,
+    pub seq_lens: crate::engine::output_pool::TaggedSlot<crate::engine::output_pool::SeqLens>,
     /// `[total_tokens]` U32 query positions on device — pool-backed so
     /// the address is stable across forwards. Required for CUDA Graph
     /// capture: the per-layer RoPE kernel reads `positions` from the
@@ -136,12 +139,14 @@ pub struct DecodeBatchShared {
     /// and live at a stable address. `None` means the shared bundle was
     /// built on a non-CUDA device or batch exceeds the pool budget;
     /// callers fall back to `Tensor::from_vec` per layer.
-    pub positions_device: Option<PooledTensor>,
+    pub positions_device:
+        Option<crate::engine::output_pool::TaggedSlot<crate::engine::output_pool::Positions>>,
     /// `[total_tokens]` U32 slot indices on device — pool-backed, same
     /// rationale as `positions_device`. Used by `cache_engine.write_batch`
     /// to skip the per-layer `Tensor::from_vec(slot_mapping)` (whose
     /// fresh device address breaks captured `cuda_memcpy_inplace`).
-    pub slot_mapping_device: Option<PooledTensor>,
+    pub slot_mapping_device:
+        Option<crate::engine::output_pool::TaggedSlot<crate::engine::output_pool::SlotMapping>>,
     /// Padding extent of `block_tables` along axis 1.
     pub max_blocks_per_seq: usize,
     /// `max(seq_lens)` — used as the kernel's upper bound.
@@ -256,8 +261,8 @@ pub fn build_decode_batch_shared_with_options(
         let total_tokens = positions.len();
         let pos_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_src = Tensor::from_vec(pos_data, (total_tokens,), device)?;
-        let pos_dst = OutputPool::global().reserve_pooled(
-            &[total_tokens],
+        let pos_dst = OutputPool::global().reserve_positions(
+            total_tokens,
             candle_core::DType::U32,
             device,
         )?;
@@ -269,8 +274,11 @@ pub fn build_decode_batch_shared_with_options(
         let slot_total = all_slot_mapping.len();
         let slot_data: Vec<u32> = all_slot_mapping.iter().map(|&s| s as u32).collect();
         let slot_src = Tensor::from_vec(slot_data, (slot_total,), device)?;
-        let slot_dst =
-            OutputPool::global().reserve_pooled(&[slot_total], candle_core::DType::U32, device)?;
+        let slot_dst = OutputPool::global().reserve_slot_mapping(
+            slot_total,
+            candle_core::DType::U32,
+            device,
+        )?;
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(slot_dst.as_tensor(), &slot_src)
             .map_err(|e| {
                 candle_core::Error::Msg(format!("build_decode_batch_shared: slot copy: {e}"))
@@ -297,8 +305,9 @@ pub fn build_decode_batch_shared_with_options(
         }
 
         let bt_src = Tensor::from_vec(bt_data, (batch_size, stride), device)?;
-        let bt_dst = OutputPool::global().reserve_pooled(
-            &[batch_size, stride],
+        let bt_dst = OutputPool::global().reserve_block_tables(
+            batch_size,
+            stride,
             candle_core::DType::U32,
             device,
         )?;
@@ -309,7 +318,7 @@ pub fn build_decode_batch_shared_with_options(
 
         let sl_src = Tensor::from_vec(seq_lens_data.clone(), (batch_size,), device)?;
         let sl_dst =
-            OutputPool::global().reserve_pooled(&[batch_size], candle_core::DType::U32, device)?;
+            OutputPool::global().reserve_seq_lens(batch_size, candle_core::DType::U32, device)?;
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(sl_dst.as_tensor(), &sl_src)
             .map_err(|e| {
                 candle_core::Error::Msg(format!("build_decode_batch_shared: sl copy: {e}"))
@@ -320,9 +329,8 @@ pub fn build_decode_batch_shared_with_options(
         // Non-pool fallback (non-CUDA, oversize batch — capture path
         // never enters this branch, so the lack of pool stability does
         // not affect captured-graph correctness). Wrap the fresh
-        // tensors via `from_pool_unchecked` so the struct's `PooledTensor`
-        // fields hold a consistent type — eager-only callers don't care
-        // about the storage source.
+        // tensors via `from_pool_unchecked` and re-tag — eager-only
+        // callers don't care about the storage source.
         let mut bt_data = vec![0u32; batch_size * actual_max_blocks_per_seq];
         for (i, seq) in sequences.iter().enumerate() {
             for (j, &block_id) in seq.block_ids.iter().enumerate() {
@@ -331,10 +339,13 @@ pub fn build_decode_batch_shared_with_options(
         }
         let bt = Tensor::from_vec(bt_data, (batch_size, actual_max_blocks_per_seq), device)?;
         let sl = Tensor::from_vec(seq_lens_data, (batch_size,), device)?;
+        use crate::engine::output_pool::TaggedSlot;
         // SAFETY: eager-only path; these tensors live for the consumer's
         // forward call. No captured graph references them.
         let bt = unsafe { PooledTensor::from_pool_unchecked(bt) };
         let sl = unsafe { PooledTensor::from_pool_unchecked(sl) };
+        let bt = TaggedSlot::__from_pool_unchecked(bt);
+        let sl = TaggedSlot::__from_pool_unchecked(sl);
         (bt, sl, actual_max_blocks_per_seq)
     };
 

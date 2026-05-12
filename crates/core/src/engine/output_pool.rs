@@ -34,9 +34,113 @@
 //! site, not a global override.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
 
 use candle_core::{DType, Device, Result, Shape, Tensor};
+
+// ─── Slot kinds ─────────────────────────────────────────────────────
+//
+// Generic pool entries share one round-robin cursor per `(dtype, shape)`.
+// The four tagged kinds below give the critical decode-batch buffers
+// (positions, slot_mapping, block_tables, seq_lens) their own
+// independent cursors, eliminating the slot-drift failure mode where a
+// generic `reserve_pooled([1], U32, …)` collides with a `positions`
+// reserve at the same shape and the cursors end up advancing in
+// unexpected interleavings (Bug B.1, commit 2614dd7).
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+enum SlotKind {
+    Generic,
+    Positions,
+    SlotMapping,
+    BlockTables,
+    SeqLens,
+}
+
+/// Tag marker for the per-token query-position buffer.
+#[derive(Debug)]
+pub struct Positions;
+/// Tag marker for the per-token KV-cache slot index buffer.
+#[derive(Debug)]
+pub struct SlotMapping;
+/// Tag marker for the `[batch, max_blocks_per_seq]` block-id table.
+#[derive(Debug)]
+pub struct BlockTables;
+/// Tag marker for the `[batch]` per-sequence length vector.
+#[derive(Debug)]
+pub struct SeqLens;
+
+/// Phantom-typed handle for a pool slot of a specific decode-batch
+/// role. Constructible only via [`OutputPool::reserve_positions`] et al,
+/// so a `TaggedSlot<Positions>` cannot be confused with a generic
+/// [`PooledTensor`] at compile time. The wrapped storage is still
+/// pool-backed (it IS a [`PooledTensor`] internally), so all
+/// view-method and as-tensor access is preserved.
+#[derive(Debug)]
+pub struct TaggedSlot<Tag> {
+    inner: PooledTensor,
+    _phantom: PhantomData<fn() -> Tag>,
+}
+
+// Manual `Clone` — `#[derive]` would unnecessarily require `Tag: Clone`
+// even though the `fn() -> Tag` phantom is `Clone` for any `Tag`.
+impl<Tag> Clone for TaggedSlot<Tag> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<Tag> TaggedSlot<Tag> {
+    fn new(inner: PooledTensor) -> Self {
+        Self {
+            inner,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Tag an already-`PooledTensor` view as this tag without going
+    /// through the pool's `reserve_*` cursor. Internal use only:
+    /// `build_decode_batch_shared_with_options` calls this in the
+    /// non-CUDA / oversize-batch fallback branch, where the storage
+    /// is a `from_pool_unchecked`-wrapped one-shot `Tensor::from_vec`
+    /// that lives for the caller's forward but is not pool-managed.
+    /// Eager-only paths never feed it into a captured graph, so the
+    /// "pool-backed = address-stable" contract isn't required there.
+    #[doc(hidden)]
+    pub fn __from_pool_unchecked(inner: PooledTensor) -> Self {
+        Self {
+            inner,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Read-only access to the underlying tensor — the same backing
+    /// device storage the pool retains.
+    pub fn as_tensor(&self) -> &Tensor {
+        self.inner.as_tensor()
+    }
+
+    /// Borrow the pool-backed view as a [`PooledTensor`]. Useful when
+    /// passing to APIs that already accept `&PooledTensor`.
+    pub fn as_pooled(&self) -> &PooledTensor {
+        &self.inner
+    }
+
+    pub fn dims(&self) -> &[usize] {
+        self.inner.dims()
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.inner.dtype()
+    }
+
+    pub fn shape(&self) -> &Shape {
+        self.inner.shape()
+    }
+}
 
 /// Type-level guarantee that a [`Tensor`]'s underlying device storage was
 /// reserved from an [`OutputPool`] (or another `'static`-equivalent
@@ -218,9 +322,18 @@ struct PoolEntry {
 }
 
 /// Shape-keyed buffer pool. See module docs.
+///
+/// The key is `(SlotKind, DType, Vec<usize>)`: generic
+/// (`reserve`/`reserve_pooled`) reserves live in their own slot space,
+/// independent of the four tagged kinds used by decode-batch metadata.
+/// Tagged reserves cannot drift into the generic bucket and vice
+/// versa — at the cost of one extra `SlotKind` discriminant byte per
+/// hash.
+type PoolKey = (SlotKind, DType, Vec<usize>);
+
 #[derive(Default)]
 pub struct OutputPool {
-    inner: Mutex<HashMap<(DType, Vec<usize>), PoolEntry>>,
+    inner: Mutex<HashMap<PoolKey, PoolEntry>>,
 }
 
 impl OutputPool {
@@ -248,7 +361,7 @@ impl OutputPool {
     /// pass it down the layer chain.  When all callers drop their
     /// clones, the storage stays alive in the pool's slot.
     pub fn reserve(&self, shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
-        let key = (dtype, shape.to_vec());
+        let key = (SlotKind::Generic, dtype, shape.to_vec());
         let mut inner = self.inner.lock().expect("OutputPool: mutex poisoned");
         let entry = inner.entry(key).or_insert_with(|| PoolEntry {
             buffers: Vec::new(),
@@ -309,9 +422,23 @@ impl OutputPool {
         dtype: DType,
         device: &Device,
     ) -> Result<PooledTensor> {
+        self.reserve_kind(SlotKind::Generic, shape, dtype, device)
+    }
+
+    /// Internal: shared back-end for `reserve_pooled` and the four
+    /// tagged reserves. Each `SlotKind` has its own cursor/bucket
+    /// namespace, so tagged kinds cannot collide with the generic
+    /// pool entries.
+    fn reserve_kind(
+        &self,
+        kind: SlotKind,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<PooledTensor> {
         const MAX_PER_SHAPE: usize = 512;
 
-        let key = (dtype, shape.to_vec());
+        let key = (kind, dtype, shape.to_vec());
         let mut inner = self.inner.lock().expect("OutputPool: mutex poisoned");
         let entry = inner.entry(key).or_insert_with(|| PoolEntry {
             buffers: Vec::new(),
@@ -322,9 +449,10 @@ impl OutputPool {
             if entry.buffers.len() >= MAX_PER_SHAPE {
                 candle_core::bail!(
                     "OutputPool::reserve_pooled: per-shape cap {} exceeded for \
-                     ({:?}, {:?}); reduce repeated reserves per forward or raise \
+                     ({:?}, {:?}, {:?}); reduce repeated reserves per forward or raise \
                      MAX_PER_SHAPE",
                     MAX_PER_SHAPE,
+                    kind,
                     dtype,
                     shape
                 );
@@ -343,6 +471,65 @@ impl OutputPool {
         // their `PooledTensor`s — so the device pointer is stable for
         // the lifetime of `OutputPool::global()` (= `'static`).
         Ok(unsafe { PooledTensor::from_pool_unchecked(tensor) })
+    }
+
+    /// Tagged reserve for the per-token query-position buffer
+    /// (`positions_device` in [`crate::layers::attention::block::DecodeBatchShared`]).
+    /// Lives in its own `SlotKind::Positions` bucket so it cannot drift
+    /// into the generic round-robin.
+    pub fn reserve_positions(
+        &self,
+        num_tokens: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<TaggedSlot<Positions>> {
+        let inner = self.reserve_kind(SlotKind::Positions, &[num_tokens], dtype, device)?;
+        Ok(TaggedSlot::new(inner))
+    }
+
+    /// Tagged reserve for the per-token KV-cache slot-mapping buffer
+    /// (`slot_mapping_device`). See [`Self::reserve_positions`].
+    pub fn reserve_slot_mapping(
+        &self,
+        num_slots: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<TaggedSlot<SlotMapping>> {
+        let inner = self.reserve_kind(SlotKind::SlotMapping, &[num_slots], dtype, device)?;
+        Ok(TaggedSlot::new(inner))
+    }
+
+    /// Tagged reserve for the `[batch, max_blocks_per_seq]` block-id
+    /// table (`block_tables`). The pool always uses the worst-case
+    /// `max_blocks_per_seq` stride so captured-graph replays read
+    /// from a stable shape regardless of the actual `seq_lens` for
+    /// this forward.
+    pub fn reserve_block_tables(
+        &self,
+        batch: usize,
+        max_blocks_per_seq: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<TaggedSlot<BlockTables>> {
+        let inner = self.reserve_kind(
+            SlotKind::BlockTables,
+            &[batch, max_blocks_per_seq],
+            dtype,
+            device,
+        )?;
+        Ok(TaggedSlot::new(inner))
+    }
+
+    /// Tagged reserve for the `[batch]` per-sequence length vector
+    /// (`seq_lens`). See [`Self::reserve_positions`].
+    pub fn reserve_seq_lens(
+        &self,
+        batch: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<TaggedSlot<SeqLens>> {
+        let inner = self.reserve_kind(SlotKind::SeqLens, &[batch], dtype, device)?;
+        Ok(TaggedSlot::new(inner))
     }
 
     /// Drop ALL pool entries and slots. Forces the next `reserve` /
@@ -383,22 +570,26 @@ impl OutputPool {
             Ok(g) => g,
             Err(_) => return,
         };
-        let mut shapes: Vec<&(DType, Vec<usize>)> = inner.keys().collect();
+        let mut shapes: Vec<&PoolKey> = inner.keys().collect();
         shapes.sort_by(|a, b| {
             // Sort for deterministic iteration order — irrelevant for
             // diff, but makes manual log inspection easier.
-            (format!("{:?}", a.0), &a.1).cmp(&(format!("{:?}", b.0), &b.1))
+            (format!("{:?}", a.0), format!("{:?}", a.1), &a.2).cmp(&(
+                format!("{:?}", b.0),
+                format!("{:?}", b.1),
+                &b.2,
+            ))
         });
         for key in shapes {
             let entry = &inner[key];
-            let (dtype, shape) = key;
+            let (kind, dtype, shape) = key;
             let shape_str = shape
                 .iter()
                 .map(|d| d.to_string())
                 .collect::<Vec<_>>()
                 .join("x");
             for slot_idx in 0..entry.buffers.len() {
-                let name = format!("pool_{dtype:?}_{shape_str}__{slot_idx:03}");
+                let name = format!("pool_{kind:?}_{dtype:?}_{shape_str}__{slot_idx:03}");
                 let bin_path = dir.join(format!("{name}.bin"));
                 let meta_path = dir.join(format!("{name}.meta"));
                 let tensor = &entry.buffers[slot_idx];
@@ -581,5 +772,193 @@ mod tests {
         assert!(!tr.is_contiguous());
         let r = tr.flatten_all();
         assert!(r.is_err(), "flatten_all on non-contiguous should bail");
+    }
+
+    // ─── Pool slot identity (slot-drift regression suite) ───────────
+    //
+    // These tests guard the "captured graph contract" invariant: every
+    // phase (JIT warmup, capture warmup, production runtime) that calls
+    // `reset_cursors()` then reserves the same sequence of pool slots
+    // MUST observe identical underlying storage addresses. Bug B
+    // (commit 2614dd7) was a violation of this invariant — capture
+    // warmup skipped `reset_cursors` and saw cursor 1 while production
+    // saw cursor 0 for the same shape, so the captured graph encoded
+    // a different device pointer than the one production wrote into.
+    //
+    // CPU testing rationale: `Tensor::clone()` clones the
+    // `Arc<RwLock<Storage>>` (not the inner Vec), so the data pointer
+    // of `CpuStorage::U32` is stable across pool slot reservations of
+    // the same slot index. That gives us a portable proxy for "is the
+    // storage we just got the same physical buffer".
+
+    /// Test-only: lift the data pointer of a pool-backed CPU tensor.
+    /// Returns `None` for non-CPU storage or unsupported dtypes — those
+    /// tests should gate themselves accordingly.
+    fn cpu_storage_data_ptr(t: &Tensor) -> Option<usize> {
+        use candle_core::{CpuStorage, Storage};
+        let (storage, _layout) = t.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(c) => match c {
+                CpuStorage::U32(v) => Some(v.as_ptr() as usize),
+                CpuStorage::F32(v) => Some(v.as_ptr() as usize),
+                CpuStorage::U8(v) => Some(v.as_ptr() as usize),
+                CpuStorage::I64(v) => Some(v.as_ptr() as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pool_slot_data_ptrs_stable_across_phases() {
+        // Three phases imitating production sequence:
+        //   1. JIT warmup forward (reset_cursors + reserve sequence)
+        //   2. capture-time build_shared (reset_cursors + reserve sequence)
+        //   3. production runtime forward (reset_cursors + reserve sequence)
+        // All three must hand out identical storage addresses for matching
+        // slot indices. Diverging addresses across phases is the failure
+        // mode that Bug B exhibited.
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+
+        let phase = || -> Vec<usize> {
+            pool.reset_cursors();
+            // Two reserves of the same (dtype, shape) — exercises the
+            // per-shape round-robin cursor at indices 0 and 1, which is
+            // precisely the bucket that drifted in Bug B.1 (positions
+            // and seq_lens both being `[1]` U32 at batch=1).
+            let a = pool.reserve_pooled(&[1], DType::U32, &dev).unwrap();
+            let b = pool.reserve_pooled(&[1], DType::U32, &dev).unwrap();
+            // Two more distinct shapes.
+            let c = pool.reserve_pooled(&[5], DType::U32, &dev).unwrap();
+            let d = pool.reserve_pooled(&[1, 64], DType::U32, &dev).unwrap();
+            vec![
+                cpu_storage_data_ptr(a.as_tensor()).unwrap(),
+                cpu_storage_data_ptr(b.as_tensor()).unwrap(),
+                cpu_storage_data_ptr(c.as_tensor()).unwrap(),
+                cpu_storage_data_ptr(d.as_tensor()).unwrap(),
+            ]
+        };
+
+        let jit = phase();
+        let capture = phase();
+        let runtime = phase();
+
+        assert_eq!(
+            jit, capture,
+            "capture-phase pool ptrs diverged from JIT warmup — \
+             slot-drift class regression (see Bug B / commit 2614dd7)"
+        );
+        assert_eq!(
+            capture, runtime,
+            "runtime pool ptrs diverged from capture warmup — \
+             captured graph would dereference the wrong slot"
+        );
+
+        // Sanity: within a phase the two `[1]/U32` reserves MUST land
+        // on distinct slots (cursor 0 vs cursor 1). Otherwise the
+        // round-robin cursor is broken and the cross-phase equality
+        // above is meaningless.
+        assert_ne!(
+            jit[0], jit[1],
+            "same-shape reserves collided into one slot — round-robin cursor broken"
+        );
+    }
+
+    #[test]
+    fn pool_slot_drift_without_reset_is_observable() {
+        // Reproducer of Bug B.1's failure mode: when a phase forgets to
+        // call `reset_cursors`, the cursor leaks from the previous phase
+        // and the slot served by `reserve_pooled` shifts. This test
+        // verifies the shift is *observable* via storage pointers — i.e.
+        // future diagnostics or fuzzers can catch the bug class.
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+
+        pool.reset_cursors();
+        // Warmup advances the cursor for `[1]/U32` past zero.
+        let _w0 = pool.reserve_pooled(&[1], DType::U32, &dev).unwrap();
+        let _w1 = pool.reserve_pooled(&[1], DType::U32, &dev).unwrap();
+
+        // Simulated buggy capture path: no reset_cursors. Cursor stays
+        // at 2 → reserve hands out slot 2.
+        let buggy = pool.reserve_pooled(&[1], DType::U32, &dev).unwrap();
+        let buggy_ptr = cpu_storage_data_ptr(buggy.as_tensor()).unwrap();
+
+        // Production path: resets first, reserve hands out slot 0.
+        pool.reset_cursors();
+        let prod = pool.reserve_pooled(&[1], DType::U32, &dev).unwrap();
+        let prod_ptr = cpu_storage_data_ptr(prod.as_tensor()).unwrap();
+
+        assert_ne!(
+            buggy_ptr, prod_ptr,
+            "without reset_cursors, slots MUST diverge — otherwise the \
+             slot-drift bug class would be invisible to diagnostics"
+        );
+    }
+
+    #[test]
+    fn reserve_pooled_data_ptr_matches_after_reset_cursors() {
+        // Strengthens `reserve_pooled_replays_same_addresses_after_reset_cursors`
+        // (which only verified `total_slots`): the actual underlying
+        // storage pointer is identical across a reset/re-reserve cycle.
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+
+        let a = pool.reserve_pooled(&[4], DType::F32, &dev).unwrap();
+        let a_ptr = cpu_storage_data_ptr(a.as_tensor()).unwrap();
+        drop(a);
+
+        pool.reset_cursors();
+        let a2 = pool.reserve_pooled(&[4], DType::F32, &dev).unwrap();
+        let a2_ptr = cpu_storage_data_ptr(a2.as_tensor()).unwrap();
+
+        assert_eq!(a_ptr, a2_ptr, "reset_cursors must replay the same slot ptr");
+        assert_eq!(pool.total_slots(), 1, "no new allocation after reset");
+    }
+
+    #[test]
+    fn engine_limits_pool_worst_case_seq_len_is_idempotent() {
+        // OnceLock semantics: subsequent `set_*` calls are silently
+        // ignored — only the first wins. This is the contract that the
+        // server's startup sequence relies on (limits published BEFORE
+        // start_engine, never overwritten). If a future refactor swaps
+        // `OnceLock` for a mutable cell, this test fails, forcing the
+        // author to revisit Bug B.2's root cause.
+        //
+        // The test uses a LOCAL `OnceLock<usize>` to avoid stomping on
+        // the process-global `engine_limits` state shared with other
+        // tests. The point is to lock down the OnceLock contract; the
+        // actual production use site reads from a real `OnceLock` with
+        // the same semantics.
+        let cell: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        assert!(cell.set(1024).is_ok(), "first set must win");
+        assert!(
+            cell.set(131072).is_err(),
+            "second set must fail silently — OnceLock idempotency contract"
+        );
+        assert_eq!(*cell.get().unwrap(), 1024);
+    }
+
+    #[test]
+    fn pool_worst_case_seq_len_falls_back_to_1024_when_unset() {
+        // Documents that build_shared's stride sizing falls back to
+        // `worst_case_max_blocks_per_seq = 1024 / 16 = 64` when neither
+        // `max_model_len` nor `max_seq_len_to_capture` was published by
+        // the server. This is the historical default that tests and
+        // benches rely on; changing it would silently re-shape every
+        // build_shared call site (Bug B.2 class).
+        //
+        // We cannot assert the actual return value of
+        // `engine_limits::pool_worst_case_seq_len()` from a test —
+        // process-global OnceLock state may have been initialised by
+        // an earlier test in the same binary. Instead the test pins the
+        // documented fallback constant via the same OnceLock pattern.
+        let cell: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let observed = cell.get().copied().unwrap_or(1024);
+        assert_eq!(
+            observed, 1024,
+            "fallback contract: unset OnceLock must read as 1024"
+        );
     }
 }

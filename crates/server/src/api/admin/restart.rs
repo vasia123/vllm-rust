@@ -170,6 +170,8 @@ impl EngineBuilder for ProductionEngineBuilder {
                 kv_cache_mgr,
                 draft_kv_cache,
                 engine_config,
+                vllm_core::engine::EngineLimits::from_globals()
+                    .expect("engine_limits must be published before restart"),
             )
         } else {
             let engine_config = EngineConfig::builder(
@@ -192,7 +194,14 @@ impl EngineBuilder for ProductionEngineBuilder {
                 "Starting engine (multi-step={})...",
                 config.multi_step_count
             );
-            start_engine(model, engine_tokenizer, kv_cache_mgr, engine_config)
+            start_engine(
+                model,
+                engine_tokenizer,
+                kv_cache_mgr,
+                engine_config,
+                vllm_core::engine::EngineLimits::from_globals()
+                    .expect("engine_limits must be published before restart"),
+            )
         };
 
         Ok(handle)

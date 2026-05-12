@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```ignore
-//! let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+//! let handle = start_engine(model, tokenizer, kv_cache_mgr, config, crate::engine::EngineLimits::for_testing());
 //! let result = handle.generate(request).await?;
 //! ```
 
@@ -27,6 +27,7 @@ pub mod debug_dump;
 mod embedding_forward;
 mod encoder_decoder;
 pub mod engine_limits;
+pub use engine_limits::{EngineLimits, EngineLimitsBuilder};
 mod handle;
 mod helpers;
 pub mod layer_dump;
@@ -107,8 +108,9 @@ pub fn start_engine<M: ModelForward>(
     tokenizer: TokenizerWrapper,
     kv_cache_mgr: KVCacheManager,
     config: EngineConfig,
+    limits: EngineLimits,
 ) -> EngineHandle {
-    let (handle, _stats) = start_engine_with_warmup(model, tokenizer, kv_cache_mgr, config);
+    let (handle, _stats) = start_engine_with_warmup(model, tokenizer, kv_cache_mgr, config, limits);
     handle
 }
 
@@ -120,6 +122,7 @@ pub fn start_engine_with_draft<M: ModelForward, D: ModelForward>(
     target_kv_cache: KVCacheManager,
     draft_kv_cache: KVCacheManager,
     config: EngineConfig,
+    limits: EngineLimits,
 ) -> EngineHandle {
     let num_speculative_tokens = config
         .speculative_config
@@ -133,7 +136,14 @@ pub fn start_engine_with_draft<M: ModelForward, D: ModelForward>(
         num_speculative_tokens,
     ));
 
-    start_engine_with_proposer(target_model, proposer, tokenizer, target_kv_cache, config)
+    start_engine_with_proposer(
+        target_model,
+        proposer,
+        tokenizer,
+        target_kv_cache,
+        config,
+        limits,
+    )
 }
 
 /// Start the inference engine with speculative decoding using any [`DraftProposer`].
@@ -146,6 +156,7 @@ pub fn start_engine_with_proposer<M: ModelForward>(
     tokenizer: TokenizerWrapper,
     target_kv_cache: KVCacheManager,
     config: EngineConfig,
+    _limits: EngineLimits,
 ) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
@@ -185,6 +196,8 @@ pub fn start_engine_with_proposer<M: ModelForward>(
 /// * `tokenizer` - Tokenizer for the model
 /// * `kv_cache_mgr` - KV cache manager (configured for this stage's layers)
 /// * `config` - Engine configuration
+/// * `limits` - Engine-wide pool sizing limits witness (see [`EngineLimits`])
+#[allow(clippy::too_many_arguments)]
 pub fn start_engine_pipeline<M: PipelineForward>(
     model: M,
     stage_config: crate::distributed::PipelineStageConfig,
@@ -193,9 +206,10 @@ pub fn start_engine_pipeline<M: PipelineForward>(
     tokenizer: TokenizerWrapper,
     kv_cache_mgr: KVCacheManager,
     config: EngineConfig,
+    limits: EngineLimits,
 ) -> EngineHandle {
     let staged_model = PipelineStagedModel::new(model, stage_config, comm, vocab_size);
-    start_engine(staged_model, tokenizer, kv_cache_mgr, config)
+    start_engine(staged_model, tokenizer, kv_cache_mgr, config, limits)
 }
 
 // ─── Engine start with warmup ─────────────────────────────────────────────
@@ -227,6 +241,7 @@ pub fn start_engine_with_warmup<M: ModelForward>(
     tokenizer: TokenizerWrapper,
     mut kv_cache_mgr: KVCacheManager,
     config: EngineConfig,
+    _limits: EngineLimits,
 ) -> (EngineHandle, WarmupStats) {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
@@ -265,9 +280,10 @@ pub async fn start_engine_with_warmup_async<M: ModelForward>(
     tokenizer: TokenizerWrapper,
     kv_cache_mgr: KVCacheManager,
     config: EngineConfig,
+    limits: EngineLimits,
 ) -> (EngineHandle, WarmupStats) {
     tokio::task::spawn_blocking(move || {
-        start_engine_with_warmup(model, tokenizer, kv_cache_mgr, config)
+        start_engine_with_warmup(model, tokenizer, kv_cache_mgr, config, limits)
     })
     .await
     .expect("warmup task panicked")
@@ -1771,7 +1787,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Engine should not be paused initially
         assert!(!handle.is_paused().await.unwrap());
@@ -1798,7 +1820,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         handle.pause(PauseMode::Keep).await.unwrap();
 
@@ -1834,7 +1862,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Submit a streaming request that will keep generating
         let request = GenerationRequest {
@@ -1884,7 +1918,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Submit a short request
         let request = GenerationRequest {
@@ -1919,7 +1959,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Double pause should be OK
         handle.pause(PauseMode::Keep).await.unwrap();
@@ -1941,7 +1987,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Pause, then resume and submit a request — should work
         handle.pause(PauseMode::Keep).await.unwrap();
@@ -1968,7 +2020,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         let request = GenerationRequest {
             prompt: "t1 t2 t3".to_string(),
@@ -2002,7 +2060,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Submit a long-running streaming request
         let request = GenerationRequest {
@@ -2044,7 +2108,13 @@ mod tests {
         let model = MockModel::new(42, 1000);
         let tokenizer = TokenizerWrapper::for_testing(1000);
         let config = test_engine_config();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         let request = GenerationRequest {
             prompt: "t1 t2 t3".to_string(),
@@ -2102,7 +2172,13 @@ mod tests {
             .enable_optimistic_scheduling(enable)
             .build();
 
-            let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+            let handle = start_engine(
+                model,
+                tokenizer,
+                kv_cache_mgr,
+                config,
+                crate::engine::EngineLimits::for_testing(),
+            );
 
             let mut handles = Vec::new();
             for &(prompt, max_tokens) in &prompts {
@@ -2163,7 +2239,13 @@ mod tests {
         .enable_optimistic_scheduling(true)
         .build();
 
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
 
         // Mix of short (1-2 tokens) and long (10-20 tokens) requests.
         // Short ones will complete quickly, invalidating pre-schedules.
@@ -2328,7 +2410,13 @@ mod tests {
             .enable_optimistic_scheduling(enable)
             .build();
 
-            let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+            let handle = start_engine(
+                model,
+                tokenizer,
+                kv_cache_mgr,
+                config,
+                crate::engine::EngineLimits::for_testing(),
+            );
 
             // Warmup: 2 requests to JIT-compile CUDA kernels
             for _ in 0..2 {

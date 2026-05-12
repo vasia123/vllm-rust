@@ -167,7 +167,13 @@ async fn test_engine_submit_and_complete() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
     let request = make_request("t1 t2 t3", 5, 999);
 
     let result = handle.generate(request).await.unwrap();
@@ -188,7 +194,13 @@ async fn test_engine_max_tokens_one_completes_immediately() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
     let request = make_request("t1 t2", 1, 999);
 
     let result = handle.generate(request).await.unwrap();
@@ -209,7 +221,13 @@ async fn test_engine_multiple_concurrent_requests() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     let req1 = make_request("t1 t2 t3", 3, 999);
     let req2 = make_request("t4 t5", 4, 999);
@@ -239,7 +257,13 @@ async fn test_engine_handles_eos_token() {
     let model = CountingMockModel::new(42, 999, 1000, 2);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
     let request = make_request("t1 t2", 10, 999);
 
     let result = handle.generate(request).await.unwrap();
@@ -260,7 +284,13 @@ async fn test_engine_streaming_tokens_arrive_in_order() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
     let request = make_request("t1 t2", 3, 999);
 
     let (_req_id, mut rx) = handle.generate_stream(request).await.unwrap();
@@ -301,7 +331,13 @@ async fn test_engine_generation_stops_at_stop_token() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     let request = GenerationRequest {
         prompt: "t1 t2 t3".to_string(),
@@ -337,7 +373,13 @@ async fn test_engine_get_stats() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     let stats = handle.get_stats().await.unwrap();
 
@@ -356,7 +398,13 @@ async fn test_engine_generation_stops_at_stop_string() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     // The mock tokenizer maps token 42 -> "t42". We set "t42" as stop string.
     let request = GenerationRequest {
@@ -397,7 +445,13 @@ async fn test_engine_cancel_request_via_drop() {
     let model = MockModel::new(42, 1000);
     let tokenizer = TokenizerWrapper::for_testing(1000);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, test_engine_config());
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        test_engine_config(),
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     // Start a streaming request then drop the receiver to cancel
     let request = make_request("t1 t2", 100, 999);

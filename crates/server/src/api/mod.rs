@@ -1097,7 +1097,13 @@ mod tests {
             None,
         )
         .build();
-        let handle = start_engine(model, tokenizer, kv_cache_mgr, engine_config);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            engine_config,
+            vllm_core::engine::EngineLimits::for_testing(),
+        );
         let (atomic_handle, _controller) = AtomicEngineHandle::new(handle);
 
         let api_tokenizer = TokenizerWrapper::for_testing(1000);

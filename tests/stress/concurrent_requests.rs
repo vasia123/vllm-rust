@@ -146,7 +146,13 @@ async fn test_100_concurrent_requests() {
     let tokenizer = TokenizerWrapper::for_testing(VOCAB_SIZE);
     let config = stress_engine_config(32);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     let start = Instant::now();
 
@@ -215,7 +221,13 @@ async fn test_cache_pressure() {
     let tokenizer = TokenizerWrapper::for_testing(VOCAB_SIZE);
     let config = stress_engine_config(4);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     // Submit requests that collectively exceed cache capacity
     let mut tasks = Vec::new();
@@ -264,7 +276,13 @@ async fn test_sustained_load_30s() {
     let tokenizer = TokenizerWrapper::for_testing(VOCAB_SIZE);
     let config = stress_engine_config(16);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
     let start = Instant::now();
     let total_requests = Arc::new(AtomicUsize::new(0));
     let completed_requests = Arc::new(AtomicUsize::new(0));
@@ -340,7 +358,13 @@ async fn test_shutdown_with_inflight() {
     let tokenizer = TokenizerWrapper::for_testing(VOCAB_SIZE);
     let config = stress_engine_config(8);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     // Submit long-running requests
     let mut tasks = Vec::new();
@@ -375,7 +399,13 @@ async fn test_streaming_no_leak() {
     let tokenizer = TokenizerWrapper::for_testing(VOCAB_SIZE);
     let config = stress_engine_config(4);
 
-    let handle = start_engine(model, tokenizer, kv_cache_mgr, config);
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
 
     for i in 0..NUM_ITERATIONS {
         let request = make_stress_request(i, 5, EOS_TOKEN);
