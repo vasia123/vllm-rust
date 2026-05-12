@@ -184,6 +184,66 @@ extern "C" __global__ void gelu_and_mul_fp16(
     }
 }
 
+// Phase 11.2.C: FP16 sibling of `silu_and_mul_separate_bf16`. Same
+// scalar semantics — `out = silu(gate) * up` element-wise — for the
+// EXL3 decode forward (F16 activations).
+extern "C" __global__ void silu_and_mul_separate_fp16(
+    __half* __restrict__ out,           // [num_tokens, d]
+    const __half* __restrict__ gate,    // [num_tokens, d]
+    const __half* __restrict__ up,      // [num_tokens, d]
+    const int d
+) {
+    const int token_idx = blockIdx.x;
+    const __half* gate_ptr = gate + token_idx * d;
+    const __half* up_ptr = up + token_idx * d;
+    __half* out_ptr = out + token_idx * d;
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float g = __half2float(gate_ptr[i]);
+        float u = __half2float(up_ptr[i]);
+        out_ptr[i] = __float2half(silu(g) * u);
+    }
+}
+
+// Phase 11.2.C: FP16 sibling of `add_bf16`. Element-wise add for the
+// EXL3 decode forward's residual path.
+extern "C" __global__ void add_fp16(
+    __half* __restrict__ out,
+    const __half* __restrict__ a,
+    const __half* __restrict__ b,
+    const int hidden_size
+) {
+    const int token_idx = blockIdx.x;
+    const __half* a_ptr = a + token_idx * hidden_size;
+    const __half* b_ptr = b + token_idx * hidden_size;
+    __half* out_ptr = out + token_idx * hidden_size;
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float av = __half2float(a_ptr[i]);
+        float bv = __half2float(b_ptr[i]);
+        out_ptr[i] = __float2half(av + bv);
+    }
+}
+
+// Phase 11.2.C: FP16 sibling of `embedding_lookup_bf16`. Gather rows
+// from a 2D F16 weight matrix into a contiguous output, indexed by
+// per-token int32 IDs.
+extern "C" __global__ void embedding_lookup_fp16(
+    __half* __restrict__ out,
+    const __half* __restrict__ weight,
+    const int* __restrict__ input_ids,
+    const int hidden_size
+) {
+    const int token_idx = blockIdx.x;
+    const int row_id = input_ids[token_idx];
+    const __half* src = weight + row_id * hidden_size;
+    __half* dst = out + token_idx * hidden_size;
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
 extern "C" __global__ void gelu_tanh_and_mul_fp16(
     __half* __restrict__ out,
     const __half* __restrict__ input,

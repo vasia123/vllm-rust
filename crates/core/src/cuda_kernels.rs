@@ -2001,8 +2001,29 @@ impl<'a> InplaceOp2 for SiluAndMulSeparateInplaceOp<'a> {
                     candle_core::Error::Msg(format!("silu_and_mul_separate_inplace launch: {e}"))
                 })?;
             }
+            (
+                CudaStorageSlice::F16(out_slice),
+                CudaStorageSlice::F16(gate_slice),
+                CudaStorageSlice::F16(up_slice),
+            ) => {
+                // Phase 11.2.C: F16 sibling for the EXL3-Llama decode
+                // forward (activations forced to F16 by main.rs).
+                let func = dev.get_or_load_custom_func(
+                    "silu_and_mul_separate_fp16",
+                    "activations",
+                    ACTIVATIONS_PTX,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(gate_slice);
+                builder.arg(up_slice);
+                builder.arg(&d_i32);
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("silu_and_mul_separate_inplace launch: {e}"))
+                })?;
+            }
             _ => candle_core::bail!(
-                "silu_and_mul_separate_inplace: only bf16 supported (out/gate/up dtype mismatch)"
+                "silu_and_mul_separate_inplace: only bf16/f16 supported (out/gate/up dtype mismatch)"
             ),
         }
         Ok(())
@@ -2027,8 +2048,11 @@ pub fn silu_and_mul_separate_pooled(gate: &Tensor, up: &Tensor) -> Result<Tensor
             up.shape()
         );
     }
-    if gate.dtype() != candle_core::DType::BF16 {
-        // Fallback for non-bf16 dtypes — kernel only has bf16 variant.
+    let gate_dt = gate.dtype();
+    if gate_dt != candle_core::DType::BF16 && gate_dt != candle_core::DType::F16 {
+        // Fallback for unsupported dtypes (F32 etc.) — kernels exist
+        // only for BF16 (Qwen3-AWQ path) and F16 (Phase 11.2.C, EXL3
+        // path).
         let activated = candle_nn::ops::silu(gate)?;
         return activated.broadcast_mul(up);
     }
@@ -2127,8 +2151,31 @@ impl<'a> InplaceOp2 for EmbeddingLookupInplaceOp<'a> {
                     candle_core::Error::Msg(format!("embedding_lookup_inplace launch: {e}"))
                 })?;
             }
+            (
+                CudaStorageSlice::F16(out_slice),
+                CudaStorageSlice::F16(w_slice),
+                CudaStorageSlice::U32(ids_slice),
+            ) => {
+                // Phase 11.2.C: F16 sibling for the EXL3-Llama embed
+                // lookup (compute dtype = F16).
+                let func = dev.get_or_load_custom_func(
+                    "embedding_lookup_fp16",
+                    "activations",
+                    ACTIVATIONS_PTX,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(w_slice);
+                builder.arg(ids_slice);
+                builder.arg(&hidden_i32);
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("embedding_lookup_fp16 launch: {e}"))
+                })?;
+            }
             _ => {
-                candle_core::bail!("embedding_lookup_inplace: only BF16 weight + U32 ids supported")
+                candle_core::bail!(
+                    "embedding_lookup_inplace: only BF16/F16 weight + U32 ids supported"
+                )
             }
         }
         Ok(())
@@ -2205,7 +2252,25 @@ impl<'a> InplaceOp2 for Bf16AddInplaceOp<'a> {
                     candle_core::Error::Msg(format!("bf16_add_inplace launch: {e}"))
                 })?;
             }
-            _ => candle_core::bail!("bf16_add_inplace: only BF16 supported"),
+            (
+                CudaStorageSlice::F16(out_slice),
+                CudaStorageSlice::F16(a_slice),
+                CudaStorageSlice::F16(b_slice),
+            ) => {
+                // Phase 11.2.C: F16 sibling for the EXL3-Llama decode
+                // forward (residual-add inputs are F16).
+                let func =
+                    dev.get_or_load_custom_func("add_fp16", "activations", ACTIVATIONS_PTX)?;
+                let mut builder = func.builder();
+                builder.arg(out_slice);
+                builder.arg(a_slice);
+                builder.arg(b_slice);
+                builder.arg(&hidden_i32);
+                unsafe { builder.launch(cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("add_fp16 inplace launch: {e}"))
+                })?;
+            }
+            _ => candle_core::bail!("add_inplace: only BF16/F16 supported"),
         }
         Ok(())
     }
@@ -2228,10 +2293,13 @@ pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_NUM_TOKENS: usize = 64;
 
-    if a.dtype() != candle_core::DType::BF16 || b.dtype() != candle_core::DType::BF16 {
-        return (a + b)?.contiguous();
-    }
-    if !a.device().is_cuda() {
+    let a_dt = a.dtype();
+    let b_dt = b.dtype();
+    if a_dt != b_dt
+        || !matches!(a_dt, candle_core::DType::BF16 | candle_core::DType::F16)
+        || !a.device().is_cuda()
+    {
+        // Unsupported dtype / CPU — defer to candle.
         return (a + b)?.contiguous();
     }
     if a.shape() != b.shape() {
@@ -2251,7 +2319,7 @@ pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
 
     let shape: Vec<usize> = dims.to_vec();
-    let output = OutputPool::global().reserve(&shape, candle_core::DType::BF16, a.device())?;
+    let output = OutputPool::global().reserve(&shape, a_dt, a.device())?;
     let op = Bf16AddInplaceOp { b: &b_c };
     output.inplace_op2(&a, &op)?;
     Ok(output)
@@ -2340,7 +2408,34 @@ impl<'a> InplaceOp2 for Bf16MatmulInplaceOp<'a> {
                     })?;
                 }
             }
-            _ => candle_core::bail!("bf16_matmul_inplace: only BF16 supported"),
+            (
+                CudaStorageSlice::F16(out_slice),
+                CudaStorageSlice::F16(x_slice),
+                CudaStorageSlice::F16(w_slice),
+            ) => {
+                // Phase 11.2.C: F16 sibling for EXL3-Llama lm_head matmul.
+                // Same row-major → column-major cuBLAS gymnastics as the
+                // BF16 case, just with `half::f16` operand type (cuBLAS
+                // HGEMM).
+                let cfg = GemmConfig::<half::f16> {
+                    transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: self.n as i32,
+                    n: self.m as i32,
+                    k: self.k as i32,
+                    alpha: half::f16::from_f32(1.0),
+                    lda: self.k as i32,
+                    ldb: self.k as i32,
+                    beta: half::f16::from_f32(0.0),
+                    ldc: self.n as i32,
+                };
+                unsafe {
+                    blas.gemm(cfg, w_slice, x_slice, out_slice).map_err(|e| {
+                        candle_core::Error::Msg(format!("f16_matmul_inplace gemm: {e}"))
+                    })?;
+                }
+            }
+            _ => candle_core::bail!("matmul_inplace: only BF16/F16 supported"),
         }
 
         Ok(())
@@ -2358,10 +2453,13 @@ pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_M: usize = 64;
 
-    if input.dtype() != candle_core::DType::BF16 || weight.dtype() != candle_core::DType::BF16 {
-        return input.matmul(&weight.t()?);
-    }
-    if !input.device().is_cuda() {
+    let in_dt = input.dtype();
+    let w_dt = weight.dtype();
+    if in_dt != w_dt
+        || !matches!(in_dt, candle_core::DType::BF16 | candle_core::DType::F16)
+        || !input.device().is_cuda()
+    {
+        // Unsupported dtype / CPU — defer to candle.
         return input.matmul(&weight.t()?);
     }
 
@@ -2387,8 +2485,7 @@ pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
 
     let mut out_shape: Vec<usize> = in_dims[..in_dims.len() - 1].to_vec();
     out_shape.push(n);
-    let output =
-        OutputPool::global().reserve(&out_shape, candle_core::DType::BF16, input.device())?;
+    let output = OutputPool::global().reserve(&out_shape, in_dt, input.device())?;
 
     let input_2d = input.reshape((m, k))?;
     let output_2d = output.reshape((m, n))?;
@@ -2426,8 +2523,11 @@ pub fn embedding_pooled(input_ids: &Tensor, weight: &Tensor) -> Result<Tensor> {
     if !input_ids.device().is_cuda() {
         candle_core::bail!("embedding_pooled: requires CUDA device");
     }
-    if weight.dtype() != candle_core::DType::BF16 {
-        candle_core::bail!("embedding_pooled: weight must be BF16");
+    if !matches!(
+        weight.dtype(),
+        candle_core::DType::BF16 | candle_core::DType::F16
+    ) {
+        candle_core::bail!("embedding_pooled: weight must be BF16 or F16");
     }
     if input_ids.dtype() != candle_core::DType::U32 {
         candle_core::bail!("embedding_pooled: input_ids must be U32");
@@ -2451,8 +2551,7 @@ pub fn embedding_pooled(input_ids: &Tensor, weight: &Tensor) -> Result<Tensor> {
     out_shape.push(hidden_size);
 
     let input_ids = input_ids.contiguous()?;
-    let output =
-        OutputPool::global().reserve(&out_shape, candle_core::DType::BF16, input_ids.device())?;
+    let output = OutputPool::global().reserve(&out_shape, weight.dtype(), input_ids.device())?;
     let op = EmbeddingLookupInplaceOp {
         weight,
         hidden_size,

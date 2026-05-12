@@ -59,8 +59,14 @@ impl QuantizedSwiGluMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = candle_nn::ops::silu(&gate)? * up;
-        self.down_proj.forward(&activated?)
+        // Phase 11.2.C: pool-backed silu+mul (F16/BF16). Falls back to
+        // candle silu+broadcast_mul for unsupported dtypes or
+        // num_tokens > 64 (prefill).
+        #[cfg(feature = "cuda-fused-activations")]
+        let activated = crate::cuda_kernels::silu_and_mul_separate_pooled(&gate, &up)?;
+        #[cfg(not(feature = "cuda-fused-activations"))]
+        let activated = (candle_nn::ops::silu(&gate)? * up)?;
+        self.down_proj.forward(&activated)
     }
 }
 
@@ -479,12 +485,22 @@ impl QuantizedLlamaDecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             shared,
         )?;
+        // Phase 11.2.C: pool-backed F16/BF16 residual add. Stable
+        // device address across forwards — captured graph reads from
+        // the same pool slot on every replay.
+        #[cfg(feature = "cuda-fused-activations")]
+        let xs = crate::cuda_kernels::bf16_add_pooled(&xs, residual)?;
+        #[cfg(not(feature = "cuda-fused-activations"))]
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = self
             .mlp
             .forward(&self.post_attention_layernorm.forward(&xs)?)?;
-        residual + xs
+        #[cfg(feature = "cuda-fused-activations")]
+        let result = crate::cuda_kernels::bf16_add_pooled(residual, &xs)?;
+        #[cfg(not(feature = "cuda-fused-activations"))]
+        let result = (residual + xs)?;
+        Ok(result)
     }
 }
 
@@ -597,16 +613,35 @@ impl QuantizedLinear for TiedEmbeddingHead {
         // Flatten 3D `[B, S, H]` to 2D so cuBLAS picks plain GEMM
         // instead of stride-0 batched GEMM. +40% e2e at c=8 on the
         // lm_head shape (Qwen3-4B-AWQ side-by-side, 2026-05-09).
+        //
+        // Phase 11.2.C: route the matmul through `bf16_matmul_pooled`
+        // (now BF16/F16 dtype-generic) when both operands are on CUDA
+        // with matching dtype, so the lm_head's output uses a
+        // stable-address pool slot. The pool wrapper itself falls back
+        // to candle `Tensor::matmul` for unsupported dtypes or
+        // m > POOL_MAX_M (prefill).
         match x.dims().len() {
             3 => {
                 let dims = x.dims();
                 let (b, s, h) = (dims[0], dims[1], dims[2]);
                 let v = self.weight.dims()[0];
                 let x_flat = x.reshape((b * s, h))?;
+                #[cfg(feature = "cuda-kernels")]
+                let y_flat = crate::cuda_kernels::bf16_matmul_pooled(&x_flat, &self.weight)?;
+                #[cfg(not(feature = "cuda-kernels"))]
                 let y_flat = x_flat.matmul(&self.weight.t()?)?;
                 y_flat.reshape((b, s, v))
             }
-            _ => x.matmul(&self.weight.t()?),
+            _ => {
+                #[cfg(feature = "cuda-kernels")]
+                {
+                    crate::cuda_kernels::bf16_matmul_pooled(x, &self.weight)
+                }
+                #[cfg(not(feature = "cuda-kernels"))]
+                {
+                    x.matmul(&self.weight.t()?)
+                }
+            }
         }
     }
 
@@ -693,7 +728,42 @@ impl crate::engine::ModelForward for QuantizedLlamaForCausalLM {
             .as_ref()
             .and_then(|arc| arc.downcast_ref::<DecodeBatchShared>());
 
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        // Phase 11.2.C: pool-backed embedding lookup. Falls back to the
+        // candle `Embedding::forward` path when CUDA is unavailable,
+        // num_tokens exceeds the pool budget (prefill), or the weight
+        // dtype isn't BF16/F16.
+        let xs = {
+            #[cfg(feature = "cuda-fused-activations")]
+            {
+                let weight = self.embed_tokens.embeddings();
+                let ids_dims = input_ids.dims();
+                let num_tokens: usize = ids_dims.iter().product();
+                let dtype_ok = matches!(
+                    weight.dtype(),
+                    candle_core::DType::BF16 | candle_core::DType::F16
+                );
+                let in_pool_budget = (1..=64).contains(&num_tokens);
+                if input_ids.device().is_cuda()
+                    && dtype_ok
+                    && in_pool_budget
+                    && weight.dims().len() == 2
+                {
+                    let ids_flat = input_ids.flatten_all()?;
+                    let out_flat = crate::cuda_kernels::embedding_pooled(&ids_flat, weight)?;
+                    let mut out_shape: Vec<usize> = ids_dims.to_vec();
+                    out_shape.push(weight.dims()[1]);
+                    out_flat.reshape(out_shape)?
+                } else {
+                    self.embed_tokens.forward(input_ids)?
+                }
+            }
+            #[cfg(not(feature = "cuda-fused-activations"))]
+            {
+                self.embed_tokens.forward(input_ids)?
+            }
+        };
+
+        let mut xs = xs;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch_with_shared(
                 &xs,
