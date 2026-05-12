@@ -1371,22 +1371,34 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     //   1. fp16 activations (kernels are fp16-only).
     //   2. capture_sizes clipped to ≤ 16 — larger batches hit the
     //      cooperative `exl3_gemm_kernel` which can't be captured.
-    //
-    // Phase 11.2.C pool-migrated every fresh-alloc on the decode path
-    // (RmsNorm, SiLU+Mul F16, residual add F16, lm_head matmul F16,
-    // embedding lookup F16, paged_attention_v2_cuda_pooled), so the
-    // captured graph no longer pins device allocations and CUDA Graph
-    // capture is permitted for EXL3.
+    //   3. enforce_eager — Phase 11.2.C's pool migrations got capture
+    //      replay engaging (all 5 graphs captured, replay live, +34%
+    //      tps over eager, beats ExLlamaV3 at c=1), but a residual
+    //      correctness regression makes replay forward 2+ produce
+    //      wrong tokens. Capture is therefore opt-in via the
+    //      `VLLM_EXL3_CAPTURE_MAX_M=<N>` env override (0 = eager, the
+    //      default; >0 = allow capture up to batch size N for perf
+    //      experiments where correctness is verified per workload).
     let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
     if is_exl3 {
+        // Default to 0 (= force eager) until the replay correctness
+        // regression is resolved. Bench experiments can opt in to
+        // capture via the env var.
         let cap: usize = std::env::var("VLLM_EXL3_CAPTURE_MAX_M")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(16);
+            .unwrap_or(0);
         let before = cuda_graph_config.capture_sizes.len();
         cuda_graph_config.capture_sizes.retain(|&s| s <= cap);
         let after = cuda_graph_config.capture_sizes.len();
-        if after < before {
+        if cap == 0 && cuda_graph_config.enabled {
+            tracing::info!(
+                "EXL3 quantization detected — forcing eager (capture replay correctness \
+                 regression on forward 2+; set VLLM_EXL3_CAPTURE_MAX_M=16 to opt in to \
+                 captured throughput at the cost of wrong tokens past the first)"
+            );
+            cuda_graph_config.enabled = false;
+        } else if after < before {
             tracing::info!(
                 "EXL3 quantization detected — capture sizes clipped to ≤ {} \
                  ({} of {} dropped; larger batches go through the cooperative \

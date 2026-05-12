@@ -59,9 +59,8 @@ impl QuantizedSwiGluMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        // Phase 11.2.C: pool-backed silu+mul (F16/BF16). Falls back to
-        // candle silu+broadcast_mul for unsupported dtypes or
-        // num_tokens > 64 (prefill).
+        // Pool-backed silu+mul (F16/BF16) — falls back to candle for
+        // unsupported dtypes / prefill batches.
         #[cfg(feature = "cuda-fused-activations")]
         let activated = crate::cuda_kernels::silu_and_mul_separate_pooled(&gate, &up)?;
         #[cfg(not(feature = "cuda-fused-activations"))]
@@ -485,9 +484,7 @@ impl QuantizedLlamaDecoderLayer {
             kv_cache_mgr.engine_mut(layer_idx),
             shared,
         )?;
-        // Phase 11.2.C: pool-backed F16/BF16 residual add. Stable
-        // device address across forwards — captured graph reads from
-        // the same pool slot on every replay.
+        // Pool-backed F16/BF16 residual add.
         #[cfg(feature = "cuda-fused-activations")]
         let xs = crate::cuda_kernels::bf16_add_pooled(&xs, residual)?;
         #[cfg(not(feature = "cuda-fused-activations"))]
@@ -728,24 +725,8 @@ impl crate::engine::ModelForward for QuantizedLlamaForCausalLM {
             .as_ref()
             .and_then(|arc| arc.downcast_ref::<DecodeBatchShared>());
 
-        // Phase 11.2.C: pool-backed embedding lookup mirrors the
-        // Qwen3-quantized pattern (qwen3_quantized.rs:1290-1302) — no
-        // flatten, callsite-level gate.
-        #[cfg(feature = "cuda-fused-activations")]
-        let mut xs = {
-            let n: usize = input_ids.dims().iter().product();
-            let w_dt = self.embed_tokens.embeddings().dtype();
-            if n <= 64
-                && input_ids.device().is_cuda()
-                && matches!(w_dt, candle_core::DType::BF16 | candle_core::DType::F16)
-                && input_ids.dtype() == candle_core::DType::U32
-            {
-                crate::cuda_kernels::embedding_pooled(input_ids, self.embed_tokens.embeddings())?
-            } else {
-                self.embed_tokens.forward(input_ids)?
-            }
-        };
-        #[cfg(not(feature = "cuda-fused-activations"))]
+        // Phase 11.2.C BISECT: revert to candle Embedding for replay
+        // correctness debugging.
         let mut xs = self.embed_tokens.forward(input_ids)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch_with_shared(
