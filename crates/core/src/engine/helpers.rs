@@ -1022,13 +1022,41 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         // (pure eager mode), `paged_attention_auto` with actual
         // max_seq_len partitioning is significantly faster — pool
         // sizing iterates over up to 3× more empty partitions per call.
-        let prefer_pooled = graph_runner.is_some();
+        // D10 diagnostic: force the pool-V2 path even in pure eager mode
+        // so eager and capture-replay both exercise the same typed forward.
+        // Without this override an eager run uses non-pool kernels, making
+        // its dump unsuitable as a baseline for comparison.
+        let prefer_pooled = graph_runner.is_some() || std::env::var("VLLM_FORCE_POOLED").is_ok();
         match crate::layers::attention::build_decode_batch_shared_with_options(
             &sequences,
             model.device(),
             prefer_pooled,
         ) {
             Ok(shared) => {
+                // D10: one-shot print of positions_device value AFTER
+                // the build wrote real positions into the pool slot.
+                // Confirms (or refutes) that production updates the
+                // slot the captured graph reads from.
+                if crate::engine::layer_dump::is_enabled() {
+                    static ONCE_POS: std::sync::Once = std::sync::Once::new();
+                    ONCE_POS.call_once(|| {
+                        if let Some(pt) = shared.positions_device.as_ref() {
+                            if let candle_core::Device::Cuda(c) = model.device() {
+                                let _ = c.cuda_stream().synchronize();
+                            }
+                            match pt.as_tensor().flatten_all() {
+                                Ok(flat) => match flat.to_vec1::<u32>() {
+                                    Ok(v) => eprintln!(
+                                        "D10: after build_shared, positions_device={:?}",
+                                        v
+                                    ),
+                                    Err(e) => eprintln!("D10: pos to_vec1 failed: {e}"),
+                                },
+                                Err(e) => eprintln!("D10: pos flatten failed: {e}"),
+                            }
+                        }
+                    });
+                }
                 forward_ctx = forward_ctx.with_decode_shared(std::sync::Arc::new(shared));
             }
             Err(e) => {
@@ -1113,6 +1141,58 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
+
+    // Phase 11.2.D diagnostic: dump per-forward decode logits when
+    // `VLLM_EXL3_DUMP_DIR` is set. Counters monotonically increment so
+    // forward N's logits land at `decode_logits.<NNNN>.bin`. Used to
+    // localize the first divergent forward between eager and capture.
+    // Phase 11.2.D one-shot diagnostic: capture forward 1's logits +
+    // pool-slot snapshot, then disable subsequent dumps. The
+    // intermediate `tensor_to_bytes` GPU→CPU copies provoke
+    // CUDA_ERROR_ILLEGAL_ADDRESS on the NEXT captured replay (most
+    // likely via cudarc 0.16's auto event-tracking on the dtoh stream
+    // interacting with captured graph state). For named-slot diff
+    // diagnosis we only need forward 1, so dump-and-disable is the
+    // path of least invasiveness.
+    if crate::engine::debug_dump::is_enabled() {
+        // D10 follow-up (task #222): dump logits EVERY decode forward so
+        // we can diff per-step and locate which decode first diverges.
+        // The earlier `ONCE` gating was a workaround for an event-tracking
+        // interaction with captured replay; with `disable_event_tracking()`
+        // active in production (server/src/main.rs::create_cuda_device)
+        // the dtoh post-replay is safe. The first-forward pool-slot snapshot
+        // stays one-shot since it captures setup state.
+        crate::engine::debug_dump::dump_tensor("decode_logits", &logits);
+        static ONCE_POOL: std::sync::Once = std::sync::Once::new();
+        ONCE_POOL.call_once(|| {
+            if let Ok(dir) = std::env::var("VLLM_EXL3_DUMP_DIR") {
+                let subdir = std::path::PathBuf::from(dir).join("pool_forward_0000");
+                crate::engine::output_pool::OutputPool::global().dump_used_slots(&subdir);
+            }
+        });
+    }
+    // D10: layer-dump flush is independent of debug_dump — it has its
+    // own env (`VLLM_LAYER_DUMP_DIR`) and its own one-shot semantics.
+    // `VLLM_LAYER_DUMP_AFTER_N` (default 0) defers the flush until that
+    // many forwards have completed, so per-layer dumps reflect e.g. the
+    // first divergent decode step rather than only decode 0.
+    if crate::engine::layer_dump::is_enabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FLUSH_COUNTDOWN: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let n: usize = std::env::var("VLLM_LAYER_DUMP_AFTER_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            FLUSH_COUNTDOWN.store(n + 1, Ordering::Relaxed);
+        });
+        let remaining = FLUSH_COUNTDOWN.fetch_sub(1, Ordering::Relaxed);
+        if remaining == 1 {
+            crate::engine::layer_dump::flush();
+        }
+    }
+
     let t_sampling_start = step_profile::enabled().then(std::time::Instant::now);
 
     // Step 4: Extract logits and sample per-sequence

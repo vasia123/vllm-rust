@@ -67,6 +67,21 @@ impl QuantizedSwiGluMlp {
         let activated = (candle_nn::ops::silu(&gate)? * up)?;
         self.down_proj.forward(&activated)
     }
+
+    /// Pool-typed forward for the captured decode hot path.
+    /// Every intermediate is `PooledTensor`; downstream linears and the
+    /// silu+mul kernel are typed-sibling wrappers, so the compiler
+    /// rejects any accidental fresh-alloc on this path.
+    #[cfg(feature = "cuda-fused-activations")]
+    fn forward_pooled(
+        &self,
+        x: &crate::engine::output_pool::PooledTensor,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        let gate = self.gate_proj.forward_pooled(x)?;
+        let up = self.up_proj.forward_pooled(x)?;
+        let activated = crate::cuda_kernels::silu_and_mul_separate_pooled_typed(&gate, &up)?;
+        self.down_proj.forward_pooled(&activated)
+    }
 }
 
 // ─── Quantized Attention ─────────────────────────────────────────────────────
@@ -245,9 +260,12 @@ impl QuantizedLlamaAttention {
                 }
             };
             let (q, k) = match shared.and_then(|s| s.positions_device.as_ref()) {
-                Some(pos_t) => self
-                    .rotary_emb
-                    .apply_varlen_with_pos_tensor(&q, &k, positions, pos_t)?,
+                Some(pos_t) => self.rotary_emb.apply_varlen_with_pos_tensor(
+                    &q,
+                    &k,
+                    positions,
+                    pos_t.as_tensor(),
+                )?,
                 None => self.rotary_emb.apply_varlen(&q, &k, positions)?,
             };
 
@@ -265,7 +283,7 @@ impl QuantizedLlamaAttention {
             };
             match shared.and_then(|s| s.slot_mapping_device.as_ref()) {
                 Some(slot_t) => cache_engine
-                    .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t)
+                    .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t.as_tensor())
                     .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?,
                 None => cache_engine
                     .write_batch(&k, &v, all_slot_mapping)
@@ -278,8 +296,8 @@ impl QuantizedLlamaAttention {
             let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len) = if let Some(s) = shared
             {
                 (
-                    s.block_tables.clone(),
-                    s.seq_lens.clone(),
+                    s.block_tables.as_tensor().clone(),
+                    s.seq_lens.as_tensor().clone(),
                     s.max_blocks_per_seq,
                     s.max_seq_len,
                 )
@@ -311,9 +329,8 @@ impl QuantizedLlamaAttention {
                 // Pooled paged_attention with worst-case sizing — stable
                 // device addresses across forwards (required for
                 // CUDA-Graph-captured decode replays).
-                let worst = crate::engine::engine_limits::max_model_len()
-                    .unwrap_or(1024)
-                    .max(max_seq_len);
+                let worst =
+                    crate::engine::engine_limits::pool_worst_case_seq_len().max(max_seq_len);
                 let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
                 crate::cuda_kernels::paged_attention_v2_cuda_pooled(
                     &q,
@@ -381,6 +398,153 @@ impl QuantizedLlamaAttention {
             let attn_output = Tensor::cat(&outputs, 0)?;
             self.o_proj.forward(&attn_output)
         }
+    }
+
+    /// Pool-typed sibling of [`Self::forward_decode_batch_with_shared`] —
+    /// every intermediate (`q/k/v` projections, RoPE outputs, paged-attn
+    /// output, `o_proj` output) is a [`PooledTensor`], so the compiler
+    /// rejects any accidental fresh-alloc tensor in the captured decode
+    /// path.
+    ///
+    /// `shared` is required (`Some`) because the captured forward needs
+    /// pool-backed `positions_device` / `slot_mapping_device` to avoid
+    /// per-layer `Tensor::from_vec`. Callers should construct
+    /// `DecodeBatchShared` via `build_decode_batch_shared_with_options(..,
+    /// prefer_pooled_attention = true)`.
+    #[cfg(feature = "cuda-kernels")]
+    fn forward_decode_batch_with_shared_pooled(
+        &self,
+        xs: &crate::engine::output_pool::PooledTensor,
+        sequences: &[DecodeSequenceMetadata],
+        cache_engine: &mut CacheEngine,
+        shared: &DecodeBatchShared,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        use crate::engine::output_pool::PooledTensor;
+        let batch_size = sequences.len();
+
+        let q = self.q_proj.forward_pooled(xs)?;
+        let k = self.k_proj.forward_pooled(xs)?;
+        let v = self.v_proj.forward_pooled(xs)?;
+        // D10: only dump for layer 0 (set by outer with_current_layer).
+        // Other layers skip because divergence is already established
+        // by the time we exit layer 0 — narrowing further into them
+        // adds noise without new information.
+        let li = crate::engine::layer_dump::current_layer();
+        if li == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.attn.q_proj", q.as_tensor());
+            crate::engine::layer_dump::dump_at("layer.00.attn.k_proj", k.as_tensor());
+            crate::engine::layer_dump::dump_at("layer.00.attn.v_proj", v.as_tensor());
+        }
+
+        // q/k/v: [batch, n_heads*head_dim] → [batch, 1, n_heads, head_dim]
+        //        → [batch, n_heads, 1, head_dim] → [batch, n_heads, head_dim]
+        let q = q
+            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .squeeze(2)?;
+        let k = k
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .squeeze(2)?;
+        let v = v
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .squeeze(2)?;
+
+        // RoPE — pool-backed positions are mandatory on the captured
+        // path; build_decode_batch_shared_with_options(.., prefer_pooled=true)
+        // guarantees `positions_device.is_some()`. If absent we bail (the
+        // captured graph can't replay correctly without a stable address).
+        let pos_t = shared.positions_device.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "forward_decode_batch_with_shared_pooled: positions_device missing — \
+                 build_decode_batch_shared must be called with prefer_pooled=true"
+                    .into(),
+            )
+        })?;
+        if li == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.attn.positions", pos_t.as_tensor());
+            crate::engine::layer_dump::dump_at(
+                "layer.00.attn.seq_lens",
+                shared.seq_lens.as_tensor(),
+            );
+            crate::engine::layer_dump::dump_at(
+                "layer.00.attn.block_tables",
+                shared.block_tables.as_tensor(),
+            );
+            if let Some(sm) = shared.slot_mapping_device.as_ref() {
+                crate::engine::layer_dump::dump_at("layer.00.attn.slot_mapping", sm.as_tensor());
+            }
+        }
+        let positions_host: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
+        // `apply_varlen_with_pos_tensor` routes through
+        // `rotary_embedding_cuda_pooled` (pool-backed output) on the F16/BF16
+        // CUDA fast path. We wrap its Tensor outputs as PooledTensor —
+        // the storage is reserved from OutputPool::global() inside the
+        // wrapper for these dtypes / batch ≤ 64.
+        let (q_t, k_t) = self.rotary_emb.apply_varlen_with_pos_tensor(
+            q.as_tensor(),
+            k.as_tensor(),
+            &positions_host,
+            pos_t.as_tensor(),
+        )?;
+        // SAFETY: rotary_embedding_cuda_pooled reserves both outputs
+        // from OutputPool::global() when num_tokens ≤ 64. Captured
+        // decode path is always within this budget.
+        let q = unsafe { PooledTensor::from_pool_unchecked(q_t) };
+        let k = unsafe { PooledTensor::from_pool_unchecked(k_t) };
+        if li == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.attn.q_rope", q.as_tensor());
+            crate::engine::layer_dump::dump_at("layer.00.attn.k_rope", k.as_tensor());
+        }
+
+        // KV write — pool-backed slot_mapping; passed-through as &Tensor
+        // since `write_batch_with_slot_tensor` accepts a raw device tensor
+        // (TS.4 keeps cache-write API at &Tensor; future work could
+        // tighten to PooledTensor).
+        let slot_t = shared.slot_mapping_device.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "forward_decode_batch_with_shared_pooled: slot_mapping_device missing".into(),
+            )
+        })?;
+        cache_engine
+            .write_batch_with_slot_tensor(
+                k.as_tensor(),
+                v.as_tensor(),
+                &shared.all_slot_mapping,
+                slot_t.as_tensor(),
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let worst = crate::engine::engine_limits::pool_worst_case_seq_len().max(shared.max_seq_len);
+        let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
+        let attn_output = crate::cuda_kernels::paged_attention_v2_cuda_pooled_typed(
+            &q,
+            cache_engine.k_cache(),
+            cache_engine.v_cache(),
+            shared.block_tables.as_tensor(),
+            shared.seq_lens.as_tensor(),
+            scale,
+            self.num_heads,
+            self.num_kv_heads,
+            shared.max_blocks_per_seq,
+            shared.max_seq_len,
+            worst,
+            self.head_dim,
+            cache_engine.block_size(),
+            partition_size,
+        )?;
+
+        if li == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at(
+                "layer.00.attn.paged_v2_out",
+                attn_output.as_tensor(),
+            );
+        }
+        // attn_output: [batch, n_heads*head_dim]. unsqueeze to 3D for o_proj.
+        let attn_3d: PooledTensor = attn_output.unsqueeze(1)?;
+        self.o_proj.forward_pooled(&attn_3d)
     }
 }
 
@@ -498,6 +662,61 @@ impl QuantizedLlamaDecoderLayer {
         #[cfg(not(feature = "cuda-fused-activations"))]
         let result = (residual + xs)?;
         Ok(result)
+    }
+
+    /// Pool-typed decoder-layer forward for the captured decode hot path.
+    /// Mirrors [`Self::forward_decode_batch_with_shared`] but threads
+    /// [`PooledTensor`] through every intermediate.
+    #[cfg(all(
+        feature = "cuda-kernels",
+        feature = "cuda-fused-activations",
+        feature = "cuda-layernorm"
+    ))]
+    fn forward_decode_batch_with_shared_pooled(
+        &self,
+        xs: &crate::engine::output_pool::PooledTensor,
+        sequences: &[DecodeSequenceMetadata],
+        kv_cache_mgr: &mut KVCacheManager,
+        layer_idx: usize,
+        shared: &DecodeBatchShared,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        let residual = xs.clone();
+        let xs_norm = self.input_layernorm.forward_pooled(xs)?;
+        // D10: only instrument layer 0 — the diff shows divergence
+        // already established by the end of layer 0, so sub-op tags
+        // inside layer 0 localise the first bad kernel.
+        if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.input_norm", xs_norm.as_tensor());
+        }
+        let xs_attn = self.self_attn.forward_decode_batch_with_shared_pooled(
+            &xs_norm,
+            sequences,
+            kv_cache_mgr.engine_mut(layer_idx),
+            shared,
+        )?;
+        if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.attn_out", xs_attn.as_tensor());
+        }
+        let xs_after_attn = crate::cuda_kernels::bf16_add_pooled_typed(&xs_attn, &residual)?;
+        if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at(
+                "layer.00.after_attn_residual",
+                xs_after_attn.as_tensor(),
+            );
+        }
+
+        let residual = xs_after_attn.clone();
+        let post_norm = self
+            .post_attention_layernorm
+            .forward_pooled(&xs_after_attn)?;
+        if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.post_attn_norm", post_norm.as_tensor());
+        }
+        let mlp_out = self.mlp.forward_pooled(&post_norm)?;
+        if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("layer.00.mlp_out", mlp_out.as_tensor());
+        }
+        crate::cuda_kernels::bf16_add_pooled_typed(&residual, &mlp_out)
     }
 }
 
@@ -725,9 +944,95 @@ impl crate::engine::ModelForward for QuantizedLlamaForCausalLM {
             .as_ref()
             .and_then(|arc| arc.downcast_ref::<DecodeBatchShared>());
 
-        // Phase 11.2.C BISECT: revert to candle Embedding for replay
-        // correctness debugging.
+        // Phase TS.4: pool-typed decode path. Every intermediate is a
+        // `PooledTensor` so the compiler rejects any accidental fresh
+        // allocation between embed and lm_head. Requires the full
+        // cuda-kernels + cuda-fused-activations + cuda-layernorm feature
+        // stack AND a `shared` bundle built with `prefer_pooled = true`.
+        // Anything else falls through to the legacy untyped path below.
+        #[cfg(all(
+            feature = "cuda-kernels",
+            feature = "cuda-fused-activations",
+            feature = "cuda-layernorm",
+        ))]
+        {
+            let weight = self.embed_tokens.embeddings();
+            let typed_eligible = shared.is_some_and(|s| s.prefer_pooled_attention)
+                && weight.device().is_cuda()
+                && matches!(
+                    weight.dtype(),
+                    candle_core::DType::F16 | candle_core::DType::BF16
+                );
+            if typed_eligible {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        target: "vllm_core::pooled_typed_path",
+                        "TS.4 typed forward path engaged for QuantizedLlama"
+                    );
+                });
+                let shared_ref = shared.expect("typed_eligible implies shared is Some");
+                if crate::engine::layer_dump::is_enabled() {
+                    crate::engine::layer_dump::dump_at("input_ids", input_ids);
+                }
+                let xs_t = crate::cuda_kernels::embedding_pooled(input_ids, weight)?;
+                // SAFETY: `embedding_pooled` reserves output from
+                // OutputPool::global() — pool-backed by construction.
+                let mut xs_pt =
+                    unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(xs_t) };
+                if crate::engine::layer_dump::is_enabled() {
+                    crate::engine::layer_dump::dump_at("embed.out", xs_pt.as_tensor());
+                }
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    xs_pt = crate::engine::layer_dump::with_current_layer(layer_idx, || {
+                        layer.forward_decode_batch_with_shared_pooled(
+                            &xs_pt,
+                            sequences,
+                            kv_cache_mgr,
+                            layer_idx,
+                            shared_ref,
+                        )
+                    })?;
+                    if crate::engine::layer_dump::is_enabled() {
+                        crate::engine::layer_dump::dump_at(
+                            &crate::engine::layer_dump::layer_out_name(layer_idx),
+                            xs_pt.as_tensor(),
+                        );
+                    }
+                }
+                let xs_pt = self.norm.forward_pooled(&xs_pt)?;
+                if crate::engine::layer_dump::is_enabled() {
+                    crate::engine::layer_dump::dump_at("final_norm.out", xs_pt.as_tensor());
+                }
+                let logits_pt = self.lm_head.forward_pooled(&xs_pt)?;
+                if crate::engine::layer_dump::is_enabled() {
+                    crate::engine::layer_dump::dump_at("lm_head.out", logits_pt.as_tensor());
+                }
+                return Ok(logits_pt.into_tensor());
+            }
+        }
+
+        // Legacy untyped path — eager / non-capture / CPU / unsupported
+        // dtype. Same semantics as before TS.4; no PooledTensor flow.
+        #[cfg(feature = "cuda-fused-activations")]
+        let mut xs = {
+            let weight = self.embed_tokens.embeddings();
+            if weight.device().is_cuda()
+                && matches!(
+                    weight.dtype(),
+                    candle_core::DType::F16 | candle_core::DType::BF16
+                )
+            {
+                crate::cuda_kernels::embedding_pooled(input_ids, weight)?
+            } else {
+                self.embed_tokens.forward(input_ids)?
+            }
+        };
+        #[cfg(not(feature = "cuda-fused-activations"))]
         let mut xs = self.embed_tokens.forward(input_ids)?;
+        if crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("embed.out", &xs);
+        }
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             xs = layer.forward_decode_batch_with_shared(
                 &xs,
@@ -736,9 +1041,22 @@ impl crate::engine::ModelForward for QuantizedLlamaForCausalLM {
                 layer_idx,
                 shared,
             )?;
+            if crate::engine::layer_dump::is_enabled() {
+                crate::engine::layer_dump::dump_at(
+                    &crate::engine::layer_dump::layer_out_name(layer_idx),
+                    &xs,
+                );
+            }
         }
         let xs = self.norm.forward(&xs)?;
-        self.lm_head.forward(&xs)
+        if crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("final_norm.out", &xs);
+        }
+        let logits = self.lm_head.forward(&xs)?;
+        if crate::engine::layer_dump::is_enabled() {
+            crate::engine::layer_dump::dump_at("lm_head.out", &logits);
+        }
+        Ok(logits)
     }
 
     fn device(&self) -> &Device {

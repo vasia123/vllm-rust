@@ -18,3 +18,7 @@ scripts/__pycache__/
 # Phase 5 EXL3 smoke test scratch
 .venv-tmp/
 model_cache/
+
+# >>> visual-plan
+.plans/sessions/
+# <<< visual-plan

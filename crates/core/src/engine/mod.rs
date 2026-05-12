@@ -20,13 +20,16 @@
 
 mod async_sampler;
 mod context;
+pub mod cr_trace;
 pub mod cuda_graph;
 pub mod cuda_graph_runner;
+pub mod debug_dump;
 mod embedding_forward;
 mod encoder_decoder;
 pub mod engine_limits;
 mod handle;
 mod helpers;
+pub mod layer_dump;
 mod model_forward;
 pub mod output_pool;
 pub mod pipeline;

@@ -148,6 +148,31 @@ pub trait QuantizedLinear: Send + Sync {
     /// Forward pass through the quantized linear layer.
     fn forward(&self, x: &Tensor) -> Result<Tensor>;
 
+    /// Pool-backed forward — produces a [`PooledTensor`] suitable for
+    /// captured-graph hot paths.
+    ///
+    /// The default implementation calls [`Self::forward`] and wraps the
+    /// result via [`PooledTensor::from_pool_unchecked`]. This is sound
+    /// **iff** the impl's `forward` reserves its output from
+    /// [`OutputPool::global`](crate::engine::output_pool::OutputPool::global).
+    /// That holds for `Exl3Linear` (via `exl3_gemm`), `MarlinLinear`
+    /// (via `marlin_gemm_pooled`), `TiedEmbeddingHead` (via
+    /// `bf16_matmul_pooled`), and other quant impls that route through
+    /// pool wrappers.
+    ///
+    /// Impls whose forward output is **not** pool-backed (e.g., a pure
+    /// candle matmul fallback) MUST override this method to either copy
+    /// the result into a pool slot or bail. Otherwise the captured
+    /// graph will see a fresh-alloc pointer and replay stale memory.
+    fn forward_pooled(
+        &self,
+        x: &crate::engine::output_pool::PooledTensor,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        let out = self.forward(x.as_tensor())?;
+        // SAFETY: see trait method doc. Override required for non-pool impls.
+        Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(out) })
+    }
+
     /// Load weights from a state dict.
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()>;
 

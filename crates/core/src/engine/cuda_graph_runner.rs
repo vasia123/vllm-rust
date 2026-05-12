@@ -623,6 +623,55 @@ impl CudaGraphRunner {
             return Ok(false);
         }
 
+        // CR.14 diagnostic: dump captured graph DAG to env-specified prefix.
+        if let Ok(prefix) = std::env::var("CR_DUMP_DAG_PREFIX") {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphGetEdges, cuGraphGetNodes, cuGraphNodeGetType, CUgraphNode, CUgraphNodeType,
+            };
+            use std::io::Write;
+            unsafe {
+                let mut num_nodes: usize = 0;
+                cuGraphGetNodes(graph, std::ptr::null_mut(), &mut num_nodes);
+                let mut nodes: Vec<CUgraphNode> = vec![std::ptr::null_mut(); num_nodes];
+                cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut num_nodes);
+                let mut types: Vec<u32> = Vec::with_capacity(num_nodes);
+                for n in &nodes {
+                    let mut t: CUgraphNodeType = std::mem::zeroed();
+                    cuGraphNodeGetType(*n, &mut t);
+                    types.push(t as u32);
+                }
+                let mut num_edges: usize = 0;
+                cuGraphGetEdges(
+                    graph,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut num_edges,
+                );
+                let path = format!("{prefix}.bs{batch_size}.txt");
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    let _ = writeln!(
+                        f,
+                        "batch_size={batch_size} nodes={num_nodes} edges={num_edges}"
+                    );
+                    let mut counts = std::collections::HashMap::<u32, usize>::new();
+                    for t in &types {
+                        *counts.entry(*t).or_insert(0) += 1;
+                    }
+                    for (t, c) in counts {
+                        let n = match t {
+                            0 => "KERNEL",
+                            1 => "MEMCPY",
+                            2 => "MEMSET",
+                            _ => "OTHER",
+                        };
+                        let _ = writeln!(f, "  {n} ({t}): {c}");
+                    }
+                    tracing::info!(target: "vllm_core::cuda_graph",
+                        "dumped DAG to {path}: nodes={num_nodes} edges={num_edges}");
+                }
+            }
+        }
+
         let mut graph_exec: CUgraphExec = std::ptr::null_mut();
         let inst_result = unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) };
         if inst_result != CUresult::CUDA_SUCCESS {
@@ -749,6 +798,35 @@ impl CudaGraphRunner {
                         e
                     ))
                 })?;
+
+                // D10 diagnostic: verify the captured input_ids buffer
+                // actually holds the real-request token after the
+                // pre-launch memcpy. If it doesn't, the captured graph's
+                // embedding kernel reads zeros and downstream layers
+                // diverge from eager. One-shot to avoid spam.
+                if crate::engine::layer_dump::is_enabled() {
+                    static ONCE_IIDS: std::sync::Once = std::sync::Once::new();
+                    ONCE_IIDS.call_once(|| {
+                        // Force a sync so dtoh sees the just-completed
+                        // memcpy; outside any capture session.
+                        let _ = self.sync_device();
+                        match captured.buffers.input_ids.flatten_all() {
+                            Ok(flat) => match flat.to_vec1::<u32>() {
+                                Ok(v) => {
+                                    let first8: Vec<u32> =
+                                        v.iter().take(8).copied().collect();
+                                    eprintln!(
+                                        "D10: post-update captured.buffers.input_ids[..8]={:?} (padded len={})",
+                                        first8,
+                                        v.len()
+                                    );
+                                }
+                                Err(e) => eprintln!("D10: to_vec1 failed: {e}"),
+                            },
+                            Err(e) => eprintln!("D10: flatten_all failed: {e}"),
+                        }
+                    });
+                }
 
                 // Get stream and replay graph
                 let stream = self.get_cuda_stream()?;

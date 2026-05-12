@@ -77,6 +77,7 @@ use candle_nn::VarBuilder;
 use candle_nn::{layer_norm, LayerNorm, Module};
 
 use crate::distributed::ProcessGroup;
+use crate::engine::output_pool::PooledTensor;
 use crate::engine::DecodeSequenceMetadata;
 use crate::kv_cache::{BlockTable, CacheEngine};
 use crate::layers::attention::ops::{apply_per_head_norm, repeat_kv};
@@ -118,10 +119,16 @@ pub struct DecodeBatchShared {
     /// Used by `cache_engine.write_batch`.
     pub all_slot_mapping: std::sync::Arc<Vec<usize>>,
     /// `[batch_size, max_blocks_per_seq]` U32 block IDs on the same
-    /// device as the model.
-    pub block_tables: Tensor,
+    /// device as the model. Pool-backed on CUDA (stable address across
+    /// forwards); `PooledTensor` enforces this invariant in the type.
+    /// On non-CUDA or when batch exceeds the pool budget, a fallback
+    /// `Tensor::from_vec` is wrapped unsafe via `from_pool_unchecked`
+    /// (its storage lives at least one forward; non-captured paths
+    /// don't care about capture-replay stability).
+    pub block_tables: PooledTensor,
     /// `[batch_size]` U32 sequence lengths (current decode position + 1).
-    pub seq_lens: Tensor,
+    /// Pool-backed; see [`Self::block_tables`].
+    pub seq_lens: PooledTensor,
     /// `[total_tokens]` U32 query positions on device — pool-backed so
     /// the address is stable across forwards. Required for CUDA Graph
     /// capture: the per-layer RoPE kernel reads `positions` from the
@@ -129,12 +136,12 @@ pub struct DecodeBatchShared {
     /// and live at a stable address. `None` means the shared bundle was
     /// built on a non-CUDA device or batch exceeds the pool budget;
     /// callers fall back to `Tensor::from_vec` per layer.
-    pub positions_device: Option<Tensor>,
+    pub positions_device: Option<PooledTensor>,
     /// `[total_tokens]` U32 slot indices on device — pool-backed, same
     /// rationale as `positions_device`. Used by `cache_engine.write_batch`
     /// to skip the per-layer `Tensor::from_vec(slot_mapping)` (whose
     /// fresh device address breaks captured `cuda_memcpy_inplace`).
-    pub slot_mapping_device: Option<Tensor>,
+    pub slot_mapping_device: Option<PooledTensor>,
     /// Padding extent of `block_tables` along axis 1.
     pub max_blocks_per_seq: usize,
     /// `max(seq_lens)` — used as the kernel's upper bound.
@@ -196,7 +203,11 @@ pub fn build_decode_batch_shared_with_options(
     // and the cache `block_size`. `engine_limits` is set by the server
     // at startup (Phase D.1); fallback 1024 / 16 = 64 preserves
     // historical behaviour for tests / benches.
-    let max_model_len = crate::engine::engine_limits::max_model_len().unwrap_or(1024);
+    // Use the capture-specific cap so block_tables stride sizing matches
+    // what paged_attention V2's partition sizing uses. Both must agree on
+    // the worst-case bound or the captured graph encodes one stride and
+    // production runtime writes the other — see Bug B in ADR 0019.
+    let max_model_len = crate::engine::engine_limits::pool_worst_case_seq_len();
     // Conservative block_size = 16 fallback covers the common path; the
     // value is also threaded through the actual scatter site, so a
     // mismatch here only affects pool capacity, not correctness.
@@ -245,20 +256,25 @@ pub fn build_decode_batch_shared_with_options(
         let total_tokens = positions.len();
         let pos_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_src = Tensor::from_vec(pos_data, (total_tokens,), device)?;
-        let pos_dst =
-            OutputPool::global().reserve(&[total_tokens], candle_core::DType::U32, device)?;
-        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&pos_dst, &pos_src).map_err(|e| {
-            candle_core::Error::Msg(format!("build_decode_batch_shared: positions copy: {e}"))
-        })?;
+        let pos_dst = OutputPool::global().reserve_pooled(
+            &[total_tokens],
+            candle_core::DType::U32,
+            device,
+        )?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(pos_dst.as_tensor(), &pos_src)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("build_decode_batch_shared: positions copy: {e}"))
+            })?;
 
         let slot_total = all_slot_mapping.len();
         let slot_data: Vec<u32> = all_slot_mapping.iter().map(|&s| s as u32).collect();
         let slot_src = Tensor::from_vec(slot_data, (slot_total,), device)?;
         let slot_dst =
-            OutputPool::global().reserve(&[slot_total], candle_core::DType::U32, device)?;
-        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&slot_dst, &slot_src).map_err(
-            |e| candle_core::Error::Msg(format!("build_decode_batch_shared: slot copy: {e}")),
-        )?;
+            OutputPool::global().reserve_pooled(&[slot_total], candle_core::DType::U32, device)?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(slot_dst.as_tensor(), &slot_src)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("build_decode_batch_shared: slot copy: {e}"))
+            })?;
 
         (Some(pos_dst), Some(slot_dst))
     } else {
@@ -281,21 +297,32 @@ pub fn build_decode_batch_shared_with_options(
         }
 
         let bt_src = Tensor::from_vec(bt_data, (batch_size, stride), device)?;
-        let bt_dst =
-            OutputPool::global().reserve(&[batch_size, stride], candle_core::DType::U32, device)?;
-        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&bt_dst, &bt_src).map_err(|e| {
-            candle_core::Error::Msg(format!("build_decode_batch_shared: bt copy: {e}"))
-        })?;
+        let bt_dst = OutputPool::global().reserve_pooled(
+            &[batch_size, stride],
+            candle_core::DType::U32,
+            device,
+        )?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(bt_dst.as_tensor(), &bt_src)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("build_decode_batch_shared: bt copy: {e}"))
+            })?;
 
         let sl_src = Tensor::from_vec(seq_lens_data.clone(), (batch_size,), device)?;
         let sl_dst =
-            OutputPool::global().reserve(&[batch_size], candle_core::DType::U32, device)?;
-        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&sl_dst, &sl_src).map_err(|e| {
-            candle_core::Error::Msg(format!("build_decode_batch_shared: sl copy: {e}"))
-        })?;
+            OutputPool::global().reserve_pooled(&[batch_size], candle_core::DType::U32, device)?;
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(sl_dst.as_tensor(), &sl_src)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("build_decode_batch_shared: sl copy: {e}"))
+            })?;
 
         (bt_dst, sl_dst, stride)
     } else {
+        // Non-pool fallback (non-CUDA, oversize batch — capture path
+        // never enters this branch, so the lack of pool stability does
+        // not affect captured-graph correctness). Wrap the fresh
+        // tensors via `from_pool_unchecked` so the struct's `PooledTensor`
+        // fields hold a consistent type — eager-only callers don't care
+        // about the storage source.
         let mut bt_data = vec![0u32; batch_size * actual_max_blocks_per_seq];
         for (i, seq) in sequences.iter().enumerate() {
             for (j, &block_id) in seq.block_ids.iter().enumerate() {
@@ -304,6 +331,10 @@ pub fn build_decode_batch_shared_with_options(
         }
         let bt = Tensor::from_vec(bt_data, (batch_size, actual_max_blocks_per_seq), device)?;
         let sl = Tensor::from_vec(seq_lens_data, (batch_size,), device)?;
+        // SAFETY: eager-only path; these tensors live for the consumer's
+        // forward call. No captured graph references them.
+        let bt = unsafe { PooledTensor::from_pool_unchecked(bt) };
+        let sl = unsafe { PooledTensor::from_pool_unchecked(sl) };
         (bt, sl, actual_max_blocks_per_seq)
     };
 
@@ -1098,9 +1129,12 @@ impl AttentionBlock {
             // forwards (Phase B.8). Falls back to per-call `Tensor::from_vec`
             // on the eager / non-pooled path.
             match shared.and_then(|s| s.positions_device.as_ref()) {
-                Some(pos_t) => self
-                    .rotary_emb
-                    .apply_varlen_with_pos_tensor(&q, &k, positions, pos_t)?,
+                Some(pos_t) => self.rotary_emb.apply_varlen_with_pos_tensor(
+                    &q,
+                    &k,
+                    positions,
+                    pos_t.as_tensor(),
+                )?,
                 None => self.rotary_emb.apply_varlen(&q, &k, positions)?,
             }
         };
@@ -1189,7 +1223,7 @@ impl AttentionBlock {
         match shared.and_then(|s| s.slot_mapping_device.as_ref()) {
             #[cfg(feature = "cuda-kernels")]
             Some(slot_t) => cache_engine
-                .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t)
+                .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t.as_tensor())
                 .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?,
             #[cfg(not(feature = "cuda-kernels"))]
             Some(_) => unreachable!("slot_mapping_device requires cuda-kernels feature"),
@@ -1203,6 +1237,9 @@ impl AttentionBlock {
         // per token (in `engine/helpers.rs`) instead of 36× via
         // `Tensor::from_vec` here. We clone the cached `Tensor`s on the
         // shared path; that's just an `Arc` refcount bump — no GPU work.
+        // Materialise as plain `Tensor` at this call site — the downstream
+        // `paged_attention_*` APIs still accept `&Tensor` (TS.3 only
+        // tightens the struct fields; TS.4 will migrate kernel signatures).
         let (block_tables, seq_lens, max_blocks_per_seq, max_seq_len): (
             Tensor,
             Tensor,
@@ -1210,8 +1247,8 @@ impl AttentionBlock {
             usize,
         ) = match shared {
             Some(s) => (
-                s.block_tables.clone(),
-                s.seq_lens.clone(),
+                s.block_tables.as_tensor().clone(),
+                s.seq_lens.as_tensor().clone(),
                 s.max_blocks_per_seq,
                 s.max_seq_len,
             ),
@@ -1248,9 +1285,7 @@ impl AttentionBlock {
         // ~3× more empty partitions).
         let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
         let attn_output = if prefer_pool {
-            let worst = crate::engine::engine_limits::max_model_len()
-                .unwrap_or(1024)
-                .max(max_seq_len);
+            let worst = crate::engine::engine_limits::pool_worst_case_seq_len().max(max_seq_len);
             let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
             crate::cuda_kernels::paged_attention_v2_cuda_pooled(
                 &q,
@@ -1401,11 +1436,12 @@ mod tests {
 
         let bt: Vec<u32> = shared
             .block_tables
+            .as_tensor()
             .flatten_all()
             .unwrap()
             .to_vec1()
             .unwrap();
-        let sl: Vec<u32> = shared.seq_lens.to_vec1().unwrap();
+        let sl: Vec<u32> = shared.seq_lens.as_tensor().to_vec1().unwrap();
         assert_eq!(bt, vec![0]);
         assert_eq!(sl, vec![6]);
     }
@@ -1430,6 +1466,7 @@ mod tests {
 
         let bt: Vec<u32> = shared
             .block_tables
+            .as_tensor()
             .flatten_all()
             .unwrap()
             .to_vec1()
@@ -1437,7 +1474,7 @@ mod tests {
         // Row 0: [3, 9, 12]; row 1: [5, 0, 0] (zero-padded).
         assert_eq!(bt, vec![3, 9, 12, 5, 0, 0]);
 
-        let sl: Vec<u32> = shared.seq_lens.to_vec1().unwrap();
+        let sl: Vec<u32> = shared.seq_lens.as_tensor().to_vec1().unwrap();
         assert_eq!(sl, vec![16, 8]); // seqlen_offset + 1
     }
 

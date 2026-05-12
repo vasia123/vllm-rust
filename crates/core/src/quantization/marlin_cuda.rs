@@ -1735,6 +1735,38 @@ pub fn marlin_gemm_pooled(
     }
 }
 
+// ─── Type-Safe PooledTensor Wrappers (Phase TS.2) ───────────────────
+
+/// Type-safe wrapper for [`marlin_gemm_pooled`]. `input` is pool-backed;
+/// quant weights (qweight/scales/qzeros/bias) are model weights and
+/// remain `&Tensor`.
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_pooled_typed(
+    input: &crate::engine::output_pool::PooledTensor,
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    bias: Option<&Tensor>,
+    size_k: usize,
+    size_n: usize,
+) -> Result<crate::engine::output_pool::PooledTensor> {
+    // SAFETY caveat: legacy `marlin_gemm_pooled` falls through to
+    // `marlin_gemm_with_optional_bias` when m > POOL_MAX_M (line 1690–1703),
+    // which returns a fresh non-pool Tensor. Captured forwards never hit
+    // that path (decode batch ≤ 16 ≪ 64), so for our scope this is safe;
+    // future expansion to prefill-capture would need a stricter cap here.
+    let out = marlin_gemm_pooled(
+        input.as_tensor(),
+        qweight,
+        scales,
+        qzeros,
+        bias,
+        size_k,
+        size_n,
+    )?;
+    Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(out) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

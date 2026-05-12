@@ -738,9 +738,12 @@ impl QuantizedQwen3Attention {
             // and replays read freed memory → ILLEGAL_ADDRESS on forward 2+.
             let (q, k) = decode_profile::time(dev, &decode_profile::ROPE_NS, || {
                 match shared.and_then(|s| s.positions_device.as_ref()) {
-                    Some(pos_t) => self
-                        .rotary_emb
-                        .apply_varlen_with_pos_tensor(&q, &k, positions, pos_t),
+                    Some(pos_t) => self.rotary_emb.apply_varlen_with_pos_tensor(
+                        &q,
+                        &k,
+                        positions,
+                        pos_t.as_tensor(),
+                    ),
                     None => self.rotary_emb.apply_varlen(&q, &k, positions),
                 }
             })?;
@@ -763,7 +766,7 @@ impl QuantizedQwen3Attention {
             decode_profile::time(dev, &decode_profile::CACHE_WRITE_NS, || {
                 match shared.and_then(|s| s.slot_mapping_device.as_ref()) {
                     Some(slot_t) => cache_engine
-                        .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t)
+                        .write_batch_with_slot_tensor(&k, &v, all_slot_mapping, slot_t.as_tensor())
                         .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}"))),
                     None => cache_engine
                         .write_batch(&k, &v, all_slot_mapping)
@@ -778,8 +781,8 @@ impl QuantizedQwen3Attention {
                 usize,
             ) = match shared {
                 Some(s) => (
-                    s.block_tables.clone(),
-                    s.seq_lens.clone(),
+                    s.block_tables.as_tensor().clone(),
+                    s.seq_lens.as_tensor().clone(),
                     s.max_blocks_per_seq,
                     s.max_seq_len,
                 ),
@@ -821,9 +824,8 @@ impl QuantizedQwen3Attention {
             let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
             let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
                 if prefer_pool {
-                    let worst = crate::engine::engine_limits::max_model_len()
-                        .unwrap_or(1024)
-                        .max(max_seq_len);
+                    let worst =
+                        crate::engine::engine_limits::pool_worst_case_seq_len().max(max_seq_len);
                     let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
                     crate::cuda_kernels::paged_attention_v2_cuda_pooled(
                         &q,

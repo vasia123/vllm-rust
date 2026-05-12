@@ -974,6 +974,77 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
     }
 }
 
+/// Zero every element of a pool-backed tensor in-place via a single
+/// `cuMemsetD8Async` (capture-safe; recorded as a memset node when
+/// invoked inside `cuStreamBeginCapture`). Used by Phase CR.1 to wipe
+/// `paged_attention_v2_cuda_pooled`'s scratch buffers each forward so
+/// captured-graph replay doesn't read stale partition slots written by
+/// a prior decode step.
+#[cfg(feature = "cuda-kernels")]
+pub fn zero_pool_tensor_dtod_count() -> usize {
+    use std::sync::atomic::Ordering;
+    static C: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    C.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "cuda-kernels")]
+fn zero_pool_tensor_dtod(t: &Tensor) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    static C: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    C.fetch_add(1, Ordering::Relaxed);
+    if std::env::var("CR_PRINT_ZPT").is_ok() {
+        eprintln!("zero_pool_tensor_dtod call #{}", C.load(Ordering::Relaxed));
+    }
+    crate::engine::cr_trace::mark_op("zero_pool_tensor_dtod");
+    use candle_core::cuda::CudaStorageSlice;
+    use candle_core::{CpuStorage, InplaceOp1, Layout};
+
+    struct ZeroFillOp;
+    impl InplaceOp1 for ZeroFillOp {
+        fn name(&self) -> &'static str {
+            "zero_pool_tensor_dtod"
+        }
+        fn cpu_fwd(&self, _s: &mut CpuStorage, _l: &Layout) -> Result<()> {
+            candle_core::bail!("zero_pool_tensor_dtod is CUDA-only")
+        }
+        fn cuda_fwd(&self, storage: &mut candle_core::CudaStorage, layout: &Layout) -> Result<()> {
+            use candle_core::cuda::cudarc::driver::sys::{cuMemsetD8Async, CUresult};
+            use candle_core::cuda::cudarc::driver::DevicePtr;
+
+            let stream = storage.device.cuda_stream();
+            macro_rules! ms {
+                ($slice:expr, $elem_size:expr) => {{
+                    let (raw, _guard) = $slice.device_ptr(&stream);
+                    let bytes = layout.shape().elem_count() * $elem_size;
+                    let ptr = raw + layout.start_offset() as u64 * $elem_size as u64;
+                    let res = unsafe { cuMemsetD8Async(ptr, 0, bytes, stream.cu_stream()) };
+                    if res != CUresult::CUDA_SUCCESS {
+                        candle_core::bail!("cuMemsetD8Async failed: {:?}", res);
+                    }
+                }};
+            }
+            match &storage.slice {
+                CudaStorageSlice::U8(s) => ms!(s, 1usize),
+                CudaStorageSlice::U32(s) => ms!(s, 4usize),
+                CudaStorageSlice::I64(s) => ms!(s, 8usize),
+                CudaStorageSlice::BF16(s) => ms!(s, 2usize),
+                CudaStorageSlice::F16(s) => ms!(s, 2usize),
+                CudaStorageSlice::F32(s) => ms!(s, 4usize),
+                CudaStorageSlice::F64(s) => ms!(s, 8usize),
+                _ => candle_core::bail!("zero_pool_tensor_dtod: unsupported dtype"),
+            }
+            Ok(())
+        }
+    }
+
+    t.inplace_op1(&ZeroFillOp)
+}
+
+#[cfg(not(feature = "cuda-kernels"))]
+fn zero_pool_tensor_dtod(_t: &Tensor) -> Result<()> {
+    Ok(())
+}
+
 /// Pool-backed PagedAttention V2 for the decode hot path. Reserves the
 /// final output and the three intermediate buffers (tmp_out, exp_sums,
 /// max_logits) from [`OutputPool`] at **worst-case** size derived from
@@ -1001,6 +1072,7 @@ pub fn paged_attention_v2_cuda_pooled(
     partition_size: usize,
 ) -> Result<Tensor> {
     use crate::engine::output_pool::OutputPool;
+    crate::engine::cr_trace::mark_op("paged_attention_v2_cuda_pooled");
 
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_NUM_SEQS: usize = 64;
@@ -1055,6 +1127,17 @@ pub fn paged_attention_v2_cuda_pooled(
         candle_core::DType::F32,
         device,
     )?;
+
+    // Phase CR.1: zero the scratch buffers via captured memset nodes so
+    // captured graph replays start every paged-attn invocation from a
+    // clean slate. Without this, pool slots retain values written by
+    // prior forwards (or by capture warmup's dummy seq_len=1), and the
+    // V2 reduce path could read stale max_logits/exp_sums from invalid
+    // partitions. The memset is a captured node (cuMemsetD8Async),
+    // capture-safe.
+    zero_pool_tensor_dtod(&tmp_out)?;
+    zero_pool_tensor_dtod(&exp_sums)?;
+    zero_pool_tensor_dtod(&max_logits)?;
 
     let op = PagedAttnV2InplaceOp {
         k_cache,
@@ -2036,6 +2119,7 @@ impl<'a> InplaceOp2 for SiluAndMulSeparateInplaceOp<'a> {
 /// falls through to the candle `silu()? * up` path (broadcast_mul).
 #[cfg(feature = "cuda-fused-activations")]
 pub fn silu_and_mul_separate_pooled(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    crate::engine::cr_trace::mark_op("silu_and_mul_separate_pooled");
     use crate::engine::output_pool::OutputPool;
 
     /// Decode-shape budget; matches the other pool wrappers.
@@ -2288,6 +2372,7 @@ impl<'a> InplaceOp2 for Bf16AddInplaceOp<'a> {
 /// pointers into the captured CUDA graph.
 #[cfg(feature = "cuda-fused-activations")]
 pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    crate::engine::cr_trace::mark_op("bf16_add_pooled");
     use crate::engine::output_pool::OutputPool;
 
     /// Decode-shape budget; matches the other pool wrappers.
@@ -2449,6 +2534,7 @@ impl<'a> InplaceOp2 for Bf16MatmulInplaceOp<'a> {
 #[cfg(feature = "cuda-kernels")]
 pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     use crate::engine::output_pool::OutputPool;
+    crate::engine::cr_trace::mark_op("bf16_matmul_pooled");
 
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_M: usize = 64;
@@ -2516,6 +2602,7 @@ pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
 #[cfg(feature = "cuda-fused-activations")]
 pub fn embedding_pooled(input_ids: &Tensor, weight: &Tensor) -> Result<Tensor> {
     use crate::engine::output_pool::OutputPool;
+    crate::engine::cr_trace::mark_op("embedding_pooled");
 
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_NUM_TOKENS: usize = 64;
@@ -2905,6 +2992,7 @@ impl<'a> InplaceOp2 for RmsNormInplaceOp<'a> {
 /// `num_tokens = batch_size × 1`.
 #[cfg(feature = "cuda-layernorm")]
 pub fn rms_norm_cuda_pooled(input: &Tensor, weight: &Tensor, epsilon: f32) -> Result<Tensor> {
+    crate::engine::cr_trace::mark_op("rms_norm_cuda_pooled");
     use crate::engine::output_pool::OutputPool;
 
     /// Inputs with up to this many tokens (= batch_size for decode) go
@@ -3394,6 +3482,7 @@ pub fn rotary_embedding_cuda_pooled(
     is_neox: bool,
 ) -> Result<(Tensor, Tensor)> {
     use crate::engine::output_pool::OutputPool;
+    crate::engine::cr_trace::mark_op("rotary_embedding_cuda_pooled");
 
     /// Same threshold as `rms_norm_cuda_pooled` (decode-shape budget).
     const POOL_MAX_NUM_TOKENS: usize = 64;
@@ -3455,6 +3544,181 @@ pub fn rotary_embedding_cuda_pooled(
     let q_out = q_out.reshape(q.shape())?;
     let k_out = k_out.reshape(k.shape())?;
     Ok((q_out, k_out))
+}
+
+// ============================================================================
+// Type-Safe PooledTensor Wrappers (Phase TS.2)
+// ============================================================================
+//
+// These siblings of the *_pooled functions above accept `&PooledTensor`
+// inputs and return `PooledTensor` outputs, propagating the pool-backed
+// storage invariant through the call chain. Captured-eligible decode
+// forwards (QuantizedLlama / Qwen3) use these so the compiler rejects
+// fresh-alloc regressions.
+//
+// Each function internally calls its legacy `_pooled` sibling — the
+// legacy functions already reserve outputs from `OutputPool::global()`,
+// so wrapping their result in `PooledTensor::from_pool_unchecked` is
+// safe by construction. Some functions additionally tighten the typed
+// version (e.g., refusing dtype/device fallbacks that the legacy version
+// silently routes through candle).
+
+use crate::engine::output_pool::PooledTensor;
+
+/// Type-safe wrapper for [`rms_norm_cuda_pooled`].
+#[cfg(feature = "cuda-layernorm")]
+pub fn rms_norm_cuda_pooled_typed(
+    input: &PooledTensor,
+    weight: &Tensor,
+    epsilon: f32,
+) -> Result<PooledTensor> {
+    let out = rms_norm_cuda_pooled(input.as_tensor(), weight, epsilon)?;
+    // SAFETY: `rms_norm_cuda_pooled` reserves output via OutputPool::global().
+    Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
+}
+
+/// Type-safe wrapper for [`silu_and_mul_separate_pooled`].
+#[cfg(feature = "cuda-fused-activations")]
+pub fn silu_and_mul_separate_pooled_typed(
+    gate: &PooledTensor,
+    up: &PooledTensor,
+) -> Result<PooledTensor> {
+    let out = silu_and_mul_separate_pooled(gate.as_tensor(), up.as_tensor())?;
+    // SAFETY: legacy reserves output from pool when dtype/device match;
+    // for the F32/CPU fallback path it returns a fresh candle tensor.
+    // We bail above on those to keep the invariant.
+    if !matches!(
+        out.dtype(),
+        candle_core::DType::BF16 | candle_core::DType::F16
+    ) {
+        candle_core::bail!(
+            "silu_and_mul_separate_pooled_typed: legacy returned non-pool dtype {:?}",
+            out.dtype()
+        );
+    }
+    Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
+}
+
+/// Type-safe wrapper for [`bf16_add_pooled`].
+#[cfg(feature = "cuda-fused-activations")]
+pub fn bf16_add_pooled_typed(a: &PooledTensor, b: &PooledTensor) -> Result<PooledTensor> {
+    let out = bf16_add_pooled(a.as_tensor(), b.as_tensor())?;
+    if !matches!(
+        out.dtype(),
+        candle_core::DType::BF16 | candle_core::DType::F16
+    ) {
+        candle_core::bail!(
+            "bf16_add_pooled_typed: legacy returned non-pool dtype {:?}",
+            out.dtype()
+        );
+    }
+    Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
+}
+
+/// Type-safe wrapper for [`bf16_matmul_pooled`].
+pub fn bf16_matmul_pooled_typed(input: &PooledTensor, weight: &Tensor) -> Result<PooledTensor> {
+    let in_dt = input.dtype();
+    if in_dt != weight.dtype()
+        || !matches!(in_dt, candle_core::DType::BF16 | candle_core::DType::F16)
+        || !input.device().is_cuda()
+    {
+        // Typed version refuses fallbacks that would return a fresh
+        // candle Tensor (line 2463 in legacy). Caller must ensure
+        // dtypes match and tensor is on CUDA.
+        candle_core::bail!(
+            "bf16_matmul_pooled_typed: requires CUDA BF16/F16 (got {:?} on {:?})",
+            in_dt,
+            input.device()
+        );
+    }
+    let out = bf16_matmul_pooled(input.as_tensor(), weight)?;
+    Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
+}
+
+/// Type-safe wrapper for [`embedding_pooled`].
+#[cfg(feature = "cuda-fused-activations")]
+pub fn embedding_pooled_typed(input_ids: &PooledTensor, weight: &Tensor) -> Result<PooledTensor> {
+    let out = embedding_pooled(input_ids.as_tensor(), weight)?;
+    Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
+}
+
+/// Type-safe wrapper for [`rotary_embedding_cuda_pooled`]. Q and K are
+/// pool-backed; positions and cos_sin_cache come from stable sources
+/// (build_decode_batch_shared / model layer state) and remain `&Tensor`.
+#[allow(clippy::too_many_arguments)]
+pub fn rotary_embedding_cuda_pooled_typed(
+    q: &PooledTensor,
+    k: &PooledTensor,
+    positions: &Tensor,
+    cos_sin_cache: &Tensor,
+    rot_dim: usize,
+    head_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    is_neox: bool,
+) -> Result<(PooledTensor, PooledTensor)> {
+    let (q_out, k_out) = rotary_embedding_cuda_pooled(
+        q.as_tensor(),
+        k.as_tensor(),
+        positions,
+        cos_sin_cache,
+        rot_dim,
+        head_size,
+        num_heads,
+        num_kv_heads,
+        is_neox,
+    )?;
+    // SAFETY: rotary_embedding_cuda_pooled reserves both outputs from
+    // OutputPool::global() when num_tokens ≤ 64. Above 64 (prefill), it
+    // falls through to rotary_embedding_cuda which returns fresh tensors
+    // — captured forwards never enter that branch (batch ≤ 16 cap).
+    // We could detect this by checking shape vs pool budget; for now
+    // trust the captured-path contract.
+    Ok((
+        unsafe { PooledTensor::from_pool_unchecked(q_out) },
+        unsafe { PooledTensor::from_pool_unchecked(k_out) },
+    ))
+}
+
+/// Type-safe wrapper for [`paged_attention_v2_cuda_pooled`].
+///
+/// `q` is pool-backed; `k_cache`/`v_cache` are CacheEngine-owned (stable
+/// for engine lifetime); `block_tables`/`seq_lens` are from
+/// `build_decode_batch_shared` (TS.3 will tighten these to `&PooledTensor`).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_v2_cuda_pooled_typed(
+    q: &PooledTensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    worst_case_max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    partition_size: usize,
+) -> Result<PooledTensor> {
+    let out = paged_attention_v2_cuda_pooled(
+        q.as_tensor(),
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        max_seq_len,
+        worst_case_max_seq_len,
+        head_dim,
+        block_size,
+        partition_size,
+    )?;
+    Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
 }
 
 // ============================================================================
@@ -4629,5 +4893,2095 @@ mod tests {
             max_diff < 5e-3,
             "V1↔V2 ALiBi parity max_diff={max_diff} (threshold 5e-3)"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase CR.8: capture-replay correctness mini-repro
+    //
+    // Apples-to-apples pool-slot diff (Phase CR.6) localised the wrong-
+    // tokens regression to two specific kernels under cuGraph replay:
+    // RoPE K (block_dim=256) and paged_attention_v2 main+reduce. These
+    // tests isolate each kernel in a self-contained capture-replay
+    // harness so the divergence reproduces without a full server. Once
+    // a test fails deterministically here, `compute-sanitizer` can be
+    // run against the test binary in seconds (test footprint ~300 MB)
+    // — orders of magnitude lighter than instrumenting the full
+    // production server (which OOMs WSL2 on a 16 GB Windows host).
+    //
+    // Both tests are `#[ignore]` (capture window tests are serialised
+    // by `--test-threads=1` to avoid sharing the GPU's default cuMemPool
+    // across captures).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Helper: build cos/sin cache for a synthetic NeoX RoPE in the
+    /// format `rotary_embedding_neox_fp16` expects (interleaved
+    /// `[cos_0..cos_{half-1}, sin_0..sin_{half-1}]` per position).
+    #[cfg(feature = "cuda-kernels")]
+    fn build_cos_sin_cache(
+        rot_dim: usize,
+        max_pos: usize,
+        rope_theta: f32,
+        dev: &Device,
+    ) -> Tensor {
+        let half = rot_dim / 2;
+        let mut data = Vec::<f32>::with_capacity(max_pos * rot_dim);
+        for pos in 0..max_pos {
+            // cos block
+            for i in 0..half {
+                let inv_freq = 1.0_f32 / rope_theta.powf((2 * i) as f32 / rot_dim as f32);
+                data.push((pos as f32 * inv_freq).cos());
+            }
+            // sin block
+            for i in 0..half {
+                let inv_freq = 1.0_f32 / rope_theta.powf((2 * i) as f32 / rot_dim as f32);
+                data.push((pos as f32 * inv_freq).sin());
+            }
+        }
+        Tensor::from_vec(data, (max_pos, rot_dim), dev).unwrap()
+    }
+
+    /// Helper: launch RoPE for Q+K via the pooled wrapper, return
+    /// (q_out, k_out) Tensors that share storage with pool slots.
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_rope_pooled(
+        q_in: &Tensor,
+        k_in: &Tensor,
+        positions: &Tensor,
+        cos_sin: &Tensor,
+        rot_dim: usize,
+        head_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+    ) -> (Tensor, Tensor) {
+        rotary_embedding_cuda_pooled(
+            q_in,
+            k_in,
+            positions,
+            cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            /* is_neox = */ true,
+        )
+        .expect("rotary_embedding_cuda_pooled")
+    }
+
+    /// Mini-repro: does the captured RoPE K kernel produce the same
+    /// output at replay as the eager kernel given the same inputs?
+    ///
+    /// Pool-slot diff (Phase CR.6) showed F16 [1, 512] slot 2 — the
+    /// RoPE K output — diverges between eager+V2-pool and capture+V2-pool
+    /// forward 1, while RoPE Q (F16 [1, 2048] slot 1) matches. Same
+    /// kernel template (`rotary_embedding_neox_fp16`), different
+    /// launch config (Q: block_dim=512 num_heads=32; K: block_dim=256
+    /// num_kv_heads=8). This test isolates the K invocation at the K's
+    /// production shape from Llama-3.2-1B.
+    ///
+    /// Pass condition: replay produces byte-identical output to eager.
+    /// Fail condition: divergence reproduces → run compute-sanitizer
+    /// against this test binary to identify root cause.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn rope_k_capture_replay_matches_eager() {
+        use crate::engine::output_pool::OutputPool;
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch,
+            cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec, CUresult,
+            CUstreamCaptureMode,
+        };
+
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        // Llama-3.2-1B decode K shape (the divergent one).
+        let num_tokens = 1usize;
+        let num_heads = 32usize; // Q heads
+        let num_kv_heads = 8usize; // K heads
+        let head_dim = 64usize;
+        let rot_dim = 64usize;
+        let rope_theta = 500000.0_f32; // Llama-3.2
+
+        // Synthetic inputs (deterministic, non-trivial).
+        let mut q_data = Vec::<half::f16>::with_capacity(num_tokens * num_heads * head_dim);
+        for i in 0..(num_tokens * num_heads * head_dim) {
+            let v = ((i as f32 * 0.0031).sin() * 0.5) as f32;
+            q_data.push(half::f16::from_f32(v));
+        }
+        let mut k_data = Vec::<half::f16>::with_capacity(num_tokens * num_kv_heads * head_dim);
+        for i in 0..(num_tokens * num_kv_heads * head_dim) {
+            let v = ((i as f32 * 0.0027).cos() * 0.5) as f32;
+            k_data.push(half::f16::from_f32(v));
+        }
+        let cos_sin = build_cos_sin_cache(rot_dim, 64, rope_theta, &dev_t);
+
+        // Positions pool-backed at stable address (matches build_decode_batch_shared).
+        let positions_src =
+            Tensor::from_vec(vec![5u32; num_tokens], (num_tokens,), &dev_t).expect("positions_src");
+        let positions_dst = OutputPool::global()
+            .reserve(&[num_tokens], DType::U32, &dev_t)
+            .expect("positions_dst reserve");
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&positions_dst, &positions_src)
+            .expect("positions memcpy");
+
+        // Q/K input tensors created as fresh allocs each iteration; the
+        // pool path reshape+contiguous keeps them in place.
+        let q_input_a =
+            Tensor::from_slice(&q_data, (num_tokens, num_heads * head_dim), &dev_t).unwrap();
+        let k_input_a =
+            Tensor::from_slice(&k_data, (num_tokens, num_kv_heads * head_dim), &dev_t).unwrap();
+
+        // ── Pre-warm pool: run eagerly twice so pool slots stabilise. ──
+        let _ = run_rope_pooled(
+            &q_input_a,
+            &k_input_a,
+            &positions_dst,
+            &cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        );
+        OutputPool::global().reset_cursors();
+        let _ = run_rope_pooled(
+            &q_input_a,
+            &k_input_a,
+            &positions_dst,
+            &cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        );
+
+        // Sync — no pending work allowed before capture.
+        unsafe {
+            let r = candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            assert_eq!(r, CUresult::CUDA_SUCCESS, "pre-eager sync");
+        }
+
+        // ── Path A: EAGER reference. Reset cursors so kernel writes go ──
+        //          to slot 0/1 of each pool entry. Capture k_out bytes.
+        OutputPool::global().reset_cursors();
+        let (_q_eager, k_eager) = run_rope_pooled(
+            &q_input_a,
+            &k_input_a,
+            &positions_dst,
+            &cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        );
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let eager_k_bytes: Vec<u16> = {
+            // Read out via to_vec for F16 → u16 raw bits.
+            let f16s: Vec<half::f16> = k_eager.flatten_all().unwrap().to_vec1().unwrap();
+            f16s.iter().map(|v| v.to_bits()).collect()
+        };
+
+        // ── Path B: CAPTURE + REPLAY. ──
+        // Warmup pass (eager call inside our function but before capture
+        // begins) re-populates pool, then we capture a second forward.
+        OutputPool::global().reset_cursors();
+        let _ = run_rope_pooled(
+            &q_input_a,
+            &k_input_a,
+            &positions_dst,
+            &cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        );
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        OutputPool::global().reset_cursors();
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let begin = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        };
+        assert_eq!(begin, CUresult::CUDA_SUCCESS, "cuStreamBeginCapture_v2");
+
+        // Capture forward: pool reserves return same slot addresses as
+        // the warmup pass above (cursor was reset).
+        let (_q_cap, k_cap) = run_rope_pooled(
+            &q_input_a,
+            &k_input_a,
+            &positions_dst,
+            &cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        );
+
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        assert_eq!(end, CUresult::CUDA_SUCCESS, "cuStreamEndCapture");
+        assert!(!graph.is_null());
+
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let inst = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+        assert_eq!(inst, CUresult::CUDA_SUCCESS, "cuGraphInstantiateWithFlags");
+
+        // Replay: same inputs (positions_dst, q_input_a, k_input_a) are
+        // still populated. The captured graph re-executes its memcpy +
+        // kernel chain against the same pool slots.
+        let launch = unsafe { cuGraphLaunch(exec, stream) };
+        assert_eq!(launch, CUresult::CUDA_SUCCESS, "cuGraphLaunch");
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let replay_k_bytes: Vec<u16> = {
+            let f16s: Vec<half::f16> = k_cap.flatten_all().unwrap().to_vec1().unwrap();
+            f16s.iter().map(|v| v.to_bits()).collect()
+        };
+
+        unsafe {
+            cuGraphExecDestroy(exec);
+            cuGraphDestroy(graph);
+        }
+
+        // Bit-identical: same kernel, same inputs, deterministic → must match.
+        if eager_k_bytes != replay_k_bytes {
+            let mismatches: Vec<(usize, u16, u16)> = eager_k_bytes
+                .iter()
+                .zip(replay_k_bytes.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .take(8)
+                .map(|(i, (a, b))| (i, *a, *b))
+                .collect();
+            panic!(
+                "RoPE K diverges under capture-replay vs eager.\n\
+                 Total elements: {}, mismatches (first 8): {:?}\n\
+                 This reproduces the Phase CR.6 finding — run compute-sanitizer\n\
+                 on this test binary to identify the root cause.",
+                eager_k_bytes.len(),
+                mismatches
+            );
+        }
+    }
+
+    /// Mini-repro v2: RoPE K under capture-replay where Q/K inputs are
+    /// themselves pool slots written by a preceding captured memcpy.
+    /// This mimics the production flow where q_proj/k_proj outputs are
+    /// pool-backed activations, NOT fresh-alloc tensors.
+    ///
+    /// If `rope_k_capture_replay_matches_eager` passed but this fails,
+    /// the bug is sensitive to whether the kernel's input is a pool-slot
+    /// pointer reused by a captured upstream op vs. a stable external
+    /// tensor — strong hint that the captured graph mis-orders ops or
+    /// has a memcpy-then-kernel dependency issue.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn rope_k_pool_chained_capture_replay_matches_eager() {
+        use crate::engine::output_pool::OutputPool;
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch,
+            cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec, CUresult,
+            CUstreamCaptureMode,
+        };
+
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        let num_tokens = 1usize;
+        let num_heads = 32usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 64usize;
+        let rot_dim = 64usize;
+        let rope_theta = 500000.0_f32;
+
+        let mut q_data = Vec::<half::f16>::with_capacity(num_tokens * num_heads * head_dim);
+        for i in 0..(num_tokens * num_heads * head_dim) {
+            q_data.push(half::f16::from_f32(
+                ((i as f32 * 0.0031).sin() * 0.5) as f32,
+            ));
+        }
+        let mut k_data = Vec::<half::f16>::with_capacity(num_tokens * num_kv_heads * head_dim);
+        for i in 0..(num_tokens * num_kv_heads * head_dim) {
+            k_data.push(half::f16::from_f32(
+                ((i as f32 * 0.0027).cos() * 0.5) as f32,
+            ));
+        }
+        let cos_sin = build_cos_sin_cache(rot_dim, 64, rope_theta, &dev_t);
+
+        let positions_src =
+            Tensor::from_vec(vec![5u32; num_tokens], (num_tokens,), &dev_t).unwrap();
+        let positions_dst = OutputPool::global()
+            .reserve(&[num_tokens], DType::U32, &dev_t)
+            .unwrap();
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&positions_dst, &positions_src)
+            .unwrap();
+
+        // Fresh source tensors holding the canonical Q/K input bytes —
+        // these are written into pool slots at the start of each path
+        // (eager + capture warmup + capture record) via captured memcpy.
+        let q_src =
+            Tensor::from_slice(&q_data, (num_tokens, num_heads * head_dim), &dev_t).unwrap();
+        let k_src =
+            Tensor::from_slice(&k_data, (num_tokens, num_kv_heads * head_dim), &dev_t).unwrap();
+
+        // Helper: reserve Q/K pool slots, memcpy src→dst, then run RoPE.
+        // This mirrors what happens at production: q_proj writes into a
+        // pool slot (which here we simulate via memcpy from a fresh src),
+        // then RoPE reads that slot. Both ops are captured in sequence.
+        let exec_path = |label: &str| -> Vec<u16> {
+            let q_pool = OutputPool::global()
+                .reserve(&[num_tokens, num_heads * head_dim], DType::F16, &dev_t)
+                .unwrap();
+            let k_pool = OutputPool::global()
+                .reserve(&[num_tokens, num_kv_heads * head_dim], DType::F16, &dev_t)
+                .unwrap();
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&k_pool, &k_src).unwrap();
+            let (_q_out, k_out) = run_rope_pooled(
+                &q_pool,
+                &k_pool,
+                &positions_dst,
+                &cos_sin,
+                rot_dim,
+                head_dim,
+                num_heads,
+                num_kv_heads,
+            );
+            let _ = label;
+            let f16s: Vec<half::f16> = k_out.flatten_all().unwrap().to_vec1().unwrap();
+            f16s.iter().map(|v| v.to_bits()).collect()
+        };
+
+        // Pre-warm pool (2 forwards eager).
+        OutputPool::global().reset_cursors();
+        let _ = exec_path("warmup1");
+        OutputPool::global().reset_cursors();
+        let _ = exec_path("warmup2");
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        // Path A: eager reference.
+        OutputPool::global().reset_cursors();
+        let eager_k = exec_path("eager");
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        // Path B: capture warmup + capture record.
+        OutputPool::global().reset_cursors();
+        let _ = exec_path("capture-warmup");
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        OutputPool::global().reset_cursors();
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let begin = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        };
+        assert_eq!(begin, CUresult::CUDA_SUCCESS);
+
+        // The exec_path inside capture window: pool reserves return the
+        // same slot addresses as the warmup pass; captured memcpys and
+        // RoPE op are recorded into the graph.
+        let q_pool = OutputPool::global()
+            .reserve(&[num_tokens, num_heads * head_dim], DType::F16, &dev_t)
+            .unwrap();
+        let k_pool = OutputPool::global()
+            .reserve(&[num_tokens, num_kv_heads * head_dim], DType::F16, &dev_t)
+            .unwrap();
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&k_pool, &k_src).unwrap();
+        let (_q_cap, k_cap) = run_rope_pooled(
+            &q_pool,
+            &k_pool,
+            &positions_dst,
+            &cos_sin,
+            rot_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+        );
+
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        assert_eq!(end, CUresult::CUDA_SUCCESS);
+
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let inst = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+        assert_eq!(inst, CUresult::CUDA_SUCCESS);
+
+        // Replay.
+        let launch = unsafe { cuGraphLaunch(exec, stream) };
+        assert_eq!(launch, CUresult::CUDA_SUCCESS);
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let f16s: Vec<half::f16> = k_cap.flatten_all().unwrap().to_vec1().unwrap();
+        let replay_k: Vec<u16> = f16s.iter().map(|v| v.to_bits()).collect();
+
+        unsafe {
+            cuGraphExecDestroy(exec);
+            cuGraphDestroy(graph);
+        }
+
+        if eager_k != replay_k {
+            let mismatches: Vec<(usize, u16, u16)> = eager_k
+                .iter()
+                .zip(replay_k.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .take(8)
+                .map(|(i, (a, b))| (i, *a, *b))
+                .collect();
+            panic!(
+                "RoPE K (pool-chained) diverges: {} elems, first 8 mismatches: {:?}",
+                eager_k.len(),
+                mismatches
+            );
+        }
+    }
+
+    /// Mini-repro v3: paged_attention V2 (main + reduce) under
+    /// capture-replay. CR.6 pool diff showed F16 [1, 32, 64] slot 0
+    /// (V2 output) diverges. Tests whether V2 kernels in isolation
+    /// reproduce the bug.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn paged_attn_v2_pool_capture_replay_matches_eager() {
+        use crate::engine::output_pool::OutputPool;
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch,
+            cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec, CUresult,
+            CUstreamCaptureMode,
+        };
+
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        // Llama-3.2-1B production shape.
+        let num_seqs = 1usize;
+        let num_heads = 32usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 64usize;
+        let block_size = 16usize;
+        let num_blocks = 8usize;
+        let max_blocks_per_seq = 1usize;
+        let max_seq_len = 6usize;
+        let worst_case_max_seq_len = 1024usize; // partition_size=64 → max_num_partitions=16
+        let partition_size = 64usize;
+
+        // Synthetic Q (pool-backed, captured src→dst memcpy in replay path).
+        let mut q_data = Vec::<half::f16>::with_capacity(num_seqs * num_heads * head_dim);
+        for i in 0..(num_seqs * num_heads * head_dim) {
+            q_data.push(half::f16::from_f32(
+                ((i as f32 * 0.0019).sin() * 0.3) as f32,
+            ));
+        }
+        let q_src = Tensor::from_slice(&q_data, (num_seqs, num_heads, head_dim), &dev_t).unwrap();
+
+        // K/V cache: pre-fill blocks with non-trivial values so attention
+        // produces meaningful (non-zero) output. NHD layout: [num_blocks, block_size, num_kv_heads, head_dim].
+        let kv_elems = num_blocks * block_size * num_kv_heads * head_dim;
+        let mut k_cache_data = Vec::<half::f16>::with_capacity(kv_elems);
+        let mut v_cache_data = Vec::<half::f16>::with_capacity(kv_elems);
+        for i in 0..kv_elems {
+            k_cache_data.push(half::f16::from_f32(
+                ((i as f32 * 0.0021).cos() * 0.4) as f32,
+            ));
+            v_cache_data.push(half::f16::from_f32(
+                ((i as f32 * 0.0023).sin() * 0.4) as f32,
+            ));
+        }
+        let k_cache = Tensor::from_slice(
+            &k_cache_data,
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            &dev_t,
+        )
+        .unwrap();
+        let v_cache = Tensor::from_slice(
+            &v_cache_data,
+            (num_blocks, block_size, num_kv_heads, head_dim),
+            &dev_t,
+        )
+        .unwrap();
+
+        // Block tables held as fresh Tensor for test lifetime.
+        let bt_dst = Tensor::from_vec(
+            vec![0u32; num_seqs * max_blocks_per_seq],
+            (num_seqs, max_blocks_per_seq),
+            &dev_t,
+        )
+        .unwrap();
+
+        // sl_dst held by test scope for entire test lifetime — its
+        // storage is stable, captureable. We use Tensor::from_vec
+        // (not pool) here because cross-test pool state pollution
+        // makes debug-build to_vec1 read garbage from sl pool slots;
+        // for this mini-repro a stable Tensor::from_vec lifetime is
+        // enough. Must run in release (--release) — debug mode hits
+        // `debug_assert_seq_lens_within_bound` inside paged_attn_v2
+        // which has a separate test-pollution issue with to_vec1.
+        let sl_dst =
+            Tensor::from_vec(vec![max_seq_len as u32; num_seqs], (num_seqs,), &dev_t).unwrap();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        let exec_path = || -> Vec<u16> {
+            let q_pool = OutputPool::global()
+                .reserve(&[num_seqs, num_heads, head_dim], DType::F16, &dev_t)
+                .unwrap();
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
+            let out = paged_attention_v2_cuda_pooled(
+                &q_pool,
+                &k_cache,
+                &v_cache,
+                &bt_dst,
+                &sl_dst,
+                scale,
+                num_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                max_seq_len,
+                worst_case_max_seq_len,
+                head_dim,
+                block_size,
+                partition_size,
+            )
+            .unwrap();
+            let f16s: Vec<half::f16> = out.flatten_all().unwrap().to_vec1().unwrap();
+            f16s.iter().map(|v| v.to_bits()).collect()
+        };
+
+        OutputPool::global().reset_cursors();
+        let _ = exec_path();
+        OutputPool::global().reset_cursors();
+        let _ = exec_path();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        OutputPool::global().reset_cursors();
+        let eager_out = exec_path();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        OutputPool::global().reset_cursors();
+        let _ = exec_path();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        OutputPool::global().reset_cursors();
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let begin = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        };
+        assert_eq!(begin, CUresult::CUDA_SUCCESS);
+
+        let q_pool = OutputPool::global()
+            .reserve(&[num_seqs, num_heads, head_dim], DType::F16, &dev_t)
+            .unwrap();
+        crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
+        let out_cap = paged_attention_v2_cuda_pooled(
+            &q_pool,
+            &k_cache,
+            &v_cache,
+            &bt_dst,
+            &sl_dst,
+            scale,
+            num_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            max_seq_len,
+            worst_case_max_seq_len,
+            head_dim,
+            block_size,
+            partition_size,
+        )
+        .unwrap();
+
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        assert_eq!(end, CUresult::CUDA_SUCCESS);
+
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let inst = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+        assert_eq!(inst, CUresult::CUDA_SUCCESS);
+
+        let launch = unsafe { cuGraphLaunch(exec, stream) };
+        assert_eq!(launch, CUresult::CUDA_SUCCESS);
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let f16s: Vec<half::f16> = out_cap.flatten_all().unwrap().to_vec1().unwrap();
+        let replay_out: Vec<u16> = f16s.iter().map(|v| v.to_bits()).collect();
+
+        unsafe {
+            cuGraphExecDestroy(exec);
+            cuGraphDestroy(graph);
+        }
+
+        if eager_out != replay_out {
+            let mismatches: Vec<(usize, u16, u16)> = eager_out
+                .iter()
+                .zip(replay_out.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .take(8)
+                .map(|(i, (a, b))| (i, *a, *b))
+                .collect();
+            panic!(
+                "paged_attn V2 diverges under capture-replay: {} elems, first 8: {:?}",
+                eager_out.len(),
+                mismatches
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase CR.9: multi-layer mini-decoder capture-replay repro
+    //
+    // Single-kernel tests (CR.8) all pass — bug not in any individual
+    // kernel's cuGraph handling. Production wrong-tokens manifests via
+    // ~600 captured nodes across 16 attention layers. This test stitches
+    // 2 layers of the EXACT typed pool-backed forward sequence
+    // (`QuantizedLlamaDecoderLayer::forward_decode_batch_with_shared_pooled`)
+    // with bf16_matmul standing in for quant linears (bug pattern
+    // observed in EXL3 AND AWQ-Marlin → not quant-specific). If 2-layer
+    // forward diverges → minimal repro for sanitizer/cuda-gdb. If not
+    // → escalate to N=4..16 layers.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[cfg(feature = "cuda-kernels")]
+    struct MiniLayerWeights {
+        input_norm: Tensor, // [hidden_size]
+        q_proj: Tensor,     // [num_heads*head_dim, hidden_size]
+        k_proj: Tensor,     // [num_kv_heads*head_dim, hidden_size]
+        v_proj: Tensor,     // [num_kv_heads*head_dim, hidden_size]
+        o_proj: Tensor,     // [hidden_size, num_heads*head_dim]
+        post_attn_norm: Tensor,
+        gate_proj: Tensor, // [intermediate_size, hidden_size]
+        up_proj: Tensor,   // [intermediate_size, hidden_size]
+        down_proj: Tensor, // [hidden_size, intermediate_size]
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn mini_decoder_make_weights(
+        cfg: &MiniDecoderCfg,
+        dev: &Device,
+        seed_base: u32,
+    ) -> Vec<MiniLayerWeights> {
+        let mut s = seed_base;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            // Tiny scale → numerical stability across many matmuls.
+            half::bf16::from_f32((((s >> 16) as f32) / 32768.0 - 1.0) * 0.02)
+        };
+        let mut mk = |shape: &[usize]| {
+            let n: usize = shape.iter().product();
+            let data: Vec<half::bf16> = (0..n).map(|_| next()).collect();
+            Tensor::from_slice(&data, shape, dev).unwrap()
+        };
+        let mk_ones = |n: usize| {
+            // RMSNorm weights start near 1.
+            let data: Vec<half::bf16> = (0..n).map(|_| half::bf16::from_f32(1.0)).collect();
+            Tensor::from_slice(&data, &[n], dev).unwrap()
+        };
+
+        let h = cfg.hidden_size;
+        let nq = cfg.num_heads * cfg.head_dim;
+        let nk = cfg.num_kv_heads * cfg.head_dim;
+        let i = cfg.intermediate_size;
+
+        (0..cfg.num_layers)
+            .map(|_| MiniLayerWeights {
+                input_norm: mk_ones(h),
+                q_proj: mk(&[nq, h]),
+                k_proj: mk(&[nk, h]),
+                v_proj: mk(&[nk, h]),
+                o_proj: mk(&[h, nq]),
+                post_attn_norm: mk_ones(h),
+                gate_proj: mk(&[i, h]),
+                up_proj: mk(&[i, h]),
+                down_proj: mk(&[h, i]),
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    #[derive(Clone)]
+    struct MiniDecoderCfg {
+        hidden_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        intermediate_size: usize,
+        num_layers: usize,
+        rms_eps: f32,
+    }
+
+    /// Run ONE decoder layer with the same op sequence as
+    /// `QuantizedLlamaDecoderLayer::forward_decode_batch_with_shared_pooled`
+    /// but with bf16_matmul replacing quant linears.
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    /// D2 bisect-gate: which op groups to keep in `mini_decoder_layer_forward`.
+    /// Set `CR_BISECT_KEEP` to a string of single-letter flags to restrict
+    /// the forward to those op groups. Default (env unset) keeps everything,
+    /// preserving the original capture-replay-correctness contract.
+    ///
+    /// Letters:
+    /// - `N` rms_norm (input + post_attn + final)
+    /// - `M` bf16_matmul (q/k/v/o/gate/up/down)
+    /// - `R` rotary_embedding
+    /// - `C` reshape_and_cache
+    /// - `P` paged_attention_v2
+    /// - `S` silu_and_mul
+    /// - `A` bf16_add (residual sums)
+    #[cfg(feature = "cuda-kernels")]
+    fn bisect_keep(c: char) -> bool {
+        use std::sync::OnceLock;
+        static MASK: OnceLock<Option<String>> = OnceLock::new();
+        let mask = MASK.get_or_init(|| std::env::var("CR_BISECT_KEEP").ok());
+        match mask {
+            None => true,
+            Some(s) => s.contains(c),
+        }
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn mini_decoder_layer_forward(
+        xs: &Tensor,
+        layer: &MiniLayerWeights,
+        cfg: &MiniDecoderCfg,
+        positions_dev: &Tensor,
+        slot_mapping_dev: &Tensor,
+        block_tables: &Tensor,
+        seq_lens: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        cos_sin: &Tensor,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+        worst: usize,
+        partition_size: usize,
+        block_size: usize,
+    ) -> Tensor {
+        let batch_size = xs.dim(0).unwrap();
+
+        // residual = xs
+        let residual = xs.clone();
+
+        // input_norm
+        let xs_n = if bisect_keep('N') {
+            rms_norm_cuda_pooled(xs, &layer.input_norm, cfg.rms_eps).unwrap()
+        } else {
+            xs.clone()
+        };
+
+        // q/k/v projections (bf16_matmul_pooled = input @ weight.t)
+        let (q, k, v) = if bisect_keep('M') {
+            (
+                bf16_matmul_pooled(&xs_n, &layer.q_proj).unwrap(),
+                bf16_matmul_pooled(&xs_n, &layer.k_proj).unwrap(),
+                bf16_matmul_pooled(&xs_n, &layer.v_proj).unwrap(),
+            )
+        } else {
+            // Use zero-cost view tensors that match the shapes the rest
+            // of the forward expects. We reuse `xs_n` reshaped if the
+            // shape happens to match — but for simplicity use pool reserves
+            // so downstream tensors still have backing storage.
+            let m = batch_size;
+            let dev = xs_n.device();
+            let dt = xs_n.dtype();
+            let qz = crate::engine::output_pool::OutputPool::global()
+                .reserve(&[m, 1, cfg.num_heads * cfg.head_dim], dt, dev)
+                .unwrap();
+            let kz = crate::engine::output_pool::OutputPool::global()
+                .reserve(&[m, 1, cfg.num_kv_heads * cfg.head_dim], dt, dev)
+                .unwrap();
+            let vz = crate::engine::output_pool::OutputPool::global()
+                .reserve(&[m, 1, cfg.num_kv_heads * cfg.head_dim], dt, dev)
+                .unwrap();
+            (qz, kz, vz)
+        };
+
+        // Reshape q/k/v to (batch, num_heads, head_dim) like the attention
+        // forward does (via reshape+transpose+squeeze).
+        let q3 = q
+            .reshape((batch_size, 1, cfg.num_heads, cfg.head_dim))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .squeeze(2)
+            .unwrap();
+        let k3 = k
+            .reshape((batch_size, 1, cfg.num_kv_heads, cfg.head_dim))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .squeeze(2)
+            .unwrap();
+        let v3 = v
+            .reshape((batch_size, 1, cfg.num_kv_heads, cfg.head_dim))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .squeeze(2)
+            .unwrap();
+
+        // RoPE (pool-backed)
+        let (q_rope, k_rope) = if bisect_keep('R') {
+            rotary_embedding_cuda_pooled(
+                &q3,
+                &k3,
+                positions_dev,
+                cos_sin,
+                cfg.head_dim,
+                cfg.head_dim,
+                cfg.num_heads,
+                cfg.num_kv_heads,
+                /* is_neox = */ true,
+            )
+            .unwrap()
+        } else {
+            (q3.clone(), k3.clone())
+        };
+        let q_for_attn = q_rope
+            .reshape((batch_size, cfg.num_heads, cfg.head_dim))
+            .unwrap();
+        let k_for_cache = k_rope
+            .reshape((batch_size, cfg.num_kv_heads, cfg.head_dim))
+            .unwrap();
+
+        // KV cache write
+        if bisect_keep('C') {
+            reshape_and_cache_cuda(
+                &k_for_cache,
+                &v3,
+                k_cache,
+                v_cache,
+                slot_mapping_dev,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                block_size,
+                CudaCacheLayout::NHD,
+            )
+            .unwrap();
+        }
+
+        // Paged attention V2 (worst-case sized, pool-backed)
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+        let attn = if bisect_keep('P') {
+            paged_attention_v2_cuda_pooled(
+                &q_for_attn,
+                k_cache,
+                v_cache,
+                block_tables,
+                seq_lens,
+                scale,
+                cfg.num_heads,
+                cfg.num_kv_heads,
+                max_blocks_per_seq,
+                max_seq_len,
+                worst,
+                cfg.head_dim,
+                block_size,
+                partition_size,
+            )
+            .unwrap()
+        } else {
+            // Reserve a stable pool slot of the same shape so downstream
+            // o_proj / residual still has a tensor of the expected layout.
+            crate::engine::output_pool::OutputPool::global()
+                .reserve(
+                    &[batch_size, cfg.num_heads * cfg.head_dim],
+                    xs_n.dtype(),
+                    xs_n.device(),
+                )
+                .unwrap()
+        };
+
+        // o_proj: attn shape [batch, num_heads*head_dim] → unsqueeze for [B,1,H*D]
+        let attn_3d = attn.unsqueeze(1).unwrap();
+        let attn_out = if bisect_keep('M') {
+            bf16_matmul_pooled(&attn_3d, &layer.o_proj).unwrap()
+        } else {
+            attn_3d.clone()
+        };
+
+        // residual add (post-attention)
+        let xs1 = if bisect_keep('A') {
+            bf16_add_pooled(&attn_out, &residual).unwrap()
+        } else {
+            attn_out
+        };
+        let residual2 = xs1.clone();
+
+        // post_attn_norm
+        let xs_n2 = if bisect_keep('N') {
+            rms_norm_cuda_pooled(&xs1, &layer.post_attn_norm, cfg.rms_eps).unwrap()
+        } else {
+            xs1.clone()
+        };
+
+        // MLP: gate + up → silu_and_mul → down
+        let (gate, up) = if bisect_keep('M') {
+            (
+                bf16_matmul_pooled(&xs_n2, &layer.gate_proj).unwrap(),
+                bf16_matmul_pooled(&xs_n2, &layer.up_proj).unwrap(),
+            )
+        } else {
+            let dt = xs_n2.dtype();
+            let dev = xs_n2.device();
+            let g = crate::engine::output_pool::OutputPool::global()
+                .reserve(&[batch_size, 1, cfg.intermediate_size], dt, dev)
+                .unwrap();
+            let u = crate::engine::output_pool::OutputPool::global()
+                .reserve(&[batch_size, 1, cfg.intermediate_size], dt, dev)
+                .unwrap();
+            (g, u)
+        };
+        let activated = if bisect_keep('S') {
+            silu_and_mul_separate_pooled(&gate, &up).unwrap()
+        } else {
+            gate.clone()
+        };
+        let mlp_out = if bisect_keep('M') {
+            bf16_matmul_pooled(&activated, &layer.down_proj).unwrap()
+        } else {
+            // Reserve a slot of post-MLP shape so the residual add below
+            // has a well-shaped operand.
+            let dt = residual2.dtype();
+            let dev = residual2.device();
+            crate::engine::output_pool::OutputPool::global()
+                .reserve(&[batch_size, 1, cfg.hidden_size], dt, dev)
+                .unwrap()
+        };
+
+        // residual add (post-MLP)
+        if bisect_keep('A') {
+            bf16_add_pooled(&residual2, &mlp_out).unwrap()
+        } else {
+            residual2
+        }
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn mini_decoder_forward(
+        xs0: &Tensor,
+        layers: &[MiniLayerWeights],
+        final_norm: &Tensor,
+        cfg: &MiniDecoderCfg,
+        positions_dev: &Tensor,
+        slot_mapping_dev: &Tensor,
+        block_tables: &Tensor,
+        seq_lens: &Tensor,
+        k_caches: &[Tensor],
+        v_caches: &[Tensor],
+        cos_sin: &Tensor,
+        max_blocks_per_seq: usize,
+        max_seq_len: usize,
+        worst: usize,
+        partition_size: usize,
+        block_size: usize,
+    ) -> Tensor {
+        let mut xs = xs0.clone();
+        for (li, layer) in layers.iter().enumerate() {
+            xs = mini_decoder_layer_forward(
+                &xs,
+                layer,
+                cfg,
+                positions_dev,
+                slot_mapping_dev,
+                block_tables,
+                seq_lens,
+                &k_caches[li],
+                &v_caches[li],
+                cos_sin,
+                max_blocks_per_seq,
+                max_seq_len,
+                worst,
+                partition_size,
+                block_size,
+            );
+        }
+        // Final norm
+        rms_norm_cuda_pooled(&xs, final_norm, cfg.rms_eps).unwrap()
+    }
+
+    /// Stress test: many memsets per capture, two rounds.
+    /// If 2nd round drops nodes → cuGraph has size/state issue.
+    /// If both retain same count → bug is specific op interaction.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn double_capture_many_memsets() {
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphGetNodes, cuGraphInstantiateWithFlags,
+            cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec,
+            CUresult, CUstreamCaptureMode,
+        };
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+        let t = Tensor::from_vec(vec![1u32; 16], (16,), &dev_t).unwrap();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let mut sizes = Vec::new();
+        for round in 0..2 {
+            unsafe {
+                cuStreamBeginCapture_v2(
+                    stream,
+                    CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                );
+            }
+            for _ in 0..400 {
+                zero_pool_tensor_dtod(&t).unwrap();
+            }
+            let mut graph: CUgraph = std::ptr::null_mut();
+            unsafe { cuStreamEndCapture(stream, &mut graph) };
+
+            let mut n: usize = 0;
+            unsafe { cuGraphGetNodes(graph, std::ptr::null_mut(), &mut n) };
+            sizes.push(n);
+            eprintln!("Round {round}: {n} nodes");
+
+            let mut exec: CUgraphExec = std::ptr::null_mut();
+            unsafe {
+                cuGraphInstantiateWithFlags(&mut exec, graph, 0);
+                cuGraphLaunch(exec, stream);
+                candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+                cuGraphExecDestroy(exec);
+                cuGraphDestroy(graph);
+            }
+            let _ = CUresult::CUDA_SUCCESS;
+        }
+        assert_eq!(sizes[0], sizes[1], "got {sizes:?}");
+    }
+
+    /// Two captures, each FULL cycle (Instantiate + Launch + Destroy).
+    /// If 2nd capture loses nodes → cuGraphInstantiate or cuGraphLaunch
+    /// from the 1st leaves stream state that breaks 2nd capture.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn double_capture_with_full_cycle() {
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphGetNodes, cuGraphInstantiateWithFlags,
+            cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec,
+            CUresult, CUstreamCaptureMode,
+        };
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+        let t = Tensor::from_vec(vec![1u32; 16], (16,), &dev_t).unwrap();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let mut sizes = Vec::new();
+        for round in 0..2 {
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS);
+            zero_pool_tensor_dtod(&t).unwrap();
+            zero_pool_tensor_dtod(&t).unwrap();
+            zero_pool_tensor_dtod(&t).unwrap();
+            let mut graph: CUgraph = std::ptr::null_mut();
+            unsafe { cuStreamEndCapture(stream, &mut graph) };
+
+            let mut n: usize = 0;
+            unsafe { cuGraphGetNodes(graph, std::ptr::null_mut(), &mut n) };
+            sizes.push(n);
+            eprintln!("Round {round}: {n} nodes (full cycle)");
+
+            let mut exec: CUgraphExec = std::ptr::null_mut();
+            unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+            unsafe { cuGraphLaunch(exec, stream) };
+            unsafe { candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize() };
+            unsafe {
+                cuGraphExecDestroy(exec);
+                cuGraphDestroy(graph);
+            }
+        }
+        assert_eq!(sizes[0], sizes[1], "got {sizes:?}");
+    }
+
+    /// Two sequential captures of a multi-op forward — WITHOUT
+    /// instantiate/launch between. If 2nd capture still loses nodes →
+    /// the bug is in EndCapture/BeginCapture sequence itself, not in
+    /// Instantiate/Launch state leaking.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn double_capture_without_instantiate() {
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphGetNodes, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph,
+            CUresult, CUstreamCaptureMode,
+        };
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        let t = Tensor::from_vec(vec![1u32; 16], (16,), &dev_t).unwrap();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let mut sizes = Vec::new();
+        for round in 0..2 {
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS, "round {round} BeginCapture");
+            // Mix: memset (from CR.1 path) + a simple op
+            zero_pool_tensor_dtod(&t).unwrap();
+            zero_pool_tensor_dtod(&t).unwrap();
+            zero_pool_tensor_dtod(&t).unwrap();
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            assert_eq!(end, CUresult::CUDA_SUCCESS);
+
+            let mut n: usize = 0;
+            unsafe {
+                cuGraphGetNodes(graph, std::ptr::null_mut(), &mut n);
+            }
+            sizes.push(n);
+            eprintln!("Round {round}: {n} nodes (no instantiate)");
+            unsafe {
+                cuGraphDestroy(graph);
+            }
+        }
+        assert_eq!(
+            sizes[0], sizes[1],
+            "double capture (no instantiate) should produce same node count, got {sizes:?}"
+        );
+    }
+
+    /// Bare-bones reproducer: capture a single `cuMemsetD8Async` call
+    /// twice in the same process. If the second capture has fewer
+    /// nodes than the first → cudarc/candle has a state issue across
+    /// consecutive captures.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn minimal_double_capture_memset() {
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphGetNodes, cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph,
+            CUgraphNode, CUresult, CUstreamCaptureMode,
+        };
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return,
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        let t = Tensor::from_vec(vec![1u32; 16], (16,), &dev_t).unwrap();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let count_nodes = |g: CUgraph| -> usize {
+            let mut n: usize = 0;
+            unsafe {
+                cuGraphGetNodes(g, std::ptr::null_mut(), &mut n);
+            }
+            n
+        };
+
+        let stream = cuda_dev.cuda_stream().cu_stream();
+
+        for round in 0..2 {
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS, "round {round} BeginCapture");
+
+            // The captured operation: zero out the tensor's storage.
+            zero_pool_tensor_dtod(&t).unwrap();
+
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            assert_eq!(end, CUresult::CUDA_SUCCESS, "round {round} EndCapture");
+
+            let n = count_nodes(graph);
+            eprintln!("Round {round}: captured graph has {n} nodes");
+            unsafe {
+                cuGraphDestroy(graph);
+            }
+        }
+    }
+
+    /// Dump a captured CUDA graph's DAG (nodes + types + edges) to a
+    /// file. Use to diff DAGs between solo and after-prior runs of the
+    /// same capture, to test the "missing dependency edge" hypothesis.
+    #[cfg(feature = "cuda-kernels")]
+    fn dump_graph_dag(
+        graph: candle_core::cuda::cudarc::driver::sys::CUgraph,
+        path: &str,
+    ) -> std::io::Result<()> {
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphGetEdges, cuGraphGetNodes, cuGraphNodeGetType, CUgraphNode, CUgraphNodeType,
+        };
+        use std::io::Write;
+        unsafe {
+            let mut num_nodes: usize = 0;
+            cuGraphGetNodes(graph, std::ptr::null_mut(), &mut num_nodes);
+            let mut nodes: Vec<CUgraphNode> = vec![std::ptr::null_mut(); num_nodes];
+            cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut num_nodes);
+
+            let mut types: Vec<u32> = Vec::with_capacity(num_nodes);
+            for n in &nodes {
+                let mut t: CUgraphNodeType = std::mem::zeroed();
+                cuGraphNodeGetType(*n, &mut t);
+                types.push(t as u32);
+            }
+
+            let mut num_edges: usize = 0;
+            cuGraphGetEdges(
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut num_edges,
+            );
+            let mut from: Vec<CUgraphNode> = vec![std::ptr::null_mut(); num_edges];
+            let mut to: Vec<CUgraphNode> = vec![std::ptr::null_mut(); num_edges];
+            cuGraphGetEdges(graph, from.as_mut_ptr(), to.as_mut_ptr(), &mut num_edges);
+
+            // Map raw ptrs to indices.
+            let ptr_to_idx = |p: CUgraphNode| -> usize {
+                nodes.iter().position(|n| *n == p).unwrap_or(usize::MAX)
+            };
+            let mut edges: Vec<(usize, usize)> = from
+                .iter()
+                .zip(to.iter())
+                .map(|(f, t)| (ptr_to_idx(*f), ptr_to_idx(*t)))
+                .collect();
+            // Sort for stable diff between runs.
+            edges.sort();
+
+            let mut f = std::fs::File::create(path)?;
+            writeln!(f, "nodes={num_nodes} edges={num_edges}")?;
+            for (i, t) in types.iter().enumerate() {
+                let t_name = match t {
+                    0 => "KERNEL",
+                    1 => "MEMCPY",
+                    2 => "MEMSET",
+                    3 => "HOST",
+                    4 => "GRAPH",
+                    5 => "EMPTY",
+                    6 => "WAIT_EVENT",
+                    7 => "EVENT_RECORD",
+                    10 => "MEM_ALLOC",
+                    11 => "MEM_FREE",
+                    _ => "OTHER",
+                };
+                writeln!(f, "node[{i}] = {t_name} ({t})")?;
+            }
+            for (s, d) in &edges {
+                writeln!(f, "edge {s} -> {d}")?;
+            }
+            // Per-node fan-in/fan-out for quick visual scan.
+            writeln!(f, "--- in-degree (= number of incoming edges):")?;
+            let mut in_deg = vec![0usize; num_nodes];
+            for (_s, d) in &edges {
+                in_deg[*d] += 1;
+            }
+            for (i, d) in in_deg.iter().enumerate() {
+                if *d == 0 {
+                    writeln!(f, "  node[{i}] (in=0) — ROOT")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inner harness for the multi-layer capture-replay correctness
+    /// check. Takes a layer count, `input_shift` flag (capture vs replay
+    /// payload differ), and `with_embedding` flag (when true, the
+    /// captured graph starts with `embedding_pooled` index_select like
+    /// production — input is U32 token IDs, not pre-embedded hidden).
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_mini_decoder_capture_replay(
+        num_layers: usize,
+        input_shift: bool,
+        with_embedding: bool,
+    ) -> std::result::Result<(), String> {
+        use crate::engine::output_pool::OutputPool;
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch,
+            cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec, CUresult,
+            CUstreamCaptureMode,
+        };
+
+        // D2 hypothesis: process-shared Device avoids the cross-invocation
+        // CudaContext drop/recreate that triggers Bug A. With CR_SHARED_DEV=1,
+        // both test invocations reuse one Device instead of creating a
+        // fresh one each call. Default (env unset) preserves the original
+        // per-call Device which reproduces Bug A.
+        let dev_t = if std::env::var("CR_SHARED_DEV").is_ok() {
+            use std::sync::OnceLock;
+            static SHARED: OnceLock<Device> = OnceLock::new();
+            SHARED
+                .get_or_init(|| {
+                    let d = Device::new_cuda_with_stream(0).expect("Device::new_cuda_with_stream");
+                    if let Device::Cuda(c) = &d {
+                        unsafe {
+                            c.disable_event_tracking();
+                        }
+                    }
+                    d
+                })
+                .clone()
+        } else {
+            match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return Ok(()),
+            }
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        // CR.11: gated by env var so we can run tests with and without
+        // the clear to verify it is the cross-test pollution that
+        // breaks replay correctness. With `CR_CLEAR_POOL=1`, both runs
+        // pass; without, the 2nd test fails 100% mismatches.
+        if std::env::var("CR_CLEAR_POOL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            crate::engine::output_pool::OutputPool::global().clear_all();
+        }
+
+        let cfg = MiniDecoderCfg {
+            hidden_size: 2048,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 64,
+            intermediate_size: 8192,
+            num_layers,
+            rms_eps: 1e-5,
+        };
+        let batch_size = 1usize;
+        let block_size = 16usize;
+        let num_blocks = 8usize;
+        let max_blocks_per_seq = 1usize;
+        let max_seq_len = 6usize;
+        let worst = 1024usize;
+        let partition_size = 64usize;
+
+        let layers = mini_decoder_make_weights(&cfg, &dev_t, 0xDEAD_BEEF);
+        let final_norm: Tensor = {
+            let v: Vec<half::bf16> = (0..cfg.hidden_size)
+                .map(|_| half::bf16::from_f32(1.0))
+                .collect();
+            Tensor::from_slice(&v, &[cfg.hidden_size], &dev_t).unwrap()
+        };
+        let kv_elems = num_blocks * block_size * cfg.num_kv_heads * cfg.head_dim;
+        let mut k_caches: Vec<Tensor> = Vec::with_capacity(cfg.num_layers);
+        let mut v_caches: Vec<Tensor> = Vec::with_capacity(cfg.num_layers);
+        for li in 0..cfg.num_layers {
+            let mut s = 0x1000 + li as u32;
+            let mut next = || {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                half::bf16::from_f32((((s >> 16) as f32) / 32768.0 - 1.0) * 0.1)
+            };
+            let kd: Vec<half::bf16> = (0..kv_elems).map(|_| next()).collect();
+            let vd: Vec<half::bf16> = (0..kv_elems).map(|_| next()).collect();
+            k_caches.push(
+                Tensor::from_slice(
+                    &kd,
+                    &[num_blocks, block_size, cfg.num_kv_heads, cfg.head_dim],
+                    &dev_t,
+                )
+                .unwrap(),
+            );
+            v_caches.push(
+                Tensor::from_slice(
+                    &vd,
+                    &[num_blocks, block_size, cfg.num_kv_heads, cfg.head_dim],
+                    &dev_t,
+                )
+                .unwrap(),
+            );
+        }
+        let cos_sin = build_cos_sin_cache(cfg.head_dim, 1024, 500000.0, &dev_t);
+        let positions_dev =
+            Tensor::from_vec(vec![5u32; batch_size], (batch_size,), &dev_t).unwrap();
+        let slot_mapping_dev =
+            Tensor::from_vec(vec![5u32; batch_size], (batch_size,), &dev_t).unwrap();
+        let block_tables = Tensor::from_vec(
+            vec![0u32; batch_size * max_blocks_per_seq],
+            (batch_size, max_blocks_per_seq),
+            &dev_t,
+        )
+        .unwrap();
+        let seq_lens =
+            Tensor::from_vec(vec![max_seq_len as u32; batch_size], (batch_size,), &dev_t).unwrap();
+        // Two payloads: "warmup" (xs_a) and "real" (xs_b). When
+        // input_shift=true, we memcpy xs_a into xs0 before warmup +
+        // capture record, and xs_b before eager baseline + replay. This
+        // mimics production where the captured graph is recorded with a
+        // dummy input_ids buffer (zeros) and replayed against real
+        // input_ids streamed in via cuda_memcpy_inplace.
+        let xs_a_data: Vec<half::bf16> = (0..(batch_size * cfg.hidden_size))
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.013).sin() * 0.05) as f32))
+            .collect();
+        let xs_b_data: Vec<half::bf16> = (0..(batch_size * cfg.hidden_size))
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.019).cos() * 0.05) as f32))
+            .collect();
+        let xs_a =
+            Tensor::from_slice(&xs_a_data, &[batch_size, 1, cfg.hidden_size], &dev_t).unwrap();
+        let xs_b =
+            Tensor::from_slice(&xs_b_data, &[batch_size, 1, cfg.hidden_size], &dev_t).unwrap();
+
+        // xs0 is the persistent input buffer that the captured graph
+        // references. We memcpy xs_a or xs_b into it depending on phase.
+        let xs0 =
+            Tensor::from_slice(&xs_a_data, &[batch_size, 1, cfg.hidden_size], &dev_t).unwrap();
+
+        // Embedding setup (only used when with_embedding=true). Mimics
+        // production's `embedding_pooled(input_ids, weight)` step that
+        // produces the first hidden state via index_select.
+        let vocab_size = 256usize;
+        let mut s = 0xCAFE_BABE_u32;
+        let mut emb_next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            half::bf16::from_f32((((s >> 16) as f32) / 32768.0 - 1.0) * 0.05)
+        };
+        let emb_data: Vec<half::bf16> = (0..(vocab_size * cfg.hidden_size))
+            .map(|_| emb_next())
+            .collect();
+        let embed_weight =
+            Tensor::from_slice(&emb_data, &[vocab_size, cfg.hidden_size], &dev_t).unwrap();
+        // input_ids (U32) — persistent buffer used by both warmup and
+        // replay; data is overwritten per phase.
+        let input_ids_a =
+            Tensor::from_vec(vec![5u32; batch_size], (batch_size, 1), &dev_t).unwrap();
+        let input_ids_b =
+            Tensor::from_vec(vec![13u32; batch_size], (batch_size, 1), &dev_t).unwrap();
+        let input_ids = Tensor::from_vec(vec![5u32; batch_size], (batch_size, 1), &dev_t).unwrap();
+
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        let load_xs = |src: &Tensor| {
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&xs0, src).unwrap();
+        };
+        let load_ids = |src: &Tensor| {
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&input_ids, src).unwrap();
+        };
+
+        let forward_once = || -> Tensor {
+            let initial = if with_embedding {
+                let embed_out = embedding_pooled(&input_ids, &embed_weight).unwrap();
+                // embedding_pooled output shape is [num_tokens, hidden] —
+                // mini layer expects [batch, 1, hidden]. Reshape to match.
+                embed_out.reshape((batch_size, 1, cfg.hidden_size)).unwrap()
+            } else {
+                xs0.clone()
+            };
+            mini_decoder_forward(
+                &initial,
+                &layers,
+                &final_norm,
+                &cfg,
+                &positions_dev,
+                &slot_mapping_dev,
+                &block_tables,
+                &seq_lens,
+                &k_caches,
+                &v_caches,
+                &cos_sin,
+                max_blocks_per_seq,
+                max_seq_len,
+                worst,
+                partition_size,
+                block_size,
+            )
+        };
+        let tensor_to_u16_bytes = |t: &Tensor| -> Vec<u16> {
+            let bf16s: Vec<half::bf16> = t.flatten_all().unwrap().to_vec1().unwrap();
+            bf16s.iter().map(|v| v.to_bits()).collect()
+        };
+
+        // Pool pre-warm: eager forwards with whatever payload (xs_a).
+        load_xs(&xs_a);
+        load_ids(&input_ids_a);
+        OutputPool::global().reset_cursors();
+        let _ = forward_once();
+        OutputPool::global().reset_cursors();
+        let _ = forward_once();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        // Eager baseline: load REAL payload (xs_b when shifting), run.
+        if input_shift {
+            load_xs(&xs_b);
+            load_ids(&input_ids_b);
+        }
+        OutputPool::global().reset_cursors();
+        let eager_out = forward_once();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let eager_bytes = tensor_to_u16_bytes(&eager_out);
+        drop(eager_out);
+
+        // Capture warmup: load DUMMY payload (xs_a). The captured
+        // graph's first kernel reads xs0/input_ids → captures pointer.
+        load_xs(&xs_a);
+        load_ids(&input_ids_a);
+        OutputPool::global().reset_cursors();
+        let _ = forward_once();
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        // Capture record: still dummy payload in xs0.
+        OutputPool::global().reset_cursors();
+        // CR.15 / D1: bracket the captured forward with cr_trace so we
+        // can diff (op, dtype, shape, slot_idx) sequences across rounds.
+        // The process-static counter labels round 0 vs round 1 when this
+        // function is invoked twice via two separate `#[test]` entries
+        // sharing one process under `--test-threads=1`.
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static ROUND: AtomicUsize = AtomicUsize::new(0);
+            let r = ROUND.fetch_add(1, Ordering::SeqCst);
+            crate::engine::cr_trace::begin_round(&format!("mini_capture_{r}"));
+        }
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let begin = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        };
+        if begin != CUresult::CUDA_SUCCESS {
+            crate::engine::cr_trace::end_round();
+            return Err(format!("BeginCapture failed: {begin:?}"));
+        }
+        let captured_out = forward_once();
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        crate::engine::cr_trace::end_round();
+        if end != CUresult::CUDA_SUCCESS {
+            return Err(format!("EndCapture failed: {end:?}"));
+        }
+
+        // CR.12: dump DAG if requested. CR_DUMP_DAG_PREFIX writes to
+        // `<prefix>.<counter>.txt`, counter increments per capture in
+        // this process. Both captures dumped when multiple tests run.
+        if let Ok(p) = std::env::var("CR_DUMP_DAG_PREFIX") {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CAP_IDX: AtomicUsize = AtomicUsize::new(0);
+            let idx = CAP_IDX.fetch_add(1, Ordering::SeqCst);
+            let full = format!("{p}.{idx}.txt");
+            let _ = dump_graph_dag(graph, &full);
+            eprintln!("dumped captured DAG to {full}");
+        }
+        if let Ok(p) = std::env::var("CR_DUMP_DAG") {
+            let _ = dump_graph_dag(graph, &p);
+            eprintln!("dumped captured DAG to {p}");
+        }
+
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let inst = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+        if inst != CUresult::CUDA_SUCCESS {
+            return Err(format!("Instantiate failed: {inst:?}"));
+        }
+
+        // Replay: load REAL payload, then launch captured graph.
+        // Captured kernel chain reads xs0/input_ids and propagates.
+        if input_shift {
+            load_xs(&xs_b);
+            load_ids(&input_ids_b);
+        }
+        let launch = unsafe { cuGraphLaunch(exec, stream) };
+        if launch != CUresult::CUDA_SUCCESS {
+            return Err(format!("Launch failed: {launch:?}"));
+        }
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let replay_bytes = tensor_to_u16_bytes(&captured_out);
+
+        unsafe {
+            cuGraphExecDestroy(exec);
+            cuGraphDestroy(graph);
+        }
+
+        if eager_bytes != replay_bytes {
+            let mismatches: Vec<(usize, u16, u16)> = eager_bytes
+                .iter()
+                .zip(replay_bytes.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .take(8)
+                .map(|(i, (a, b))| (i, *a, *b))
+                .collect();
+            let n_diff = eager_bytes
+                .iter()
+                .zip(replay_bytes.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            return Err(format!(
+                "Mini-decoder ({num_layers}-layer) diverges: {} elems, {} mismatches ({:.1}%), first 8: {:?}",
+                eager_bytes.len(),
+                n_diff,
+                100.0 * n_diff as f64 / eager_bytes.len() as f64,
+                mismatches
+            ));
+        }
+        Ok(())
+    }
+
+    /// 1-layer, no input shift — minimum repro size.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn mini_decoder_1layer_capture_replay_matches_eager() {
+        if let Err(e) = run_mini_decoder_capture_replay(1, false, false) {
+            panic!("{e}");
+        }
+    }
+
+    /// 2-layer, no input shift (same payload for eager and replay).
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn mini_decoder_2layer_capture_replay_matches_eager() {
+        if let Err(e) = run_mini_decoder_capture_replay(2, false, false) {
+            panic!("{e}");
+        }
+    }
+
+    /// 16-layer, no input shift.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn mini_decoder_16layer_capture_replay_matches_eager() {
+        if let Err(e) = run_mini_decoder_capture_replay(16, false, false) {
+            panic!("{e}");
+        }
+    }
+
+    /// 16-layer WITH input shift.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn mini_decoder_16layer_capture_replay_with_input_shift() {
+        if let Err(e) = run_mini_decoder_capture_replay(16, true, false) {
+            panic!("{e}");
+        }
+    }
+
+    /// 16-layer + input shift + EMBEDDING — full production-like flow:
+    /// input_ids → embedding_pooled → decoder layers → final_norm.
+    /// Capture recorded with input_ids_a (token=5), replay against
+    /// input_ids_b (token=13). If the captured graph's embedding/index_select
+    /// is the culprit → diverges here.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn mini_decoder_16layer_capture_replay_with_embedding() {
+        if let Err(e) = run_mini_decoder_capture_replay(16, true, true) {
+            panic!("{e}");
+        }
+    }
+
+    /// Same as `mini_decoder_16layer_capture_replay_with_input_shift`
+    /// but named differently to trigger ordering — runs AFTER another
+    /// capture-replay test. Confirms second-capture-after-first-capture
+    /// pattern (production: batch=1 → batch=2 → batch=4 → ...).
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn zz_mini_decoder_second_with_input_shift_after_prior() {
+        if let Err(e) = run_mini_decoder_capture_replay(16, true, false) {
+            panic!("{e}");
+        }
+    }
+
+    /// 16-layer + 2 SEQUENTIAL decode forwards (replay the captured
+    /// graph twice with advancing seq_lens/positions/slot_mapping
+    /// between calls). Production runs 12 decode forwards in sequence;
+    /// the wrong-tokens regression manifests from forward 2 onwards.
+    /// If forward 1's KV cache write is silently corrupt under replay,
+    /// forward 2 reads bad KV and diverges from eager's forward 2.
+    /// This test diffs forward 1 AND forward 2 outputs between eager
+    /// and capture-replay paths.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore]
+    fn mini_decoder_16layer_capture_replay_two_forwards() {
+        if let Err(e) = run_mini_decoder_two_forwards_capture_replay(16) {
+            panic!("{e}");
+        }
+    }
+
+    /// Two-forward variant of [`run_mini_decoder_capture_replay`].
+    /// Compares BOTH forward 1 and forward 2 outputs between eager and
+    /// capture-replay. Between forwards, advances seq_lens (6→7),
+    /// positions (5→6), slot_mapping (5→6) — so forward 2 reads what
+    /// forward 1 wrote to KV cache.
+    #[cfg(feature = "cuda-kernels")]
+    fn run_mini_decoder_two_forwards_capture_replay(
+        num_layers: usize,
+    ) -> std::result::Result<(), String> {
+        use crate::engine::output_pool::OutputPool;
+        use candle_core::cuda::cudarc::driver::sys::{
+            cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch,
+            cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec, CUresult,
+            CUstreamCaptureMode,
+        };
+
+        let dev_t = match Device::new_cuda_with_stream(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => return Ok(()),
+        };
+        let cuda_dev = match &dev_t {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+
+        let cfg = MiniDecoderCfg {
+            hidden_size: 2048,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 64,
+            intermediate_size: 8192,
+            num_layers,
+            rms_eps: 1e-5,
+        };
+        let batch_size = 1usize;
+        let block_size = 16usize;
+        let num_blocks = 8usize;
+        let max_blocks_per_seq = 1usize;
+        let worst = 1024usize;
+        let partition_size = 64usize;
+
+        let layers = mini_decoder_make_weights(&cfg, &dev_t, 0xDEAD_BEEF);
+        let final_norm: Tensor = {
+            let v: Vec<half::bf16> = (0..cfg.hidden_size)
+                .map(|_| half::bf16::from_f32(1.0))
+                .collect();
+            Tensor::from_slice(&v, &[cfg.hidden_size], &dev_t).unwrap()
+        };
+        let kv_elems = num_blocks * block_size * cfg.num_kv_heads * cfg.head_dim;
+
+        // Build TWO sets of KV caches: one for eager, one for capture
+        // replay. Pre-populated identically; each path's forward writes
+        // independently so we can verify forward 1's KV write
+        // correctness via forward 2 read.
+        let mk_kv = |seed: u32| -> Tensor {
+            let mut s = seed;
+            let data: Vec<half::bf16> = (0..kv_elems)
+                .map(|_| {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    half::bf16::from_f32((((s >> 16) as f32) / 32768.0 - 1.0) * 0.1)
+                })
+                .collect();
+            Tensor::from_slice(
+                &data,
+                &[num_blocks, block_size, cfg.num_kv_heads, cfg.head_dim],
+                &dev_t,
+            )
+            .unwrap()
+        };
+        let mut k_eager: Vec<Tensor> = (0..num_layers)
+            .map(|li| mk_kv(0x1000 + li as u32))
+            .collect();
+        let mut v_eager: Vec<Tensor> = (0..num_layers)
+            .map(|li| mk_kv(0x2000 + li as u32))
+            .collect();
+        let mut k_cap: Vec<Tensor> = (0..num_layers)
+            .map(|li| mk_kv(0x1000 + li as u32))
+            .collect();
+        let mut v_cap: Vec<Tensor> = (0..num_layers)
+            .map(|li| mk_kv(0x2000 + li as u32))
+            .collect();
+
+        let cos_sin = build_cos_sin_cache(cfg.head_dim, 1024, 500000.0, &dev_t);
+
+        // Persistent metadata buffers — overwritten per forward.
+        let positions_dev =
+            Tensor::from_vec(vec![0u32; batch_size], (batch_size,), &dev_t).unwrap();
+        let slot_mapping_dev =
+            Tensor::from_vec(vec![0u32; batch_size], (batch_size,), &dev_t).unwrap();
+        let block_tables = Tensor::from_vec(
+            vec![0u32; batch_size * max_blocks_per_seq],
+            (batch_size, max_blocks_per_seq),
+            &dev_t,
+        )
+        .unwrap();
+        let seq_lens = Tensor::from_vec(vec![0u32; batch_size], (batch_size,), &dev_t).unwrap();
+
+        let load_u32_1 = |t: &Tensor, val: u32| {
+            let src = Tensor::from_vec(vec![val; batch_size], t.shape(), &dev_t).unwrap();
+            crate::engine::cuda_graph_runner::cuda_memcpy_inplace(t, &src).unwrap();
+        };
+
+        // Hidden state input (constant across forwards for simplicity —
+        // production threads argmax of forward N as input to forward N+1
+        // but we keep this fixed to isolate KV cache state effects).
+        let xs0_data: Vec<half::bf16> = (0..(batch_size * cfg.hidden_size))
+            .map(|i| half::bf16::from_f32(((i as f32 * 0.013).sin() * 0.05) as f32))
+            .collect();
+        let xs0 = Tensor::from_slice(&xs0_data, &[batch_size, 1, cfg.hidden_size], &dev_t).unwrap();
+
+        let run_fwd = |k: &[Tensor], v: &[Tensor], max_seq: usize| -> Tensor {
+            mini_decoder_forward(
+                &xs0,
+                &layers,
+                &final_norm,
+                &cfg,
+                &positions_dev,
+                &slot_mapping_dev,
+                &block_tables,
+                &seq_lens,
+                k,
+                v,
+                &cos_sin,
+                max_blocks_per_seq,
+                max_seq,
+                worst,
+                partition_size,
+                block_size,
+            )
+        };
+        let bytes_of = |t: &Tensor| -> Vec<u16> {
+            let f: Vec<half::bf16> = t.flatten_all().unwrap().to_vec1().unwrap();
+            f.iter().map(|v| v.to_bits()).collect()
+        };
+
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+
+        // ── Path A: EAGER both forwards on k_eager/v_eager ───────────
+        // Forward 1: position=5, seq_len=6, slot=5
+        load_u32_1(&positions_dev, 5);
+        load_u32_1(&slot_mapping_dev, 5);
+        load_u32_1(&seq_lens, 6);
+        // Pre-warm pool
+        OutputPool::global().reset_cursors();
+        let _ = run_fwd(&k_eager, &v_eager, 6);
+        OutputPool::global().reset_cursors();
+        let _ = run_fwd(&k_eager, &v_eager, 6);
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        // Restore k_eager/v_eager (warmups wrote to slot 5). Re-populate.
+        for li in 0..num_layers {
+            k_eager[li] = mk_kv(0x1000 + li as u32);
+            v_eager[li] = mk_kv(0x2000 + li as u32);
+        }
+        OutputPool::global().reset_cursors();
+        let eager_fwd1 = run_fwd(&k_eager, &v_eager, 6);
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let eager_fwd1_bytes = bytes_of(&eager_fwd1);
+        drop(eager_fwd1);
+        // Forward 2: position=6, seq_len=7, slot=6 — reads slot 5 (just written by forward 1)
+        load_u32_1(&positions_dev, 6);
+        load_u32_1(&slot_mapping_dev, 6);
+        load_u32_1(&seq_lens, 7);
+        OutputPool::global().reset_cursors();
+        let eager_fwd2 = run_fwd(&k_eager, &v_eager, 7);
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let eager_fwd2_bytes = bytes_of(&eager_fwd2);
+        drop(eager_fwd2);
+
+        // ── Path B: CAPTURE warmup + record + REPLAY twice ───────────
+        // Forward 1 (warmup + record).
+        load_u32_1(&positions_dev, 5);
+        load_u32_1(&slot_mapping_dev, 5);
+        load_u32_1(&seq_lens, 6);
+        OutputPool::global().reset_cursors();
+        let _ = run_fwd(&k_cap, &v_cap, 6);
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        // Restore.
+        for li in 0..num_layers {
+            k_cap[li] = mk_kv(0x1000 + li as u32);
+            v_cap[li] = mk_kv(0x2000 + li as u32);
+        }
+        OutputPool::global().reset_cursors();
+        let stream = cuda_dev.cuda_stream().cu_stream();
+        let begin = unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        };
+        if begin != CUresult::CUDA_SUCCESS {
+            return Err(format!("BeginCapture: {begin:?}"));
+        }
+        let captured_fwd1_out = run_fwd(&k_cap, &v_cap, 6);
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        if end != CUresult::CUDA_SUCCESS {
+            return Err(format!("EndCapture: {end:?}"));
+        }
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let inst = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+        if inst != CUresult::CUDA_SUCCESS {
+            return Err(format!("Instantiate: {inst:?}"));
+        }
+        // Replay 1 (forward 1).
+        let l1 = unsafe { cuGraphLaunch(exec, stream) };
+        if l1 != CUresult::CUDA_SUCCESS {
+            return Err(format!("Launch 1: {l1:?}"));
+        }
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let cap_fwd1_bytes = bytes_of(&captured_fwd1_out);
+        // Forward 2: advance metadata, replay same graph.
+        load_u32_1(&positions_dev, 6);
+        load_u32_1(&slot_mapping_dev, 6);
+        load_u32_1(&seq_lens, 7);
+        // NB: max_seq_len kernel-arg captured into the graph reflects
+        // FORWARD 1's value (6). We can't change it. But seq_lens TENSOR
+        // contents we just bumped to 7. paged_attn V2 uses the device
+        // seq_lens for its bounds, so it should adapt. The captured
+        // max_seq_len const is only used for kernel grid sizing (max
+        // partitions); since partition_size is fixed and seq_lens fits
+        // within worst_case_max_seq_len, it's fine.
+        let l2 = unsafe { cuGraphLaunch(exec, stream) };
+        if l2 != CUresult::CUDA_SUCCESS {
+            return Err(format!("Launch 2: {l2:?}"));
+        }
+        unsafe {
+            candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+        }
+        let cap_fwd2_bytes = bytes_of(&captured_fwd1_out);
+
+        unsafe {
+            cuGraphExecDestroy(exec);
+            cuGraphDestroy(graph);
+        }
+
+        let mut errs = Vec::new();
+        if eager_fwd1_bytes != cap_fwd1_bytes {
+            let nd = eager_fwd1_bytes
+                .iter()
+                .zip(cap_fwd1_bytes.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            errs.push(format!(
+                "FWD 1 diverges: {nd}/{} mismatches",
+                eager_fwd1_bytes.len()
+            ));
+        }
+        if eager_fwd2_bytes != cap_fwd2_bytes {
+            let nd = eager_fwd2_bytes
+                .iter()
+                .zip(cap_fwd2_bytes.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            errs.push(format!(
+                "FWD 2 diverges: {nd}/{} mismatches",
+                eager_fwd2_bytes.len()
+            ));
+        }
+        if !errs.is_empty() {
+            return Err(errs.join("; "));
+        }
+        Ok(())
     }
 }

@@ -278,6 +278,17 @@ impl<M: ModelForward> StandardExecution<M> {
         // Phase D.3: capture warmup always wants pool-backed attention
         // — replay reads from the captured pool addresses, so the
         // worst-case-sized buffers are mandatory.
+        //
+        // D10 (Bug B fix): rewind cursors BEFORE building shared so the
+        // pool slot it reserves for positions / slot_mapping / block_tables
+        // / seq_lens matches the slot index that production runtime forwards
+        // get from their own pre-forward reset_cursors+build_shared. Without
+        // this, JIT warmup's earlier build_shared has advanced the cursors
+        // and capture-time build_shared reserves DIFFERENT slot indices.
+        // The captured graph encodes those slot addresses, but production
+        // writes its real data into the cursor=0 slots — replay reads stale
+        // warmup data and the model generates wrong tokens.
+        crate::engine::output_pool::OutputPool::global().reset_cursors();
         let shared = match crate::layers::attention::build_decode_batch_shared_with_options(
             &sequences, &device, true,
         ) {
@@ -740,6 +751,25 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
         let mut sorted_sizes = config.decode_batch_sizes.clone();
         sorted_sizes.sort_by(|a, b| b.cmp(a));
 
+        // CR.14 mitigation: only the FIRST `cuStreamBeginCapture` session
+        // in a process captures fully — subsequent sessions silently drop
+        // ~68% of operations (cudarc/CUDA driver state interaction; see
+        // ADR 0019). Workaround: capture only ONE batch size; remaining
+        // sizes get eager JIT warmup but no graph. Default policy here:
+        // capture the LARGEST size (most expensive per-op savings),
+        // others fall back to eager replay.
+        //
+        // Env override `VLLM_CAPTURE_SINGLE_SIZE=<n>` lets users target a
+        // specific size (e.g., =1 for typical c=1 chat workloads).
+        let capture_single_size: Option<usize> = std::env::var("VLLM_CAPTURE_SINGLE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let chosen_capture_size: Option<usize> = if config.enable_graph_capture {
+            capture_single_size.or_else(|| sorted_sizes.first().copied())
+        } else {
+            None
+        };
+
         for batch_size in sorted_sizes {
             if batch_size == 0 {
                 stats
@@ -767,8 +797,21 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 }
             }
 
-            // Phase 2: CUDA graph registration
-            if config.enable_graph_capture && dispatcher.is_enabled() {
+            // Phase 2: CUDA graph registration — gated to a SINGLE
+            // batch size to avoid the multi-capture-loses-nodes bug
+            // (CR.14 / ADR 0019).
+            let do_capture = config.enable_graph_capture
+                && dispatcher.is_enabled()
+                && chosen_capture_size == Some(batch_size);
+            if !do_capture && config.enable_graph_capture && config.show_progress {
+                info!(
+                    batch_size,
+                    "CUDA graph capture skipped — single-capture policy \
+                     (only batch_size={:?} captured)",
+                    chosen_capture_size
+                );
+            }
+            if do_capture {
                 match self.capture_decode_graph(batch_size, kv_cache_mgr, dispatcher) {
                     Ok(true) => {
                         stats.graphs_captured += 1;

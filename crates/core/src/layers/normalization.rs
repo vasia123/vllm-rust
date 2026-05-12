@@ -56,6 +56,42 @@ impl RmsNorm {
         }
     }
 
+    /// Pool-backed forward for the captured decode hot path. Only
+    /// supports the `Standard` variant — `ScalePlusOne` / `Unweighted`
+    /// allocate F32 intermediates via candle ops, which are not pool-
+    /// backed; callers on those variants must fall back to
+    /// [`Self::forward`] (eager paths only).
+    #[cfg(feature = "cuda-layernorm")]
+    pub fn forward_pooled(
+        &self,
+        xs: &crate::engine::output_pool::PooledTensor,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        match self.variant {
+            RmsNormVariant::Standard => {
+                let weight = self.weight.as_ref().expect("Standard RmsNorm needs weight");
+                if crate::cuda_kernels::rms_norm_cuda_available(xs.as_tensor()) {
+                    let xs_c = xs.contiguous()?;
+                    return crate::cuda_kernels::rms_norm_cuda_pooled_typed(
+                        &xs_c,
+                        weight,
+                        self.eps as f32,
+                    );
+                }
+                candle_core::bail!(
+                    "RmsNorm::forward_pooled: cuda kernel unavailable for {:?} on {:?}; \
+                     captured forward requires CUDA",
+                    xs.dtype(),
+                    xs.device()
+                );
+            }
+            _ => candle_core::bail!(
+                "RmsNorm::forward_pooled: only Standard variant is pool-backed; \
+                 got {:?} — caller must use eager Self::forward",
+                self.variant
+            ),
+        }
+    }
+
     pub fn weight(&self) -> Option<&Tensor> {
         self.weight.as_ref()
     }

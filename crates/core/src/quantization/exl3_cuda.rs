@@ -443,6 +443,35 @@ pub fn exl3_gemv(a: &Tensor, trellis: &Tensor, bpw: u32, codebook: Exl3Codebook)
     Ok(output)
 }
 
+// ─── Type-Safe PooledTensor Wrappers (Phase TS.2) ───────────────────
+
+/// Type-safe wrapper for [`exl3_gemm`]. `a` is pool-backed; trellis/suh/svh
+/// are model weights (stable for engine lifetime, remain `&Tensor`).
+pub fn exl3_gemm_pooled_typed(
+    a: &crate::engine::output_pool::PooledTensor,
+    trellis: &Tensor,
+    suh: Option<&Tensor>,
+    svh: Option<&Tensor>,
+    bpw: u32,
+    codebook: Exl3Codebook,
+) -> Result<crate::engine::output_pool::PooledTensor> {
+    let out = exl3_gemm(a.as_tensor(), trellis, suh, svh, bpw, codebook)?;
+    // SAFETY: `exl3_gemm` reserves output from OutputPool::global() (line 349).
+    Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(out) })
+}
+
+/// Type-safe wrapper for [`exl3_gemv`].
+pub fn exl3_gemv_pooled_typed(
+    a: &crate::engine::output_pool::PooledTensor,
+    trellis: &Tensor,
+    bpw: u32,
+    codebook: Exl3Codebook,
+) -> Result<crate::engine::output_pool::PooledTensor> {
+    let out = exl3_gemv(a.as_tensor(), trellis, bpw, codebook)?;
+    // SAFETY: `exl3_gemv` reserves output from OutputPool::global() (line 434).
+    Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(out) })
+}
+
 struct Exl3GemvInplaceOp {
     trellis: Tensor,
     m: usize,
@@ -2340,6 +2369,186 @@ mod tests {
                 CUresult::CUDA_SUCCESS,
                 "cuStreamEndCapture after had_r_128_fp16 failed: {end:?}"
             );
+        }
+
+        /// Phase CR.10: capture + INSTANTIATE + REPLAY exl3_gemm and
+        /// compare replay output to eager. Existing capture-window
+        /// tests verify capture SUCCESS but never run the captured
+        /// graph — replay correctness is the production-blocking
+        /// regression (forward 1 logits differ between eager and capture
+        /// replay).
+        ///
+        /// If this test fails, EXL3 GEMM under cuGraph replay produces
+        /// different output than eager invocation — the root cause of
+        /// the full-server wrong-tokens bug.
+        #[test]
+        #[ignore]
+        fn exl3_gemm_capture_replay_matches_eager() {
+            use candle_core::cuda::cudarc::driver::sys::{
+                cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch,
+                cuStreamBeginCapture_v2, cuStreamEndCapture, CUgraph, CUgraphExec, CUresult,
+                CUstreamCaptureMode,
+            };
+
+            let dev_t = match Device::new_cuda_with_stream(0) {
+                Ok(d) if d.is_cuda() => d,
+                _ => return,
+            };
+            let cuda_dev = match &dev_t {
+                Device::Cuda(c) => c.clone(),
+                _ => unreachable!(),
+            };
+            unsafe {
+                cuda_dev.disable_event_tracking();
+            }
+
+            // Llama-3.2-1B q_proj shape: m=1 (batch=1 decode), k=2048, n=2048.
+            let m = 1usize;
+            let k = 2048usize;
+            let n = 2048usize;
+            let bpw = 3u32;
+            let trellis_elems = (k / 16) * (n / 16) * 16 * bpw as usize;
+            let mut td: Vec<i16> = Vec::with_capacity(trellis_elems);
+            let mut seed: u32 = 0xDEAD_BEEF;
+            for _ in 0..trellis_elems {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                td.push((seed >> 16) as i16);
+            }
+            let trellis =
+                Tensor::from_slice(&td, (k / 16, n / 16, 16 * bpw as usize), &dev_t).unwrap();
+            let mut xd = Vec::with_capacity(m * k);
+            for i in 0..(m * k) {
+                let v = ((i as f32 * 0.0017).sin() * 0.05) as f32;
+                xd.push(half::f16::from_f32(v));
+            }
+            let x = Tensor::from_slice(&xd, (m, k), &dev_t).unwrap();
+            let ones_suh = Tensor::ones(k, DType::F16, &dev_t).unwrap();
+            let ones_svh = Tensor::ones(n, DType::F16, &dev_t).unwrap();
+
+            // Pre-warm caches.
+            let _ = crate::quantization::exl3_scratch::exl3_locks(&cuda_dev).unwrap();
+            let _ = crate::quantization::exl3_scratch::exl3_had_null_scale(&cuda_dev).unwrap();
+            // Warmup gemm calls (pool growth + kernel JIT).
+            let _ = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .unwrap();
+            let _ = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .unwrap();
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            unsafe {
+                candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            // Eager baseline.
+            let eager_out = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .unwrap();
+            unsafe {
+                candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+            let eager_bytes: Vec<u16> = {
+                let f: Vec<half::f16> = eager_out.flatten_all().unwrap().to_vec1().unwrap();
+                f.iter().map(|v| v.to_bits()).collect()
+            };
+            drop(eager_out);
+
+            // Capture warmup.
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            let _ = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .unwrap();
+            unsafe {
+                candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            crate::engine::output_pool::OutputPool::global().reset_cursors();
+            let stream = cuda_dev.cuda_stream().cu_stream();
+            let begin = unsafe {
+                cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            };
+            assert_eq!(begin, CUresult::CUDA_SUCCESS);
+
+            let captured_out = exl3_gemm(
+                &x,
+                &trellis,
+                Some(&ones_suh),
+                Some(&ones_svh),
+                bpw,
+                Exl3Codebook::Default,
+            )
+            .unwrap();
+
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let end = unsafe { cuStreamEndCapture(stream, &mut graph) };
+            assert_eq!(end, CUresult::CUDA_SUCCESS);
+
+            let mut exec: CUgraphExec = std::ptr::null_mut();
+            let inst = unsafe { cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
+            assert_eq!(inst, CUresult::CUDA_SUCCESS);
+
+            let launch = unsafe { cuGraphLaunch(exec, stream) };
+            assert_eq!(launch, CUresult::CUDA_SUCCESS);
+            unsafe {
+                candle_core::cuda::cudarc::driver::sys::cuCtxSynchronize();
+            }
+
+            let replay_bytes: Vec<u16> = {
+                let f: Vec<half::f16> = captured_out.flatten_all().unwrap().to_vec1().unwrap();
+                f.iter().map(|v| v.to_bits()).collect()
+            };
+
+            unsafe {
+                cuGraphExecDestroy(exec);
+                cuGraphDestroy(graph);
+            }
+
+            if eager_bytes != replay_bytes {
+                let mismatches: Vec<(usize, u16, u16)> = eager_bytes
+                    .iter()
+                    .zip(replay_bytes.iter())
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .take(8)
+                    .map(|(i, (a, b))| (i, *a, *b))
+                    .collect();
+                let n_diff = eager_bytes
+                    .iter()
+                    .zip(replay_bytes.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                panic!(
+                    "exl3_gemm diverges under capture-replay: {} elems, {} mismatches ({:.1}%), first 8: {:?}",
+                    eager_bytes.len(),
+                    n_diff,
+                    100.0 * n_diff as f64 / eager_bytes.len() as f64,
+                    mismatches
+                );
+            }
         }
     }
 }

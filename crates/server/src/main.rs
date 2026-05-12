@@ -1371,32 +1371,32 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     //   1. fp16 activations (kernels are fp16-only).
     //   2. capture_sizes clipped to ≤ 16 — larger batches hit the
     //      cooperative `exl3_gemm_kernel` which can't be captured.
-    //   3. enforce_eager — Phase 11.2.C's pool migrations got capture
-    //      replay engaging (all 5 graphs captured, replay live, +34%
-    //      tps over eager, beats ExLlamaV3 at c=1), but a residual
-    //      correctness regression makes replay forward 2+ produce
-    //      wrong tokens. Capture is therefore opt-in via the
-    //      `VLLM_EXL3_CAPTURE_MAX_M=<N>` env override (0 = eager, the
-    //      default; >0 = allow capture up to batch size N for perf
-    //      experiments where correctness is verified per workload).
+    //
+    // The earlier replay-correctness regression (decode forward 2+
+    // producing wrong tokens) was traced to two pool-slot drift bugs
+    // (see `docs/adr/0019-pooled-tensor-type-safety.md` and memory
+    // pointer `bug_b_root_cause_pool_slot_drift`). Both fixed:
+    //   - `OutputPool::reset_cursors()` before capture-time
+    //     `build_decode_batch_shared_with_options` in
+    //     `engine/standard.rs::capture_decode_graph`.
+    //   - `engine_limits::set_max_model_len` moved BEFORE `start_engine`
+    //     (this file, just after `KVCacheManager::new`).
+    //
+    // Capture is now on by default for EXL3 with a sensible cap (16).
+    // Override via `VLLM_EXL3_CAPTURE_MAX_M=<N>` (0 = force eager for
+    // diagnostics).
     let is_exl3 = files.quantization.method == vllm_core::quantization::QuantizationMethod::Exl3;
     if is_exl3 {
-        // Default to 0 (= force eager) until the replay correctness
-        // regression is resolved. Bench experiments can opt in to
-        // capture via the env var.
+        const DEFAULT_CAP: usize = 16;
         let cap: usize = std::env::var("VLLM_EXL3_CAPTURE_MAX_M")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(DEFAULT_CAP);
         let before = cuda_graph_config.capture_sizes.len();
         cuda_graph_config.capture_sizes.retain(|&s| s <= cap);
         let after = cuda_graph_config.capture_sizes.len();
         if cap == 0 && cuda_graph_config.enabled {
-            tracing::info!(
-                "EXL3 quantization detected — forcing eager (capture replay correctness \
-                 regression on forward 2+; set VLLM_EXL3_CAPTURE_MAX_M=16 to opt in to \
-                 captured throughput at the cost of wrong tokens past the first)"
-            );
+            tracing::info!("EXL3 quantization detected — VLLM_EXL3_CAPTURE_MAX_M=0 forces eager");
             cuda_graph_config.enabled = false;
         } else if after < before {
             tracing::info!(
@@ -1807,6 +1807,33 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         cache_config.num_blocks, cache_config.num_layers
     );
     let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+
+    // Phase D.1 (moved here from after-engine-start as part of D10
+    // task #222 fix): publish max_model_len BEFORE start_engine so the
+    // capture-warmup `build_decode_batch_shared_with_options` sizes its
+    // worst-case-blocks-per-seq stride from the real value (e.g.,
+    // 131072 / 16 = 8192 for Llama 3.2). Setting it AFTER start_engine
+    // left warmup with the 1024 fallback → stride 64; captured graph
+    // encoded a 64-entry block_tables slot, but runtime build_shared
+    // (after set_max_model_len) reserved a fresh 8192-entry slot and
+    // replay dereferenced the stale 64-entry one for sequences that
+    // crossed the first block boundary. Idempotent: OnceLock::set is a
+    // no-op on subsequent calls.
+    {
+        let default_max_model_len = std::cmp::min(
+            num_blocks * block_size,
+            files.config.max_position_embeddings,
+        );
+        let mml = max_model_len_override.unwrap_or(default_max_model_len);
+        vllm_core::engine::engine_limits::set_max_model_len(mml);
+        // Separately publish the capture-only sequence cap so pool
+        // sizing (paged_attn V2 partitions, block_tables stride) stays
+        // cheap when --max-model-len is large but actual workloads
+        // don't approach it. We clamp to mml so we never advertise a
+        // larger capture window than the model actually supports.
+        let capture_cap = std::cmp::min(max_seq_len_to_capture, mml);
+        vllm_core::engine::engine_limits::set_max_seq_len_to_capture(capture_cap);
+    }
 
     // `eos_token_id` may be absent in the config.json (Qwen3, Mistral
     // base). Fall back to 0; stop logic still honors stop_strings +
