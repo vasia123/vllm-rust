@@ -690,15 +690,30 @@ impl InplaceOp2 for Exl3GemmInplaceOp {
             mangled_gemm_symbol(self.bpw, false, self.codebook.as_u32(), shape)
         };
         let ptx = gemm_ptx_for_bpw(self.bpw)?;
-        let func = dev.get_or_load_custom_func(
-            crate::quantization::exl3_scratch::intern_kernel_name(kernel_name),
-            if use_decode_fast_path {
-                "exl3_gemm_decode"
-            } else {
-                "exl3_gemm"
-            },
-            ptx,
-        )?;
+        // Module-cache key MUST include bpw. Each `gemm_ptx_for_bpw(b)`
+        // returns the PTX for that specific bpw's instantiations only;
+        // `dev.get_or_load_custom_func` caches the loaded module by
+        // `module_name`, so sharing one name across different PTX
+        // bodies causes the first-loaded body to hide the others —
+        // mixed-precision EXL3 checkpoints (e.g. body=2bpw, lm_head=6bpw)
+        // fail with "named symbol not found" on the higher-bpw layer.
+        let base = if use_decode_fast_path {
+            "exl3_gemm_decode_b"
+        } else {
+            "exl3_gemm_b"
+        };
+        let module_name =
+            crate::quantization::exl3_scratch::intern_kernel_name(format!("{base}{}", self.bpw,));
+        let interned_name = crate::quantization::exl3_scratch::intern_kernel_name(kernel_name);
+        let func = dev
+            .get_or_load_custom_func(interned_name, module_name, ptx)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "exl3 kernel lookup failed (bpw={}, m={}, k={}, n={}, \
+                     decode_path={}, symbol={}): {}",
+                    self.bpw, self.m, self.k, self.n, use_decode_fast_path, interned_name, e,
+                ))
+            })?;
 
         // Bump dynamic shared memory cap. cuFuncSetAttribute is idempotent
         // per-function; we set it on every dispatch for safety (low-cost).

@@ -47,12 +47,25 @@ pub struct Exl3TensorInfo {
 }
 
 /// EXL3 quantization configuration.
-#[derive(Debug, Clone)]
+///
+/// Intentionally lean: per-tensor `bits_per_weight` is derived in the
+/// weight loader from the trellis tensor's last dim
+/// (`trellis.shape[-1] / 16`), so any `bits` / `bits_per_weight` field
+/// in `quantization_config.json` is **ignored**. ExLlamaV3 ships
+/// mixed-precision checkpoints (head_bits trick: `lm_head` at a higher
+/// bpw than the body), so the on-disk shape is the single source of
+/// truth. Trusting the declared value was a foot-gun that produced
+/// `shape mismatch for lm_head.trellis` errors on 2.0bpw 14B
+/// checkpoints.
+///
+/// What we still keep here:
+/// - codebook flags (`mcg_default`, `mul1_default`) — fed into every
+///   `Exl3Linear`, control the trellis-decode multiplier path;
+/// - `ignored_layers` — dense-fallback layer-name patterns;
+/// - `tensor_storage` — original-shape hints exposed via the
+///   safetensors-side metadata, used by the dense-fallback path.
+#[derive(Debug, Clone, Default)]
 pub struct Exl3Config {
-    /// Bits per weight. ExLlamaV3 supports 2..=8.
-    /// Determined per-tensor from `trellis.shape[-1] / 16`; the value in
-    /// `Config` is the dominant bpw for sanity checks only.
-    pub bits_per_weight: u32,
     /// True when `.mcg` flag tensors are present and the codebook multiplier
     /// `EXL3_MCG_MULTIPLIER` should be applied during trellis decode.
     pub mcg_default: bool,
@@ -67,21 +80,14 @@ pub struct Exl3Config {
 
 impl Exl3Config {
     /// Build a config from `quantization_config` raw JSON.
+    ///
+    /// Per-tensor bits-per-weight is NOT read here — it's derived
+    /// from each trellis tensor's last dim in the loader. Any `bits`
+    /// / `bits_per_weight` field in the JSON is silently ignored:
+    /// trusting it caused the "shape mismatch for lm_head.trellis"
+    /// regression on ExLlamaV3 head_bits checkpoints (declared 2bpw,
+    /// lm_head actually 6bpw).
     pub fn from_detected(raw: &HashMap<String, Value>) -> Self {
-        // EXL3 checkpoints encode `bits` as float (e.g. 3.0, 3.5, 4.0)
-        // and `bits_per_weight` may be either int or absent. We round
-        // down because the kernel selects K=floor(bits), with the
-        // actual stored bit-width carried by the trellis tensor's
-        // last dim (validated at load time).
-        let read_numeric = |key: &str| -> Option<u32> {
-            raw.get(key)
-                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-                .map(|n| n as u32)
-        };
-        let bits_per_weight = read_numeric("bits_per_weight")
-            .or_else(|| read_numeric("bits"))
-            .unwrap_or(4);
-
         let mcg_default = raw
             .get("mcg_multiplier")
             .and_then(|v| v.as_u64())
@@ -129,23 +135,10 @@ impl Exl3Config {
             .unwrap_or_default();
 
         Self {
-            bits_per_weight,
             mcg_default,
             mul1_default,
             ignored_layers,
             tensor_storage,
-        }
-    }
-}
-
-impl Default for Exl3Config {
-    fn default() -> Self {
-        Self {
-            bits_per_weight: 4,
-            mcg_default: false,
-            mul1_default: false,
-            ignored_layers: Vec::new(),
-            tensor_storage: HashMap::new(),
         }
     }
 }
@@ -315,19 +308,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn config_parses_minimum_fields() {
+    fn config_ignores_declared_bits() {
+        // `bits` / `bits_per_weight` in the JSON are explicitly NOT
+        // read — per-tensor bpw is derived in the loader. This test
+        // pins that contract: future changes that bring the field
+        // back will fail it.
         let mut raw = HashMap::new();
         raw.insert("bits_per_weight".to_string(), json!(3));
+        raw.insert("bits".to_string(), json!(2.0));
         let cfg = Exl3Config::from_detected(&raw);
-        assert_eq!(cfg.bits_per_weight, 3);
         assert!(!cfg.mcg_default);
         assert!(!cfg.mul1_default);
+        // No bits_per_weight field on `Exl3Config` — compiles as proof.
     }
 
     #[test]
     fn config_picks_up_codebook_flags() {
         let mut raw = HashMap::new();
-        raw.insert("bits_per_weight".to_string(), json!(4));
         raw.insert(
             "mcg_multiplier".to_string(),
             json!(EXL3_MCG_MULTIPLIER as u64),

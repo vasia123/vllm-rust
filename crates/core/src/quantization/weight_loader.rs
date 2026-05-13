@@ -457,26 +457,54 @@ impl QuantizedWeightLoader for Exl3WeightLoader {
     ) -> Result<Box<dyn QuantizedLinear>> {
         let vb = self.vb.pp(prefix);
 
-        // `trellis` shape is `(k/16, n/16, 16*K)` with k = in_features,
-        // n = out_features, K = bpw. We don't know the exact bpw for this
-        // layer until we read the tensor's last dim — `bits_per_weight`
-        // in the config is the dominant value, not authoritative per-layer.
-        // The on-disk dtype is int16; candle 0.10.2 has native I16 which
-        // preserves byte layout (each i16 is 2 bytes on GPU as well), so
-        // we can pass the slice directly to the kernel which interprets
-        // it as `uint16_t*` — the bit pattern is identical.
+        // `trellis` shape is `(k/16, n/16, 16*bpw)` with k = in_features,
+        // n = out_features. Per-tensor bpw is read straight from the
+        // tensor's last dim — ExLlamaV3 ships mixed-precision checkpoints
+        // (head_bits trick: lm_head at higher bpw than body), and any
+        // body-wide `bits` in `quantization_config.json` is metadata
+        // only. The on-disk dtype is int16; candle 0.10.2 has native
+        // I16 which preserves byte layout (each i16 is 2 bytes on GPU
+        // as well), so we can pass the slice directly to the kernel
+        // which interprets it as `uint16_t*` — the bit pattern is
+        // identical.
         let k_blocks = in_features / 16;
         let n_blocks = out_features / 16;
-        let last_dim = 16 * self.config.bits_per_weight as usize;
-        let trellis = vb.get_with_hints_dtype(
-            (k_blocks, n_blocks, last_dim),
-            "trellis",
-            Init::Const(0.0),
-            DType::I16,
-        )?;
-        // Bits-per-weight from the actual tensor shape, in case the config
-        // value disagrees.
-        let bits_per_weight = (trellis.dims()[2] / 16) as u32;
+        let trellis = vb.get_unchecked_dtype("trellis", DType::I16).map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "exl3 loader: failed to load `{prefix}.trellis`: {e}"
+            ))
+        })?;
+        let dims = trellis.dims();
+        if dims.len() != 3 {
+            candle_core::bail!(
+                "exl3 loader: `{prefix}.trellis` rank must be 3, got dims {:?}",
+                dims
+            );
+        }
+        if dims[0] != k_blocks || dims[1] != n_blocks {
+            candle_core::bail!(
+                "exl3 loader: `{prefix}.trellis` shape {:?} doesn't match \
+                 (in_features/16, out_features/16, *) = ({}, {}, *)",
+                dims,
+                k_blocks,
+                n_blocks
+            );
+        }
+        if dims[2] == 0 || dims[2] % 16 != 0 {
+            candle_core::bail!(
+                "exl3 loader: `{prefix}.trellis` last dim {} not a positive \
+                 multiple of 16 (expected 16 * bpw)",
+                dims[2]
+            );
+        }
+        let bits_per_weight = (dims[2] / 16) as u32;
+        if !(2..=8).contains(&bits_per_weight) {
+            candle_core::bail!(
+                "exl3 loader: `{prefix}.trellis` derived bpw {} outside \
+                 supported range 2..=8",
+                bits_per_weight
+            );
+        }
 
         let suh = vb.get_with_hints_dtype(in_features, "suh", Init::Const(0.0), DType::F16)?;
         let svh = vb.get_with_hints_dtype(out_features, "svh", Init::Const(0.0), DType::F16)?;
@@ -1938,5 +1966,107 @@ mod tests {
         // in_features = 10 is not divisible by 32
         let result = loader.load_linear("layer", 10, 4, false);
         assert!(result.is_err());
+    }
+
+    // ─── EXL3 per-tensor bpw inference ───────────────────────────────
+    //
+    // Pin the contract that `Exl3WeightLoader::load_linear` accepts any
+    // bpw ∈ 2..=8 on the trellis last dim, rejects malformed shapes
+    // with diagnostic error messages, and does NOT consult any
+    // bpw-like field from the config. This is the regression guard
+    // for ExLlamaV3 mixed-precision (head_bits) checkpoints like
+    // `turboderp/Qwen2.5-14B-Instruct-exl3 @ 2.0bpw`.
+
+    fn build_exl3_vb(trellis_shape: (usize, usize, usize)) -> VarBuilder<'static> {
+        // Build an in-memory VarBuilder under prefix `layer.` with a
+        // trellis tensor at the requested shape, plus the suh/svh
+        // accompaniments load_linear expects.
+        let dev = Device::Cpu;
+        let trellis = Tensor::zeros(trellis_shape, DType::I16, &dev).expect("trellis zeros");
+        // suh/svh shapes are in_features / out_features = 16 * blocks.
+        let suh = Tensor::zeros(16 * trellis_shape.0, DType::F16, &dev).unwrap();
+        let svh = Tensor::zeros(16 * trellis_shape.1, DType::F16, &dev).unwrap();
+        let mut tensors: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+        tensors.insert("layer.trellis".to_string(), trellis);
+        tensors.insert("layer.suh".to_string(), suh);
+        tensors.insert("layer.svh".to_string(), svh);
+        VarBuilder::from_tensors(tensors, DType::F16, &dev)
+    }
+
+    #[test]
+    fn exl3_loader_accepts_body_bpw_2() {
+        let vb = build_exl3_vb((1, 1, 32)); // 16 * 2 = 32 → bpw=2
+        let loader = Exl3WeightLoader::new(vb, Exl3Config::default());
+        let res = loader.load_linear("layer", 16, 16, false);
+        assert!(
+            res.is_ok(),
+            "load_linear must accept bpw=2 trellis (last dim 32), got error: {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn exl3_loader_accepts_head_bits_bpw_6() {
+        // Mixed-precision case: `lm_head` shipped at 6bpw while body is
+        // 2bpw. Loader must derive bpw from the trellis tensor's last
+        // dim regardless of any config-side declared value.
+        let vb = build_exl3_vb((1, 1, 96)); // 16 * 6 = 96 → bpw=6
+        let loader = Exl3WeightLoader::new(vb, Exl3Config::default());
+        let res = loader.load_linear("layer", 16, 16, false);
+        assert!(
+            res.is_ok(),
+            "load_linear must accept bpw=6 trellis (last dim 96) — \
+             head_bits regression guard. Error: {:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn exl3_loader_rejects_first_dim_mismatch() {
+        // trellis says k_blocks=2 but caller requested in_features=16
+        // (i.e. k_blocks=1). Loader must catch this.
+        let vb = build_exl3_vb((2, 1, 64));
+        let loader = Exl3WeightLoader::new(vb, Exl3Config::default());
+        let err = loader
+            .load_linear("layer", 16, 16, false)
+            .err()
+            .expect("first-dim mismatch must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("trellis") && msg.contains("doesn't match"),
+            "expected shape-mismatch diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn exl3_loader_rejects_last_dim_not_multiple_of_16() {
+        let vb = build_exl3_vb((1, 1, 40)); // 40 % 16 != 0
+        let loader = Exl3WeightLoader::new(vb, Exl3Config::default());
+        let err = loader
+            .load_linear("layer", 16, 16, false)
+            .err()
+            .expect("non-multiple last dim must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("multiple of 16"),
+            "expected 'multiple of 16' diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn exl3_loader_rejects_bpw_outside_supported_range() {
+        // last_dim = 16 → bpw=1 (below supported 2..=8)
+        let vb = build_exl3_vb((1, 1, 16));
+        let loader = Exl3WeightLoader::new(vb, Exl3Config::default());
+        let err = loader
+            .load_linear("layer", 16, 16, false)
+            .err()
+            .expect("bpw=1 must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("supported range 2..=8"),
+            "expected supported-range diagnostic, got: {msg}"
+        );
     }
 }
