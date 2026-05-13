@@ -454,9 +454,8 @@ pub fn exl3_gemv(a: &Tensor, trellis: &Tensor, bpw: u32, codebook: Exl3Codebook)
         );
     }
     let device = a.device();
-    let output = crate::engine::output_pool::OutputPool::global()
-        .reserve_pooled(&[m, n], DType::F16, device)?
-        .into_tensor();
+    let output =
+        crate::engine::output_pool::OutputPool::global().reserve(&[m, n], DType::F16, device)?;
     let op = Exl3GemvInplaceOp {
         trellis: trellis.clone(),
         m,
@@ -1070,9 +1069,11 @@ pub fn had_r_128_fp16(input: &Tensor, scale: Option<&Tensor>, mode: HadScale) ->
     }
 
     let device = input.device();
-    let output = crate::engine::output_pool::OutputPool::global()
-        .reserve_pooled(&[rows, cols], DType::F16, device)?
-        .into_tensor();
+    let output = crate::engine::output_pool::OutputPool::global().reserve(
+        &[rows, cols],
+        DType::F16,
+        device,
+    )?;
     let op = HadR128Fp16InplaceOp {
         scale: scale.cloned(),
         mode,

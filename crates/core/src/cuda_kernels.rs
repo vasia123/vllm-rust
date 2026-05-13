@@ -1111,30 +1111,25 @@ pub fn paged_attention_v2_cuda_pooled(
     // → fixed addresses across forwards regardless of actual seq_len.
     let dtype = q.dtype();
     let device = q.device();
-    let output = OutputPool::global()
-        .reserve_pooled(&[num_seqs, num_heads, head_dim], dtype, device)?
-        .into_tensor();
-    let tmp_out = OutputPool::global()
-        .reserve_pooled(
-            &[num_seqs, num_heads, max_num_partitions, head_dim],
-            candle_core::DType::F32,
-            device,
-        )?
-        .into_tensor();
-    let exp_sums = OutputPool::global()
-        .reserve_pooled(
-            &[num_seqs, num_heads, max_num_partitions],
-            candle_core::DType::F32,
-            device,
-        )?
-        .into_tensor();
-    let max_logits = OutputPool::global()
-        .reserve_pooled(
-            &[num_seqs, num_heads, max_num_partitions],
-            candle_core::DType::F32,
-            device,
-        )?
-        .into_tensor();
+    // PERF NOTE: see exl3_gemm/marlin_gemm — Result<PooledTensor> ABI
+    // regression. paged_attention V2 reserve sites kept on legacy
+    // `reserve()` for the same reason.
+    let output = OutputPool::global().reserve(&[num_seqs, num_heads, head_dim], dtype, device)?;
+    let tmp_out = OutputPool::global().reserve(
+        &[num_seqs, num_heads, max_num_partitions, head_dim],
+        candle_core::DType::F32,
+        device,
+    )?;
+    let exp_sums = OutputPool::global().reserve(
+        &[num_seqs, num_heads, max_num_partitions],
+        candle_core::DType::F32,
+        device,
+    )?;
+    let max_logits = OutputPool::global().reserve(
+        &[num_seqs, num_heads, max_num_partitions],
+        candle_core::DType::F32,
+        device,
+    )?;
 
     // Phase CR.1: zero the scratch buffers via captured memset nodes so
     // captured graph replays start every paged-attn invocation from a
@@ -2160,9 +2155,7 @@ pub fn silu_and_mul_separate_pooled(gate: &Tensor, up: &Tensor) -> Result<Tensor
 
     let shape: Vec<usize> = dims.to_vec();
     let dtype = gate.dtype();
-    let output = OutputPool::global()
-        .reserve_pooled(&shape, dtype, gate.device())?
-        .into_tensor();
+    let output = OutputPool::global().reserve(&shape, dtype, gate.device())?;
     let op = SiluAndMulSeparateInplaceOp { up: &up };
     output.inplace_op2(&gate, &op)?;
     Ok(output)
@@ -2414,9 +2407,7 @@ pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
 
     let shape: Vec<usize> = dims.to_vec();
-    let output = OutputPool::global()
-        .reserve_pooled(&shape, a_dt, a.device())?
-        .into_tensor();
+    let output = OutputPool::global().reserve(&shape, a_dt, a.device())?;
     let op = Bf16AddInplaceOp { b: &b_c };
     output.inplace_op2(&a, &op)?;
     Ok(output)
@@ -2583,9 +2574,7 @@ pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
 
     let mut out_shape: Vec<usize> = in_dims[..in_dims.len() - 1].to_vec();
     out_shape.push(n);
-    let output = OutputPool::global()
-        .reserve_pooled(&out_shape, in_dt, input.device())?
-        .into_tensor();
+    let output = OutputPool::global().reserve(&out_shape, in_dt, input.device())?;
 
     let input_2d = input.reshape((m, k))?;
     let output_2d = output.reshape((m, n))?;
@@ -2652,9 +2641,7 @@ pub fn embedding_pooled(input_ids: &Tensor, weight: &Tensor) -> Result<Tensor> {
     out_shape.push(hidden_size);
 
     let input_ids = input_ids.contiguous()?;
-    let output = OutputPool::global()
-        .reserve_pooled(&out_shape, weight.dtype(), input_ids.device())?
-        .into_tensor();
+    let output = OutputPool::global().reserve(&out_shape, weight.dtype(), input_ids.device())?;
     let op = EmbeddingLookupInplaceOp {
         weight,
         hidden_size,
@@ -3027,9 +3014,7 @@ pub fn rms_norm_cuda_pooled(input: &Tensor, weight: &Tensor, epsilon: f32) -> Re
     let shape: Vec<usize> = dims.to_vec();
     let dtype = input.dtype();
 
-    let output = OutputPool::global()
-        .reserve_pooled(&shape, dtype, input.device())?
-        .into_tensor();
+    let output = OutputPool::global().reserve(&shape, dtype, input.device())?;
     let op = RmsNormInplaceOp { weight, epsilon };
     output.inplace_op2(&input, &op)?;
     Ok(output)
@@ -3537,9 +3522,7 @@ pub fn rotary_embedding_cuda_pooled(
     let dtype = q_flat.dtype();
     let device = q_flat.device();
 
-    let q_out = OutputPool::global()
-        .reserve_pooled(&q_shape, dtype, device)?
-        .into_tensor();
+    let q_out = OutputPool::global().reserve(&q_shape, dtype, device)?;
     let q_op = RopeInplaceOp {
         positions,
         cos_sin_cache,
@@ -3550,9 +3533,7 @@ pub fn rotary_embedding_cuda_pooled(
     };
     q_out.inplace_op2(&q_flat, &q_op)?;
 
-    let k_out = OutputPool::global()
-        .reserve_pooled(&k_shape, dtype, device)?
-        .into_tensor();
+    let k_out = OutputPool::global().reserve(&k_shape, dtype, device)?;
     let k_op = RopeInplaceOp {
         positions,
         cos_sin_cache,

@@ -383,18 +383,33 @@ impl OutputPool {
     /// would not be retained by the pool and could be freed before a
     /// captured graph replays).
     ///
-    /// This is the **only** generic entry point for getting a tensor
-    /// out of the pool. For decode-batch metadata buffers
-    /// (positions / slot_mapping / block_tables / seq_lens) use the
-    /// tagged [`Self::reserve_positions`] / [`Self::reserve_slot_mapping`]
-    /// / [`Self::reserve_block_tables`] / [`Self::reserve_seq_lens`]
-    /// methods, which give each kind its own cursor namespace.
+    /// **PERF NOTE**: every production hot-path migration of
+    /// `.reserve(...)?` → `.reserve_pooled(...)?.into_tensor()` measured
+    /// in this codebase (EXL3 GEMM, Marlin GEMM, paged_attention V2,
+    /// per-layer RoPE / RMSNorm / SiLU / matmul wrappers) showed a
+    /// diffuse throughput regression at moderate-to-high concurrency
+    /// (e.g. ~26% drop at c=8 on Qwen3-4B-AWQ, ~47% drop at c=16 on
+    /// Llama-3.2-1B-EXL3). The two paths are semantically identical at
+    /// the Rust level; the regression is at the
+    /// `Result<PooledTensor>` ABI boundary. Inlining (`#[inline]`,
+    /// `#[inline(always)]`), `#[repr(transparent)]` on `PooledTensor`,
+    /// and direct-body variants did not eliminate it. Suspected
+    /// LLVM-level interaction between PooledTensor's drop-handling
+    /// unwind tables and register allocation in heavy launch
+    /// closures. See memory note
+    /// `pool_reserve_pooled_abi_regression` for the same-session
+    /// bench data.
     ///
-    /// Wrappers that need a bare `Tensor` (because they hand it to
-    /// candle infrastructure expecting `&Tensor`) should call
-    /// `.into_tensor()` immediately at the pool boundary — that drops
-    /// the type invariant locally and signals the boundary visibly in
-    /// code review.
+    /// **In practice**: prefer [`Self::reserve`] (returns `Result<Tensor>`)
+    /// for hot pool sites until the regression is root-caused upstream.
+    /// `reserve_pooled` is currently used by:
+    /// - the four tagged variants
+    ///   ([`Self::reserve_positions`] / [`Self::reserve_slot_mapping`]
+    ///   / [`Self::reserve_block_tables`] / [`Self::reserve_seq_lens`])
+    ///   which return `Result<TaggedSlot<_>>` rather than
+    ///   `Result<PooledTensor>` at the call site;
+    /// - [`PooledTensor::contiguous`] internal materialisation;
+    /// - tests.
     #[inline]
     pub fn reserve_pooled(
         &self,
@@ -405,26 +420,40 @@ impl OutputPool {
         self.reserve_kind(SlotKind::Generic, shape, dtype, device)
     }
 
-    /// Legacy bare-`Tensor` reserve. Retained for the EXL3 cooperative
-    /// GEMM hot path (`quantization::exl3_cuda::exl3_gemm`) which shows
-    /// a 25-50% c=16 throughput regression when migrated to the
-    /// `reserve_pooled(...).into_tensor()` form, despite the two paths
-    /// being semantically identical at the Rust level. Root cause not
-    /// yet diagnosed; suspected LLVM-level codegen difference around
-    /// the `unsafe { PooledTensor::from_pool_unchecked }` wrap-unwrap
-    /// pair inside the EXL3 GEMM kernel-launch closure. Every other
-    /// hot-path reserve site has been migrated to `reserve_pooled`.
+    /// Bare-`Tensor` reserve, used by every production hot pool site.
+    /// Returns `Result<Tensor>` directly without going through the
+    /// `PooledTensor` newtype wrapper.
     ///
-    /// **Do not add new callers.** If you find yourself needing this
-    /// API, first try `reserve_pooled(...).into_tensor()` — if your
-    /// site doesn't show a perf regression, use that. Document any
-    /// new callers here.
+    /// **Why this exists despite `reserve_pooled`**: same-session benches
+    /// on Llama-3.2-1B-EXL3 (c=16) and Qwen3-4B-AWQ (c=8) showed a
+    /// diffuse 25-50% throughput regression when production reserve
+    /// sites were migrated to `reserve_pooled(...).into_tensor()`. The
+    /// two paths are semantically identical at the Rust level — the
+    /// only ABI difference is `Result<PooledTensor>` vs
+    /// `Result<Tensor>` at the function-return boundary. Inlining
+    /// (`#[inline]`, `#[inline(always)]`), `#[repr(transparent)]` on
+    /// `PooledTensor`, direct-body single-function variants, and
+    /// `.map(|p| p.into_tensor())?` orderings all failed to eliminate
+    /// the regression. Suspected LLVM-level interaction between the
+    /// `PooledTensor` wrapper's drop-handling unwind tables and register
+    /// allocation in heavy launch closures (cooperative GEMM, V2
+    /// paged-attention reduce). See memory note
+    /// `pool_reserve_pooled_abi_regression` for the full diagnostic
+    /// trail.
+    ///
+    /// **Storage stability**: the returned tensor IS pool-backed (its
+    /// device storage outlives any captured CUDA Graph that records
+    /// its pointer), it just doesn't carry the type-level
+    /// `PooledTensor` marker. Slot-drift safety still comes from the
+    /// `reset_cursors` + deterministic-order discipline at each
+    /// forward; the `PooledTensor` type was meant to guard against
+    /// fresh-alloc accidents (different problem, addressed by
+    /// `reserve_pooled` where it's affordable).
     ///
     /// On cap exceeded this method falls through to a fresh non-pool
-    /// allocation rather than erroring; the resulting tensor does not
-    /// have the `PooledTensor` storage-stability invariant, so it must
-    /// not be fed into a captured CUDA graph that records its device
-    /// pointer.
+    /// allocation rather than erroring; the resulting tensor in that
+    /// fall-through case is NOT pool-backed and must not be fed into
+    /// a captured graph that records its device pointer.
     pub fn reserve(&self, shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
         let key = (SlotKind::Generic, dtype, shape.to_vec());
         let mut inner = self.inner.lock().expect("OutputPool: mutex poisoned");

@@ -1711,9 +1711,12 @@ pub fn marlin_gemm_pooled(
     // the engine loop, growing the pool only when the same shape is
     // requested twice in one forward (q/k/v of identical N, gate/up,
     // etc.).
-    let output_2d = OutputPool::global()
-        .reserve_pooled(&[m, size_n], DType::BF16, input.device())?
-        .into_tensor();
+    // PERF NOTE: see crates/core/src/quantization/exl3_cuda.rs::exl3_gemm
+    // for the analogous regression discussion. Marlin cooperative GEMM
+    // shows the same `Result<PooledTensor>` ABI-boundary regression
+    // (~26% c=8 throughput drop on Qwen3-4B-AWQ). Keep on legacy
+    // `reserve()` returning `Result<Tensor>`.
+    let output_2d = OutputPool::global().reserve(&[m, size_n], DType::BF16, input.device())?;
 
     let op = MarlinGemmInplaceOp {
         qweight,

@@ -296,9 +296,7 @@ impl FlashInferBackend {
         let num_seqs = q_dims.first().copied().unwrap_or(0);
 
         let output = if num_seqs <= POOL_MAX_NUM_SEQS {
-            let out = OutputPool::global()
-                .reserve_pooled(&q_dims, q.dtype(), device)?
-                .into_tensor();
+            let out = OutputPool::global().reserve(&q_dims, q.dtype(), device)?;
             wrapper.run_with_plan_into(
                 q,
                 cache_engine.k_cache(),
