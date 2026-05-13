@@ -252,12 +252,13 @@ impl CacheEngine {
                 &device,
             )?;
             let dst = crate::engine::output_pool::OutputPool::global()
-                .reserve(&[new_tokens], candle_core::DType::U32, &device)
+                .reserve_pooled(&[new_tokens], candle_core::DType::U32, &device)
                 .map_err(|e| {
                     CacheError::Candle(candle_core::Error::Msg(format!(
                         "scatter_into_cache_cuda: pool reserve failed: {e}"
                     )))
-                })?;
+                })?
+                .into_tensor();
             crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&dst, &src).map_err(|e| {
                 CacheError::Candle(candle_core::Error::Msg(format!(
                     "scatter_into_cache_cuda: slot copy: {e}"

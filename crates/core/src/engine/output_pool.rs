@@ -14,15 +14,27 @@
 //!    decode forward in [`crate::engine::helpers::execute_batched_decode_with_graph`].
 //!    This rewinds all per-shape round-robin cursors back to zero.
 //! 2. Each kernel-launch site that wants a pre-allocated output requests
-//!    one via [`OutputPool::reserve`].  The first call for a given
-//!    `(shape, dtype)` allocates a fresh tensor; subsequent calls within
-//!    the same forward step return *distinct* pre-allocated tensors at
-//!    increasing pool indices, and grow the pool on demand if the pool
-//!    runs out of pre-allocated buffers.
+//!    one via one of two entry points:
+//!
+//!      - [`OutputPool::reserve_pooled`] — generic, returns a
+//!        [`PooledTensor`] for any `(shape, dtype)`.
+//!      - One of the four tagged reserves
+//!        ([`OutputPool::reserve_positions`], [`OutputPool::reserve_slot_mapping`],
+//!        [`OutputPool::reserve_block_tables`], [`OutputPool::reserve_seq_lens`])
+//!        for decode-batch metadata buffers. Each tag has its own
+//!        [`SlotKind`] bucket and cursor namespace, so unrelated tagged
+//!        reserves and the generic pool cannot drift into shared slots.
+//!
+//!    The first call for a given key allocates a fresh tensor;
+//!    subsequent calls within the same forward step return *distinct*
+//!    pre-allocated tensors at increasing pool indices, and grow the
+//!    pool on demand if the pool runs out of pre-allocated buffers.
 //! 3. The returned tensor shares storage (Arc-cloned) with the pooled
 //!    tensor — kernels write into that storage; the caller hands the
 //!    tensor down the layer chain; the storage stays alive for the life
-//!    of the pool.
+//!    of the pool. Wrappers that need a bare `Tensor` should call
+//!    `.into_tensor()` at the pool boundary so the type-erasure is
+//!    locally visible in code review.
 //!
 //! Because forwards are executed serially inside the engine task, a
 //! single global pool is safe.  A `Mutex` guards the inner map; the
@@ -166,6 +178,7 @@ impl<Tag> TaggedSlot<Tag> {
 /// the underlying Arc-shared `Tensor` — the storage is still pool-backed,
 /// the caller just loses the type-level guarantee.
 #[derive(Clone, Debug)]
+#[repr(transparent)]
 pub struct PooledTensor {
     inner: Tensor,
 }
@@ -184,6 +197,7 @@ impl PooledTensor {
     /// - wrapping the [`CudaGraphRunner`](super::cuda_graph_runner::CudaGraphRunner)'s
     ///   persistent `input_ids` / `output` buffers, which it owns for the
     ///   life of every captured graph that references them.
+    #[inline(always)]
     pub(crate) unsafe fn from_pool_unchecked(t: Tensor) -> Self {
         Self { inner: t }
     }
@@ -191,6 +205,7 @@ impl PooledTensor {
     /// Read-only access to the underlying tensor. Use this when passing
     /// the pooled tensor to candle ops, weight matmuls, or anywhere a
     /// generic `&Tensor` is required.
+    #[inline]
     pub fn as_tensor(&self) -> &Tensor {
         &self.inner
     }
@@ -199,6 +214,7 @@ impl PooledTensor {
     /// pool-backed storage; the caller has just dropped the compile-time
     /// invariant. Prefer `as_tensor()` unless an owning `Tensor` is
     /// genuinely required (e.g., for `Clone` into a struct field).
+    #[inline(always)]
     pub fn into_tensor(self) -> Tensor {
         self.inner
     }
@@ -355,67 +371,31 @@ impl OutputPool {
         }
     }
 
-    /// Hand out a pre-allocated tensor of `(shape, dtype)`, growing the
-    /// pool on demand.  The returned tensor shares storage with the
-    /// pool's owning copy; consumers may write through it freely and
-    /// pass it down the layer chain.  When all callers drop their
-    /// clones, the storage stays alive in the pool's slot.
-    pub fn reserve(&self, shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
-        let key = (SlotKind::Generic, dtype, shape.to_vec());
-        let mut inner = self.inner.lock().expect("OutputPool: mutex poisoned");
-        let entry = inner.entry(key).or_insert_with(|| PoolEntry {
-            buffers: Vec::new(),
-            cursor: 0,
-        });
-
-        // Bound per-shape growth.  In a single decode forward, the same
-        // shape is requested at most ~108× (q/k/v/o + gate/up/down across
-        // 36 layers, with q/o/down sharing one N).  A conservative cap
-        // of 512 absorbs any reasonable forward, but prevents unbounded
-        // accumulation when a caller forgets to invoke `reset_cursors`
-        // (e.g. prefill historically did not, leaking ~250 entries per
-        // request — see commit log for the post-Stage-12 OOM regression).
-        // When the cap is hit we fall back to a one-shot allocation; the
-        // caller still gets a usable tensor, the pool just doesn't grow.
-        const MAX_PER_SHAPE: usize = 512;
-
-        if entry.cursor >= entry.buffers.len() {
-            if entry.buffers.len() >= MAX_PER_SHAPE {
-                // Fall through: allocate without retaining in the pool.
-                // The cursor is still incremented so subsequent `reserve`s
-                // in this forward see consistent growth semantics.
-                drop(inner);
-                let fresh = Tensor::zeros(shape, dtype, device)?;
-                return Ok(fresh);
-            }
-            // Grow the pool. `Tensor::zeros` is the only candle entry
-            // point that materialises a fresh CudaSlice without
-            // intermediate copies.  This pays a one-shot cuMemAlloc per
-            // newly-needed slot; subsequent forwards reuse the slot and
-            // skip the syscall entirely.
-            let fresh = Tensor::zeros(shape, dtype, device)?;
-            entry.buffers.push(fresh);
-        }
-
-        let slot_idx = entry.cursor;
-        let tensor = entry.buffers[entry.cursor].clone();
-        entry.cursor += 1;
-        super::cr_trace::log_reserve(dtype, shape, slot_idx, 0);
-        Ok(tensor)
-    }
-
-    /// Type-safe sibling of [`Self::reserve`]. Returns a [`PooledTensor`]
-    /// whose underlying storage is owned by this pool. Prefer this in
-    /// new code — captured-eligible kernel wrappers should take
-    /// `&PooledTensor` so the compiler can reject fresh-allocation
-    /// regressions.
+    /// Hand out a pool-backed tensor of `(shape, dtype)`, growing the
+    /// pool on demand. Returns a [`PooledTensor`] whose underlying
+    /// storage is owned by this pool — the `'static` lifetime of
+    /// `OutputPool::global()` makes the storage address stable for any
+    /// captured CUDA Graph that records a kernel reading from it.
     ///
-    /// Unlike [`Self::reserve`], this method **errors** when the
-    /// per-shape pool cap (`MAX_PER_SHAPE = 512`) is exceeded, because
-    /// falling through to a fresh non-pool allocation would silently
-    /// violate the `PooledTensor` invariant (the resulting tensor's
-    /// storage would not be retained by the pool and could be freed
-    /// before a captured graph replays).
+    /// Errors when the per-shape pool cap (`MAX_PER_SHAPE = 512`) is
+    /// exceeded; falling through to a fresh non-pool allocation would
+    /// silently violate the [`PooledTensor`] invariant (its storage
+    /// would not be retained by the pool and could be freed before a
+    /// captured graph replays).
+    ///
+    /// This is the **only** generic entry point for getting a tensor
+    /// out of the pool. For decode-batch metadata buffers
+    /// (positions / slot_mapping / block_tables / seq_lens) use the
+    /// tagged [`Self::reserve_positions`] / [`Self::reserve_slot_mapping`]
+    /// / [`Self::reserve_block_tables`] / [`Self::reserve_seq_lens`]
+    /// methods, which give each kind its own cursor namespace.
+    ///
+    /// Wrappers that need a bare `Tensor` (because they hand it to
+    /// candle infrastructure expecting `&Tensor`) should call
+    /// `.into_tensor()` immediately at the pool boundary — that drops
+    /// the type invariant locally and signals the boundary visibly in
+    /// code review.
+    #[inline]
     pub fn reserve_pooled(
         &self,
         shape: &[usize],
@@ -425,10 +405,55 @@ impl OutputPool {
         self.reserve_kind(SlotKind::Generic, shape, dtype, device)
     }
 
+    /// Legacy bare-`Tensor` reserve. Retained for the EXL3 cooperative
+    /// GEMM hot path (`quantization::exl3_cuda::exl3_gemm`) which shows
+    /// a 25-50% c=16 throughput regression when migrated to the
+    /// `reserve_pooled(...).into_tensor()` form, despite the two paths
+    /// being semantically identical at the Rust level. Root cause not
+    /// yet diagnosed; suspected LLVM-level codegen difference around
+    /// the `unsafe { PooledTensor::from_pool_unchecked }` wrap-unwrap
+    /// pair inside the EXL3 GEMM kernel-launch closure. Every other
+    /// hot-path reserve site has been migrated to `reserve_pooled`.
+    ///
+    /// **Do not add new callers.** If you find yourself needing this
+    /// API, first try `reserve_pooled(...).into_tensor()` — if your
+    /// site doesn't show a perf regression, use that. Document any
+    /// new callers here.
+    ///
+    /// On cap exceeded this method falls through to a fresh non-pool
+    /// allocation rather than erroring; the resulting tensor does not
+    /// have the `PooledTensor` storage-stability invariant, so it must
+    /// not be fed into a captured CUDA graph that records its device
+    /// pointer.
+    pub fn reserve(&self, shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
+        let key = (SlotKind::Generic, dtype, shape.to_vec());
+        let mut inner = self.inner.lock().expect("OutputPool: mutex poisoned");
+        let entry = inner.entry(key).or_insert_with(|| PoolEntry {
+            buffers: Vec::new(),
+            cursor: 0,
+        });
+        const MAX_PER_SHAPE: usize = 512;
+        if entry.cursor >= entry.buffers.len() {
+            if entry.buffers.len() >= MAX_PER_SHAPE {
+                drop(inner);
+                let fresh = Tensor::zeros(shape, dtype, device)?;
+                return Ok(fresh);
+            }
+            let fresh = Tensor::zeros(shape, dtype, device)?;
+            entry.buffers.push(fresh);
+        }
+        let slot_idx = entry.cursor;
+        let tensor = entry.buffers[entry.cursor].clone();
+        entry.cursor += 1;
+        super::cr_trace::log_reserve(dtype, shape, slot_idx, 0);
+        Ok(tensor)
+    }
+
     /// Internal: shared back-end for `reserve_pooled` and the four
     /// tagged reserves. Each `SlotKind` has its own cursor/bucket
     /// namespace, so tagged kinds cannot collide with the generic
     /// pool entries.
+    #[inline]
     fn reserve_kind(
         &self,
         kind: SlotKind,
@@ -624,8 +649,8 @@ mod tests {
         let dev = Device::Cpu;
         // Two reserves of the same shape inside a single (un-reset)
         // window should allocate two distinct tensors.
-        let a = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
-        let b = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
+        let a = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
+        let b = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
         // Different storage = different ptrs. We approximate this by
         // checking that `Tensor` identities (`as_ptr()` of the storage
         // arc) differ. Cheap proxy: write one, read the other.
@@ -640,15 +665,15 @@ mod tests {
     fn reset_cursors_replays_existing_buffers() {
         let pool = OutputPool::default();
         let dev = Device::Cpu;
-        let _ = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
-        let _ = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
         assert_eq!(pool.total_slots(), 2);
 
         pool.reset_cursors();
 
         // Reserve again — cursor restarts, no new allocation.
-        let _ = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
-        let _ = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
         assert_eq!(pool.total_slots(), 2, "pool should not grow on replay");
     }
 
@@ -656,9 +681,9 @@ mod tests {
     fn distinct_shapes_keep_separate_slots() {
         let pool = OutputPool::default();
         let dev = Device::Cpu;
-        let _ = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
-        let _ = pool.reserve(&[8, 4], DType::F32, &dev).unwrap();
-        let _ = pool.reserve(&[4, 8], DType::F16, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[8, 4], DType::F32, &dev).unwrap();
+        let _ = pool.reserve_pooled(&[4, 8], DType::F16, &dev).unwrap();
         assert_eq!(pool.total_slots(), 3);
     }
 

@@ -1111,22 +1111,30 @@ pub fn paged_attention_v2_cuda_pooled(
     // → fixed addresses across forwards regardless of actual seq_len.
     let dtype = q.dtype();
     let device = q.device();
-    let output = OutputPool::global().reserve(&[num_seqs, num_heads, head_dim], dtype, device)?;
-    let tmp_out = OutputPool::global().reserve(
-        &[num_seqs, num_heads, max_num_partitions, head_dim],
-        candle_core::DType::F32,
-        device,
-    )?;
-    let exp_sums = OutputPool::global().reserve(
-        &[num_seqs, num_heads, max_num_partitions],
-        candle_core::DType::F32,
-        device,
-    )?;
-    let max_logits = OutputPool::global().reserve(
-        &[num_seqs, num_heads, max_num_partitions],
-        candle_core::DType::F32,
-        device,
-    )?;
+    let output = OutputPool::global()
+        .reserve_pooled(&[num_seqs, num_heads, head_dim], dtype, device)?
+        .into_tensor();
+    let tmp_out = OutputPool::global()
+        .reserve_pooled(
+            &[num_seqs, num_heads, max_num_partitions, head_dim],
+            candle_core::DType::F32,
+            device,
+        )?
+        .into_tensor();
+    let exp_sums = OutputPool::global()
+        .reserve_pooled(
+            &[num_seqs, num_heads, max_num_partitions],
+            candle_core::DType::F32,
+            device,
+        )?
+        .into_tensor();
+    let max_logits = OutputPool::global()
+        .reserve_pooled(
+            &[num_seqs, num_heads, max_num_partitions],
+            candle_core::DType::F32,
+            device,
+        )?
+        .into_tensor();
 
     // Phase CR.1: zero the scratch buffers via captured memset nodes so
     // captured graph replays start every paged-attn invocation from a
@@ -2152,7 +2160,9 @@ pub fn silu_and_mul_separate_pooled(gate: &Tensor, up: &Tensor) -> Result<Tensor
 
     let shape: Vec<usize> = dims.to_vec();
     let dtype = gate.dtype();
-    let output = OutputPool::global().reserve(&shape, dtype, gate.device())?;
+    let output = OutputPool::global()
+        .reserve_pooled(&shape, dtype, gate.device())?
+        .into_tensor();
     let op = SiluAndMulSeparateInplaceOp { up: &up };
     output.inplace_op2(&gate, &op)?;
     Ok(output)
@@ -2404,7 +2414,9 @@ pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
 
     let shape: Vec<usize> = dims.to_vec();
-    let output = OutputPool::global().reserve(&shape, a_dt, a.device())?;
+    let output = OutputPool::global()
+        .reserve_pooled(&shape, a_dt, a.device())?
+        .into_tensor();
     let op = Bf16AddInplaceOp { b: &b_c };
     output.inplace_op2(&a, &op)?;
     Ok(output)
@@ -2571,7 +2583,9 @@ pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
 
     let mut out_shape: Vec<usize> = in_dims[..in_dims.len() - 1].to_vec();
     out_shape.push(n);
-    let output = OutputPool::global().reserve(&out_shape, in_dt, input.device())?;
+    let output = OutputPool::global()
+        .reserve_pooled(&out_shape, in_dt, input.device())?
+        .into_tensor();
 
     let input_2d = input.reshape((m, k))?;
     let output_2d = output.reshape((m, n))?;
@@ -2638,7 +2652,9 @@ pub fn embedding_pooled(input_ids: &Tensor, weight: &Tensor) -> Result<Tensor> {
     out_shape.push(hidden_size);
 
     let input_ids = input_ids.contiguous()?;
-    let output = OutputPool::global().reserve(&out_shape, weight.dtype(), input_ids.device())?;
+    let output = OutputPool::global()
+        .reserve_pooled(&out_shape, weight.dtype(), input_ids.device())?
+        .into_tensor();
     let op = EmbeddingLookupInplaceOp {
         weight,
         hidden_size,
@@ -3011,7 +3027,9 @@ pub fn rms_norm_cuda_pooled(input: &Tensor, weight: &Tensor, epsilon: f32) -> Re
     let shape: Vec<usize> = dims.to_vec();
     let dtype = input.dtype();
 
-    let output = OutputPool::global().reserve(&shape, dtype, input.device())?;
+    let output = OutputPool::global()
+        .reserve_pooled(&shape, dtype, input.device())?
+        .into_tensor();
     let op = RmsNormInplaceOp { weight, epsilon };
     output.inplace_op2(&input, &op)?;
     Ok(output)
@@ -3519,7 +3537,9 @@ pub fn rotary_embedding_cuda_pooled(
     let dtype = q_flat.dtype();
     let device = q_flat.device();
 
-    let q_out = OutputPool::global().reserve(&q_shape, dtype, device)?;
+    let q_out = OutputPool::global()
+        .reserve_pooled(&q_shape, dtype, device)?
+        .into_tensor();
     let q_op = RopeInplaceOp {
         positions,
         cos_sin_cache,
@@ -3530,7 +3550,9 @@ pub fn rotary_embedding_cuda_pooled(
     };
     q_out.inplace_op2(&q_flat, &q_op)?;
 
-    let k_out = OutputPool::global().reserve(&k_shape, dtype, device)?;
+    let k_out = OutputPool::global()
+        .reserve_pooled(&k_shape, dtype, device)?
+        .into_tensor();
     let k_op = RopeInplaceOp {
         positions,
         cos_sin_cache,
@@ -5030,8 +5052,9 @@ mod tests {
         let positions_src =
             Tensor::from_vec(vec![5u32; num_tokens], (num_tokens,), &dev_t).expect("positions_src");
         let positions_dst = OutputPool::global()
-            .reserve(&[num_tokens], DType::U32, &dev_t)
-            .expect("positions_dst reserve");
+            .reserve_pooled(&[num_tokens], DType::U32, &dev_t)
+            .expect("positions_dst reserve")
+            .into_tensor();
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&positions_dst, &positions_src)
             .expect("positions memcpy");
 
@@ -5237,8 +5260,9 @@ mod tests {
         let positions_src =
             Tensor::from_vec(vec![5u32; num_tokens], (num_tokens,), &dev_t).unwrap();
         let positions_dst = OutputPool::global()
-            .reserve(&[num_tokens], DType::U32, &dev_t)
-            .unwrap();
+            .reserve_pooled(&[num_tokens], DType::U32, &dev_t)
+            .unwrap()
+            .into_tensor();
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&positions_dst, &positions_src)
             .unwrap();
 
@@ -5256,11 +5280,13 @@ mod tests {
         // then RoPE reads that slot. Both ops are captured in sequence.
         let exec_path = |label: &str| -> Vec<u16> {
             let q_pool = OutputPool::global()
-                .reserve(&[num_tokens, num_heads * head_dim], DType::F16, &dev_t)
-                .unwrap();
+                .reserve_pooled(&[num_tokens, num_heads * head_dim], DType::F16, &dev_t)
+                .unwrap()
+                .into_tensor();
             let k_pool = OutputPool::global()
-                .reserve(&[num_tokens, num_kv_heads * head_dim], DType::F16, &dev_t)
-                .unwrap();
+                .reserve_pooled(&[num_tokens, num_kv_heads * head_dim], DType::F16, &dev_t)
+                .unwrap()
+                .into_tensor();
             crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
             crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&k_pool, &k_src).unwrap();
             let (_q_out, k_out) = run_rope_pooled(
@@ -5312,11 +5338,13 @@ mod tests {
         // same slot addresses as the warmup pass; captured memcpys and
         // RoPE op are recorded into the graph.
         let q_pool = OutputPool::global()
-            .reserve(&[num_tokens, num_heads * head_dim], DType::F16, &dev_t)
-            .unwrap();
+            .reserve_pooled(&[num_tokens, num_heads * head_dim], DType::F16, &dev_t)
+            .unwrap()
+            .into_tensor();
         let k_pool = OutputPool::global()
-            .reserve(&[num_tokens, num_kv_heads * head_dim], DType::F16, &dev_t)
-            .unwrap();
+            .reserve_pooled(&[num_tokens, num_kv_heads * head_dim], DType::F16, &dev_t)
+            .unwrap()
+            .into_tensor();
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&k_pool, &k_src).unwrap();
         let (_q_cap, k_cap) = run_rope_pooled(
@@ -5470,8 +5498,9 @@ mod tests {
 
         let exec_path = || -> Vec<u16> {
             let q_pool = OutputPool::global()
-                .reserve(&[num_seqs, num_heads, head_dim], DType::F16, &dev_t)
-                .unwrap();
+                .reserve_pooled(&[num_seqs, num_heads, head_dim], DType::F16, &dev_t)
+                .unwrap()
+                .into_tensor();
             crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
             let out = paged_attention_v2_cuda_pooled(
                 &q_pool,
@@ -5522,8 +5551,9 @@ mod tests {
         assert_eq!(begin, CUresult::CUDA_SUCCESS);
 
         let q_pool = OutputPool::global()
-            .reserve(&[num_seqs, num_heads, head_dim], DType::F16, &dev_t)
-            .unwrap();
+            .reserve_pooled(&[num_seqs, num_heads, head_dim], DType::F16, &dev_t)
+            .unwrap()
+            .into_tensor();
         crate::engine::cuda_graph_runner::cuda_memcpy_inplace(&q_pool, &q_src).unwrap();
         let out_cap = paged_attention_v2_cuda_pooled(
             &q_pool,
@@ -5740,14 +5770,17 @@ mod tests {
             let dev = xs_n.device();
             let dt = xs_n.dtype();
             let qz = crate::engine::output_pool::OutputPool::global()
-                .reserve(&[m, 1, cfg.num_heads * cfg.head_dim], dt, dev)
-                .unwrap();
+                .reserve_pooled(&[m, 1, cfg.num_heads * cfg.head_dim], dt, dev)
+                .unwrap()
+                .into_tensor();
             let kz = crate::engine::output_pool::OutputPool::global()
-                .reserve(&[m, 1, cfg.num_kv_heads * cfg.head_dim], dt, dev)
-                .unwrap();
+                .reserve_pooled(&[m, 1, cfg.num_kv_heads * cfg.head_dim], dt, dev)
+                .unwrap()
+                .into_tensor();
             let vz = crate::engine::output_pool::OutputPool::global()
-                .reserve(&[m, 1, cfg.num_kv_heads * cfg.head_dim], dt, dev)
-                .unwrap();
+                .reserve_pooled(&[m, 1, cfg.num_kv_heads * cfg.head_dim], dt, dev)
+                .unwrap()
+                .into_tensor();
             (qz, kz, vz)
         };
 
@@ -5839,12 +5872,13 @@ mod tests {
             // Reserve a stable pool slot of the same shape so downstream
             // o_proj / residual still has a tensor of the expected layout.
             crate::engine::output_pool::OutputPool::global()
-                .reserve(
+                .reserve_pooled(
                     &[batch_size, cfg.num_heads * cfg.head_dim],
                     xs_n.dtype(),
                     xs_n.device(),
                 )
                 .unwrap()
+                .into_tensor()
         };
 
         // o_proj: attn shape [batch, num_heads*head_dim] → unsqueeze for [B,1,H*D]
@@ -5880,11 +5914,13 @@ mod tests {
             let dt = xs_n2.dtype();
             let dev = xs_n2.device();
             let g = crate::engine::output_pool::OutputPool::global()
-                .reserve(&[batch_size, 1, cfg.intermediate_size], dt, dev)
-                .unwrap();
+                .reserve_pooled(&[batch_size, 1, cfg.intermediate_size], dt, dev)
+                .unwrap()
+                .into_tensor();
             let u = crate::engine::output_pool::OutputPool::global()
-                .reserve(&[batch_size, 1, cfg.intermediate_size], dt, dev)
-                .unwrap();
+                .reserve_pooled(&[batch_size, 1, cfg.intermediate_size], dt, dev)
+                .unwrap()
+                .into_tensor();
             (g, u)
         };
         let activated = if bisect_keep('S') {
@@ -5900,8 +5936,9 @@ mod tests {
             let dt = residual2.dtype();
             let dev = residual2.device();
             crate::engine::output_pool::OutputPool::global()
-                .reserve(&[batch_size, 1, cfg.hidden_size], dt, dev)
+                .reserve_pooled(&[batch_size, 1, cfg.hidden_size], dt, dev)
                 .unwrap()
+                .into_tensor()
         };
 
         // residual add (post-MLP)

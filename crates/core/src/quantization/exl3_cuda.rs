@@ -345,6 +345,30 @@ pub fn exl3_gemm(
     // arg (immutable host ref, mutable device write — same pattern as
     // existing `silu_and_mul_separate_inplace`).
     let device = a.device();
+    // PERF NOTE: this hot loop uses the legacy `reserve` (returning
+    // `Result<Tensor>` directly) rather than `reserve_pooled` (returning
+    // `Result<PooledTensor>` then `.into_tensor()` at the call site).
+    // The two should be semantically identical, but the latter form
+    // produces a measurable ~50% c=16 throughput regression here
+    // (1685 → 600 tps on Llama-3.2-1B-EXL3, confirmed via same-session
+    // stash/unstash). Attempts that did NOT restore perf:
+    //   - `#[inline(always)]` on `reserve_pooled`, `reserve_kind`,
+    //     `from_pool_unchecked`, `into_tensor`.
+    //   - `#[repr(transparent)]` on `PooledTensor` so the wrapper has
+    //     identical layout to `Tensor`.
+    //   - bypassing the `reserve_kind` indirection via a direct-bodied
+    //     `reserve_pooled_direct` variant.
+    //   - `.map(|p| p.into_tensor())?` ordering vs `?.into_tensor()`.
+    // What DID restore perf: returning `Result<Tensor>` from the pool
+    // (either old `reserve` or a `reserve_via_pooled` that wraps then
+    // unwraps the `PooledTensor` inside one function body, so the
+    // function-return ABI is `Result<Tensor>`).
+    // Suspected root cause: even with `#[repr(transparent)]`, rustc's
+    // ABI treats `Result<PooledTensor>` as a distinct return type and
+    // emits drop-handling unwind paths around the call site that
+    // poison register allocation in the surrounding cooperative-GEMM
+    // launch closure. Inlining is partial — the unwind tables stay
+    // even when the body is inlined.
     let output =
         crate::engine::output_pool::OutputPool::global().reserve(&[m, n], DType::F16, device)?;
     let a_had =
@@ -430,8 +454,9 @@ pub fn exl3_gemv(a: &Tensor, trellis: &Tensor, bpw: u32, codebook: Exl3Codebook)
         );
     }
     let device = a.device();
-    let output =
-        crate::engine::output_pool::OutputPool::global().reserve(&[m, n], DType::F16, device)?;
+    let output = crate::engine::output_pool::OutputPool::global()
+        .reserve_pooled(&[m, n], DType::F16, device)?
+        .into_tensor();
     let op = Exl3GemvInplaceOp {
         trellis: trellis.clone(),
         m,
@@ -1045,11 +1070,9 @@ pub fn had_r_128_fp16(input: &Tensor, scale: Option<&Tensor>, mode: HadScale) ->
     }
 
     let device = input.device();
-    let output = crate::engine::output_pool::OutputPool::global().reserve(
-        &[rows, cols],
-        DType::F16,
-        device,
-    )?;
+    let output = crate::engine::output_pool::OutputPool::global()
+        .reserve_pooled(&[rows, cols], DType::F16, device)?
+        .into_tensor();
     let op = HadR128Fp16InplaceOp {
         scale: scale.cloned(),
         mode,
