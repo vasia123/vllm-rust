@@ -1,9 +1,11 @@
 #[cfg(feature = "cuda-fused-activations")]
 use candle_core::CustomOp2;
 use candle_core::{
-    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, InplaceOp2, Layout, Result, Shape,
-    Storage, Tensor,
+    cuda::CudaStorageSlice, CpuStorage, CudaStorage, CustomOp1, DType, InplaceOp2, Layout, Result,
+    Shape, Storage, Tensor,
 };
+
+use crate::kv_cache::quantization::KVCacheDtype;
 
 /// Clone a CudaStorageSlice by pattern-matching each variant.
 /// CudaStorageSlice does not derive Clone, but inner CudaSlice<T> does.
@@ -80,10 +82,29 @@ trait PagedAttnDtype:
     + Copy
     + 'static
 {
-    const KERNEL_V1: &'static str;
-    const KERNEL_V1_ALIBI: &'static str;
-    const KERNEL_V2: &'static str;
-    const KERNEL_V2_ALIBI: &'static str;
+    /// Kernel symbols for Q dtype × KV cache dtype combinations. See
+    /// `crates/core/kernels/paged_attention.cu` for the underlying
+    /// implementations. `_AUTO` means KV cache stored at the same dtype
+    /// as Q (native fp16 / bf16); FP8 / INT8 entries handle quantized KV
+    /// cache with inline kernel-side dequantization driven by per-tensor
+    /// `k_scale` / `v_scale` device pointers.
+    const KERNEL_V1_AUTO: &'static str;
+    const KERNEL_V1_AUTO_ALIBI: &'static str;
+    const KERNEL_V1_FP8_E4M3: &'static str;
+    const KERNEL_V1_FP8_E5M2: &'static str;
+    const KERNEL_V1_INT8: &'static str;
+    // Phase 10: ALiBi + FP8/INT8 KV cache combinations.
+    const KERNEL_V1_FP8_E4M3_ALIBI: &'static str;
+    const KERNEL_V1_FP8_E5M2_ALIBI: &'static str;
+    const KERNEL_V1_INT8_ALIBI: &'static str;
+    const KERNEL_V2_AUTO: &'static str;
+    const KERNEL_V2_AUTO_ALIBI: &'static str;
+    const KERNEL_V2_FP8_E4M3: &'static str;
+    const KERNEL_V2_FP8_E5M2: &'static str;
+    const KERNEL_V2_INT8: &'static str;
+    const KERNEL_V2_FP8_E4M3_ALIBI: &'static str;
+    const KERNEL_V2_FP8_E5M2_ALIBI: &'static str;
+    const KERNEL_V2_INT8_ALIBI: &'static str;
     const KERNEL_V2_REDUCE: &'static str;
     const NAME: &'static str;
 
@@ -96,10 +117,22 @@ trait PagedAttnDtype:
 }
 
 impl PagedAttnDtype for half::bf16 {
-    const KERNEL_V1: &'static str = "paged_attention_v1_bf16";
-    const KERNEL_V1_ALIBI: &'static str = "paged_attention_v1_bf16_alibi";
-    const KERNEL_V2: &'static str = "paged_attention_v2_bf16";
-    const KERNEL_V2_ALIBI: &'static str = "paged_attention_v2_bf16_alibi";
+    const KERNEL_V1_AUTO: &'static str = "paged_attention_v1_bf16";
+    const KERNEL_V1_AUTO_ALIBI: &'static str = "paged_attention_v1_bf16_alibi";
+    const KERNEL_V1_FP8_E4M3: &'static str = "paged_attention_v1_bf16_fp8e4m3";
+    const KERNEL_V1_FP8_E5M2: &'static str = "paged_attention_v1_bf16_fp8e5m2";
+    const KERNEL_V1_INT8: &'static str = "paged_attention_v1_bf16_int8";
+    const KERNEL_V1_FP8_E4M3_ALIBI: &'static str = "paged_attention_v1_bf16_fp8e4m3_alibi";
+    const KERNEL_V1_FP8_E5M2_ALIBI: &'static str = "paged_attention_v1_bf16_fp8e5m2_alibi";
+    const KERNEL_V1_INT8_ALIBI: &'static str = "paged_attention_v1_bf16_int8_alibi";
+    const KERNEL_V2_AUTO: &'static str = "paged_attention_v2_bf16";
+    const KERNEL_V2_AUTO_ALIBI: &'static str = "paged_attention_v2_bf16_alibi";
+    const KERNEL_V2_FP8_E4M3: &'static str = "paged_attention_v2_bf16_fp8e4m3";
+    const KERNEL_V2_FP8_E5M2: &'static str = "paged_attention_v2_bf16_fp8e5m2";
+    const KERNEL_V2_INT8: &'static str = "paged_attention_v2_bf16_int8";
+    const KERNEL_V2_FP8_E4M3_ALIBI: &'static str = "paged_attention_v2_bf16_fp8e4m3_alibi";
+    const KERNEL_V2_FP8_E5M2_ALIBI: &'static str = "paged_attention_v2_bf16_fp8e5m2_alibi";
+    const KERNEL_V2_INT8_ALIBI: &'static str = "paged_attention_v2_bf16_int8_alibi";
     const KERNEL_V2_REDUCE: &'static str = "paged_attention_v2_reduce_bf16";
     const NAME: &'static str = "bf16";
 
@@ -119,10 +152,22 @@ impl PagedAttnDtype for half::bf16 {
 }
 
 impl PagedAttnDtype for half::f16 {
-    const KERNEL_V1: &'static str = "paged_attention_v1_f16";
-    const KERNEL_V1_ALIBI: &'static str = "paged_attention_v1_f16_alibi";
-    const KERNEL_V2: &'static str = "paged_attention_v2_f16";
-    const KERNEL_V2_ALIBI: &'static str = "paged_attention_v2_f16_alibi";
+    const KERNEL_V1_AUTO: &'static str = "paged_attention_v1_f16";
+    const KERNEL_V1_AUTO_ALIBI: &'static str = "paged_attention_v1_f16_alibi";
+    const KERNEL_V1_FP8_E4M3: &'static str = "paged_attention_v1_f16_fp8e4m3";
+    const KERNEL_V1_FP8_E5M2: &'static str = "paged_attention_v1_f16_fp8e5m2";
+    const KERNEL_V1_INT8: &'static str = "paged_attention_v1_f16_int8";
+    const KERNEL_V1_FP8_E4M3_ALIBI: &'static str = "paged_attention_v1_f16_fp8e4m3_alibi";
+    const KERNEL_V1_FP8_E5M2_ALIBI: &'static str = "paged_attention_v1_f16_fp8e5m2_alibi";
+    const KERNEL_V1_INT8_ALIBI: &'static str = "paged_attention_v1_f16_int8_alibi";
+    const KERNEL_V2_AUTO: &'static str = "paged_attention_v2_f16";
+    const KERNEL_V2_AUTO_ALIBI: &'static str = "paged_attention_v2_f16_alibi";
+    const KERNEL_V2_FP8_E4M3: &'static str = "paged_attention_v2_f16_fp8e4m3";
+    const KERNEL_V2_FP8_E5M2: &'static str = "paged_attention_v2_f16_fp8e5m2";
+    const KERNEL_V2_INT8: &'static str = "paged_attention_v2_f16_int8";
+    const KERNEL_V2_FP8_E4M3_ALIBI: &'static str = "paged_attention_v2_f16_fp8e4m3_alibi";
+    const KERNEL_V2_FP8_E5M2_ALIBI: &'static str = "paged_attention_v2_f16_fp8e5m2_alibi";
+    const KERNEL_V2_INT8_ALIBI: &'static str = "paged_attention_v2_f16_int8_alibi";
     const KERNEL_V2_REDUCE: &'static str = "paged_attention_v2_reduce_f16";
     const NAME: &'static str = "f16";
 
@@ -153,6 +198,18 @@ struct PagedAttnOp {
     max_seq_len: usize,
     head_dim: usize,
     block_size: usize,
+    /// KV cache storage dtype. `Auto` => K/V cache stored at Q dtype
+    /// (fp16/bf16). Quantized variants (`Fp8E4m3`, `Fp8E5m2`, `Int8`)
+    /// store K/V as packed U8 bytes and require per-tensor `k_scale` /
+    /// `v_scale` device pointers for inline kernel-side dequantization.
+    kv_cache_dtype: KVCacheDtype,
+    /// Per-tensor scalar F32 scale for K cache (length-1 device tensor).
+    /// Required when `kv_cache_dtype != Auto`. Default value 1.0 maps
+    /// the symmetric input range linearly to the FP8/INT8 storage and
+    /// matches the write-side scale.
+    k_scale: Option<Tensor>,
+    /// Per-tensor scalar F32 scale for V cache. See [`Self::k_scale`].
+    v_scale: Option<Tensor>,
 }
 
 impl CustomOp1 for PagedAttnOp {
@@ -177,13 +234,181 @@ impl CustomOp1 for PagedAttnOp {
     }
 }
 
+// ============================================================================
+// Paged-attention scale plumbing helpers
+// ============================================================================
+//
+// Per-tensor scales (`k_scale`, `v_scale`) for quantized KV cache live in
+// `CacheEngine::scales` as length-1 F32 device tensors. We need to extract
+// the device `CudaSlice<f32>` and pass it to the kernel — but Tensor's
+// storage guard has lifetime tied to the Tensor, so callers must hold the
+// guard alive across the kernel-launch closure. These helpers centralise
+// the boilerplate while preserving the lifetime contract.
+//
+// `validate_scales_for_kv_dtype` performs eager validation: quantized cache
+// dtypes require BOTH scales to be present and F32. Auto-mode silently
+// drops scales (they aren't used). Diagnoses misconfigurations at the
+// API boundary rather than as a runtime kernel-launch failure.
+fn validate_scales_for_kv_dtype(
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: &Option<Tensor>,
+    v_scale: &Option<Tensor>,
+) -> Result<()> {
+    if kv_cache_dtype == KVCacheDtype::Auto {
+        return Ok(());
+    }
+    let k = k_scale.as_ref().ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "paged_attention: kv_cache_dtype={:?} requires `k_scale` tensor (per-tensor F32 scalar)",
+            kv_cache_dtype
+        ))
+    })?;
+    let v = v_scale.as_ref().ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "paged_attention: kv_cache_dtype={:?} requires `v_scale` tensor (per-tensor F32 scalar)",
+            kv_cache_dtype
+        ))
+    })?;
+    if k.dtype() != DType::F32 {
+        candle_core::bail!("paged_attention: k_scale must be F32, got {:?}", k.dtype());
+    }
+    if v.dtype() != DType::F32 {
+        candle_core::bail!("paged_attention: v_scale must be F32, got {:?}", v.dtype());
+    }
+    if k.elem_count() != 1 || v.elem_count() != 1 {
+        candle_core::bail!(
+            "paged_attention: per-tensor scales must have 1 element each, got k={} v={}",
+            k.elem_count(),
+            v.elem_count()
+        );
+    }
+    Ok(())
+}
+
+// WORKAROUND: cudarc 0.19 does not expose `impl PushKernelArg<Option<&CudaSlice<T>>>`
+// — its trait-impl matrix only covers `&CudaSlice<T>` / `&CudaSlice<T> mut`.
+// To pass an *optional* device pointer (kernel param `const float* k_scale_ptr`)
+// we need 8 bytes of zero serialised into the kernel-arg slot when the
+// Rust side has `None`. The `&u64` `PushKernelArg<&T: DeviceRepr>` impl
+// memcpys 8 bytes from the host stack into the launch's args array;
+// cuLaunchKernel then forwards those 8 bytes to the kernel which sees
+// a nullptr `const float*`. The paged_attention kernel helpers test
+// against nullptr and fall back to scale=1.0.
+//
+// Drop this whole workaround when cudarc grows native `Option<&CudaSlice>`
+// support (upstream issue tracker: cudarc/issues). Until then, keep
+// this static const + the `push_scale_args` helper as the single chokepoint.
+static NULL_DEV_PTR_VALUE: u64 = 0;
+
+/// Extract a length-1 F32 device slice (per-tensor scale) from a tensor's
+/// storage guard. Validated at the API boundary (see
+/// [`validate_scales_for_kv_dtype`]) so this only handles the happy path.
+fn extract_f32_scalar<'g, D>(
+    guard: &'g D,
+    name: &str,
+) -> Result<&'g candle_core::cuda::cudarc::driver::CudaSlice<f32>>
+where
+    D: std::ops::Deref<Target = Storage>,
+{
+    match &**guard {
+        Storage::Cuda(cs) => match &cs.slice {
+            CudaStorageSlice::F32(s) => Ok(s),
+            _ => candle_core::bail!(
+                "paged_attention: {} scale must be F32 on CUDA, got non-F32 slice",
+                name
+            ),
+        },
+        _ => candle_core::bail!("paged_attention: {} scale must be on CUDA", name),
+    }
+}
+
+/// Extract a native-dtype (`T`) K/V cache slice from a storage guard.
+/// Used on the Auto path where K/V cache shares Q's dtype.
+fn expect_native_kv_slice<'g, T: PagedAttnDtype>(
+    guard: &'g (impl std::ops::Deref<Target = Storage>),
+    name: &str,
+) -> Result<&'g candle_core::cuda::cudarc::driver::CudaSlice<T>> {
+    match &**guard {
+        Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "paged_attention: {} cache dtype must match Q ({}) on Auto KV path",
+                name,
+                T::NAME
+            ))
+        }),
+        _ => candle_core::bail!("paged_attention: {} cache must be on CUDA", name),
+    }
+}
+
+/// Extract a U8 K/V cache slice from a storage guard. Used on the
+/// quantized path (FP8 E4M3/E5M2, INT8) where K/V cache is stored as
+/// raw bytes regardless of the underlying numeric format. The byte-vs-
+/// signed-vs-FP8 reinterpretation is done kernel-side by the matching
+/// `load_kv_to_f32` template specialization.
+fn expect_u8_kv_slice<'g>(
+    guard: &'g (impl std::ops::Deref<Target = Storage>),
+    name: &str,
+) -> Result<&'g candle_core::cuda::cudarc::driver::CudaSlice<u8>> {
+    match &**guard {
+        Storage::Cuda(cs) => match &cs.slice {
+            CudaStorageSlice::U8(s) => Ok(s),
+            _ => candle_core::bail!(
+                "paged_attention: quantized {} cache must be U8 byte storage, found other slice",
+                name
+            ),
+        },
+        _ => candle_core::bail!("paged_attention: {} cache must be on CUDA", name),
+    }
+}
+
+/// Push the `(k_scale_ptr, v_scale_ptr)` trailing kernel args. For Auto
+/// mode the slices are `None` and we push two device-side null pointers
+/// via [`NULL_DEV_PTR_VALUE`].
+fn push_scale_args<'b>(
+    builder: &mut candle_core::cuda::cudarc::driver::LaunchArgs<'b>,
+    k_scale: Option<&'b candle_core::cuda::cudarc::driver::CudaSlice<f32>>,
+    v_scale: Option<&'b candle_core::cuda::cudarc::driver::CudaSlice<f32>>,
+) {
+    use candle_core::cuda::cudarc::driver::PushKernelArg;
+    match k_scale {
+        Some(s) => {
+            builder.arg(s);
+        }
+        None => {
+            builder.arg(&NULL_DEV_PTR_VALUE);
+        }
+    }
+    match v_scale {
+        Some(s) => {
+            builder.arg(s);
+        }
+        None => {
+            builder.arg(&NULL_DEV_PTR_VALUE);
+        }
+    }
+}
+
 impl PagedAttnOp {
+    /// Pick the kernel symbol for the current Q dtype × KV cache dtype
+    /// combination. `Auto` keeps the legacy path; quantized variants
+    /// route to the FP8/INT8 inline-dequant kernels.
+    fn kernel_symbol_v1<T: PagedAttnDtype>(&self) -> &'static str {
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => T::KERNEL_V1_AUTO,
+            KVCacheDtype::Fp8E4m3 => T::KERNEL_V1_FP8_E4M3,
+            KVCacheDtype::Fp8E5m2 => T::KERNEL_V1_FP8_E5M2,
+            KVCacheDtype::Int8 => T::KERNEL_V1_INT8,
+        }
+    }
+
     fn run_v1<T: PagedAttnDtype>(
         &self,
         q_storage: &CudaStorage,
         num_seqs: usize,
     ) -> Result<(CudaStorage, Shape)> {
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        validate_scales_for_kv_dtype(self.kv_cache_dtype, &self.k_scale, &self.v_scale)?;
 
         let dev = &q_storage.device;
         let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
@@ -192,28 +417,6 @@ impl PagedAttnOp {
                 T::NAME
             ))
         })?;
-
-        let (k_guard, _) = self.k_cache.storage_and_layout();
-        let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention: K cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("paged_attention: K cache must be on CUDA"),
-        };
-
-        let (v_guard, _) = self.v_cache.storage_and_layout();
-        let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention: V cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("paged_attention: V cache must be on CUDA"),
-        };
 
         let (bt_guard, _) = self.block_tables.storage_and_layout();
         let bt_slice = match &*bt_guard {
@@ -233,14 +436,26 @@ impl PagedAttnOp {
             _ => candle_core::bail!("seq_lens must be on CUDA"),
         };
 
+        // Per-tensor F32 scales — guards must outlive the kernel launch.
+        let k_scale_guard_layout = self.k_scale.as_ref().map(|t| t.storage_and_layout());
+        let v_scale_guard_layout = self.v_scale.as_ref().map(|t| t.storage_and_layout());
+        let k_scale_slice = k_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "k_scale"))
+            .transpose()?;
+        let v_scale_slice = v_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "v_scale"))
+            .transpose()?;
+
         let head_dim = self.head_dim;
         let elem_count = num_seqs * self.num_heads * head_dim;
-        // Each (seq, head) block writes a full `head_dim` slice of output;
-        // every byte is covered before any read. SAFETY: kernel never
-        // reads `output_slice` before writing it.
+        // SAFETY: every (seq, head) block writes a full `head_dim` slice
+        // of output; every byte is covered before any read.
         let output_slice = unsafe { dev.alloc::<T>(elem_count) }?;
 
-        let func = dev.get_or_load_custom_func(T::KERNEL_V1, "paged_attention", PTX)?;
+        let kernel_sym = self.kernel_symbol_v1::<T>();
+        let func = dev.get_or_load_custom_func(kernel_sym, "paged_attention", PTX)?;
 
         // Shared memory: q_smem[head_dim] + reduce_smem[NUM_WARPS] + logits[max_seq_len]
         let shared_mem_bytes =
@@ -258,28 +473,71 @@ impl PagedAttnOp {
         let head_dim_i32 = head_dim as i32;
         let block_size_i32 = self.block_size as i32;
 
-        let mut builder = func.builder();
-        builder.arg(&output_slice);
-        builder.arg(q_slice);
-        builder.arg(k_slice);
-        builder.arg(v_slice);
-        builder.arg(bt_slice);
-        builder.arg(sl_slice);
-        builder.arg(&self.scale);
-        builder.arg(&num_heads_i32);
-        builder.arg(&num_kv_heads_i32);
-        builder.arg(&max_blocks_i32);
-        builder.arg(&head_dim_i32);
-        builder.arg(&block_size_i32);
+        // The K/V slice element type differs between Auto (Q dtype) and
+        // quantized (raw u8 byte storage). Each branch holds its own
+        // storage guards alive through the kernel launch; common scalar
+        // args + scale-ptr args are appended uniformly.
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => {
+                let (k_guard, _) = self.k_cache.storage_and_layout();
+                let k_slice = expect_native_kv_slice::<T>(&k_guard, "K")?;
+                let (v_guard, _) = self.v_cache.storage_and_layout();
+                let v_slice = expect_native_kv_slice::<T>(&v_guard, "V")?;
 
-        // SAFETY: kernel launch with validated parameters and contiguous buffers
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| candle_core::Error::Msg(format!("paged_attention launch: {e}")))?;
+                let mut builder = func.builder();
+                builder.arg(&output_slice);
+                builder.arg(q_slice);
+                builder.arg(k_slice);
+                builder.arg(v_slice);
+                builder.arg(bt_slice);
+                builder.arg(sl_slice);
+                builder.arg(&self.scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
 
-        drop(k_guard);
-        drop(v_guard);
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("paged_attention launch: {e}")))?;
+
+                drop(k_guard);
+                drop(v_guard);
+            }
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 | KVCacheDtype::Int8 => {
+                let (k_guard, _) = self.k_cache.storage_and_layout();
+                let k_slice = expect_u8_kv_slice(&k_guard, "K")?;
+                let (v_guard, _) = self.v_cache.storage_and_layout();
+                let v_slice = expect_u8_kv_slice(&v_guard, "V")?;
+
+                let mut builder = func.builder();
+                builder.arg(&output_slice);
+                builder.arg(q_slice);
+                builder.arg(k_slice);
+                builder.arg(v_slice);
+                builder.arg(bt_slice);
+                builder.arg(sl_slice);
+                builder.arg(&self.scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
+
+                unsafe { builder.launch(cfg) }
+                    .map_err(|e| candle_core::Error::Msg(format!("paged_attention launch: {e}")))?;
+
+                drop(k_guard);
+                drop(v_guard);
+            }
+        }
+
         drop(bt_guard);
         drop(sl_guard);
+        drop(k_scale_guard_layout);
+        drop(v_scale_guard_layout);
 
         let output_storage = CudaStorage {
             slice: T::into_storage_slice(output_slice),
@@ -342,6 +600,57 @@ pub fn paged_attention_cuda(
         max_seq_len,
         head_dim,
         block_size,
+        // Auto KV cache by default; callers that need quantized KV must
+        // use `paged_attention_cuda_with_kv_dtype`.
+        kv_cache_dtype: KVCacheDtype::Auto,
+        k_scale: None,
+        v_scale: None,
+    };
+
+    let output = q.apply_op1_no_bwd(&op)?;
+    output.reshape((num_seqs, num_heads * head_dim))
+}
+
+/// Explicit-KV-dtype variant of [`paged_attention_cuda`]. Use when the
+/// KV cache is FP8/INT8 packed; pass per-tensor `k_scale` / `v_scale`
+/// length-1 F32 device tensors (Auto mode ignores them and may pass
+/// `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_cuda_with_kv_dtype(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+) -> Result<Tensor> {
+    let q = q.contiguous()?;
+    let num_seqs = q.dim(0)?;
+
+    let op = PagedAttnOp {
+        k_cache: k_cache.clone(),
+        v_cache: v_cache.clone(),
+        block_tables: block_tables.contiguous()?,
+        seq_lens: seq_lens.contiguous()?,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        max_seq_len,
+        head_dim,
+        block_size,
+        kv_cache_dtype,
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -425,6 +734,10 @@ struct PagedAttnV2Op {
     /// Picked at launch by the dispatcher; the kernel reads it as a runtime arg.
     partition_size: usize,
     max_num_partitions: usize,
+    /// See [`PagedAttnOp::kv_cache_dtype`].
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
 }
 
 impl CustomOp1 for PagedAttnV2Op {
@@ -450,12 +763,25 @@ impl CustomOp1 for PagedAttnV2Op {
 }
 
 impl PagedAttnV2Op {
+    /// Pick the V2 Stage-1 kernel symbol for the current Q dtype × KV
+    /// cache dtype combination.
+    fn kernel_symbol_v2<T: PagedAttnDtype>(&self) -> &'static str {
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => T::KERNEL_V2_AUTO,
+            KVCacheDtype::Fp8E4m3 => T::KERNEL_V2_FP8_E4M3,
+            KVCacheDtype::Fp8E5m2 => T::KERNEL_V2_FP8_E5M2,
+            KVCacheDtype::Int8 => T::KERNEL_V2_INT8,
+        }
+    }
+
     fn run_v2<T: PagedAttnDtype>(
         &self,
         q_storage: &CudaStorage,
         num_seqs: usize,
     ) -> Result<(CudaStorage, Shape)> {
         use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+
+        validate_scales_for_kv_dtype(self.kv_cache_dtype, &self.k_scale, &self.v_scale)?;
 
         let dev = &q_storage.device;
         let q_slice = T::slice_from(&q_storage.slice).ok_or_else(|| {
@@ -464,28 +790,6 @@ impl PagedAttnV2Op {
                 T::NAME
             ))
         })?;
-
-        let (k_guard, _) = self.k_cache.storage_and_layout();
-        let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention_v2: K cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("paged_attention_v2: K cache must be on CUDA"),
-        };
-
-        let (v_guard, _) = self.v_cache.storage_and_layout();
-        let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention_v2: V cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("paged_attention_v2: V cache must be on CUDA"),
-        };
 
         let (bt_guard, _) = self.block_tables.storage_and_layout();
         let bt_slice = match &*bt_guard {
@@ -505,6 +809,18 @@ impl PagedAttnV2Op {
             _ => candle_core::bail!("seq_lens must be on CUDA"),
         };
 
+        // Per-tensor F32 scales — see `run_v1` for the same pattern.
+        let k_scale_guard_layout = self.k_scale.as_ref().map(|t| t.storage_and_layout());
+        let v_scale_guard_layout = self.v_scale.as_ref().map(|t| t.storage_and_layout());
+        let k_scale_slice = k_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "k_scale"))
+            .transpose()?;
+        let v_scale_slice = v_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "v_scale"))
+            .transpose()?;
+
         let head_dim = self.head_dim;
         let max_num_partitions = self.max_num_partitions;
 
@@ -520,7 +836,8 @@ impl PagedAttnV2Op {
         let output_slice = dev.alloc_zeros::<T>(out_size)?;
 
         // Stage 1: partitioned attention kernel
-        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2, "paged_attention", PTX)?;
+        let kernel_sym = self.kernel_symbol_v2::<T>();
+        let v2_func = dev.get_or_load_custom_func(kernel_sym, "paged_attention", PTX)?;
 
         // Shared memory: q[head_dim] + reduce[NUM_WARPS] + logits[partition_size]
         let shared_mem_bytes =
@@ -544,28 +861,69 @@ impl PagedAttnV2Op {
         let partition_size_i32 = self.partition_size as i32;
         let max_partitions_i32 = max_num_partitions as i32;
 
-        {
-            let mut builder = v2_func.builder();
-            builder.arg(&tmp_out_slice);
-            builder.arg(&exp_sums_slice);
-            builder.arg(&max_logits_slice);
-            builder.arg(q_slice);
-            builder.arg(k_slice);
-            builder.arg(v_slice);
-            builder.arg(bt_slice);
-            builder.arg(sl_slice);
-            builder.arg(&self.scale);
-            builder.arg(&num_heads_i32);
-            builder.arg(&num_kv_heads_i32);
-            builder.arg(&max_blocks_i32);
-            builder.arg(&head_dim_i32);
-            builder.arg(&block_size_i32);
-            builder.arg(&partition_size_i32);
-            builder.arg(&max_partitions_i32);
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => {
+                let (k_guard, _) = self.k_cache.storage_and_layout();
+                let k_slice = expect_native_kv_slice::<T>(&k_guard, "K")?;
+                let (v_guard, _) = self.v_cache.storage_and_layout();
+                let v_slice = expect_native_kv_slice::<T>(&v_guard, "V")?;
 
-            // SAFETY: kernel launch with validated parameters and contiguous buffers
-            unsafe { builder.launch(v2_cfg) }
-                .map_err(|e| candle_core::Error::Msg(format!("paged_attention_v2 launch: {e}")))?;
+                let mut builder = v2_func.builder();
+                builder.arg(&tmp_out_slice);
+                builder.arg(&exp_sums_slice);
+                builder.arg(&max_logits_slice);
+                builder.arg(q_slice);
+                builder.arg(k_slice);
+                builder.arg(v_slice);
+                builder.arg(bt_slice);
+                builder.arg(sl_slice);
+                builder.arg(&self.scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(&partition_size_i32);
+                builder.arg(&max_partitions_i32);
+                push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
+
+                unsafe { builder.launch(v2_cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("paged_attention_v2 launch: {e}"))
+                })?;
+                drop(k_guard);
+                drop(v_guard);
+            }
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 | KVCacheDtype::Int8 => {
+                let (k_guard, _) = self.k_cache.storage_and_layout();
+                let k_slice = expect_u8_kv_slice(&k_guard, "K")?;
+                let (v_guard, _) = self.v_cache.storage_and_layout();
+                let v_slice = expect_u8_kv_slice(&v_guard, "V")?;
+
+                let mut builder = v2_func.builder();
+                builder.arg(&tmp_out_slice);
+                builder.arg(&exp_sums_slice);
+                builder.arg(&max_logits_slice);
+                builder.arg(q_slice);
+                builder.arg(k_slice);
+                builder.arg(v_slice);
+                builder.arg(bt_slice);
+                builder.arg(sl_slice);
+                builder.arg(&self.scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(&partition_size_i32);
+                builder.arg(&max_partitions_i32);
+                push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
+
+                unsafe { builder.launch(v2_cfg) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("paged_attention_v2 launch: {e}"))
+                })?;
+                drop(k_guard);
+                drop(v_guard);
+            }
         }
 
         // Stage 2: reduce kernel
@@ -599,10 +957,13 @@ impl PagedAttnV2Op {
                 .map_err(|e| candle_core::Error::Msg(format!("paged_attention_v2 reduce: {e}")))?;
         }
 
-        drop(k_guard);
-        drop(v_guard);
+        // K/V guards were dropped inside the per-dtype match above; bt
+        // and sl guards stay alive across the reduce launch since the
+        // reduce kernel reads `sl_slice` again.
         drop(bt_guard);
         drop(sl_guard);
+        drop(k_scale_guard_layout);
+        drop(v_scale_guard_layout);
 
         let output_storage = CudaStorage {
             slice: T::into_storage_slice(output_slice),
@@ -705,6 +1066,68 @@ pub fn paged_attention_v2_cuda_with_partition_size(
         block_size,
         partition_size,
         max_num_partitions,
+        // Auto KV cache by default; see
+        // `paged_attention_v2_cuda_with_kv_dtype` for the quantized
+        // entry point.
+        kv_cache_dtype: KVCacheDtype::Auto,
+        k_scale: None,
+        v_scale: None,
+    };
+
+    let output = q.apply_op1_no_bwd(&op)?;
+    output.reshape((num_seqs, num_heads * head_dim))
+}
+
+/// Explicit-KV-dtype variant of [`paged_attention_v2_cuda_with_partition_size`].
+/// `kv_cache_dtype = Auto` reproduces the legacy behaviour; quantized
+/// variants require length-1 F32 `k_scale` / `v_scale` device tensors
+/// matching the write-side calibration.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_v2_cuda_with_kv_dtype(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    partition_size: usize,
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+) -> Result<Tensor> {
+    if partition_size == 0 {
+        candle_core::bail!("paged_attention_v2: partition_size must be > 0");
+    }
+    let q = q.contiguous()?;
+    let num_seqs = q.dim(0)?;
+    let max_num_partitions = max_seq_len.div_ceil(partition_size);
+
+    let seq_lens_c = seq_lens.contiguous()?;
+    debug_assert_seq_lens_within_bound(&seq_lens_c, max_seq_len)?;
+
+    let op = PagedAttnV2Op {
+        k_cache: k_cache.clone(),
+        v_cache: v_cache.clone(),
+        block_tables: block_tables.contiguous()?,
+        seq_lens: seq_lens_c,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        max_seq_len,
+        head_dim,
+        block_size,
+        partition_size,
+        max_num_partitions,
+        kv_cache_dtype,
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -890,8 +1313,10 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
         let head_dim = self.head_dim;
         let max_num_partitions = self.max_num_partitions;
 
-        // Stage 1: partitioned attention kernel
-        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2, "paged_attention", PTX)?;
+        // Stage 1: partitioned attention kernel. The pooled-V2 path
+        // currently supports `Auto` KV cache only — quantized cache flows
+        // through `paged_attention_v2_cuda_with_kv_dtype`.
+        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2_AUTO, "paged_attention", PTX)?;
         let shared_mem_bytes =
             ((head_dim + NUM_WARPS + self.partition_size) * std::mem::size_of::<f32>()) as u32;
         let v2_cfg = LaunchConfig {
@@ -930,6 +1355,11 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
             builder.arg(&block_size_i32);
             builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
+            // Pooled-V2 currently routes Auto KV cache only — push two
+            // device nullptrs for `(k_scale_ptr, v_scale_ptr)` so the
+            // kernel side falls back to scale=1.0. The kernel signature
+            // requires these slots whether or not the cache is quantized.
+            push_scale_args(&mut builder, None, None);
             // SAFETY: validated kernel params; pooled scratch buffers are
             // exclusively held by this op for the duration of the launch.
             unsafe { builder.launch(v2_cfg) }.map_err(|e| {
@@ -1071,8 +1501,91 @@ pub fn paged_attention_v2_cuda_pooled(
     block_size: usize,
     partition_size: usize,
 ) -> Result<Tensor> {
+    paged_attention_v2_cuda_pooled_with_kv_dtype(
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        max_seq_len,
+        worst_case_max_seq_len,
+        head_dim,
+        block_size,
+        partition_size,
+        KVCacheDtype::Auto,
+        None,
+        None,
+    )
+}
+
+/// KV-dtype-aware variant of [`paged_attention_v2_cuda_pooled`].
+///
+/// The pooled fast-path keeps the legacy `PagedAttnV2InplaceOp` which
+/// supports `Auto` KV cache only — quantized cache + worst-case-sized
+/// scratch + captured CUDA graph is a follow-up integration step
+/// (kernel side already handles FP8/INT8 dequant via `paged_attention_v2_*`
+/// entry points; pooled in-place op needs to thread scale ptrs through
+/// to `PagedAttnV2InplaceOp::cuda_fwd` too).
+///
+/// For oversize batches (num_seqs > POOL_MAX_NUM_SEQS) we fall through
+/// to the non-pooled `paged_attention_v2_cuda_with_kv_dtype`, which DOES
+/// handle quantized cache; that path is the production target for
+/// prefill / large-batch decode of FP8 KV models.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_v2_cuda_pooled_with_kv_dtype(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    worst_case_max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    partition_size: usize,
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+) -> Result<Tensor> {
     use crate::engine::output_pool::OutputPool;
     crate::engine::cr_trace::mark_op("paged_attention_v2_cuda_pooled");
+
+    if kv_cache_dtype != KVCacheDtype::Auto {
+        // Quantized KV cache + pooled-V2 captured-graph path is not yet
+        // wired. Until `PagedAttnV2InplaceOp` carries scale pointers
+        // through to its launch builder, route the call through the
+        // non-pooled wrapper instead — the only cost is per-call scratch
+        // allocation (no pool reuse for FP8 KV models on the captured
+        // path). EXL3 + FP8 typically runs with `--enforce-eager` so
+        // this fallback is the production path anyway.
+        return paged_attention_v2_cuda_with_kv_dtype(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            seq_lens,
+            scale,
+            num_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            max_seq_len,
+            head_dim,
+            block_size,
+            partition_size,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        );
+    }
+    let _ = (k_scale, v_scale); // Auto path ignores scales by definition.
 
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_NUM_SEQS: usize = 64;
@@ -1186,8 +1699,50 @@ pub fn paged_attention_auto(
     head_dim: usize,
     block_size: usize,
 ) -> Result<Tensor> {
+    paged_attention_auto_with_kv_dtype(
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        scale,
+        num_heads,
+        num_kv_heads,
+        max_blocks_per_seq,
+        max_seq_len,
+        head_dim,
+        block_size,
+        KVCacheDtype::Auto,
+        None,
+        None,
+    )
+}
+
+/// KV-dtype-aware variant of [`paged_attention_auto`]. Routes to V1 or
+/// V2 based on `max_seq_len` and selects the matching FP8/INT8 kernel
+/// when `kv_cache_dtype != Auto`. Per-tensor `k_scale` / `v_scale`
+/// (F32 length-1 device tensors) must be supplied for quantized cache;
+/// pass `None` for `Auto`.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_auto_with_kv_dtype(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    block_tables: &Tensor,
+    seq_lens: &Tensor,
+    scale: f32,
+    num_heads: usize,
+    num_kv_heads: usize,
+    max_blocks_per_seq: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+    block_size: usize,
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+) -> Result<Tensor> {
     if max_seq_len > V2_SEQ_LEN_THRESHOLD {
-        paged_attention_v2_cuda_with_partition_size(
+        paged_attention_v2_cuda_with_kv_dtype(
             q,
             k_cache,
             v_cache,
@@ -1201,9 +1756,12 @@ pub fn paged_attention_auto(
             head_dim,
             block_size,
             select_v2_partition_size(max_seq_len),
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
         )
     } else {
-        paged_attention_cuda(
+        paged_attention_cuda_with_kv_dtype(
             q,
             k_cache,
             v_cache,
@@ -1216,6 +1774,9 @@ pub fn paged_attention_auto(
             max_seq_len,
             head_dim,
             block_size,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
         )
     }
 }
@@ -1242,6 +1803,14 @@ struct PagedAttnAlibiOp {
     max_seq_len: usize,
     head_dim: usize,
     block_size: usize,
+    // Phase 10 — ALiBi + FP8/INT8 KV cache. `Auto` selects the legacy
+    // native-dtype path (same kernel symbol layout as before this
+    // phase); quantised variants route through the new
+    // `KERNEL_V1_*_ALIBI` entry points which take per-tensor scale
+    // pointers alongside `alibi_slopes`.
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
 }
 
 impl CustomOp1 for PagedAttnAlibiOp {
@@ -1267,6 +1836,18 @@ impl CustomOp1 for PagedAttnAlibiOp {
 }
 
 impl PagedAttnAlibiOp {
+    /// Pick the kernel symbol for the current Q dtype × KV cache dtype
+    /// combination. `Auto` keeps the legacy native-dtype symbol;
+    /// quantised variants route to the Phase 10 entry points.
+    fn kernel_symbol_v1<T: PagedAttnDtype>(&self) -> &'static str {
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => T::KERNEL_V1_AUTO_ALIBI,
+            KVCacheDtype::Fp8E4m3 => T::KERNEL_V1_FP8_E4M3_ALIBI,
+            KVCacheDtype::Fp8E5m2 => T::KERNEL_V1_FP8_E5M2_ALIBI,
+            KVCacheDtype::Int8 => T::KERNEL_V1_INT8_ALIBI,
+        }
+    }
+
     fn run_v1_alibi<T: PagedAttnDtype>(
         &self,
         q_storage: &CudaStorage,
@@ -1282,27 +1863,11 @@ impl PagedAttnAlibiOp {
             ))
         })?;
 
-        let (k_guard, _) = self.k_cache.storage_and_layout();
-        let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention_v1_alibi: K cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("paged_attention: K cache must be on CUDA"),
-        };
+        // Validate FP8/INT8 scales presence when in a quantised mode.
+        validate_scales_for_kv_dtype(self.kv_cache_dtype, &self.k_scale, &self.v_scale)?;
 
+        let (k_guard, _) = self.k_cache.storage_and_layout();
         let (v_guard, _) = self.v_cache.storage_and_layout();
-        let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention_v1_alibi: V cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("paged_attention: V cache must be on CUDA"),
-        };
 
         let (bt_guard, _) = self.block_tables.storage_and_layout();
         let bt_slice = match &*bt_guard {
@@ -1331,11 +1896,24 @@ impl PagedAttnAlibiOp {
             _ => candle_core::bail!("alibi_slopes must be on CUDA"),
         };
 
+        // Per-tensor F32 scale slices for quantised paths (None on Auto).
+        let k_scale_guard_layout = self.k_scale.as_ref().map(|t| t.storage_and_layout());
+        let v_scale_guard_layout = self.v_scale.as_ref().map(|t| t.storage_and_layout());
+        let k_scale_slice = k_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "k_scale"))
+            .transpose()?;
+        let v_scale_slice = v_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "v_scale"))
+            .transpose()?;
+
         let head_dim = self.head_dim;
         let elem_count = num_seqs * self.num_heads * head_dim;
         let output_slice = dev.alloc_zeros::<T>(elem_count)?;
 
-        let func = dev.get_or_load_custom_func(T::KERNEL_V1_ALIBI, "paged_attention", PTX)?;
+        let kernel_sym = self.kernel_symbol_v1::<T>();
+        let func = dev.get_or_load_custom_func(kernel_sym, "paged_attention", PTX)?;
 
         let shared_mem_bytes =
             ((head_dim + NUM_WARPS + self.max_seq_len) * std::mem::size_of::<f32>()) as u32;
@@ -1355,23 +1933,51 @@ impl PagedAttnAlibiOp {
         let mut builder = func.builder();
         builder.arg(&output_slice);
         builder.arg(q_slice);
-        builder.arg(k_slice);
-        builder.arg(v_slice);
-        builder.arg(bt_slice);
-        builder.arg(sl_slice);
-        builder.arg(&self.scale);
-        builder.arg(&num_heads_i32);
-        builder.arg(&num_kv_heads_i32);
-        builder.arg(&max_blocks_i32);
-        builder.arg(&head_dim_i32);
-        builder.arg(&block_size_i32);
-        builder.arg(alibi_slice);
+        // K/V slice extraction is dtype-conditional: Auto uses `slice<T>`,
+        // FP8/INT8 use raw U8 bytes (the kernel template's `Cache_t`
+        // marker drives the inline dequant inside `load_kv_to_f32`).
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => {
+                let k_native = expect_native_kv_slice::<T>(&k_guard, "K")?;
+                let v_native = expect_native_kv_slice::<T>(&v_guard, "V")?;
+                builder.arg(k_native);
+                builder.arg(v_native);
+                builder.arg(bt_slice);
+                builder.arg(sl_slice);
+                builder.arg(&self.scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(alibi_slice);
+                push_scale_args(&mut builder, None, None);
+            }
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 | KVCacheDtype::Int8 => {
+                let k_u8 = expect_u8_kv_slice(&k_guard, "K")?;
+                let v_u8 = expect_u8_kv_slice(&v_guard, "V")?;
+                builder.arg(k_u8);
+                builder.arg(v_u8);
+                builder.arg(bt_slice);
+                builder.arg(sl_slice);
+                builder.arg(&self.scale);
+                builder.arg(&num_heads_i32);
+                builder.arg(&num_kv_heads_i32);
+                builder.arg(&max_blocks_i32);
+                builder.arg(&head_dim_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(alibi_slice);
+                push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
+            }
+        }
 
         // SAFETY: kernel launch with validated parameters and contiguous buffers
         unsafe { builder.launch(cfg) }
             .map_err(|e| candle_core::Error::Msg(format!("paged_attention alibi launch: {e}")))?;
 
         drop(alibi_guard);
+        drop(k_scale_guard_layout);
+        drop(v_scale_guard_layout);
         drop(k_guard);
         drop(v_guard);
         drop(bt_guard);
@@ -1437,6 +2043,13 @@ pub fn paged_attention_cuda_alibi(
         max_seq_len,
         head_dim,
         block_size,
+        // Legacy public API: pin Auto KV cache so the dispatch routes
+        // through the unchanged `KERNEL_V1_AUTO_ALIBI` symbol. Phase
+        // 10 quantised paths must use the new
+        // `paged_attention_cuda_alibi_with_kv_dtype` wrapper.
+        kv_cache_dtype: KVCacheDtype::Auto,
+        k_scale: None,
+        v_scale: None,
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -1462,6 +2075,12 @@ struct PagedAttnV2AlibiOp {
     /// Same role as in [`PagedAttnV2Op::partition_size`].
     partition_size: usize,
     max_num_partitions: usize,
+    // Phase 10 — see `PagedAttnAlibiOp::kv_cache_dtype`. `Auto` keeps
+    // the legacy native-dtype path; FP8/INT8 routes through the new
+    // `KERNEL_V2_*_ALIBI` symbols.
+    kv_cache_dtype: KVCacheDtype,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
 }
 
 impl CustomOp1 for PagedAttnV2AlibiOp {
@@ -1487,6 +2106,16 @@ impl CustomOp1 for PagedAttnV2AlibiOp {
 }
 
 impl PagedAttnV2AlibiOp {
+    /// See `PagedAttnAlibiOp::kernel_symbol_v1`.
+    fn kernel_symbol_v2<T: PagedAttnDtype>(&self) -> &'static str {
+        match self.kv_cache_dtype {
+            KVCacheDtype::Auto => T::KERNEL_V2_AUTO_ALIBI,
+            KVCacheDtype::Fp8E4m3 => T::KERNEL_V2_FP8_E4M3_ALIBI,
+            KVCacheDtype::Fp8E5m2 => T::KERNEL_V2_FP8_E5M2_ALIBI,
+            KVCacheDtype::Int8 => T::KERNEL_V2_INT8_ALIBI,
+        }
+    }
+
     fn run_v2_alibi<T: PagedAttnDtype>(
         &self,
         q_storage: &CudaStorage,
@@ -1502,27 +2131,21 @@ impl PagedAttnV2AlibiOp {
             ))
         })?;
 
-        let (k_guard, _) = self.k_cache.storage_and_layout();
-        let k_slice = match &*k_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention_v2_alibi: K cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("K cache must be on CUDA"),
-        };
+        validate_scales_for_kv_dtype(self.kv_cache_dtype, &self.k_scale, &self.v_scale)?;
 
+        let (k_guard, _) = self.k_cache.storage_and_layout();
         let (v_guard, _) = self.v_cache.storage_and_layout();
-        let v_slice = match &*v_guard {
-            Storage::Cuda(cs) => T::slice_from(&cs.slice).ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "paged_attention_v2_alibi: V cache dtype must match Q ({})",
-                    T::NAME
-                ))
-            })?,
-            _ => candle_core::bail!("V cache must be on CUDA"),
-        };
+
+        let k_scale_guard_layout = self.k_scale.as_ref().map(|t| t.storage_and_layout());
+        let v_scale_guard_layout = self.v_scale.as_ref().map(|t| t.storage_and_layout());
+        let k_scale_slice = k_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "k_scale"))
+            .transpose()?;
+        let v_scale_slice = v_scale_guard_layout
+            .as_ref()
+            .map(|(g, _)| extract_f32_scalar(g, "v_scale"))
+            .transpose()?;
 
         let (bt_guard, _) = self.block_tables.storage_and_layout();
         let bt_slice = match &*bt_guard {
@@ -1563,8 +2186,10 @@ impl PagedAttnV2AlibiOp {
         let out_size = num_seqs * self.num_heads * head_dim;
         let output_slice = dev.alloc_zeros::<T>(out_size)?;
 
-        // Stage 1: partitioned attention with ALiBi
-        let v2_func = dev.get_or_load_custom_func(T::KERNEL_V2_ALIBI, "paged_attention", PTX)?;
+        // Stage 1: partitioned attention with ALiBi. Phase 10 — symbol
+        // depends on kv_cache_dtype.
+        let v2_sym = self.kernel_symbol_v2::<T>();
+        let v2_func = dev.get_or_load_custom_func(v2_sym, "paged_attention", PTX)?;
 
         let shared_mem_bytes =
             ((head_dim + NUM_WARPS + self.partition_size) * std::mem::size_of::<f32>()) as u32;
@@ -1593,19 +2218,47 @@ impl PagedAttnV2AlibiOp {
             builder.arg(&exp_sums_slice);
             builder.arg(&max_logits_slice);
             builder.arg(q_slice);
-            builder.arg(k_slice);
-            builder.arg(v_slice);
-            builder.arg(bt_slice);
-            builder.arg(sl_slice);
-            builder.arg(&self.scale);
-            builder.arg(&num_heads_i32);
-            builder.arg(&num_kv_heads_i32);
-            builder.arg(&max_blocks_i32);
-            builder.arg(&head_dim_i32);
-            builder.arg(&block_size_i32);
-            builder.arg(&partition_size_i32);
-            builder.arg(&max_partitions_i32);
-            builder.arg(alibi_slice);
+            // See V1 dispatch above — Auto uses native slice<T>, FP8/INT8
+            // route through U8 byte slice. The kernel template's KV
+            // marker drives inline dequant via `load_kv_to_f32`.
+            match self.kv_cache_dtype {
+                KVCacheDtype::Auto => {
+                    let k_native = expect_native_kv_slice::<T>(&k_guard, "K")?;
+                    let v_native = expect_native_kv_slice::<T>(&v_guard, "V")?;
+                    builder.arg(k_native);
+                    builder.arg(v_native);
+                    builder.arg(bt_slice);
+                    builder.arg(sl_slice);
+                    builder.arg(&self.scale);
+                    builder.arg(&num_heads_i32);
+                    builder.arg(&num_kv_heads_i32);
+                    builder.arg(&max_blocks_i32);
+                    builder.arg(&head_dim_i32);
+                    builder.arg(&block_size_i32);
+                    builder.arg(&partition_size_i32);
+                    builder.arg(&max_partitions_i32);
+                    builder.arg(alibi_slice);
+                    push_scale_args(&mut builder, None, None);
+                }
+                KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 | KVCacheDtype::Int8 => {
+                    let k_u8 = expect_u8_kv_slice(&k_guard, "K")?;
+                    let v_u8 = expect_u8_kv_slice(&v_guard, "V")?;
+                    builder.arg(k_u8);
+                    builder.arg(v_u8);
+                    builder.arg(bt_slice);
+                    builder.arg(sl_slice);
+                    builder.arg(&self.scale);
+                    builder.arg(&num_heads_i32);
+                    builder.arg(&num_kv_heads_i32);
+                    builder.arg(&max_blocks_i32);
+                    builder.arg(&head_dim_i32);
+                    builder.arg(&block_size_i32);
+                    builder.arg(&partition_size_i32);
+                    builder.arg(&max_partitions_i32);
+                    builder.arg(alibi_slice);
+                    push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
+                }
+            }
 
             // SAFETY: kernel launch with validated parameters
             unsafe { builder.launch(v2_cfg) }
@@ -1644,6 +2297,8 @@ impl PagedAttnV2AlibiOp {
         }
 
         drop(alibi_guard);
+        drop(k_scale_guard_layout);
+        drop(v_scale_guard_layout);
         drop(k_guard);
         drop(v_guard);
         drop(bt_guard);
@@ -1703,6 +2358,11 @@ pub fn paged_attention_auto_alibi(
             block_size,
             partition_size,
             max_num_partitions,
+            // Legacy public API: pin Auto KV cache (Phase 10 quantised
+            // path is exposed separately).
+            kv_cache_dtype: KVCacheDtype::Auto,
+            k_scale: None,
+            v_scale: None,
         };
 
         let output = q.apply_op1_no_bwd(&op)?;
@@ -4867,6 +5527,202 @@ mod tests {
     /// the existing parity test does not exercise ALiBi at all.
     #[cfg(feature = "cuda-kernels")]
     #[test]
+    /// V2 with FP8 E4M3 KV cache must produce output close to V2 with
+    /// the same (unquantized) K/V tensors at fp16/bf16. The acceptable
+    /// error budget reflects FP8 E4M3's per-value precision (~12.5%
+    /// max relative on any one byte, much less after dot-product RMS).
+    /// scale=1.0 maps the [-448, 448] FP8 range directly so all test
+    /// values (±0.5) survive without saturation.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_fp8e4m3_matches_auto() {
+        use crate::kv_cache::quantization::{quantize_fp8, KVCacheDtype};
+
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let max_diff = run_paged_attn_v2_quantized_case::<half::bf16>(
+            &dev,
+            KVCacheDtype::Fp8E4m3,
+            8,   // num_q_heads
+            2,   // num_kv_heads (GQA group=4)
+            128, // head_dim
+            16,  // block_size
+            128, // seq_len
+            128, // partition_size
+            1.0, // k_scale
+            1.0, // v_scale
+            |t, scale| quantize_fp8(t, scale),
+            DType::BF16,
+        );
+        assert!(
+            max_diff < 0.05,
+            "paged_attn V2 FP8 E4M3 vs Auto: max_diff={max_diff} (threshold 0.05)"
+        );
+    }
+
+    /// V2 with INT8 KV cache + properly calibrated scale must match the
+    /// Auto baseline closely. INT8 with per-tensor scale = max_abs/127
+    /// gives ~max_abs/127 absolute quantization step per byte; for our
+    /// ±0.5 test fixture that is ~4e-3 per byte, RMS-aggregated across
+    /// `seq_len` tokens.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_int8_matches_auto() {
+        use crate::kv_cache::quantization::{quantize_int8, KVCacheDtype};
+
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let int8_scale = 0.5 / 127.0; // test data abs range capped at 0.5
+        let max_diff = run_paged_attn_v2_quantized_case::<half::bf16>(
+            &dev,
+            KVCacheDtype::Int8,
+            8,
+            2,
+            128,
+            16,
+            128,
+            128,
+            int8_scale,
+            int8_scale,
+            |t, scale| quantize_int8(t, scale),
+            DType::BF16,
+        );
+        assert!(
+            max_diff < 0.02,
+            "paged_attn V2 INT8 vs Auto: max_diff={max_diff} (threshold 0.02)"
+        );
+    }
+
+    /// Helper: run V2 with quantized KV cache and compare against the
+    /// Auto-mode baseline computed on the same raw input. Returns
+    /// `max(|out_quant - out_auto|)` element-wise.
+    #[cfg(feature = "cuda-kernels")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_v2_quantized_case<T>(
+        dev: &Device,
+        kv_cache_dtype: crate::kv_cache::quantization::KVCacheDtype,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+        partition_size: usize,
+        k_scale_val: f32,
+        v_scale_val: f32,
+        quantize: impl Fn(&Tensor, &Tensor) -> Result<Tensor>,
+        compute_dtype: DType,
+    ) -> f32
+    where
+        T: PagedAttnDtype + 'static,
+    {
+        use crate::cuda_kernels::{
+            paged_attention_v2_cuda_with_kv_dtype, paged_attention_v2_cuda_with_partition_size,
+        };
+
+        let num_seqs = 1usize;
+        let max_blocks_per_seq = seq_len.div_ceil(block_size);
+        let q_f32: Vec<f32> = (0..num_seqs * num_q_heads * head_dim)
+            .map(|i| (i as f32 * 0.0123).sin() * 0.5)
+            .collect();
+        let kv_elements = max_blocks_per_seq * block_size * num_kv_heads * head_dim;
+        let k_f32: Vec<f32> = (0..kv_elements)
+            .map(|i| (i as f32 * 0.0271).cos() * 0.5)
+            .collect();
+        let v_f32: Vec<f32> = (0..kv_elements)
+            .map(|i| (i as f32 * 0.0411).sin() * 0.5)
+            .collect();
+
+        let q = Tensor::from_vec(q_f32.clone(), (num_seqs, num_q_heads, head_dim), dev)
+            .unwrap()
+            .to_dtype(compute_dtype)
+            .unwrap();
+        let k_full = Tensor::from_vec(
+            k_f32.clone(),
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            dev,
+        )
+        .unwrap()
+        .to_dtype(compute_dtype)
+        .unwrap();
+        let v_full = Tensor::from_vec(
+            v_f32.clone(),
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            dev,
+        )
+        .unwrap()
+        .to_dtype(compute_dtype)
+        .unwrap();
+
+        let bt: Vec<u32> = (0..max_blocks_per_seq as u32).collect();
+        let block_tables = Tensor::from_vec(bt, (num_seqs, max_blocks_per_seq), dev).unwrap();
+        let seq_lens = Tensor::from_vec(vec![seq_len as u32], num_seqs, dev).unwrap();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Baseline: Auto KV cache.
+        let auto_out = paged_attention_v2_cuda_with_partition_size(
+            &q,
+            &k_full,
+            &v_full,
+            &block_tables,
+            &seq_lens,
+            scale,
+            num_q_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            seq_len,
+            head_dim,
+            block_size,
+            partition_size,
+        )
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        // Quantize K/V to U8 storage; the per-tensor scale is supplied
+        // externally — we don't use CacheEngine's write path because
+        // we want to compare the raw paged_attn kernel against the
+        // exact same input data, without any reshape/scatter noise.
+        let k_scale_t = Tensor::from_vec(vec![k_scale_val], 1, dev).unwrap();
+        let v_scale_t = Tensor::from_vec(vec![v_scale_val], 1, dev).unwrap();
+        let k_quant = quantize(&k_full, &k_scale_t).unwrap();
+        let v_quant = quantize(&v_full, &v_scale_t).unwrap();
+
+        let quant_out = paged_attention_v2_cuda_with_kv_dtype(
+            &q,
+            &k_quant,
+            &v_quant,
+            &block_tables,
+            &seq_lens,
+            scale,
+            num_q_heads,
+            num_kv_heads,
+            max_blocks_per_seq,
+            seq_len,
+            head_dim,
+            block_size,
+            partition_size,
+            kv_cache_dtype,
+            Some(&k_scale_t),
+            Some(&v_scale_t),
+        )
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        auto_out
+            .iter()
+            .zip(quant_out.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
     fn test_paged_attn_v2_alibi_parity() {
         let Ok(dev) = Device::new_cuda(0) else { return };
         let num_q_heads = 4;
@@ -5704,7 +6560,16 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda-kernels")]
+    // `mini_decoder_layer_forward` and downstream replay helpers/tests
+    // invoke `rms_norm_cuda_pooled` / `bf16_add_pooled` /
+    // `silu_and_mul_separate_pooled` / `embedding_pooled` which live
+    // behind the `cuda-layernorm` and `cuda-fused-activations`
+    // sub-features. Gating only on `cuda-kernels` made the lib test
+    // binary fail to compile in the default `cuda-kernels`-only build
+    // (the historical baseline documented in Cargo.toml). The
+    // `mini-decoder-tests` meta-feature aggregates the actual
+    // dependencies — see Cargo.toml for the rationale.
+    #[cfg(feature = "mini-decoder-tests")]
     #[allow(clippy::too_many_arguments)]
     fn mini_decoder_layer_forward(
         xs: &Tensor,
@@ -5930,7 +6795,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[allow(clippy::too_many_arguments)]
     fn mini_decoder_forward(
         xs0: &Tensor,
@@ -6302,7 +7167,7 @@ mod tests {
     /// payload differ), and `with_embedding` flag (when true, the
     /// captured graph starts with `embedding_pooled` index_select like
     /// production — input is U32 token IDs, not pre-embedded hidden).
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[allow(clippy::too_many_arguments)]
     fn run_mini_decoder_capture_replay(
         num_layers: usize,
@@ -6644,7 +7509,7 @@ mod tests {
     }
 
     /// 1-layer, no input shift — minimum repro size.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn mini_decoder_1layer_capture_replay_matches_eager() {
@@ -6654,7 +7519,7 @@ mod tests {
     }
 
     /// 2-layer, no input shift (same payload for eager and replay).
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn mini_decoder_2layer_capture_replay_matches_eager() {
@@ -6664,7 +7529,7 @@ mod tests {
     }
 
     /// 16-layer, no input shift.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn mini_decoder_16layer_capture_replay_matches_eager() {
@@ -6674,7 +7539,7 @@ mod tests {
     }
 
     /// 16-layer WITH input shift.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn mini_decoder_16layer_capture_replay_with_input_shift() {
@@ -6688,7 +7553,7 @@ mod tests {
     /// Capture recorded with input_ids_a (token=5), replay against
     /// input_ids_b (token=13). If the captured graph's embedding/index_select
     /// is the culprit → diverges here.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn mini_decoder_16layer_capture_replay_with_embedding() {
@@ -6701,7 +7566,7 @@ mod tests {
     /// but named differently to trigger ordering — runs AFTER another
     /// capture-replay test. Confirms second-capture-after-first-capture
     /// pattern (production: batch=1 → batch=2 → batch=4 → ...).
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn zz_mini_decoder_second_with_input_shift_after_prior() {
@@ -6718,7 +7583,7 @@ mod tests {
     /// forward 2 reads bad KV and diverges from eager's forward 2.
     /// This test diffs forward 1 AND forward 2 outputs between eager
     /// and capture-replay paths.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     #[test]
     #[ignore]
     fn mini_decoder_16layer_capture_replay_two_forwards() {
@@ -6732,7 +7597,7 @@ mod tests {
     /// capture-replay. Between forwards, advances seq_lens (6→7),
     /// positions (5→6), slot_mapping (5→6) — so forward 2 reads what
     /// forward 1 wrote to KV cache.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(feature = "mini-decoder-tests")]
     fn run_mini_decoder_two_forwards_capture_replay(
         num_layers: usize,
     ) -> std::result::Result<(), String> {

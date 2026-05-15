@@ -332,6 +332,89 @@ impl KVCacheManager {
         self.engines[layer_idx].as_standard_mut()
     }
 
+    /// Apply a headroom factor to every layer's KV scales. No-op for
+    /// non-quantised caches and for layers already pinned with explicit
+    /// scales (where headroom doesn't apply). See
+    /// `KVScales::set_headroom_factor`.
+    pub fn set_kv_headroom_factor(&mut self, factor: f32) -> Result<(), CacheError> {
+        for variant in self.engines.iter_mut() {
+            if let CacheVariant::Standard(e) = variant {
+                e.set_kv_headroom_factor(factor)?;
+            }
+            // MLA caches: headroom factor lives on MLAScales; left for a
+            // follow-up wiring step since MLA models route through a
+            // separate engine path that doesn't yet expose the setter.
+        }
+        Ok(())
+    }
+
+    /// Apply per-layer KV cache scales loaded from a model checkpoint.
+    ///
+    /// `scales` maps layer index → `(k_scale, v_scale)` pair. Each
+    /// component is optional because some checkpoints ship only one
+    /// side (the missing side falls through to first-write
+    /// calibration). For layers not present in the map, the
+    /// first-write calibration path stays active.
+    ///
+    /// Must be called **before** any model forward pass — see
+    /// `CacheEngine::set_kv_scales` for the slot-stability contract.
+    ///
+    /// Returns the number of layers where at least one scale was
+    /// pinned. Returns 0 (with no side effects) if this is an MLA
+    /// cache manager — MLA scales are managed separately by
+    /// `MLAScales` and are not yet wired through this entry point.
+    pub fn apply_checkpoint_kv_scales(
+        &mut self,
+        scales: &std::collections::HashMap<usize, (Option<f32>, Option<f32>)>,
+    ) -> Result<usize, CacheError> {
+        // MLA caches use a different scales struct (kv_c_scale /
+        // k_pe_scale) and a different checkpoint layout; the standard
+        // checkpoint patterns we recognise don't apply. Returning 0
+        // keeps the first-write calibration path alive for MLA without
+        // forcing the caller to know the cache variant up front.
+        if !self
+            .engines
+            .iter()
+            .all(|v| matches!(v, CacheVariant::Standard(_)))
+        {
+            tracing::info!(
+                "apply_checkpoint_kv_scales: skipping MLA cache manager — \
+                 MLA scale checkpoint loading is a separate code path"
+            );
+            return Ok(0);
+        }
+
+        let mut pinned = 0usize;
+        for (&layer_idx, &(k_opt, v_opt)) in scales.iter() {
+            if layer_idx >= self.engines.len() {
+                continue;
+            }
+            // Apply only when both sides are known — `set_kv_scales`
+            // pins them together as the calibrated pair. If only one
+            // side ships in the checkpoint, log it but keep the
+            // first-write calibration path: a half-calibrated cache
+            // would underflow on the missing side and overflow on the
+            // other, giving worse output than uncalibrated.
+            match (k_opt, v_opt) {
+                (Some(k), Some(v)) => {
+                    self.engines[layer_idx]
+                        .as_standard_mut()
+                        .set_kv_scales(k, v)?;
+                    pinned += 1;
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    tracing::warn!(
+                        layer = layer_idx,
+                        "checkpoint ships only one of (k_scale, v_scale); \
+                         keeping first-write calibration for this layer"
+                    );
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Get the MLACacheEngine for a specific layer (immutable).
     ///
     /// # Panics

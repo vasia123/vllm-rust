@@ -17,8 +17,14 @@ pub enum KVCacheDtype {
     /// Automatic: use model's compute dtype (BF16/F16), no quantization
     #[default]
     Auto,
-    /// FP8 E4M3 format: 2x compression, requires Hopper+ (sm_89)
+    /// FP8 E4M3 format: 2x compression, requires Hopper+ (sm_89). Higher
+    /// precision (3-bit mantissa) but narrower range than E5M2 — typical
+    /// choice for inference activations.
     Fp8E4m3,
+    /// FP8 E5M2 format: 2x compression, same hardware as E4M3. Wider
+    /// range (5-bit exponent) at the cost of precision (2-bit mantissa);
+    /// useful for outlier-heavy distributions.
+    Fp8E5m2,
     /// INT8 symmetric: 2x compression, wider hardware support (Ampere+)
     Int8,
 }
@@ -28,7 +34,7 @@ impl KVCacheDtype {
     pub fn element_size(&self, compute_dtype: DType) -> usize {
         match self {
             KVCacheDtype::Auto => compute_dtype.size_in_bytes(),
-            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Int8 => 1,
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 | KVCacheDtype::Int8 => 1,
         }
     }
 
@@ -36,7 +42,7 @@ impl KVCacheDtype {
     pub fn storage_dtype(&self, compute_dtype: DType) -> DType {
         match self {
             KVCacheDtype::Auto => compute_dtype,
-            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Int8 => DType::U8,
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 | KVCacheDtype::Int8 => DType::U8,
         }
     }
 
@@ -48,9 +54,20 @@ impl KVCacheDtype {
     /// Minimum CUDA compute capability required.
     pub fn min_capability(&self) -> u32 {
         match self {
-            KVCacheDtype::Auto => 70,    // Volta for BF16
-            KVCacheDtype::Fp8E4m3 => 89, // Hopper (H100)
-            KVCacheDtype::Int8 => 80,    // Ampere (A100)
+            KVCacheDtype::Auto => 70,                            // Volta for BF16
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 => 89, // Ada / Hopper
+            KVCacheDtype::Int8 => 80,                            // Ampere (A100)
+        }
+    }
+
+    /// Stable kernel-symbol token. Used to suffix paged_attention entry
+    /// point names — see `cuda_kernels::PagedAttnDtype` constants.
+    pub fn kernel_token(&self) -> &'static str {
+        match self {
+            KVCacheDtype::Auto => "auto",
+            KVCacheDtype::Fp8E4m3 => "fp8e4m3",
+            KVCacheDtype::Fp8E5m2 => "fp8e5m2",
+            KVCacheDtype::Int8 => "int8",
         }
     }
 }
@@ -65,50 +82,159 @@ pub struct KVScales {
     pub k_scale: Tensor,
     /// Scale for V cache: `v_fp8 = v / v_scale`
     pub v_scale: Tensor,
+    /// True once scales have been pinned (either explicit `from_values`
+    /// / `set_kv_scales` or first-write calibration). Stays `true` for
+    /// the lifetime of the cache to preserve the slot-stability
+    /// contract: cached bytes were encoded under `(k_scale, v_scale)`
+    /// and stay valid only as long as those values do not change.
+    /// `reset()` clears the flag along with the scales so a fresh
+    /// request can recalibrate on its first write.
+    calibrated: bool,
+    /// Multiplicative headroom factor applied during first-write
+    /// calibration: `scale = absmax * headroom / FP8_MAX`. Reserves
+    /// representable range above the first-batch maximum so later
+    /// decode tokens that drift slightly upwards don't saturate (the
+    /// observed "phrase loop" failure mode at headroom=1.0). Default
+    /// 1.5 is calibrated against Qwen3 / Llama RMSNorm post-projection
+    /// activations where decode-time absmax stays within ~50 % of
+    /// prefill absmax. Setting it to 1.0 reproduces the strict
+    /// first-batch behaviour from Phase 5. Has no effect once
+    /// `calibrated` is true.
+    headroom_factor: f32,
 }
 
+/// Default headroom factor applied on top of first-batch absmax during
+/// FP8/INT8 KV cache calibration. See `KVScales::headroom_factor`.
+pub const DEFAULT_KV_HEADROOM_FACTOR: f32 = 1.5;
+
 impl KVScales {
-    /// Create new scales initialized to 1.0 (identity scaling).
+    /// Create new scales initialized to 1.0 (identity scaling), not
+    /// yet calibrated. The first write into a quantised cache will
+    /// pin per-tensor scales from the observed K/V absmax.
     pub fn new(device: &Device) -> Result<Self> {
         let k_scale = Tensor::ones(1, DType::F32, device)?;
         let v_scale = Tensor::ones(1, DType::F32, device)?;
-        Ok(Self { k_scale, v_scale })
+        Ok(Self {
+            k_scale,
+            v_scale,
+            calibrated: false,
+            headroom_factor: DEFAULT_KV_HEADROOM_FACTOR,
+        })
     }
 
-    /// Create scales from explicit values.
+    /// Create scales from explicit values. Considered already
+    /// calibrated — no first-write recalibration will overwrite them.
     pub fn from_values(k_scale: f32, v_scale: f32, device: &Device) -> Result<Self> {
         let k_scale = Tensor::from_slice(&[k_scale], 1, device)?;
         let v_scale = Tensor::from_slice(&[v_scale], 1, device)?;
-        Ok(Self { k_scale, v_scale })
+        Ok(Self {
+            k_scale,
+            v_scale,
+            calibrated: true,
+            headroom_factor: DEFAULT_KV_HEADROOM_FACTOR,
+        })
     }
 
-    /// Update K scale based on observed data.
+    /// Override the headroom factor used by first-write calibration.
+    ///
+    /// `1.0` reproduces strict first-batch behaviour (Phase 5);
+    /// values in `[1.0, 2.0]` are typical. Negative / zero / non-finite
+    /// values are rejected. Has no effect once scales are calibrated.
+    pub fn set_headroom_factor(&mut self, factor: f32) -> Result<()> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(candle_core::Error::Msg(format!(
+                "KV scale headroom factor must be a positive finite value, got {factor}"
+            )));
+        }
+        self.headroom_factor = factor;
+        Ok(())
+    }
+
+    /// Current headroom factor — exposed for diagnostics and tests.
+    pub fn headroom_factor(&self) -> f32 {
+        self.headroom_factor
+    }
+
+    /// Update K scale based on observed data (no headroom applied).
     pub fn calibrate_k(&mut self, k: &Tensor) -> Result<()> {
         self.k_scale = compute_scale(k)?;
         Ok(())
     }
 
-    /// Update V scale based on observed data.
+    /// Update V scale based on observed data (no headroom applied).
     pub fn calibrate_v(&mut self, v: &Tensor) -> Result<()> {
         self.v_scale = compute_scale(v)?;
         Ok(())
     }
 
-    /// Update both scales based on observed data.
+    /// Update both scales based on observed data and mark calibrated.
+    /// No headroom applied — use [`Self::calibrate_if_needed`] for the
+    /// first-write path that respects [`Self::headroom_factor`].
     pub fn calibrate(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         self.calibrate_k(k)?;
         self.calibrate_v(v)?;
+        self.calibrated = true;
         Ok(())
     }
 
-    /// Reset scales back to identity (1.0).
+    /// First-write calibration entry point: if scales have not been
+    /// pinned yet, derive them from the supplied K/V tensors and mark
+    /// `calibrated = true`. On subsequent calls (or when explicit
+    /// scales were provided up-front), this is a no-op.
     ///
-    /// Called during cache reset to ensure stale calibration data
-    /// from previous requests doesn't affect new requests.
+    /// Applies [`Self::headroom_factor`] on top of the observed absmax
+    /// so the quantisation range stays valid across the request
+    /// lifetime, not only for the first batch. With factor=1.0 (Phase
+    /// 5 behaviour) we observed decode-time "phrase loops" when later
+    /// tokens drifted above the prefill absmax and clamped to
+    /// `±FP8_MAX` — losing the upper bits. Factor=1.5 reserves a
+    /// 50 % buffer.
+    ///
+    /// Rationale (still applies): scale=1.0 with FP8 E4M3 (min normal
+    /// ≈ 0.0156) is catastrophic for typical RMSNorm-normalised K/V
+    /// whose absmax is well below 1.0 — quantisation rounds the bulk
+    /// of values to zero. Anchoring scales on the first observed
+    /// batch keeps representable range matched to actual activations,
+    /// while freezing them afterwards preserves the byte-stability of
+    /// already-written slots.
+    pub fn calibrate_if_needed(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        if self.calibrated {
+            return Ok(());
+        }
+        let h = self.headroom_factor as f64;
+        // Apply headroom by scaling the absmax before dividing by
+        // FP8_MAX. Equivalent to dividing the resulting scale by
+        // `1/headroom`, but staying in tensor ops keeps everything on
+        // device.
+        self.k_scale = compute_scale_with_headroom(k, h)?;
+        self.v_scale = compute_scale_with_headroom(v, h)?;
+        self.calibrated = true;
+        Ok(())
+    }
+
+    /// Pin scales to explicit values (e.g. loaded from checkpoint or
+    /// computed by an offline calibration pass). Marks calibrated so
+    /// first-write calibration will not overwrite them.
+    pub fn set(&mut self, k_scale: f32, v_scale: f32) -> Result<()> {
+        let device = self.k_scale.device().clone();
+        self.k_scale = Tensor::from_slice(&[k_scale], 1, &device)?;
+        self.v_scale = Tensor::from_slice(&[v_scale], 1, &device)?;
+        self.calibrated = true;
+        Ok(())
+    }
+
+    /// Whether scales have been pinned.
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
+
+    /// Reset scales back to identity (1.0) and clear the calibrated
+    /// flag so the next request's first write recalibrates afresh.
     pub fn reset(&mut self) -> Result<()> {
         let device = self.k_scale.device().clone();
         self.k_scale = Tensor::ones(1, DType::F32, &device)?;
         self.v_scale = Tensor::ones(1, DType::F32, &device)?;
+        self.calibrated = false;
         Ok(())
     }
 }
@@ -134,6 +260,19 @@ fn compute_scale(tensor: &Tensor) -> Result<Tensor> {
     let abs_tensor = tensor.abs()?.to_dtype(DType::F32)?;
     let max_val = abs_tensor.flatten_all()?.max(0)?;
     let scale = (max_val / FP8_E4M3_MAX as f64)?.maximum(SCALE_MIN as f64)?;
+    Ok(scale)
+}
+
+/// Compute per-tensor scale with a multiplicative headroom factor.
+///
+/// `scale = max(abs(tensor)) * headroom / FP8_MAX`, clamped at
+/// `SCALE_MIN`. Used by [`KVScales::calibrate_if_needed`] to reserve
+/// representable range above the first-batch maximum so later decode
+/// tokens that drift slightly upwards do not clamp to `±FP8_MAX`.
+fn compute_scale_with_headroom(tensor: &Tensor, headroom: f64) -> Result<Tensor> {
+    let abs_tensor = tensor.abs()?.to_dtype(DType::F32)?;
+    let max_val = abs_tensor.flatten_all()?.max(0)?;
+    let scale = ((max_val * headroom)? / FP8_E4M3_MAX as f64)?.maximum(SCALE_MIN as f64)?;
     Ok(scale)
 }
 
@@ -387,6 +526,110 @@ mod tests {
         assert!(!KVCacheDtype::Auto.is_quantized());
         assert!(KVCacheDtype::Fp8E4m3.is_quantized());
         assert!(KVCacheDtype::Int8.is_quantized());
+    }
+
+    // ---- Phase 8: headroom factor calibration ----
+
+    fn read_scalar(t: &Tensor) -> f32 {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()[0]
+    }
+
+    #[test]
+    fn headroom_factor_default_is_1_5() {
+        let scales = KVScales::new(&Device::Cpu).unwrap();
+        assert!((scales.headroom_factor() - DEFAULT_KV_HEADROOM_FACTOR).abs() < 1e-6);
+        assert!((DEFAULT_KV_HEADROOM_FACTOR - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn headroom_factor_rejects_non_positive() {
+        let mut scales = KVScales::new(&Device::Cpu).unwrap();
+        assert!(scales.set_headroom_factor(0.0).is_err());
+        assert!(scales.set_headroom_factor(-1.0).is_err());
+        assert!(scales.set_headroom_factor(f32::NAN).is_err());
+        assert!(scales.set_headroom_factor(f32::INFINITY).is_err());
+        assert!(scales.set_headroom_factor(1.0).is_ok());
+        assert!(scales.set_headroom_factor(2.5).is_ok());
+    }
+
+    #[test]
+    fn calibrate_if_needed_applies_headroom() {
+        // For a tensor with absmax = 4.0 and headroom = 1.5,
+        // expected scale = 4.0 * 1.5 / 448 ≈ 0.01339
+        let device = Device::Cpu;
+        let k = Tensor::from_slice(&[1.0f32, -4.0, 2.0], 3, &device).unwrap();
+        let v = Tensor::from_slice(&[0.5f32, -3.0, 2.5], 3, &device).unwrap();
+        let mut scales = KVScales::new(&device).unwrap();
+
+        scales.calibrate_if_needed(&k, &v).unwrap();
+        assert!(scales.is_calibrated());
+
+        let expected_k = 4.0 * 1.5 / FP8_E4M3_MAX;
+        let expected_v = 3.0 * 1.5 / FP8_E4M3_MAX;
+        assert!(
+            (read_scalar(&scales.k_scale) - expected_k).abs() < 1e-5,
+            "k_scale {} vs expected {}",
+            read_scalar(&scales.k_scale),
+            expected_k
+        );
+        assert!(
+            (read_scalar(&scales.v_scale) - expected_v).abs() < 1e-5,
+            "v_scale {} vs expected {}",
+            read_scalar(&scales.v_scale),
+            expected_v
+        );
+    }
+
+    #[test]
+    fn headroom_1_0_matches_phase5_behaviour() {
+        // headroom=1.0 reproduces strict first-batch sizing (absmax /
+        // FP8_MAX), matching the Phase 5 baseline.
+        let device = Device::Cpu;
+        let k = Tensor::from_slice(&[2.0f32, -2.0], 2, &device).unwrap();
+        let v = Tensor::from_slice(&[1.0f32], 1, &device).unwrap();
+
+        let mut scales = KVScales::new(&device).unwrap();
+        scales.set_headroom_factor(1.0).unwrap();
+        scales.calibrate_if_needed(&k, &v).unwrap();
+
+        assert!(
+            (read_scalar(&scales.k_scale) - 2.0 / FP8_E4M3_MAX).abs() < 1e-5,
+            "headroom=1.0 must give absmax/FP8_MAX exactly"
+        );
+    }
+
+    #[test]
+    fn calibrate_if_needed_is_idempotent() {
+        // Second call must not overwrite already-pinned scales —
+        // slot-stability contract.
+        let device = Device::Cpu;
+        let k1 = Tensor::from_slice(&[1.0f32], 1, &device).unwrap();
+        let v1 = Tensor::from_slice(&[1.0f32], 1, &device).unwrap();
+        let k2 = Tensor::from_slice(&[100.0f32], 1, &device).unwrap();
+        let v2 = Tensor::from_slice(&[100.0f32], 1, &device).unwrap();
+
+        let mut scales = KVScales::new(&device).unwrap();
+        scales.calibrate_if_needed(&k1, &v1).unwrap();
+        let first = read_scalar(&scales.k_scale);
+        scales.calibrate_if_needed(&k2, &v2).unwrap();
+        let second = read_scalar(&scales.k_scale);
+        assert_eq!(first, second, "second calibrate_if_needed must be a no-op");
+    }
+
+    #[test]
+    fn from_values_ignores_headroom() {
+        // Explicit scales (checkpoint or set()) bypass first-write
+        // calibration and therefore are unaffected by headroom.
+        let device = Device::Cpu;
+        let scales = KVScales::from_values(0.1, 0.2, &device).unwrap();
+        assert_eq!(read_scalar(&scales.k_scale), 0.1);
+        assert_eq!(read_scalar(&scales.v_scale), 0.2);
+        assert!(scales.is_calibrated());
     }
 
     #[test]

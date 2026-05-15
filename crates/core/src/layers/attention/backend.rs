@@ -6,7 +6,7 @@
 
 use candle_core::{Result, Tensor};
 
-use crate::kv_cache::{BlockId, CacheEngine};
+use crate::kv_cache::{BlockId, CacheEngine, KVCacheDtype};
 
 /// Metadata for a single sequence in paged attention.
 #[derive(Debug, Clone)]
@@ -280,6 +280,27 @@ pub trait AttentionBackend: Send + Sync {
             candle_core::DType::F16,
             candle_core::DType::BF16,
         ]
+    }
+
+    /// KV cache storage dtypes this backend can read correctly.
+    ///
+    /// Backends that read the cache as a typed slice without inline
+    /// dequantization (e.g. FlashInfer's default prefill kernel) must
+    /// declare only `KVCacheDtype::Auto` here — otherwise FP8/INT8 U8
+    /// byte storage gets interpreted as native floats and produces
+    /// silent garbage.
+    ///
+    /// The selector (`AttentionBackendSelector::try_*`) consults this
+    /// list to skip backends that don't support the requested KV cache
+    /// dtype, and call sites that bypass the selector (e.g.
+    /// `VLLM_FLASHINFER_DECODE` opt-in) MUST bail when the backend
+    /// declares no support for the active `CacheEngine::kv_cache_dtype()`.
+    ///
+    /// Default: `&[KVCacheDtype::Auto]` (no quantized support). Backends
+    /// with inline dequant in their kernel (our paged_attention V1/V2
+    /// path) override this with `&[Auto, Fp8E4m3, Fp8E5m2, Int8]`.
+    fn supported_kv_cache_dtypes(&self) -> &[KVCacheDtype] {
+        &[KVCacheDtype::Auto]
     }
 }
 

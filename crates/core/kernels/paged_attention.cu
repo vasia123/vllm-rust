@@ -7,8 +7,10 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <float.h>
+#include <stdint.h>
 
 // Type-erased fp16/bf16 conversion helpers. The kernels operate in F32 internally
 // (Q/K/V are upcast to float for arithmetic) and only the load/store boundary
@@ -27,6 +29,69 @@ template <> __device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(flo
 }
 template <> __device__ __forceinline__ __half from_f32<__half>(float x) {
     return __float2half(x);
+}
+
+// ============================================================================
+// KV cache load helper — uniform interface across fp16 / bf16 / fp8 / int8.
+// ============================================================================
+//
+// `Cache_t` identifies the on-disk cache type. For full-precision native types
+// (__half, __nv_bfloat16) the scale parameter is ignored and the value is just
+// upcast to float. For quantized types (fp8_e4m3, fp8_e5m2, int8_t) the byte
+// is dequantized via inline conversion and multiplied by a per-tensor scalar
+// scale. Calling code reads the scale once per kernel (loaded into a uniform
+// register) and passes it to every load — CUDA L1 caches the constant load.
+//
+// Wrappers around fp8 storage:
+//   `fp8_e4m3_byte` / `fp8_e5m2_byte` exist purely as type markers so template
+//   specialization can distinguish the two FP8 encodings that share the same
+//   1-byte storage. Rust passes the raw U8 device pointer; the kernel parameter
+//   is declared with the appropriate marker type and the per-byte read is
+//   re-interpreted to the matching CUDA fp8 class for conversion.
+struct fp8_e4m3_byte { uint8_t b; };
+struct fp8_e5m2_byte { uint8_t b; };
+
+template <typename Cache_t>
+__device__ __forceinline__ float load_kv_to_f32(Cache_t v, float scale);
+
+template <>
+__device__ __forceinline__ float load_kv_to_f32<__half>(__half v, float /*scale*/) {
+    return __half2float(v);
+}
+template <>
+__device__ __forceinline__ float load_kv_to_f32<__nv_bfloat16>(
+    __nv_bfloat16 v, float /*scale*/) {
+    return __bfloat162float(v);
+}
+template <>
+__device__ __forceinline__ float load_kv_to_f32<fp8_e4m3_byte>(
+    fp8_e4m3_byte v, float scale) {
+    // The CUDA fp8 class encapsulates the byte and provides an explicit
+    // `operator float()`. Reinterpret the storage byte as the e4m3 class
+    // and convert.
+    __nv_fp8_e4m3 packed;
+    packed.__x = static_cast<__nv_fp8_storage_t>(v.b);
+    return static_cast<float>(packed) * scale;
+}
+template <>
+__device__ __forceinline__ float load_kv_to_f32<fp8_e5m2_byte>(
+    fp8_e5m2_byte v, float scale) {
+    __nv_fp8_e5m2 packed;
+    packed.__x = static_cast<__nv_fp8_storage_t>(v.b);
+    return static_cast<float>(packed) * scale;
+}
+template <>
+__device__ __forceinline__ float load_kv_to_f32<int8_t>(int8_t v, float scale) {
+    // INT8 storage is U8 on the Rust side (`quantize_int8` writes
+    // `rounded + 128` to fit unsigned u8 — see
+    // `crates/core/src/kv_cache/quantization.rs::quantize_int8`).
+    // The kernel parameter is declared `int8_t*` purely to dispatch the
+    // template specialization; here we reinterpret the byte as unsigned
+    // and subtract 128 to recover the symmetric [-128, 127] range
+    // before applying the scale. Equivalent to vLLM's
+    // `int8::scaled_convert` flow.
+    const uint8_t u = static_cast<uint8_t>(v);
+    return (static_cast<float>(u) - 128.0f) * scale;
 }
 
 // NUM_THREADS must be >= head_dim for correctness when head_dim <= 128,
@@ -116,12 +181,12 @@ __device__ float block_reduce_max(float val, float* reduce_smem) {
 //   float q_smem[head_dim]             -- query vector
 //   float reduce_smem[NUM_WARPS]       -- reduction workspace
 //   float logits[max_context_len]      -- QK logits (variable)
-template <typename T>
+template <typename Q_t, typename Cache_t>
 __device__ void paged_attention_v1_impl(
-    T* __restrict__ out,                       // [num_seqs, num_heads, head_dim]
-    const T* __restrict__ q,                   // [num_seqs, num_heads, head_dim]
-    const T* __restrict__ k_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
-    const T* __restrict__ v_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
+    Q_t* __restrict__ out,                     // [num_seqs, num_heads, head_dim]
+    const Q_t* __restrict__ q,                 // [num_seqs, num_heads, head_dim]
+    const Cache_t* __restrict__ k_cache,       // [num_blocks, block_size, num_kv_heads, head_dim]
+    const Cache_t* __restrict__ v_cache,       // [num_blocks, block_size, num_kv_heads, head_dim]
     const int* __restrict__ block_tables,      // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ seq_lens,          // [num_seqs]
     const float scale,
@@ -130,7 +195,9 @@ __device__ void paged_attention_v1_impl(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
-    const float* __restrict__ alibi_slopes     // [num_heads] or nullptr
+    const float* __restrict__ alibi_slopes,    // [num_heads] or nullptr
+    const float* __restrict__ k_scale_ptr,     // [1] or nullptr (1.0 default)
+    const float* __restrict__ v_scale_ptr      // [1] or nullptr (1.0 default)
 ) {
     const int head_idx = blockIdx.x;
     const int seq_idx = blockIdx.y;
@@ -145,6 +212,11 @@ __device__ void paged_attention_v1_impl(
 
     // ALiBi slope for this head (0 if not using ALiBi)
     const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[head_idx] : 0.0f;
+    // Per-tensor KV scales — loaded once per kernel (cached in L1). Native-dtype
+    // cache (fp16/bf16) ignores these in `load_kv_to_f32`; quantized cache
+    // (fp8/int8) multiplies the dequantized byte by the scale.
+    const float k_scale = (k_scale_ptr != nullptr) ? *k_scale_ptr : 1.0f;
+    const float v_scale = (v_scale_ptr != nullptr) ? *v_scale_ptr : 1.0f;
 
     // Shared memory layout (fixed offsets to avoid overlap):
     //   [0, head_dim)                          -- q vector
@@ -162,7 +234,7 @@ __device__ void paged_attention_v1_impl(
     // Load query vector into shared memory (threads loop if head_dim > NUM_THREADS)
     for (int d = tid; d < head_dim; d += NUM_THREADS) {
         const int q_offset = seq_idx * num_heads * head_dim + head_idx * head_dim + d;
-        q_smem[d] = to_f32<T>(q[q_offset]);
+        q_smem[d] = to_f32<Q_t>(q[q_offset]);
     }
     __syncthreads();
 
@@ -185,7 +257,7 @@ __device__ void paged_attention_v1_impl(
                                    + token * cache_stride_token
                                    + kv_head_idx * head_dim
                                    + d;
-                const float k_val = to_f32<T>(k_cache[k_offset]);
+                const float k_val = load_kv_to_f32<Cache_t>(k_cache[k_offset], k_scale);
                 qk += q_smem[d] * k_val;
             }
 
@@ -243,7 +315,7 @@ __device__ void paged_attention_v1_impl(
                                    + token * cache_stride_token
                                    + kv_head_idx * head_dim
                                    + d;
-                const float v_val = to_f32<T>(v_cache[v_offset]);
+                const float v_val = load_kv_to_f32<Cache_t>(v_cache[v_offset], v_scale);
                 const float weight = logits[block_idx * block_size + token];
                 acc += weight * v_val;
             }
@@ -251,11 +323,21 @@ __device__ void paged_attention_v1_impl(
 
         // Write output
         const int out_offset = seq_idx * num_heads * head_dim + head_idx * head_dim + d;
-        out[out_offset] = from_f32<T>(acc);
+        out[out_offset] = from_f32<Q_t>(acc);
     }
 }
 
-// Standard entry point: configurable head_dim and block_size, no ALiBi.
+// ============================================================================
+// V1 entry points
+// ============================================================================
+//
+// Existing fp16/bf16 entries (kv_cache_dtype == Auto, i.e. KV cache stored at
+// the same dtype as Q) gain two trailing optional scale pointers — pass
+// nullptr to skip scaling (existing Auto behaviour). FP8/INT8 entries cast
+// the cache pointer to the appropriate marker type and require scales.
+
+// --- Auto KV cache (Q dtype matches cache dtype) -----------------------------
+
 extern "C" __global__ void paged_attention_v1_bf16(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ q,
@@ -268,17 +350,18 @@ extern "C" __global__ void paged_attention_v1_bf16(
     const int num_kv_heads,
     const int max_blocks_per_seq,
     const int head_dim,
-    const int block_size
+    const int block_size,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v1_impl<__nv_bfloat16>(
+    paged_attention_v1_impl<__nv_bfloat16, __nv_bfloat16>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size,
-        nullptr  // no ALiBi
+        /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
 
-// Entry point with ALiBi positional bias support.
 extern "C" __global__ void paged_attention_v1_bf16_alibi(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ q,
@@ -292,17 +375,18 @@ extern "C" __global__ void paged_attention_v1_bf16_alibi(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
-    const float* __restrict__ alibi_slopes     // [num_heads]
+    const float* __restrict__ alibi_slopes,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v1_impl<__nv_bfloat16>(
+    paged_attention_v1_impl<__nv_bfloat16, __nv_bfloat16>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size,
-        alibi_slopes
+        alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
 
-// F16 entry points — thin wrappers over the templated impl with __half.
 extern "C" __global__ void paged_attention_v1_f16(
     __half* __restrict__ out,
     const __half* __restrict__ q,
@@ -315,13 +399,15 @@ extern "C" __global__ void paged_attention_v1_f16(
     const int num_kv_heads,
     const int max_blocks_per_seq,
     const int head_dim,
-    const int block_size
+    const int block_size,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v1_impl<__half>(
+    paged_attention_v1_impl<__half, __half>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size,
-        nullptr
+        /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
 
@@ -338,15 +424,94 @@ extern "C" __global__ void paged_attention_v1_f16_alibi(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
-    const float* __restrict__ alibi_slopes
+    const float* __restrict__ alibi_slopes,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v1_impl<__half>(
+    paged_attention_v1_impl<__half, __half>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size,
-        alibi_slopes
+        alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
+
+// --- Quantized KV cache (FP8 E4M3 / E5M2 / INT8) -----------------------------
+//
+// The KV cache is allocated as U8 on the Rust side; the kernel parameter type
+// (`fp8_e4m3_byte*`, `fp8_e5m2_byte*`, `int8_t*`) selects the dequantization
+// path inside `load_kv_to_f32`. Two macros — one for the non-ALiBi entry, one
+// for the ALiBi entry — keep both forms in lock-step. Both call the same
+// `paged_attention_v1_impl<QTYPE, CACHE_T>` template; only the
+// `alibi_slopes` argument differs.
+#define EXL3_DEFINE_V1_QUANT(QTYPE, QSUFFIX, KVMARKER, KVSUFFIX) \
+extern "C" __global__ void paged_attention_v1_##QSUFFIX##_##KVSUFFIX( \
+    QTYPE* __restrict__ out, \
+    const QTYPE* __restrict__ q, \
+    const KVMARKER* __restrict__ k_cache, \
+    const KVMARKER* __restrict__ v_cache, \
+    const int* __restrict__ block_tables, \
+    const int* __restrict__ seq_lens, \
+    const float scale, \
+    const int num_heads, \
+    const int num_kv_heads, \
+    const int max_blocks_per_seq, \
+    const int head_dim, \
+    const int block_size, \
+    const float* __restrict__ k_scale_ptr, \
+    const float* __restrict__ v_scale_ptr \
+) { \
+    paged_attention_v1_impl<QTYPE, KVMARKER>( \
+        out, q, k_cache, v_cache, block_tables, seq_lens, \
+        scale, num_heads, num_kv_heads, max_blocks_per_seq, \
+        head_dim, block_size, \
+        /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr \
+    ); \
+}
+
+#define EXL3_DEFINE_V1_QUANT_ALIBI(QTYPE, QSUFFIX, KVMARKER, KVSUFFIX) \
+extern "C" __global__ void paged_attention_v1_##QSUFFIX##_##KVSUFFIX##_alibi( \
+    QTYPE* __restrict__ out, \
+    const QTYPE* __restrict__ q, \
+    const KVMARKER* __restrict__ k_cache, \
+    const KVMARKER* __restrict__ v_cache, \
+    const int* __restrict__ block_tables, \
+    const int* __restrict__ seq_lens, \
+    const float scale, \
+    const int num_heads, \
+    const int num_kv_heads, \
+    const int max_blocks_per_seq, \
+    const int head_dim, \
+    const int block_size, \
+    const float* __restrict__ alibi_slopes, \
+    const float* __restrict__ k_scale_ptr, \
+    const float* __restrict__ v_scale_ptr \
+) { \
+    paged_attention_v1_impl<QTYPE, KVMARKER>( \
+        out, q, k_cache, v_cache, block_tables, seq_lens, \
+        scale, num_heads, num_kv_heads, max_blocks_per_seq, \
+        head_dim, block_size, \
+        alibi_slopes, k_scale_ptr, v_scale_ptr \
+    ); \
+}
+
+EXL3_DEFINE_V1_QUANT(__nv_bfloat16, bf16, fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V1_QUANT(__nv_bfloat16, bf16, fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V1_QUANT(__nv_bfloat16, bf16, int8_t,        int8)
+EXL3_DEFINE_V1_QUANT(__half,        f16,  fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V1_QUANT(__half,        f16,  fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V1_QUANT(__half,        f16,  int8_t,        int8)
+
+// Phase 10: ALiBi + FP8/INT8 entry points. 6 new V1 symbols.
+EXL3_DEFINE_V1_QUANT_ALIBI(__nv_bfloat16, bf16, fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V1_QUANT_ALIBI(__nv_bfloat16, bf16, fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V1_QUANT_ALIBI(__nv_bfloat16, bf16, int8_t,        int8)
+EXL3_DEFINE_V1_QUANT_ALIBI(__half,        f16,  fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V1_QUANT_ALIBI(__half,        f16,  fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V1_QUANT_ALIBI(__half,        f16,  int8_t,        int8)
+
+#undef EXL3_DEFINE_V1_QUANT
+#undef EXL3_DEFINE_V1_QUANT_ALIBI
 
 // ============================================================================
 // PagedAttention V2: Split-K partitioned attention for long sequences
@@ -371,14 +536,14 @@ extern "C" __global__ void paged_attention_v1_f16_alibi(
 // the value adaptively from `max_seq_len`.
 
 // V2 main kernel: compute attention for one partition of the sequence.
-template <typename T>
+template <typename Q_t, typename Cache_t>
 __device__ void paged_attention_v2_impl(
     float* __restrict__ tmp_out,               // [num_seqs, num_heads, max_num_partitions, head_dim]
     float* __restrict__ exp_sums,              // [num_seqs, num_heads, max_num_partitions]
     float* __restrict__ max_logits_out,        // [num_seqs, num_heads, max_num_partitions]
-    const T* __restrict__ q,                   // [num_seqs, num_heads, head_dim]
-    const T* __restrict__ k_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
-    const T* __restrict__ v_cache,             // [num_blocks, block_size, num_kv_heads, head_dim]
+    const Q_t* __restrict__ q,                 // [num_seqs, num_heads, head_dim]
+    const Cache_t* __restrict__ k_cache,       // [num_blocks, block_size, num_kv_heads, head_dim]
+    const Cache_t* __restrict__ v_cache,       // [num_blocks, block_size, num_kv_heads, head_dim]
     const int* __restrict__ block_tables,      // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ seq_lens,          // [num_seqs]
     const float scale,
@@ -389,7 +554,9 @@ __device__ void paged_attention_v2_impl(
     const int block_size,
     const int partition_size,
     const int max_num_partitions,
-    const float* __restrict__ alibi_slopes     // [num_heads] or nullptr
+    const float* __restrict__ alibi_slopes,    // [num_heads] or nullptr
+    const float* __restrict__ k_scale_ptr,     // [1] or nullptr (1.0 default)
+    const float* __restrict__ v_scale_ptr      // [1] or nullptr (1.0 default)
 ) {
     const int head_idx = blockIdx.x;
     const int seq_idx = blockIdx.y;
@@ -426,10 +593,14 @@ __device__ void paged_attention_v2_impl(
     const int cache_stride_block = block_size * num_kv_heads * head_dim;
     const int cache_stride_token = num_kv_heads * head_dim;
 
+    // Per-tensor KV scales (see V1 impl for rationale).
+    const float k_scale = (k_scale_ptr != nullptr) ? *k_scale_ptr : 1.0f;
+    const float v_scale = (v_scale_ptr != nullptr) ? *v_scale_ptr : 1.0f;
+
     // Load query into shared memory
     for (int d = tid; d < head_dim; d += NUM_THREADS) {
         const int q_offset = seq_idx * num_heads * head_dim + head_idx * head_dim + d;
-        q_smem[d] = to_f32<T>(q[q_offset]);
+        q_smem[d] = to_f32<Q_t>(q[q_offset]);
     }
     __syncthreads();
 
@@ -476,7 +647,7 @@ __device__ void paged_attention_v2_impl(
             for (int dd = 0; dd < 16; dd++) {
                 if (dd >= dims_per_thread) break;  // compile-time-friendly bound
                 const int d = dim_base + dd;
-                qk += q_smem[d] * to_f32<T>(k_cache[k_base + d]);
+                qk += q_smem[d] * load_kv_to_f32<Cache_t>(k_cache[k_base + d], k_scale);
             }
 
             // Warp-level reduce; result lands in lane 0.
@@ -525,7 +696,7 @@ __device__ void paged_attention_v2_impl(
                     const int k_offset = physical_block * cache_stride_block
                                        + token_in_block * cache_stride_token
                                        + kv_head_idx * head_dim + d;
-                    qk += q_smem[d] * to_f32<T>(k_cache[k_offset]);
+                    qk += q_smem[d] * load_kv_to_f32<Cache_t>(k_cache[k_offset], k_scale);
                 }
 
                 qk = block_reduce_sum(qk, reduce_smem);
@@ -596,7 +767,7 @@ __device__ void paged_attention_v2_impl(
                                    + token_in_block * cache_stride_token
                                    + kv_head_idx * head_dim + d;
                 const int local_idx = abs_token - partition_start_token;
-                acc += logits[local_idx] * to_f32<T>(v_cache[v_offset]);
+                acc += logits[local_idx] * load_kv_to_f32<Cache_t>(v_cache[v_offset], v_scale);
             }
         }
 
@@ -787,16 +958,21 @@ extern "C" __global__ void paged_attention_v2_reduce_f16(
     );
 }
 
-// V2 entry point: standard (no ALiBi).
+// ============================================================================
+// V2 entry points
+// ============================================================================
+
+// --- Auto KV cache (Q dtype matches cache dtype) -----------------------------
+
 extern "C" __global__ void paged_attention_v2_bf16(
-    float* __restrict__ tmp_out,               // [num_seqs, num_heads, max_num_partitions, head_dim]
-    float* __restrict__ exp_sums,              // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits,            // [num_seqs, num_heads, max_num_partitions]
-    const __nv_bfloat16* __restrict__ q,       // [num_seqs, num_heads, head_dim]
-    const __nv_bfloat16* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
-    const __nv_bfloat16* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads, head_dim]
-    const int* __restrict__ block_tables,      // [num_seqs, max_blocks_per_seq]
-    const int* __restrict__ seq_lens,          // [num_seqs]
+    float* __restrict__ tmp_out,
+    float* __restrict__ exp_sums,
+    float* __restrict__ max_logits,
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
     const float scale,
     const int num_heads,
     const int num_kv_heads,
@@ -804,18 +980,19 @@ extern "C" __global__ void paged_attention_v2_bf16(
     const int head_dim,
     const int block_size,
     const int partition_size,
-    const int max_num_partitions
+    const int max_num_partitions,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v2_impl<__nv_bfloat16>(
+    paged_attention_v2_impl<__nv_bfloat16, __nv_bfloat16>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size, partition_size, max_num_partitions,
-        nullptr  // no ALiBi
+        /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
 
-// V2 entry point with ALiBi support.
 extern "C" __global__ void paged_attention_v2_bf16_alibi(
     float* __restrict__ tmp_out,
     float* __restrict__ exp_sums,
@@ -833,18 +1010,19 @@ extern "C" __global__ void paged_attention_v2_bf16_alibi(
     const int block_size,
     const int partition_size,
     const int max_num_partitions,
-    const float* __restrict__ alibi_slopes     // [num_heads]
+    const float* __restrict__ alibi_slopes,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v2_impl<__nv_bfloat16>(
+    paged_attention_v2_impl<__nv_bfloat16, __nv_bfloat16>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size, partition_size, max_num_partitions,
-        alibi_slopes
+        alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
 
-// V2 F16 entry points.
 extern "C" __global__ void paged_attention_v2_f16(
     float* __restrict__ tmp_out,
     float* __restrict__ exp_sums,
@@ -861,14 +1039,16 @@ extern "C" __global__ void paged_attention_v2_f16(
     const int head_dim,
     const int block_size,
     const int partition_size,
-    const int max_num_partitions
+    const int max_num_partitions,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v2_impl<__half>(
+    paged_attention_v2_impl<__half, __half>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size, partition_size, max_num_partitions,
-        nullptr
+        /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
 
@@ -889,13 +1069,95 @@ extern "C" __global__ void paged_attention_v2_f16_alibi(
     const int block_size,
     const int partition_size,
     const int max_num_partitions,
-    const float* __restrict__ alibi_slopes
+    const float* __restrict__ alibi_slopes,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr
 ) {
-    paged_attention_v2_impl<__half>(
+    paged_attention_v2_impl<__half, __half>(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
         head_dim, block_size, partition_size, max_num_partitions,
-        alibi_slopes
+        alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
+
+// --- Quantized KV cache (FP8 E4M3 / E5M2 / INT8) -----------------------------
+#define EXL3_DEFINE_V2_QUANT(QTYPE, QSUFFIX, KVMARKER, KVSUFFIX) \
+extern "C" __global__ void paged_attention_v2_##QSUFFIX##_##KVSUFFIX( \
+    float* __restrict__ tmp_out, \
+    float* __restrict__ exp_sums, \
+    float* __restrict__ max_logits, \
+    const QTYPE* __restrict__ q, \
+    const KVMARKER* __restrict__ k_cache, \
+    const KVMARKER* __restrict__ v_cache, \
+    const int* __restrict__ block_tables, \
+    const int* __restrict__ seq_lens, \
+    const float scale, \
+    const int num_heads, \
+    const int num_kv_heads, \
+    const int max_blocks_per_seq, \
+    const int head_dim, \
+    const int block_size, \
+    const int partition_size, \
+    const int max_num_partitions, \
+    const float* __restrict__ k_scale_ptr, \
+    const float* __restrict__ v_scale_ptr \
+) { \
+    paged_attention_v2_impl<QTYPE, KVMARKER>( \
+        tmp_out, exp_sums, max_logits, \
+        q, k_cache, v_cache, block_tables, seq_lens, \
+        scale, num_heads, num_kv_heads, max_blocks_per_seq, \
+        head_dim, block_size, partition_size, max_num_partitions, \
+        /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr \
+    ); \
+}
+
+#define EXL3_DEFINE_V2_QUANT_ALIBI(QTYPE, QSUFFIX, KVMARKER, KVSUFFIX) \
+extern "C" __global__ void paged_attention_v2_##QSUFFIX##_##KVSUFFIX##_alibi( \
+    float* __restrict__ tmp_out, \
+    float* __restrict__ exp_sums, \
+    float* __restrict__ max_logits, \
+    const QTYPE* __restrict__ q, \
+    const KVMARKER* __restrict__ k_cache, \
+    const KVMARKER* __restrict__ v_cache, \
+    const int* __restrict__ block_tables, \
+    const int* __restrict__ seq_lens, \
+    const float scale, \
+    const int num_heads, \
+    const int num_kv_heads, \
+    const int max_blocks_per_seq, \
+    const int head_dim, \
+    const int block_size, \
+    const int partition_size, \
+    const int max_num_partitions, \
+    const float* __restrict__ alibi_slopes, \
+    const float* __restrict__ k_scale_ptr, \
+    const float* __restrict__ v_scale_ptr \
+) { \
+    paged_attention_v2_impl<QTYPE, KVMARKER>( \
+        tmp_out, exp_sums, max_logits, \
+        q, k_cache, v_cache, block_tables, seq_lens, \
+        scale, num_heads, num_kv_heads, max_blocks_per_seq, \
+        head_dim, block_size, partition_size, max_num_partitions, \
+        alibi_slopes, k_scale_ptr, v_scale_ptr \
+    ); \
+}
+
+EXL3_DEFINE_V2_QUANT(__nv_bfloat16, bf16, fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V2_QUANT(__nv_bfloat16, bf16, fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V2_QUANT(__nv_bfloat16, bf16, int8_t,        int8)
+EXL3_DEFINE_V2_QUANT(__half,        f16,  fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V2_QUANT(__half,        f16,  fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V2_QUANT(__half,        f16,  int8_t,        int8)
+
+// Phase 10: ALiBi + FP8/INT8 entry points. 6 new V2 symbols.
+EXL3_DEFINE_V2_QUANT_ALIBI(__nv_bfloat16, bf16, fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V2_QUANT_ALIBI(__nv_bfloat16, bf16, fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V2_QUANT_ALIBI(__nv_bfloat16, bf16, int8_t,        int8)
+EXL3_DEFINE_V2_QUANT_ALIBI(__half,        f16,  fp8_e4m3_byte, fp8e4m3)
+EXL3_DEFINE_V2_QUANT_ALIBI(__half,        f16,  fp8_e5m2_byte, fp8e5m2)
+EXL3_DEFINE_V2_QUANT_ALIBI(__half,        f16,  int8_t,        int8)
+
+#undef EXL3_DEFINE_V2_QUANT
+#undef EXL3_DEFINE_V2_QUANT_ALIBI

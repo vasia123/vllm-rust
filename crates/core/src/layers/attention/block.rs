@@ -1295,10 +1295,17 @@ impl AttentionBlock {
         // faster for short generations (worst-case sizing iterates over
         // ~3× more empty partitions).
         let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
+        // Pass the cache's quantization metadata + scales through the
+        // attention call. `Auto` plus `None` scales reproduces the
+        // legacy behaviour byte-for-byte; FP8/INT8 paths consume the
+        // per-tensor F32 scales held inside `CacheEngine::scales`.
+        let kv_cache_dtype = cache_engine.kv_cache_dtype();
+        let k_scale = cache_engine.k_scale();
+        let v_scale = cache_engine.v_scale();
         let attn_output = if prefer_pool {
             let worst = crate::engine::engine_limits::pool_worst_case_seq_len().max(max_seq_len);
             let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
-            crate::cuda_kernels::paged_attention_v2_cuda_pooled(
+            crate::cuda_kernels::paged_attention_v2_cuda_pooled_with_kv_dtype(
                 &q,
                 cache_engine.k_cache(),
                 cache_engine.v_cache(),
@@ -1313,9 +1320,12 @@ impl AttentionBlock {
                 self.head_dim,
                 cache_engine.block_size(),
                 partition_size,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
             )?
         } else {
-            crate::cuda_kernels::paged_attention_auto(
+            crate::cuda_kernels::paged_attention_auto_with_kv_dtype(
                 &q,
                 cache_engine.k_cache(),
                 cache_engine.v_cache(),
@@ -1328,6 +1338,9 @@ impl AttentionBlock {
                 max_seq_len,
                 self.head_dim,
                 cache_engine.block_size(),
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
             )?
         };
 

@@ -14,6 +14,17 @@ cuda-fused-activations = ["cuda-kernels"]
 cuda-layernorm = ["cuda-kernels"]
 cuda-moe = ["cuda-kernels"]
 marlin = ["cuda-kernels"]
+# Aggregate gate for the CUDA-graph mini-decoder bisect tests in
+# `crates/core/src/cuda_kernels.rs::tests::*`. Those tests call
+# `rms_norm_cuda_pooled` / `embedding_pooled` /
+# `bf16_add_pooled` / `silu_and_mul_separate_pooled`, which live
+# behind the layernorm + fused-activations sub-features. Without
+# this gate the test build was failing whenever `cuda-kernels`
+# was enabled but the sub-features were not — a pre-existing
+# breakage that masked every test in the `vllm-core` lib test
+# binary. The tests themselves are `#[ignore]`-d (they require a
+# real GPU + capture support); the gate only guards compilation.
+mini-decoder-tests = ["cuda-kernels", "cuda-layernorm", "cuda-fused-activations"]
 # Aggregate feature describing the *intended* production GPU build set.
 # When all listed features compile cleanly, pulling this in turns on every
 # kernel-level optimisation in vllm-core (Marlin INT4, fused norms, fused

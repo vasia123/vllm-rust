@@ -10,7 +10,7 @@ use super::block_pool::BlockId;
 use super::error::CacheError;
 use super::mla_cache_config::MLACacheConfig;
 use super::quantization::{
-    compute_int8_scale, dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype,
+    dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype,
 };
 
 type Result<T> = std::result::Result<T, CacheError>;
@@ -41,26 +41,61 @@ pub struct MLAScales {
     pub kv_c_scale: Tensor,
     /// Scale for k_pe cache
     pub k_pe_scale: Tensor,
+    /// See `KVScales::calibrated` — true once pinned (explicit or
+    /// first-write); cleared on `reset` between requests.
+    calibrated: bool,
+    /// See `KVScales::headroom_factor` — multiplicative buffer above
+    /// the first-batch absmax to absorb decode-time activation drift.
+    headroom_factor: f32,
 }
 
+// FP8 E4M3 dynamic range and minimum scale; kept inline because this
+// module pre-dates the shared constants module and stays internally
+// consistent with `KVScales`'s own copies.
+const MLA_FP8_MAX: f64 = 448.0;
+const MLA_SCALE_MIN: f64 = 1e-12;
+
 impl MLAScales {
-    /// Create new scales initialized to 1.0.
+    /// Create new scales initialized to 1.0, not yet calibrated. The
+    /// first write into a quantised MLA cache will derive per-tensor
+    /// scales from the observed kv_c / k_pe absmax.
     pub fn new(device: &candle_core::Device) -> candle_core::Result<Self> {
         Ok(Self {
             kv_c_scale: Tensor::ones(1, DType::F32, device)?,
             k_pe_scale: Tensor::ones(1, DType::F32, device)?,
+            calibrated: false,
+            headroom_factor: crate::kv_cache::quantization::DEFAULT_KV_HEADROOM_FACTOR,
         })
     }
 
-    /// Reset scales back to identity (1.0).
+    /// Reset scales back to identity (1.0) and clear calibrated.
     pub fn reset(&mut self) -> candle_core::Result<()> {
         let device = self.kv_c_scale.device().clone();
         self.kv_c_scale = Tensor::ones(1, DType::F32, &device)?;
         self.k_pe_scale = Tensor::ones(1, DType::F32, &device)?;
+        self.calibrated = false;
         Ok(())
     }
 
-    /// Update scales based on observed data.
+    /// Override headroom factor; see `KVScales::set_headroom_factor`.
+    pub fn set_headroom_factor(&mut self, factor: f32) -> candle_core::Result<()> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(candle_core::Error::Msg(format!(
+                "MLA scale headroom factor must be a positive finite value, got {factor}"
+            )));
+        }
+        self.headroom_factor = factor;
+        Ok(())
+    }
+
+    /// Current headroom factor.
+    pub fn headroom_factor(&self) -> f32 {
+        self.headroom_factor
+    }
+
+    /// Update scales based on observed data and mark calibrated.
+    /// No headroom applied — use [`Self::calibrate_if_needed`] for the
+    /// first-write path that respects [`Self::headroom_factor`].
     pub fn calibrate(&mut self, kv_c: &Tensor, k_pe: &Tensor) -> candle_core::Result<()> {
         let abs_kv_c = kv_c.abs()?.to_dtype(DType::F32)?;
         let abs_k_pe = k_pe.abs()?.to_dtype(DType::F32)?;
@@ -68,14 +103,37 @@ impl MLAScales {
         let max_kv_c = abs_kv_c.flatten_all()?.max(0)?;
         let max_k_pe = abs_k_pe.flatten_all()?.max(0)?;
 
-        // FP8 E4M3 max = 448.0
-        const FP8_MAX: f64 = 448.0;
-        const SCALE_MIN: f64 = 1e-12;
+        self.kv_c_scale = (max_kv_c / MLA_FP8_MAX)?.maximum(MLA_SCALE_MIN)?;
+        self.k_pe_scale = (max_k_pe / MLA_FP8_MAX)?.maximum(MLA_SCALE_MIN)?;
 
-        self.kv_c_scale = (max_kv_c / FP8_MAX)?.maximum(SCALE_MIN)?;
-        self.k_pe_scale = (max_k_pe / FP8_MAX)?.maximum(SCALE_MIN)?;
-
+        self.calibrated = true;
         Ok(())
+    }
+
+    /// First-write calibration — see `KVScales::calibrate_if_needed`
+    /// for the slot-stability rationale. Applies [`Self::headroom_factor`]
+    /// on top of first-batch absmax.
+    pub fn calibrate_if_needed(&mut self, kv_c: &Tensor, k_pe: &Tensor) -> candle_core::Result<()> {
+        if self.calibrated {
+            return Ok(());
+        }
+        let h = self.headroom_factor as f64;
+        let abs_kv_c = kv_c.abs()?.to_dtype(DType::F32)?;
+        let abs_k_pe = k_pe.abs()?.to_dtype(DType::F32)?;
+
+        let max_kv_c = abs_kv_c.flatten_all()?.max(0)?;
+        let max_k_pe = abs_k_pe.flatten_all()?.max(0)?;
+
+        self.kv_c_scale = ((max_kv_c * h)? / MLA_FP8_MAX)?.maximum(MLA_SCALE_MIN)?;
+        self.k_pe_scale = ((max_k_pe * h)? / MLA_FP8_MAX)?.maximum(MLA_SCALE_MIN)?;
+
+        self.calibrated = true;
+        Ok(())
+    }
+
+    /// Whether scales have been pinned.
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
     }
 }
 
@@ -141,11 +199,14 @@ impl MLACacheEngine {
         // Apply quantization if enabled
         let (kv_c_src, k_pe_src) = match self.config.kv_cache_dtype {
             KVCacheDtype::Auto => (kv_c, k_pe),
-            KVCacheDtype::Fp8E4m3 => {
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 => {
+                // First-write calibration — see comment block in
+                // `cache_engine.rs::quantize_write_data` for the
+                // slot-stability + representable-range rationale.
                 let scales = self.scales.as_mut().ok_or_else(|| {
                     candle_core::Error::Msg("FP8 mode requires scales".to_string())
                 })?;
-                scales.calibrate(&kv_c, &k_pe)?;
+                scales.calibrate_if_needed(&kv_c, &k_pe)?;
 
                 let kv_c_quant = quantize_fp8(&kv_c, &scales.kv_c_scale)?;
                 let k_pe_quant = quantize_fp8(&k_pe, &scales.k_pe_scale)?;
@@ -156,9 +217,7 @@ impl MLACacheEngine {
                 let scales = self.scales.as_mut().ok_or_else(|| {
                     candle_core::Error::Msg("INT8 mode requires scales".to_string())
                 })?;
-
-                scales.kv_c_scale = compute_int8_scale(&kv_c)?;
-                scales.k_pe_scale = compute_int8_scale(&k_pe)?;
+                scales.calibrate_if_needed(&kv_c, &k_pe)?;
 
                 let kv_c_quant = quantize_int8(&kv_c, &scales.kv_c_scale)?;
                 let k_pe_quant = quantize_int8(&k_pe, &scales.k_pe_scale)?;
@@ -224,7 +283,7 @@ impl MLACacheEngine {
         // Apply dequantization if needed
         let (kv_c, k_pe) = match self.config.kv_cache_dtype {
             KVCacheDtype::Auto => (kv_c_flat, k_pe_flat),
-            KVCacheDtype::Fp8E4m3 => {
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 => {
                 let scales = self.scales.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("FP8 mode requires scales".to_string())
                 })?;

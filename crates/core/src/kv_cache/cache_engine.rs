@@ -4,8 +4,7 @@ use super::block_pool::BlockId;
 use super::config::{CacheConfig, KVCacheLayout};
 use super::error::CacheError;
 use super::quantization::{
-    compute_int8_scale, dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype,
-    KVScales,
+    dequantize_fp8, dequantize_int8, quantize_fp8, quantize_int8, KVCacheDtype, KVScales,
 };
 
 /// Owns pre-allocated GPU tensors for one layer's KV cache.
@@ -97,6 +96,18 @@ impl CacheEngine {
         self.scales.as_ref().map(|s| &s.v_scale)
     }
 
+    /// Override the headroom factor used by first-write calibration.
+    /// No-op when the cache is not quantised (no scales present).
+    /// See `KVScales::set_headroom_factor` for semantics.
+    pub fn set_kv_headroom_factor(&mut self, factor: f32) -> Result<(), CacheError> {
+        if let Some(scales) = self.scales.as_mut() {
+            scales
+                .set_headroom_factor(factor)
+                .map_err(CacheError::Candle)?;
+        }
+        Ok(())
+    }
+
     /// Raw K cache tensor (shape depends on layout).
     pub fn k_cache(&self) -> &Tensor {
         &self.k_cache
@@ -117,6 +128,39 @@ impl CacheEngine {
         self.block_size
     }
 
+    /// KV cache storage dtype (`Auto`, `Fp8E4m3`, `Fp8E5m2`, or `Int8`).
+    /// Attention call sites need this to route through the correct
+    /// paged_attention kernel variant + push the matching scale args.
+    pub fn kv_cache_dtype(&self) -> KVCacheDtype {
+        self.kv_cache_dtype
+    }
+
+    /// Set per-tensor K/V scales explicitly. Use this in offline or
+    /// warmup-driven calibration flows: the scales fix the dequant
+    /// linear factor for every byte written into this cache, so they
+    /// must be in place BEFORE any quantized write. Re-setting scales
+    /// after the cache has been populated will produce stale-slot
+    /// corruption — see the rationale in
+    /// [`Self::quantize_write_data`].
+    ///
+    /// `k_scale_value` and `v_scale_value` are scalar F32 multipliers
+    /// such that `dequantized = stored_byte * scale` (FP8) or
+    /// `(stored_byte - 128) * scale` (INT8).
+    ///
+    /// Returns an error if the cache is not configured for a quantized
+    /// dtype.
+    pub fn set_kv_scales(
+        &mut self,
+        k_scale_value: f32,
+        v_scale_value: f32,
+    ) -> Result<(), CacheError> {
+        let scales = self.scales.as_mut().ok_or_else(|| {
+            candle_core::Error::Msg("set_kv_scales called on non-quantized CacheEngine".to_string())
+        })?;
+        *scales = KVScales::from_values(k_scale_value, v_scale_value, self.k_cache.device())?;
+        Ok(())
+    }
+
     /// Quantize write data based on kv_cache_dtype setting.
     ///
     /// Input and output are in [new_tokens, kv_heads, head_dim] layout.
@@ -131,15 +175,35 @@ impl CacheEngine {
     ) -> Result<(Tensor, Tensor), CacheError> {
         match self.kv_cache_dtype {
             KVCacheDtype::Auto => Ok((k_prepared.clone(), v_prepared.clone())),
-            KVCacheDtype::Fp8E4m3 => {
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 => {
+                // Correctness contract: scales MUST stay constant across
+                // the lifetime of cached slots — a dynamic per-write
+                // recalibration would silently invalidate every byte
+                // that was quantised under the previous scale. To still
+                // get a representable range matched to actual model
+                // activations (scale=1.0 rounds the bulk of typical
+                // RMSNorm-normalised K/V to zero in FP8 E4M3), we run a
+                // *one-shot* calibration on the very first write per
+                // request: `calibrate_if_needed` pins
+                // `(k_scale, v_scale) = absmax/FP8_MAX` from the observed
+                // tensors and freezes them. Every subsequent write —
+                // and matching read-side dequant in the paged_attn
+                // kernel via `load_kv_to_f32` — uses those same fixed
+                // scales. `KVScales::reset()` clears the flag when the
+                // cache itself is reset between requests.
                 let scales = self.scales.as_mut().ok_or_else(|| {
                     candle_core::Error::Msg("FP8 mode requires scales".to_string())
                 })?;
-                scales.calibrate(k_orig, v_orig)?;
+                scales.calibrate_if_needed(k_orig, v_orig)?;
 
                 let k_2d = k_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
                 let v_2d = v_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
 
+                // Note: `quantize_fp8` currently encodes E4M3 only.
+                // E5M2 storage uses the same byte width and the kernel
+                // distinguishes them on the read path; the write path
+                // shares one encoder for the moment — full E5M2 quant
+                // tables are a follow-up.
                 let k_quant = quantize_fp8(&k_2d, &scales.k_scale)?;
                 let v_quant = quantize_fp8(&v_2d, &scales.v_scale)?;
 
@@ -149,12 +213,15 @@ impl CacheEngine {
                 ))
             }
             KVCacheDtype::Int8 => {
+                // See FP8 branch — same one-shot first-write calibration
+                // policy applies. For INT8 with scale=1.0, the quantiser
+                // saturates at ±127 for any activation > 127 and loses
+                // sub-integer precision below; first-write calibration
+                // fits absmax/127 to the actual range.
                 let scales = self.scales.as_mut().ok_or_else(|| {
                     candle_core::Error::Msg("INT8 mode requires scales".to_string())
                 })?;
-
-                scales.k_scale = compute_int8_scale(k_orig)?;
-                scales.v_scale = compute_int8_scale(v_orig)?;
+                scales.calibrate_if_needed(k_orig, v_orig)?;
 
                 let k_2d = k_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
                 let v_2d = v_prepared.reshape((new_tokens * self.num_kv_heads, self.head_dim))?;
@@ -407,7 +474,13 @@ impl CacheEngine {
     ) -> Result<(Tensor, Tensor), CacheError> {
         match self.kv_cache_dtype {
             KVCacheDtype::Auto => Ok((k_flat.clone(), v_flat.clone())),
-            KVCacheDtype::Fp8E4m3 => {
+            KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2 => {
+                // E5M2 shares the byte storage with E4M3; the dequant
+                // helper currently treats them as the same — full E5M2
+                // decode table is a follow-up. Read-side correctness
+                // along the paged_attention kernel path uses the
+                // matching `load_kv_to_f32` specialization driven by the
+                // KVCacheDtype dispatch in `cuda_kernels.rs`.
                 let scales = self.scales.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("FP8 mode requires scales".to_string())
                 })?;
@@ -786,6 +859,14 @@ mod tests {
         let v = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
         let slot_mapping = vec![8, 9, 10];
 
+        // Static-calibration contract: scales must be set BEFORE the
+        // first write. For symmetric INT8 we pick `max_abs / 127`,
+        // matching what dynamic per-write calibration used to produce
+        // for this synthetic fixture.
+        let max_abs = k_data.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let scale = (max_abs / 127.0).max(1e-6);
+        engine.set_kv_scales(scale, scale).unwrap();
+
         engine.write(&k, &v, &slot_mapping).unwrap();
 
         let (k_out, _) = engine.read(&[2], 3).unwrap();
@@ -1042,6 +1123,13 @@ mod tests {
             .collect();
         let k = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
         let v = Tensor::from_vec(k_data.clone(), (2, 3, 8), &Device::Cpu).unwrap();
+
+        // Static calibration before write — see `write_read_roundtrip_int8`
+        // for the rationale (per-write recalibration would corrupt
+        // previously stored slots).
+        let max_abs = k_data.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let scale = (max_abs / 127.0).max(1e-6);
+        engine.set_kv_scales(scale, scale).unwrap();
 
         engine.write(&k, &v, &[0, 1, 2]).unwrap();
 

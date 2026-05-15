@@ -215,6 +215,15 @@ enum Command {
         #[arg(long, default_value = "auto")]
         kv_cache_dtype: String,
 
+        /// Multiplicative headroom factor applied to FP8/INT8 KV cache
+        /// scales during first-write calibration. `scale = absmax *
+        /// factor / FP8_MAX`. Default 1.5 reserves 50 % range above
+        /// the first-batch max for decode-time drift; 1.0 reproduces
+        /// strict first-batch sizing (Phase 5 baseline). No effect for
+        /// --kv-cache-dtype auto or when checkpoint scales are loaded.
+        #[arg(long, default_value_t = 1.5)]
+        kv_headroom_factor: f32,
+
         /// CPU swap space in GiB for offloading KV cache.
         /// 0 disables CPU offloading.
         #[arg(long, default_value_t = 0.0)]
@@ -468,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
             // KV Cache / Memory
             block_size,
             kv_cache_dtype,
+            kv_headroom_factor,
             swap_space,
             cpu_offload_gb,
             num_gpu_blocks_override,
@@ -914,6 +924,7 @@ async fn main() -> anyhow::Result<()> {
                 // New args
                 block_size,
                 kv_cache_dtype,
+                kv_headroom_factor,
                 swap_space,
                 cpu_offload_gb,
                 num_gpu_blocks_override,
@@ -1018,6 +1029,7 @@ struct ServerLaunchConfig {
     // KV Cache / Memory
     block_size: usize,
     kv_cache_dtype: String,
+    kv_headroom_factor: f32,
     swap_space: f32,
     cpu_offload_gb: f32,
     num_gpu_blocks_override: Option<usize>,
@@ -1117,6 +1129,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         // New args
         block_size,
         kv_cache_dtype,
+        kv_headroom_factor,
         swap_space,
         cpu_offload_gb,
         num_gpu_blocks_override,
@@ -1447,6 +1460,14 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     } else {
         loader::load_weights(&files.weights, dtype, &device)?
     };
+
+    // Phase 7: keep a cheap clone of the mmap-backed VarBuilder so we
+    // can scan for per-layer KV cache scales *after* the model has
+    // consumed its own copy. VarBuilder clone is an Arc bump — no
+    // re-mmap, no extra memory pressure. The actual scan and apply
+    // happen after `parsed_kv_cache_dtype` / `kv_cache_num_layers` are
+    // computed (just before `KVCacheManager::new`).
+    let vb_for_kv_scales = vb.clone();
 
     // Validate max_cpu_loras against the number of startup adapters.
     // Dynamic LoRA loading with an LRU cache is not yet implemented; this
@@ -1806,7 +1827,81 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         "Allocating KV cache ({} blocks, {} layers)...",
         cache_config.num_blocks, cache_config.num_layers
     );
-    let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+    let mut kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+
+    // Phase 8: apply headroom factor to all layers' first-write
+    // calibration. Done BEFORE Phase 7 checkpoint apply because
+    // checkpoint scales (when present) take the `set_kv_scales` path
+    // which marks the cache calibrated — headroom has no effect on
+    // already-calibrated scales, so the order doesn't change behaviour
+    // when both are in play, but doing it first avoids surprise if a
+    // future patch makes headroom mutate already-calibrated scales.
+    if parsed_kv_cache_dtype != KVCacheDtype::Auto && kv_headroom_factor != 1.5 {
+        // Only log when the user explicitly diverges from the default;
+        // 1.5 is the silent baseline (Phase 8 default).
+        tracing::info!(
+            "Applying KV cache headroom factor {} to all layers",
+            kv_headroom_factor
+        );
+    }
+    if parsed_kv_cache_dtype != KVCacheDtype::Auto {
+        if let Err(e) = kv_cache_mgr.set_kv_headroom_factor(kv_headroom_factor) {
+            anyhow::bail!("Failed to apply --kv-headroom-factor {kv_headroom_factor}: {e}");
+        }
+    }
+
+    // Phase 7: harvest per-layer KV cache scales from the checkpoint
+    // and pin them on each `CacheEngine` BEFORE `start_engine` so the
+    // warmup forwards and the first real request see the same
+    // calibrated scales. `try_load_kv_cache_scales` matches the
+    // canonical NVIDIA AMMO/ModelOpt, Qwen2.5-FP8, GPT-OSS, and
+    // fused-kv_scale naming patterns; layers with no matching tensor
+    // stay on first-write calibration. Skipped entirely for `Auto` KV
+    // (no scales needed) and for dummy weights (no real tensors to
+    // scan).
+    if parsed_kv_cache_dtype != KVCacheDtype::Auto
+        && parsed_load_format != loader::LoadFormat::Dummy
+    {
+        match vllm_core::quantization::kv_cache_scales::try_load_kv_cache_scales(
+            &vb_for_kv_scales,
+            kv_cache_num_layers,
+        ) {
+            Ok(found) if !found.is_empty() => {
+                tracing::info!(
+                    "Found checkpoint KV cache scales for {} of {} layers \
+                     (kv_cache_dtype={:?})",
+                    found.len(),
+                    kv_cache_num_layers,
+                    parsed_kv_cache_dtype
+                );
+                let scales_for_apply: std::collections::HashMap<usize, (Option<f32>, Option<f32>)> =
+                    found
+                        .into_iter()
+                        .map(|(idx, s)| (idx, (s.k_scale, s.v_scale)))
+                        .collect();
+                match kv_cache_mgr.apply_checkpoint_kv_scales(&scales_for_apply) {
+                    Ok(pinned) => tracing::info!(
+                        "Pinned KV cache scales for {} layers from checkpoint",
+                        pinned
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Failed to apply checkpoint KV cache scales: {e}. \
+                         Falling back to first-write calibration."
+                    ),
+                }
+            }
+            Ok(_) => tracing::info!(
+                "No per-layer KV cache scales found in checkpoint \
+                 (kv_cache_dtype={:?}); using first-write calibration",
+                parsed_kv_cache_dtype
+            ),
+            Err(e) => tracing::warn!(
+                "Failed to scan checkpoint for KV cache scales: {e}. \
+                 Falling back to first-write calibration."
+            ),
+        }
+    }
+    drop(vb_for_kv_scales);
 
     // Phase D.1 (moved here from after-engine-start as part of D10
     // task #222 fix): publish max_model_len BEFORE start_engine so the

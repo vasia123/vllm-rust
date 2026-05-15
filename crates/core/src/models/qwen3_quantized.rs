@@ -822,12 +822,17 @@ impl QuantizedQwen3Attention {
             // a 5-10× per-call slowdown at c=8 with prompt=256, observed
             // empirically in the eager-bench head-to-head.
             let prefer_pool = shared.is_some_and(|s| s.prefer_pooled_attention);
+            // KV cache quantization metadata + scales — see block.rs
+            // for the equivalent thread-through.
+            let kv_cache_dtype = cache_engine.kv_cache_dtype();
+            let k_scale = cache_engine.k_scale();
+            let v_scale = cache_engine.v_scale();
             let attn_output = decode_profile::time(dev, &decode_profile::PAGED_ATTN_NS, || {
                 if prefer_pool {
                     let worst =
                         crate::engine::engine_limits::pool_worst_case_seq_len().max(max_seq_len);
                     let partition_size = crate::cuda_kernels::select_v2_partition_size(worst);
-                    crate::cuda_kernels::paged_attention_v2_cuda_pooled(
+                    crate::cuda_kernels::paged_attention_v2_cuda_pooled_with_kv_dtype(
                         &q,
                         cache_engine.k_cache(),
                         cache_engine.v_cache(),
@@ -842,9 +847,12 @@ impl QuantizedQwen3Attention {
                         self.head_dim,
                         cache_engine.block_size(),
                         partition_size,
+                        kv_cache_dtype,
+                        k_scale,
+                        v_scale,
                     )
                 } else {
-                    crate::cuda_kernels::paged_attention_auto(
+                    crate::cuda_kernels::paged_attention_auto_with_kv_dtype(
                         &q,
                         cache_engine.k_cache(),
                         cache_engine.v_cache(),
@@ -857,6 +865,9 @@ impl QuantizedQwen3Attention {
                         max_seq_len,
                         self.head_dim,
                         cache_engine.block_size(),
+                        kv_cache_dtype,
+                        k_scale,
+                        v_scale,
                     )
                 }
             })?;

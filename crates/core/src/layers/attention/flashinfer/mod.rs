@@ -30,6 +30,45 @@ use candle_core::DType;
 use candle_core::{Device, IndexOp, Result, Tensor};
 
 use crate::kv_cache::CacheEngine;
+#[cfg(feature = "flashinfer")]
+use crate::kv_cache::KVCacheDtype;
+
+/// KV cache dtypes the FlashInfer **decode** path supports.
+///
+/// Phase 6.b: `Fp8E4m3` / `Fp8E5m2` are wired through
+/// `flashinfer_rs::ffi::BatchDecodePlan::run_fp8` (per-tensor F32
+/// scales). `Int8` stays out — upstream has no INT8 decode kernel.
+#[cfg(feature = "flashinfer")]
+const FLASHINFER_DECODE_SUPPORTED_KV_DTYPES: &[KVCacheDtype] = &[
+    KVCacheDtype::Auto,
+    KVCacheDtype::Fp8E4m3,
+    KVCacheDtype::Fp8E5m2,
+];
+
+/// KV cache dtypes the FlashInfer **prefill** path supports.
+///
+/// Upstream FlashInfer's `BatchPrefillPagedKVCache` kernel has no
+/// FP8 / INT8 entry today (the C ABI exposes only a single
+/// non-quantised `flashinfer_batch_prefill_run`). The
+/// `prefill_attention` entry point therefore falls back to
+/// `prefill_naive` for any quantised cache: naive attention computes
+/// from the fresh K/V arguments (it does not read back from the
+/// paged cache), so the FP8 bytes already stored in the cache stay
+/// valid for the subsequent decode-with-fp8 path.
+#[cfg(feature = "flashinfer")]
+const FLASHINFER_PREFILL_SUPPORTED_KV_DTYPES: &[KVCacheDtype] = &[KVCacheDtype::Auto];
+
+/// Union of what FlashInfer can read in *any* path. Exported via
+/// `AttentionBackend::supported_kv_cache_dtypes` so the selector knows
+/// FlashInfer is a valid candidate for FP8 — the per-entry-point
+/// `ensure_kv_cache_supported_*` checks still route prefill through
+/// the naive fallback.
+#[cfg(feature = "flashinfer")]
+const FLASHINFER_SUPPORTED_KV_DTYPES: &[KVCacheDtype] = &[
+    KVCacheDtype::Auto,
+    KVCacheDtype::Fp8E4m3,
+    KVCacheDtype::Fp8E5m2,
+];
 
 use super::backend::{AttentionBackend, BatchedDecodeMetadata, PagedAttentionMetadata};
 
@@ -66,6 +105,86 @@ impl FlashInferBackend {
             workspace: std::sync::Mutex::new(None),
             block_size,
         }
+    }
+
+    /// Bail with a clear error if the supplied `CacheEngine` uses a KV
+    /// cache dtype this backend cannot read correctly on the decode
+    /// path.
+    ///
+    /// Called at the start of every decode-side attention entry point
+    /// that consumes `cache_engine`. The defensive check is redundant
+    /// when the caller already went through `AttentionBackendSelector`
+    /// (which validates `KVCacheDtype` against `supported_kv_cache_dtypes`)
+    /// but covers the env-gated opt-in path
+    /// (`VLLM_FLASHINFER_DECODE=1`) and any future direct construction
+    /// of the backend. Without it FlashInfer would interpret U8 cache
+    /// bytes as native floats and emit silent garbage.
+    #[cfg(feature = "flashinfer")]
+    fn ensure_kv_cache_supported_decode(&self, cache_engine: &CacheEngine) -> Result<()> {
+        let dtype = cache_engine.kv_cache_dtype();
+        if FLASHINFER_DECODE_SUPPORTED_KV_DTYPES.contains(&dtype) {
+            return Ok(());
+        }
+        Err(candle_core::Error::Msg(format!(
+            "FlashInfer decode does not support kv_cache_dtype={:?} \
+             (supports {:?}). Use --kv-cache-dtype auto or fp8_e4m3/fp8_e5m2, \
+             or disable the FlashInfer code path (unset VLLM_FLASHINFER_DECODE) \
+             so the paged_attention kernel (which dequantises FP8/INT8 inline) \
+             handles this request.",
+            dtype, FLASHINFER_DECODE_SUPPORTED_KV_DTYPES
+        )))
+    }
+
+    /// `true` when prefill must take the naive fallback because the
+    /// FlashInfer prefill kernel cannot read the active KV cache dtype
+    /// (upstream has no FP8/INT8 prefill kernel today). Caller routes
+    /// to `prefill_naive`, which computes from the fresh K/V arguments
+    /// and never reads back from the quantised cache.
+    #[cfg(feature = "flashinfer")]
+    fn prefill_requires_naive_fallback(&self, cache_engine: &CacheEngine) -> bool {
+        !FLASHINFER_PREFILL_SUPPORTED_KV_DTYPES.contains(&cache_engine.kv_cache_dtype())
+    }
+
+    /// Extract per-tensor F32 scales from a `CacheEngine` for an FP8
+    /// decode launch. Returns `(k_scale, v_scale)`. Bails with a clear
+    /// error if scales are missing or not F32 scalars.
+    #[cfg(feature = "flashinfer")]
+    fn extract_fp8_scales(&self, cache_engine: &CacheEngine) -> Result<(f32, f32)> {
+        let k_scale = cache_engine
+            .k_scale()
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "FlashInfer FP8 decode: cache_engine missing k_scale tensor".to_string(),
+                )
+            })?
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "FlashInfer FP8 decode: k_scale tensor is empty".to_string(),
+                )
+            })?;
+        let v_scale = cache_engine
+            .v_scale()
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "FlashInfer FP8 decode: cache_engine missing v_scale tensor".to_string(),
+                )
+            })?
+            .to_dtype(candle_core::DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "FlashInfer FP8 decode: v_scale tensor is empty".to_string(),
+                )
+            })?;
+        Ok((k_scale, v_scale))
     }
 
     /// Get or create workspace buffer for the given device.
@@ -295,14 +414,55 @@ impl FlashInferBackend {
         let q_dims = q.dims().to_vec();
         let num_seqs = q_dims.first().copied().unwrap_or(0);
 
+        let kv_dtype = cache_engine.kv_cache_dtype();
+        let use_fp8 = matches!(kv_dtype, KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2);
+        let kv_ffi_dtype = match kv_dtype {
+            KVCacheDtype::Fp8E4m3 => Some(flashinfer_rs::ffi::DType::Float8E4M3),
+            KVCacheDtype::Fp8E5m2 => Some(flashinfer_rs::ffi::DType::Float8E5M2),
+            _ => None,
+        };
+
         let output = if num_seqs <= POOL_MAX_NUM_SEQS {
             let out = OutputPool::global().reserve(&q_dims, q.dtype(), device)?;
-            wrapper.run_with_plan_into(
+            if use_fp8 {
+                let (k_scale, v_scale) = self.extract_fp8_scales(cache_engine)?;
+                wrapper.run_with_plan_fp8_into(
+                    q,
+                    cache_engine.k_cache(),
+                    cache_engine.v_cache(),
+                    plan,
+                    &out,
+                    1.0, // q_scale: Q stays in F16/BF16, no per-tensor Q quant
+                    k_scale,
+                    v_scale,
+                    kv_ffi_dtype.expect("use_fp8 set ⇒ kv_ffi_dtype is Some"),
+                )?;
+            } else {
+                wrapper.run_with_plan_into(
+                    q,
+                    cache_engine.k_cache(),
+                    cache_engine.v_cache(),
+                    plan,
+                    &out,
+                )?;
+            }
+            out
+        } else if use_fp8 {
+            // Non-pool path on FP8: allocate output ourselves, then
+            // route through the same FP8 runner (no `run_with_plan`
+            // overload accepts FP8 args without an explicit output).
+            let (k_scale, v_scale) = self.extract_fp8_scales(cache_engine)?;
+            let out = Tensor::zeros(&*q_dims, q.dtype(), device)?;
+            wrapper.run_with_plan_fp8_into(
                 q,
                 cache_engine.k_cache(),
                 cache_engine.v_cache(),
                 plan,
                 &out,
+                1.0,
+                k_scale,
+                v_scale,
+                kv_ffi_dtype.expect("use_fp8 set ⇒ kv_ffi_dtype is Some"),
             )?;
             out
         } else {
@@ -387,6 +547,22 @@ impl FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<(Tensor, Tensor)> {
+        // DCP + FP8 KV is not supported: the FlashInfer FP8 decode FFI
+        // (`run_fp8`) has no LSE-emitting overload, so we can't fold the
+        // FP8 dequant into the LSE-correct path used by Context
+        // Parallelism. Bail with a clear hint — DCP users must keep
+        // `--kv-cache-dtype auto` until upstream exposes
+        // `..._run_fp8_with_lse`.
+        let kv_dtype = cache_engine.kv_cache_dtype();
+        if matches!(kv_dtype, KVCacheDtype::Fp8E4m3 | KVCacheDtype::Fp8E5m2) {
+            return Err(candle_core::Error::Msg(format!(
+                "FlashInfer LSE decode (Decode Context Parallelism) does not yet \
+                 support kv_cache_dtype={kv_dtype:?}. Upstream FlashInfer's FP8 \
+                 decode entry point does not emit LSE. Use --kv-cache-dtype auto \
+                 with DCP, or disable DCP (decode_context_parallel_size=1) to use \
+                 FP8 KV cache."
+            )));
+        }
         let device = q.device();
         let batch_size = metadata.kv_lengths.len();
 
@@ -521,6 +697,25 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Tensor> {
+        // FlashInfer's prefill kernel doesn't read FP8/INT8 cache;
+        // route through the naive prefill, which computes from the
+        // fresh K/V arguments and never touches the quantised cache.
+        // The K/V are still written to the cache (quantised by
+        // CacheEngine::write) so the subsequent decode-with-fp8 path
+        // sees them.
+        if self.prefill_requires_naive_fallback(cache_engine) {
+            return self.prefill_naive(
+                q,
+                k,
+                v,
+                attention_mask,
+                cache_engine,
+                metadata,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+        }
         let device = q.device();
 
         // CPU fallback — FlashInfer requires CUDA
@@ -560,6 +755,7 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Tensor> {
+        self.ensure_kv_cache_supported_decode(cache_engine)?;
         let device = q.device();
 
         // CPU fallback — FlashInfer requires CUDA
@@ -596,6 +792,7 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<(Tensor, Option<Tensor>)> {
+        self.ensure_kv_cache_supported_decode(cache_engine)?;
         let device = q.device();
 
         // CPU fallback: FlashInfer kernels require CUDA. Return None for LSE since DCP
@@ -647,6 +844,11 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
+        // No plan for the naive-fallback prefill path — return None and
+        // let `prefill_attention_with_plan` route to `prefill_naive`.
+        if self.prefill_requires_naive_fallback(cache_engine) {
+            return Ok(None);
+        }
         let device = cache_engine.k_cache().device();
         if !device.is_cuda() {
             return Ok(None);
@@ -717,6 +919,19 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Tensor> {
+        if self.prefill_requires_naive_fallback(cache_engine) {
+            return self.prefill_naive(
+                q,
+                k,
+                v,
+                attention_mask,
+                cache_engine,
+                metadata,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            );
+        }
         let device = q.device();
         if !device.is_cuda() {
             return self.prefill_attention(
@@ -787,6 +1002,7 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>> {
+        self.ensure_kv_cache_supported_decode(cache_engine)?;
         if !cache_engine.k_cache().device().is_cuda() {
             return Ok(None);
         }
@@ -815,6 +1031,7 @@ impl AttentionBackend for FlashInferBackend {
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<Tensor> {
+        self.ensure_kv_cache_supported_decode(cache_engine)?;
         let device = q.device();
         if !device.is_cuda() {
             // CPU path doesn't have a plan; route to existing batched_decode.
@@ -853,6 +1070,10 @@ impl AttentionBackend for FlashInferBackend {
 
     fn supported_dtypes(&self) -> &[DType] {
         &[DType::F16, DType::BF16]
+    }
+
+    fn supported_kv_cache_dtypes(&self) -> &[KVCacheDtype] {
+        FLASHINFER_SUPPORTED_KV_DTYPES
     }
 }
 
@@ -950,6 +1171,124 @@ mod tests {
     fn test_flashinfer_with_block_size() {
         let backend = FlashInferBackend::with_block_size(32);
         assert_eq!(backend.block_size, 32);
+    }
+
+    #[cfg(feature = "flashinfer")]
+    #[test]
+    fn test_supported_kv_cache_dtypes_includes_fp8() {
+        // Phase 6.b: FlashInfer declares Auto + Fp8E4m3 + Fp8E5m2 (the
+        // decode path now routes FP8 through `BatchDecodePlan::run_fp8`,
+        // and the prefill path falls back to naive on FP8). INT8 stays
+        // out — upstream has no INT8 decode kernel.
+        use crate::kv_cache::KVCacheDtype;
+        let backend = FlashInferBackend::new();
+        let supported = backend.supported_kv_cache_dtypes();
+        assert_eq!(
+            supported,
+            &[
+                KVCacheDtype::Auto,
+                KVCacheDtype::Fp8E4m3,
+                KVCacheDtype::Fp8E5m2
+            ]
+        );
+        assert!(!supported.contains(&KVCacheDtype::Int8));
+    }
+
+    #[cfg(feature = "flashinfer")]
+    #[test]
+    fn test_ensure_kv_cache_supported_decode_bails_on_int8() {
+        // Defensive bail covers callers that bypass the selector. INT8
+        // KV cache is *not* supported by FlashInfer (upstream lacks an
+        // INT8 decode entry point), so the decode-side check must
+        // reject it even though FP8 is now accepted.
+        use crate::kv_cache::{CacheConfig, CacheEngine, KVCacheDtype};
+        let device = Device::Cpu;
+        let cfg = CacheConfig {
+            block_size: 16,
+            num_blocks: 2,
+            num_layers: 1,
+            num_kv_heads: 4,
+            head_dim: 64,
+            dtype: DType::F16,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Int8,
+            cpu_offload: None,
+        };
+        let cache = CacheEngine::new(&cfg).unwrap();
+        let backend = FlashInferBackend::new();
+        let res = backend.ensure_kv_cache_supported_decode(&cache);
+        let err = res
+            .err()
+            .expect("ensure_kv_cache_supported_decode must reject INT8 cache");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("kv_cache_dtype"),
+            "error must mention kv_cache_dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains("Int8"),
+            "error must name the unsupported dtype, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "flashinfer")]
+    #[test]
+    fn test_ensure_kv_cache_supported_decode_accepts_auto_and_fp8() {
+        use crate::kv_cache::{CacheConfig, CacheEngine, KVCacheDtype};
+        let device = Device::Cpu;
+        for dt in [
+            KVCacheDtype::Auto,
+            KVCacheDtype::Fp8E4m3,
+            KVCacheDtype::Fp8E5m2,
+        ] {
+            let cfg = CacheConfig {
+                block_size: 16,
+                num_blocks: 2,
+                num_layers: 1,
+                num_kv_heads: 4,
+                head_dim: 64,
+                dtype: DType::F16,
+                device: device.clone(),
+                kv_cache_dtype: dt,
+                cpu_offload: None,
+            };
+            let cache = CacheEngine::new(&cfg).unwrap();
+            let backend = FlashInferBackend::new();
+            backend
+                .ensure_kv_cache_supported_decode(&cache)
+                .unwrap_or_else(|e| {
+                    panic!("decode KV cache {dt:?} must be supported, got error: {e}")
+                });
+        }
+    }
+
+    #[cfg(feature = "flashinfer")]
+    #[test]
+    fn test_prefill_requires_naive_fallback() {
+        // FlashInfer prefill kernel has no FP8/INT8 entry — quantised
+        // KV caches must route through `prefill_naive`, which computes
+        // from the fresh K/V arguments and never reads the cache.
+        use crate::kv_cache::{CacheConfig, CacheEngine, KVCacheDtype};
+        let device = Device::Cpu;
+        let make_cache = |dt: KVCacheDtype| {
+            CacheEngine::new(&CacheConfig {
+                block_size: 16,
+                num_blocks: 2,
+                num_layers: 1,
+                num_kv_heads: 4,
+                head_dim: 64,
+                dtype: DType::F16,
+                device: device.clone(),
+                kv_cache_dtype: dt,
+                cpu_offload: None,
+            })
+            .unwrap()
+        };
+        let backend = FlashInferBackend::new();
+        assert!(!backend.prefill_requires_naive_fallback(&make_cache(KVCacheDtype::Auto)));
+        assert!(backend.prefill_requires_naive_fallback(&make_cache(KVCacheDtype::Fp8E4m3)));
+        assert!(backend.prefill_requires_naive_fallback(&make_cache(KVCacheDtype::Fp8E5m2)));
+        assert!(backend.prefill_requires_naive_fallback(&make_cache(KVCacheDtype::Int8)));
     }
 
     #[test]

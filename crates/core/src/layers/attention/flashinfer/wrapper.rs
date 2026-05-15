@@ -570,6 +570,92 @@ impl DecodeWrapper {
         Ok(output)
     }
 
+    /// Replay a pre-built decode plan against an FP8 (E4M3 / E5M2)
+    /// paged KV cache. Output buffer must already be allocated with
+    /// the right shape/dtype (matching `q`). `k_scale` and `v_scale`
+    /// are per-tensor F32 scalars from `CacheEngine::scales`; `q_scale`
+    /// is 1.0 when Q is kept in F16/BF16 (the common case).
+    ///
+    /// `kv_dtype` declares the storage dtype of `k_cache`/`v_cache`
+    /// (`Float8E4m3` or `Float8E5m2`); the upstream "scale baking"
+    /// path multiplies `sm_scale * q_scale * k_scale` into softmax
+    /// and applies `output *= v_scale` post-launch (LSE correction
+    /// disabled because we pass `lse=null`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_plan_fp8_into(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        plan: &DecodePlan,
+        output: &Tensor,
+        q_scale: f32,
+        k_scale: f32,
+        v_scale: f32,
+        kv_dtype: flashinfer_rs::ffi::DType,
+    ) -> Result<()> {
+        let q = tensor_bridge::ensure_contiguous(q)?;
+        if output.dtype() != q.dtype() {
+            return Err(candle_core::Error::Msg(format!(
+                "FlashInfer FP8 decode: output dtype {:?} does not match Q dtype {:?}",
+                output.dtype(),
+                q.dtype()
+            )));
+        }
+        if output.dims() != q.dims() {
+            return Err(candle_core::Error::Msg(format!(
+                "FlashInfer FP8 decode: output shape {:?} does not match Q shape {:?}",
+                output.dims(),
+                q.dims()
+            )));
+        }
+        if !q_scale.is_finite() || !k_scale.is_finite() || !v_scale.is_finite() {
+            return Err(candle_core::Error::Msg(format!(
+                "FlashInfer FP8 decode: scales must be finite \
+                 (got q_scale={q_scale}, k_scale={k_scale}, v_scale={v_scale})"
+            )));
+        }
+
+        let q_ffi_dtype = tensor_bridge::candle_to_ffi_dtype(q.dtype())?;
+
+        let q_ptr = tensor_bridge::tensor_to_device_ptr(&q)?;
+        let k_cache_ptr = tensor_bridge::tensor_to_device_ptr(k_cache)?;
+        let v_cache_ptr = tensor_bridge::tensor_to_device_ptr(v_cache)?;
+        let kv_indptr_ptr = tensor_bridge::tensor_to_device_ptr(&plan.kv_indptr)? as *const i32;
+        let kv_indices_ptr = tensor_bridge::tensor_to_device_ptr(&plan.kv_indices)? as *const i32;
+        let kv_last_page_len_ptr =
+            tensor_bridge::tensor_to_device_ptr(&plan.kv_last_page_len)? as *const i32;
+        let stream_ptr = tensor_bridge::get_cuda_stream_ptr(&self.device)?;
+        let output_ptr = tensor_bridge::tensor_to_device_ptr(output)? as *mut std::ffi::c_void;
+
+        unsafe {
+            plan.plan
+                .run_fp8(
+                    q_ptr,
+                    k_cache_ptr,
+                    v_cache_ptr,
+                    kv_indptr_ptr,
+                    kv_indices_ptr,
+                    kv_last_page_len_ptr,
+                    output_ptr,
+                    std::ptr::null_mut(), // lse
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    false, // correct_lse_for_v_scale — N/A when lse is null
+                    q_ffi_dtype,
+                    kv_dtype,
+                    self.config.ffi_kv_layout(),
+                    stream_ptr,
+                )
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("FlashInfer FP8 decode forward failed: {e}"))
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Replay a pre-built decode plan into a caller-provided output
     /// buffer. Allocates nothing — the receiver tensor's storage must
     /// already match `q.dims()` and `q.dtype()`. Used by the pooled

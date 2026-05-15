@@ -1,0 +1,19 @@
+# Project-level cargo settings for the WSL build environment.
+#
+# WSL VM has a 10 GiB hard cap (set in /mnt/c/Users/vasis/.wslconfig).
+# The CUDA toolchain (nvcc + g++-12 host parser) on
+# template-heavy code (upstream FlashInfer's BatchPrefillDispatched,
+# RopeQuantizeKernel, FP8 sampling, ...) peaks at:
+#   - ~1-2 GiB per nvcc job in `cargo check` / debug builds
+#   - ~5-6 GiB per nvcc job in `cargo build --release` (-O3 amplifies
+#     template-instantiation memory because nvcc keeps optimised IR
+#     trees in core).
+#
+# `jobs = 1` is the only safe setting for release: two parallel
+# release nvcc jobs already exceeded the cap and OOM-killed the VM.
+# Debug paths tolerate j = 2 but we keep one value here to avoid
+# accidental "I'll just bump it" footguns on the release path.
+# Override per-invocation with `cargo check -j 2` when intentional.
+
+[build]
+jobs = 1

@@ -12,6 +12,7 @@ use super::backend::AttentionBackend;
 use super::flash::FlashAttentionBackend;
 use super::flashinfer::FlashInferBackend;
 use super::naive::NaiveAttentionBackend;
+use crate::kv_cache::KVCacheDtype;
 
 /// GPU compute capability, matching NVIDIA SM versions.
 ///
@@ -70,6 +71,11 @@ pub struct AttentionRequirements {
     pub needs_mla: bool,
     /// GPU compute capability, if known
     pub gpu_capability: Option<GpuCapability>,
+    /// KV cache storage dtype. Backends are rejected during selection
+    /// when this is quantised (FP8/INT8) and they don't declare support
+    /// via `AttentionBackend::supported_kv_cache_dtypes`. Default
+    /// `Auto`.
+    pub kv_cache_dtype: KVCacheDtype,
 }
 
 impl AttentionRequirements {
@@ -81,6 +87,7 @@ impl AttentionRequirements {
             sliding_window: false,
             needs_mla: false,
             gpu_capability: None,
+            kv_cache_dtype: KVCacheDtype::Auto,
         }
     }
 
@@ -96,6 +103,11 @@ impl AttentionRequirements {
 
     pub fn with_gpu_capability(mut self, capability: GpuCapability) -> Self {
         self.gpu_capability = Some(capability);
+        self
+    }
+
+    pub fn with_kv_cache_dtype(mut self, dtype: KVCacheDtype) -> Self {
+        self.kv_cache_dtype = dtype;
         self
     }
 }
@@ -222,6 +234,26 @@ impl AttentionBackendSelector {
             trace.push(SelectionReason::Rejected {
                 backend: "flashinfer",
                 reason: "head_dim must be 64, 128, or 256 for FlashInfer",
+            });
+            return None;
+        }
+
+        // Phase 6.b: FlashInfer decode now reads FP8 E4M3/E5M2 via the
+        // upstream `flashinfer_batch_decode_run_fp8` entry point; the
+        // prefill path falls back to naive (which computes from fresh
+        // K/V and never reads the quantised cache). INT8 stays
+        // unsupported — upstream has no INT8 decode kernel. Selection
+        // must reject INT8 here so it falls through to paged_attention,
+        // which dequantises INT8 inline kernel-side.
+        let supported_kv = [
+            KVCacheDtype::Auto,
+            KVCacheDtype::Fp8E4m3,
+            KVCacheDtype::Fp8E5m2,
+        ];
+        if !supported_kv.contains(&requirements.kv_cache_dtype) {
+            trace.push(SelectionReason::Rejected {
+                backend: "flashinfer",
+                reason: "INT8 KV cache not yet supported by FlashInfer backend",
             });
             return None;
         }
@@ -697,6 +729,53 @@ mod tests {
         let result = AttentionBackendSelector::select(&req);
         // FlashInfer rejected for head_dim=96, should get flash-attn or naive
         assert_ne!(result.backend.name(), "flashinfer");
+    }
+
+    #[cfg(feature = "flashinfer")]
+    #[test]
+    fn test_flashinfer_accepts_fp8_rejects_int8() {
+        // Phase 6.b: FlashInfer's decode path now reads FP8 E4M3/E5M2
+        // through `BatchDecodePlan::run_fp8`; the prefill side falls
+        // back to naive (no FP8 prefill kernel upstream). INT8 stays
+        // unsupported — there is no INT8 decode entry point in
+        // upstream FlashInfer, so selection must reject it and fall
+        // through to paged_attention.
+        for dtype in [KVCacheDtype::Fp8E4m3, KVCacheDtype::Fp8E5m2] {
+            let req = AttentionRequirements::new(32, 8, 128).with_kv_cache_dtype(dtype);
+            let result = AttentionBackendSelector::select(&req);
+            assert_eq!(
+                result.backend.name(),
+                "flashinfer",
+                "FlashInfer must be accepted for kv_cache_dtype={dtype:?}"
+            );
+        }
+
+        let req_int8 =
+            AttentionRequirements::new(32, 8, 128).with_kv_cache_dtype(KVCacheDtype::Int8);
+        let result = AttentionBackendSelector::select(&req_int8);
+        assert_ne!(
+            result.backend.name(),
+            "flashinfer",
+            "FlashInfer must be rejected for INT8 KV cache"
+        );
+        let fi_rejected = result.trace.iter().any(|r| {
+            matches!(
+                r,
+                SelectionReason::Rejected {
+                    backend: "flashinfer",
+                    ..
+                }
+            )
+        });
+        assert!(fi_rejected, "trace must record FlashInfer INT8 rejection");
+    }
+
+    #[test]
+    fn test_attention_requirements_with_kv_cache_dtype() {
+        let req = AttentionRequirements::new(32, 8, 128).with_kv_cache_dtype(KVCacheDtype::Fp8E4m3);
+        assert_eq!(req.kv_cache_dtype, KVCacheDtype::Fp8E4m3);
+        let default_req = AttentionRequirements::new(32, 8, 128);
+        assert_eq!(default_req.kv_cache_dtype, KVCacheDtype::Auto);
     }
 
     // =========================================================================

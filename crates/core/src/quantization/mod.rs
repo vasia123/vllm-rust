@@ -49,6 +49,7 @@ pub mod gptq;
 #[cfg(feature = "cuda-kernels")]
 pub mod gptq_cuda;
 pub mod inc;
+pub mod kv_cache_scales;
 pub mod marlin;
 #[cfg(feature = "marlin")]
 pub mod marlin_cuda;
