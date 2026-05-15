@@ -17,7 +17,7 @@ marlin = ["cuda-kernels"]
 # Aggregate gate for the CUDA-graph mini-decoder bisect tests in
 # `crates/core/src/cuda_kernels.rs::tests::*`. Those tests call
 # `rms_norm_cuda_pooled` / `embedding_pooled` /
-# `bf16_add_pooled` / `silu_and_mul_separate_pooled`, which live
+# `half_add_pooled` / `silu_and_mul_separate_pooled`, which live
 # behind the layernorm + fused-activations sub-features. Without
 # this gate the test build was failing whenever `cuda-kernels`
 # was enabled but the sub-features were not — a pre-existing
@@ -26,19 +26,22 @@ marlin = ["cuda-kernels"]
 # real GPU + capture support); the gate only guards compilation.
 mini-decoder-tests = ["cuda-kernels", "cuda-layernorm", "cuda-fused-activations"]
 # Aggregate feature describing the *intended* production GPU build set.
-# When all listed features compile cleanly, pulling this in turns on every
-# kernel-level optimisation in vllm-core (Marlin INT4, fused norms, fused
-# activations, MoE kernels, FlashInfer attention).  AWQ checkpoints route
-# through Marlin; RMSNorm/RoPE through fused CUDA; attention through
-# FlashInfer paged kernels.
+# Pulls in every kernel-level optimisation in vllm-core (Marlin INT4,
+# fused norms, fused activations, MoE kernels, FlashInfer attention).
+# AWQ checkpoints route through Marlin; RMSNorm/RoPE through fused
+# CUDA; attention through FlashInfer paged kernels.
 #
-# NOTE (2026-05): `marlin`, `flashinfer`, `cuda-layernorm`,
-# `cuda-fused-activations`, and `cuda-moe` currently fail to build against
-# the bumped cudarc / candle stack (LaunchArgs::arg API change and FFI
-# guard-lifetime issues).  Until those are repaired, recommend building
-# with just `cuda-kernels` — the AWQ fast path still routes through
-# `gptq_cuda::gptq_gemm` (which only requires `cuda-kernels`) and gives
-# a large speed-up over `AwqLinear`'s CPU dequant.
+# Build prerequisites (CUDA 12.4+):
+# - `marlin`, `cuda-layernorm`, `cuda-fused-activations`, `cuda-moe`,
+#   `flashinfer` previously broke against the cudarc 0.16 LaunchArgs::arg
+#   API change and CUDA 12.0's nvcc parser bug on long template
+#   instantiations. Both issues are resolved on the current toolchain
+#   (cudarc-bumped + CUDA 12.4): all five sub-features compile cleanly
+#   under `cargo check --features cuda-default` as of 2026-05-15.
+# - Release builds with this feature set need ~24 GiB swap on WSL2 due
+#   to ptxas memory peaks on the FlashInfer template-heavy kernels;
+#   see `.cargo/config.toml` (`jobs = 1`) and the WSL2 `.wslconfig`
+#   notes.
 cuda-default = [
     "cuda-kernels",
     "cuda-layernorm",
@@ -146,3 +149,34 @@ required-features = ["cuda"]
 name = "flashinfer_decode_bench"
 harness = false
 required-features = ["cuda-kernels", "flashinfer"]
+
+# Tier 1 per-kernel benches — see docs/perf/tiered-benches.md (planned)
+# for the rationale. Each catches regressions at the kernel level
+# (alloc strategy, dispatch predicate, pool slot stability) without
+# requiring a full release server build.
+[[bench]]
+name = "fused_activations_bench"
+harness = false
+required-features = ["cuda-kernels", "cuda-fused-activations"]
+
+[[bench]]
+name = "rms_norm_bench"
+harness = false
+required-features = ["cuda-kernels", "cuda-layernorm"]
+
+[[bench]]
+name = "rotary_embedding_bench"
+harness = false
+required-features = ["cuda-kernels"]
+
+# Tier 2.b — real Qwen3 decoder layer bench (loads turboderp/Qwen3-8B-exl3
+# at setup). Catches regressions in quantised linear dispatch +
+# layer-level kernel chain side-effects that Tier 1 micros cannot see.
+# Only `cuda-kernels` is mandatory — the bench is intentionally
+# runnable under any superset (cuda-kernels alone, +cuda-fused-activations,
+# +cuda-default, …) so feature-bisect snapshot diffs can localise which
+# sub-feature drives a regression.
+[[bench]]
+name = "quantized_layer_bench"
+harness = false
+required-features = ["cuda-kernels"]

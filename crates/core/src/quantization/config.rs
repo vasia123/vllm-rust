@@ -157,7 +157,7 @@ pub trait QuantizedLinear: Send + Sync {
     /// [`OutputPool::global`](crate::engine::output_pool::OutputPool::global).
     /// That holds for `Exl3Linear` (via `exl3_gemm`), `MarlinLinear`
     /// (via `marlin_gemm_pooled`), `TiedEmbeddingHead` (via
-    /// `bf16_matmul_pooled`), and other quant impls that route through
+    /// `half_matmul_pooled`), and other quant impls that route through
     /// pool wrappers.
     ///
     /// Impls whose forward output is **not** pool-backed (e.g., a pure

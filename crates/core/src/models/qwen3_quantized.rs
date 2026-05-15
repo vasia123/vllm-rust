@@ -915,7 +915,17 @@ impl QuantizedQwen3Attention {
 
 // ─── Quantized Decoder Layer ─────────────────────────────────────────────────
 
-struct QuantizedQwen3DecoderLayer {
+/// One decoder block from a quantised Qwen3 model.
+///
+/// Exposed as `pub` (alongside [`QuantizedQwen3ForCausalLM::layer`]) so
+/// `benches/quantized_layer_bench.rs` can target a **single layer** at
+/// production-realistic shape — measurements isolate per-layer kernel
+/// chain regressions (quantised-linear dispatch, fused activations
+/// gating, residual paths) without re-running the full 36-layer
+/// forward. Public construction is not supported; use
+/// [`QuantizedQwen3ForCausalLM::new`] and pick a layer via
+/// [`QuantizedQwen3ForCausalLM::layer`].
+pub struct QuantizedQwen3DecoderLayer {
     self_attn: QuantizedQwen3Attention,
     mlp: QuantizedSwiGluMlp,
     input_layernorm: RmsNorm,
@@ -1009,7 +1019,7 @@ impl QuantizedQwen3DecoderLayer {
         self.forward_decode_batch_with_shared(xs, sequences, kv_cache_mgr, layer_idx, None)
     }
 
-    fn forward_decode_batch_with_shared(
+    pub fn forward_decode_batch_with_shared(
         &self,
         xs: &Tensor,
         sequences: &[DecodeSequenceMetadata],
@@ -1031,9 +1041,14 @@ impl QuantizedQwen3DecoderLayer {
         // Pool-backed residual adds — captured-graph replay needs the
         // residual sum's device address to be stable across forwards;
         // candle's `Tensor::add` allocates fresh per call.
+        // `half_add_pooled` name is historical — the underlying kernel
+        // handles BF16 and F16 with the same launch shape. Gate on
+        // both so EXL3 models (forced to F16 by the kernel constraint
+        // documented in `crates/core/src/quantization/exl3.rs`) get
+        // the pool-backed stable-address path too.
         #[cfg(feature = "cuda-fused-activations")]
         let xs = if xs.device().is_cuda() && xs.dtype() == DType::BF16 {
-            crate::cuda_kernels::bf16_add_pooled(&xs, residual)?
+            crate::cuda_kernels::half_add_pooled(&xs, residual)?
         } else {
             (xs + residual)?
         };
@@ -1049,8 +1064,10 @@ impl QuantizedQwen3DecoderLayer {
 
         #[cfg(feature = "cuda-fused-activations")]
         {
+            // Same BF16+F16 dtype gate as the post-attention residual
+            // add above — see comment there.
             if xs.device().is_cuda() && xs.dtype() == DType::BF16 {
-                return crate::cuda_kernels::bf16_add_pooled(residual, &xs);
+                return crate::cuda_kernels::half_add_pooled(residual, &xs);
             }
         }
         residual + xs
@@ -1112,6 +1129,20 @@ impl QuantizedQwen3ForCausalLM {
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
+    }
+
+    /// Borrow one decoder layer. Used by
+    /// `benches/quantized_layer_bench.rs` (Tier 2.b) to target a single
+    /// layer with production-realistic weights without rerunning the
+    /// full 36-layer chain.
+    pub fn layer(&self, idx: usize) -> &QuantizedQwen3DecoderLayer {
+        &self.layers[idx]
+    }
+
+    /// Number of decoder layers in this model. Pair with
+    /// [`Self::layer`] for layer-targeted benches.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     pub fn forward(
@@ -1181,7 +1212,7 @@ impl QuantizedLinear for TiedEmbeddingHead {
         // Qwen3-4B-AWQ in side-by-side bench (118.8 → 157.1 tps).
         //
         // 2026-05-09 (Phase B.6): on the decode hot path
-        // `crate::cuda_kernels::bf16_matmul_pooled` reserves the output
+        // `crate::cuda_kernels::half_matmul_pooled` reserves the output
         // from the global OutputPool so its device address stays stable
         // across forwards — required for CUDA Graph capture replay.
         // Wrapper itself falls back to candle's matmul for prefill / non-BF16.
@@ -1193,7 +1224,7 @@ impl QuantizedLinear for TiedEmbeddingHead {
                 let x_flat = x.reshape((b * s, h))?;
                 #[cfg(feature = "cuda-kernels")]
                 {
-                    let y_flat = crate::cuda_kernels::bf16_matmul_pooled(&x_flat, &self.weight)?;
+                    let y_flat = crate::cuda_kernels::half_matmul_pooled(&x_flat, &self.weight)?;
                     return y_flat.reshape((b, s, v));
                 }
                 #[allow(unreachable_code)]
@@ -1205,7 +1236,7 @@ impl QuantizedLinear for TiedEmbeddingHead {
             _ => {
                 #[cfg(feature = "cuda-kernels")]
                 {
-                    return crate::cuda_kernels::bf16_matmul_pooled(x, &self.weight);
+                    return crate::cuda_kernels::half_matmul_pooled(x, &self.weight);
                 }
                 #[allow(unreachable_code)]
                 x.matmul(&self.weight.t()?)

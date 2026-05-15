@@ -3034,8 +3034,8 @@ impl<'a> InplaceOp2 for Bf16AddInplaceOp<'a> {
 /// Qwen3-4B decode forward, all of which leaked unstable device
 /// pointers into the captured CUDA graph.
 #[cfg(feature = "cuda-fused-activations")]
-pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    crate::engine::cr_trace::mark_op("bf16_add_pooled");
+pub fn half_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    crate::engine::cr_trace::mark_op("half_add_pooled");
     use crate::engine::output_pool::OutputPool;
 
     /// Decode-shape budget; matches the other pool wrappers.
@@ -3052,7 +3052,7 @@ pub fn bf16_add_pooled(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
     if a.shape() != b.shape() {
         candle_core::bail!(
-            "bf16_add_pooled: shape mismatch {:?} vs {:?}",
+            "half_add_pooled: shape mismatch {:?} vs {:?}",
             a.shape(),
             b.shape()
         );
@@ -3195,9 +3195,9 @@ impl<'a> InplaceOp2 for Bf16MatmulInplaceOp<'a> {
 /// into the receiver. Falls back to candle's `Tensor::matmul` for
 /// prefill, non-BF16 dtypes, or non-CUDA devices.
 #[cfg(feature = "cuda-kernels")]
-pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
+pub fn half_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     use crate::engine::output_pool::OutputPool;
-    crate::engine::cr_trace::mark_op("bf16_matmul_pooled");
+    crate::engine::cr_trace::mark_op("half_matmul_pooled");
 
     /// Decode-shape budget; matches the other pool wrappers.
     const POOL_MAX_M: usize = 64;
@@ -3214,7 +3214,7 @@ pub fn bf16_matmul_pooled(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
 
     let in_dims = input.dims();
     if in_dims.len() < 2 {
-        candle_core::bail!("bf16_matmul_pooled: input must have ≥ 2 dims");
+        candle_core::bail!("half_matmul_pooled: input must have ≥ 2 dims");
     }
     let k = in_dims[in_dims.len() - 1];
     let m: usize = in_dims[..in_dims.len() - 1].iter().product();
@@ -4262,24 +4262,24 @@ pub fn silu_and_mul_separate_pooled_typed(
     Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
 }
 
-/// Type-safe wrapper for [`bf16_add_pooled`].
+/// Type-safe wrapper for [`half_add_pooled`].
 #[cfg(feature = "cuda-fused-activations")]
-pub fn bf16_add_pooled_typed(a: &PooledTensor, b: &PooledTensor) -> Result<PooledTensor> {
-    let out = bf16_add_pooled(a.as_tensor(), b.as_tensor())?;
+pub fn half_add_pooled_typed(a: &PooledTensor, b: &PooledTensor) -> Result<PooledTensor> {
+    let out = half_add_pooled(a.as_tensor(), b.as_tensor())?;
     if !matches!(
         out.dtype(),
         candle_core::DType::BF16 | candle_core::DType::F16
     ) {
         candle_core::bail!(
-            "bf16_add_pooled_typed: legacy returned non-pool dtype {:?}",
+            "half_add_pooled_typed: legacy returned non-pool dtype {:?}",
             out.dtype()
         );
     }
     Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
 }
 
-/// Type-safe wrapper for [`bf16_matmul_pooled`].
-pub fn bf16_matmul_pooled_typed(input: &PooledTensor, weight: &Tensor) -> Result<PooledTensor> {
+/// Type-safe wrapper for [`half_matmul_pooled`].
+pub fn half_matmul_pooled_typed(input: &PooledTensor, weight: &Tensor) -> Result<PooledTensor> {
     let in_dt = input.dtype();
     if in_dt != weight.dtype()
         || !matches!(in_dt, candle_core::DType::BF16 | candle_core::DType::F16)
@@ -4289,12 +4289,12 @@ pub fn bf16_matmul_pooled_typed(input: &PooledTensor, weight: &Tensor) -> Result
         // candle Tensor (line 2463 in legacy). Caller must ensure
         // dtypes match and tensor is on CUDA.
         candle_core::bail!(
-            "bf16_matmul_pooled_typed: requires CUDA BF16/F16 (got {:?} on {:?})",
+            "half_matmul_pooled_typed: requires CUDA BF16/F16 (got {:?} on {:?})",
             in_dt,
             input.device()
         );
     }
-    let out = bf16_matmul_pooled(input.as_tensor(), weight)?;
+    let out = half_matmul_pooled(input.as_tensor(), weight)?;
     Ok(unsafe { PooledTensor::from_pool_unchecked(out) })
 }
 
@@ -6561,7 +6561,7 @@ mod tests {
     }
 
     // `mini_decoder_layer_forward` and downstream replay helpers/tests
-    // invoke `rms_norm_cuda_pooled` / `bf16_add_pooled` /
+    // invoke `rms_norm_cuda_pooled` / `half_add_pooled` /
     // `silu_and_mul_separate_pooled` / `embedding_pooled` which live
     // behind the `cuda-layernorm` and `cuda-fused-activations`
     // sub-features. Gating only on `cuda-kernels` made the lib test
@@ -6600,12 +6600,12 @@ mod tests {
             xs.clone()
         };
 
-        // q/k/v projections (bf16_matmul_pooled = input @ weight.t)
+        // q/k/v projections (half_matmul_pooled = input @ weight.t)
         let (q, k, v) = if bisect_keep('M') {
             (
-                bf16_matmul_pooled(&xs_n, &layer.q_proj).unwrap(),
-                bf16_matmul_pooled(&xs_n, &layer.k_proj).unwrap(),
-                bf16_matmul_pooled(&xs_n, &layer.v_proj).unwrap(),
+                half_matmul_pooled(&xs_n, &layer.q_proj).unwrap(),
+                half_matmul_pooled(&xs_n, &layer.k_proj).unwrap(),
+                half_matmul_pooled(&xs_n, &layer.v_proj).unwrap(),
             )
         } else {
             // Use zero-cost view tensors that match the shapes the rest
@@ -6730,14 +6730,14 @@ mod tests {
         // o_proj: attn shape [batch, num_heads*head_dim] → unsqueeze for [B,1,H*D]
         let attn_3d = attn.unsqueeze(1).unwrap();
         let attn_out = if bisect_keep('M') {
-            bf16_matmul_pooled(&attn_3d, &layer.o_proj).unwrap()
+            half_matmul_pooled(&attn_3d, &layer.o_proj).unwrap()
         } else {
             attn_3d.clone()
         };
 
         // residual add (post-attention)
         let xs1 = if bisect_keep('A') {
-            bf16_add_pooled(&attn_out, &residual).unwrap()
+            half_add_pooled(&attn_out, &residual).unwrap()
         } else {
             attn_out
         };
@@ -6753,8 +6753,8 @@ mod tests {
         // MLP: gate + up → silu_and_mul → down
         let (gate, up) = if bisect_keep('M') {
             (
-                bf16_matmul_pooled(&xs_n2, &layer.gate_proj).unwrap(),
-                bf16_matmul_pooled(&xs_n2, &layer.up_proj).unwrap(),
+                half_matmul_pooled(&xs_n2, &layer.gate_proj).unwrap(),
+                half_matmul_pooled(&xs_n2, &layer.up_proj).unwrap(),
             )
         } else {
             let dt = xs_n2.dtype();
@@ -6775,7 +6775,7 @@ mod tests {
             gate.clone()
         };
         let mlp_out = if bisect_keep('M') {
-            bf16_matmul_pooled(&activated, &layer.down_proj).unwrap()
+            half_matmul_pooled(&activated, &layer.down_proj).unwrap()
         } else {
             // Reserve a slot of post-MLP shape so the residual add below
             // has a well-shaped operand.
@@ -6789,7 +6789,7 @@ mod tests {
 
         // residual add (post-MLP)
         if bisect_keep('A') {
-            bf16_add_pooled(&residual2, &mlp_out).unwrap()
+            half_add_pooled(&residual2, &mlp_out).unwrap()
         } else {
             residual2
         }

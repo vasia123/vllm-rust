@@ -650,7 +650,7 @@ impl QuantizedLlamaDecoderLayer {
         )?;
         // Pool-backed F16/BF16 residual add.
         #[cfg(feature = "cuda-fused-activations")]
-        let xs = crate::cuda_kernels::bf16_add_pooled(&xs, residual)?;
+        let xs = crate::cuda_kernels::half_add_pooled(&xs, residual)?;
         #[cfg(not(feature = "cuda-fused-activations"))]
         let xs = (xs + residual)?;
         let residual = &xs;
@@ -658,7 +658,7 @@ impl QuantizedLlamaDecoderLayer {
             .mlp
             .forward(&self.post_attention_layernorm.forward(&xs)?)?;
         #[cfg(feature = "cuda-fused-activations")]
-        let result = crate::cuda_kernels::bf16_add_pooled(residual, &xs)?;
+        let result = crate::cuda_kernels::half_add_pooled(residual, &xs)?;
         #[cfg(not(feature = "cuda-fused-activations"))]
         let result = (residual + xs)?;
         Ok(result)
@@ -697,7 +697,7 @@ impl QuantizedLlamaDecoderLayer {
         if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
             crate::engine::layer_dump::dump_at("layer.00.attn_out", xs_attn.as_tensor());
         }
-        let xs_after_attn = crate::cuda_kernels::bf16_add_pooled_typed(&xs_attn, &residual)?;
+        let xs_after_attn = crate::cuda_kernels::half_add_pooled_typed(&xs_attn, &residual)?;
         if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
             crate::engine::layer_dump::dump_at(
                 "layer.00.after_attn_residual",
@@ -716,7 +716,7 @@ impl QuantizedLlamaDecoderLayer {
         if layer_idx == 0 && crate::engine::layer_dump::is_enabled() {
             crate::engine::layer_dump::dump_at("layer.00.mlp_out", mlp_out.as_tensor());
         }
-        crate::cuda_kernels::bf16_add_pooled_typed(&residual, &mlp_out)
+        crate::cuda_kernels::half_add_pooled_typed(&residual, &mlp_out)
     }
 }
 
@@ -830,7 +830,7 @@ impl QuantizedLinear for TiedEmbeddingHead {
         // instead of stride-0 batched GEMM. +40% e2e at c=8 on the
         // lm_head shape (Qwen3-4B-AWQ side-by-side, 2026-05-09).
         //
-        // Phase 11.2.C: route the matmul through `bf16_matmul_pooled`
+        // Phase 11.2.C: route the matmul through `half_matmul_pooled`
         // (now BF16/F16 dtype-generic) when both operands are on CUDA
         // with matching dtype, so the lm_head's output uses a
         // stable-address pool slot. The pool wrapper itself falls back
@@ -843,7 +843,7 @@ impl QuantizedLinear for TiedEmbeddingHead {
                 let v = self.weight.dims()[0];
                 let x_flat = x.reshape((b * s, h))?;
                 #[cfg(feature = "cuda-kernels")]
-                let y_flat = crate::cuda_kernels::bf16_matmul_pooled(&x_flat, &self.weight)?;
+                let y_flat = crate::cuda_kernels::half_matmul_pooled(&x_flat, &self.weight)?;
                 #[cfg(not(feature = "cuda-kernels"))]
                 let y_flat = x_flat.matmul(&self.weight.t()?)?;
                 y_flat.reshape((b, s, v))
@@ -851,7 +851,7 @@ impl QuantizedLinear for TiedEmbeddingHead {
             _ => {
                 #[cfg(feature = "cuda-kernels")]
                 {
-                    crate::cuda_kernels::bf16_matmul_pooled(x, &self.weight)
+                    crate::cuda_kernels::half_matmul_pooled(x, &self.weight)
                 }
                 #[cfg(not(feature = "cuda-kernels"))]
                 {
