@@ -178,6 +178,13 @@ fn bench_decoder_layer(c: &mut Criterion) {
     let mut kv = make_kv_cache_mgr(cfg, device);
     let dtype = DType::F16;
 
+    // Snapshot rms_norm dispatch counter; reported at the end so a single
+    // bench run answers "did the custom kernel dispatch actually fire?".
+    // See memory/cuda_layernorm_4pct_regression.md for the methodology.
+    #[cfg(feature = "cuda-layernorm")]
+    let rms_count_start = vllm_core::cuda_kernels::RMS_NORM_CUDA_POOLED_COUNT
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     for &m in CONCURRENCIES {
         let xs = make_input_xs(m, cfg.hidden_size, dtype, device);
         let sequences = make_sequences(m);
@@ -206,12 +213,27 @@ fn bench_decoder_layer(c: &mut Criterion) {
                         Some(black_box(&shared)),
                     )
                     .unwrap();
-                // Tiny DtoH to force kernel completion before next iter.
                 let _ = y.dim(0).unwrap();
+                // EXPLICIT GPU sync — forces wall-clock measurement of
+                // CUDA work, not CPU enqueue rate. Without this, criterion
+                // measures host-side iteration speed: kernels execute
+                // concurrently with the next iter's enqueue and per-call
+                // GPU timing deltas (e.g. cuda-layernorm RmsNorm 10.5 vs
+                // 6.2 µs) get hidden by the dispatch pipeline. See
+                // memory/cuda_layernorm_4pct_regression.md targeted test.
+                sync(device);
             });
         });
     }
     group.finish();
+
+    #[cfg(feature = "cuda-layernorm")]
+    {
+        let rms_count_end = vllm_core::cuda_kernels::RMS_NORM_CUDA_POOLED_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let delta = rms_count_end.saturating_sub(rms_count_start);
+        eprintln!("[quantized_layer_bench] rms_norm_cuda_pooled invocations during sweep: {delta}");
+    }
 }
 
 criterion_group!(benches, bench_decoder_layer);

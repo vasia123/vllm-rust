@@ -755,17 +755,24 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
         // in a process captures fully — subsequent sessions silently drop
         // ~68% of operations (cudarc/CUDA driver state interaction; see
         // ADR 0019). Workaround: capture only ONE batch size; remaining
-        // sizes get eager JIT warmup but no graph. Default policy here:
-        // capture the LARGEST size (most expensive per-op savings),
-        // others fall back to eager replay.
+        // sizes get eager JIT warmup but no graph.
+        //
+        // Policy (2026-05-16): prefer the SMALLEST captured batch size
+        // (= typical c=1 chat decode), since CPU dispatch overhead is the
+        // largest fraction of per-step cost there. Measured on
+        // Qwen3-8B-exl3 c=1: capturing bsz=1 instead of bsz=16 gave
+        // +7.4% throughput (26.9 → 28.9 tps) with no regression on larger
+        // batches (they continue to run eager JIT-warmed, same as before).
+        // See `memory/exl3_perf_session_2026-05-16.md`.
         //
         // Env override `VLLM_CAPTURE_SINGLE_SIZE=<n>` lets users target a
-        // specific size (e.g., =1 for typical c=1 chat workloads).
+        // different size (e.g., =16 for batched-serving workloads where
+        // c≈max_requests dominates).
         let capture_single_size: Option<usize> = std::env::var("VLLM_CAPTURE_SINGLE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok());
         let chosen_capture_size: Option<usize> = if config.enable_graph_capture {
-            capture_single_size.or_else(|| sorted_sizes.first().copied())
+            capture_single_size.or_else(|| sorted_sizes.last().copied())
         } else {
             None
         };

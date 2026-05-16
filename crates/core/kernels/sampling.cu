@@ -11,6 +11,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <float.h>
 
 #define NUM_THREADS 256
@@ -538,5 +539,93 @@ extern "C" __global__ void temperature_scale_f32_per_seq(
 
     for (int i = tid; i < vocab_size; i += NUM_THREADS) {
         seq_logits[i] *= inv_t;
+    }
+}
+
+// ============================================================================
+// Parallel multinomial sampling — no-filter fast path
+// ============================================================================
+// Grid: (num_seqs, 1, 1)
+// Block: (NUM_THREADS, 1, 1)
+//
+// Replaces the single-threaded `top_k_top_p_sample_per_seq` kernel for the
+// common case where top_k=0 (disabled) and top_p=1.0 (disabled). Inverse-CDF
+// sampling from a softmax-normalized probability distribution.
+//
+// Algorithm (two-pass, mostly parallel):
+//   Pass 1 (parallel): each thread sums its contiguous chunk
+//                       chunk_sums[tid] = sum(probs[tid*chunk_size : (tid+1)*chunk_size])
+//   Pass 2 (single thread): walks chunk_sums to find the chunk c where
+//                       prefix_cdf(c) <= target < prefix_cdf(c+1),
+//                       then linear scan within chunk c to find exact token id.
+//
+// Why single-thread Pass 2 is OK: chunk_sums has only NUM_THREADS=256 entries
+// (fits in shared mem), and the within-chunk scan covers only `chunk_size`
+// (~600 for vocab=151k) elements. Total serial work ≤ 1000 ops, vs the old
+// kernel's full vocab scan = 151k ops. ~150× speedup.
+extern "C" __global__ void multinomial_sample_no_filter_parallel(
+    uint32_t* __restrict__ output_ids,        // [num_seqs]
+    const float* __restrict__ probs,           // [num_seqs, vocab_size] F32
+    const float* __restrict__ rand_vals,       // [num_seqs] F32, uniform [0,1)
+    const int vocab_size
+) {
+    const int seq_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float rand_val = rand_vals[seq_idx];
+    const float* seq_probs = probs + seq_idx * vocab_size;
+
+    const int chunk_size = (vocab_size + NUM_THREADS - 1) / NUM_THREADS;
+    const int my_start = tid * chunk_size;
+    const int my_end = min(my_start + chunk_size, vocab_size);
+
+    __shared__ float chunk_sums[NUM_THREADS];
+
+    // Pass 1: parallel — each thread sums its contiguous chunk.
+    float chunk_sum = 0.0f;
+    for (int i = my_start; i < my_end; i++) {
+        chunk_sum += seq_probs[i];
+    }
+    chunk_sums[tid] = chunk_sum;
+    __syncthreads();
+
+    // Pass 2: single thread (tid=0) walks chunks + finds exact token.
+    // ~256 + ~chunk_size ≈ ~1000 sequential ops — negligible at f32.
+    if (tid == 0) {
+        float total_sum = 0.0f;
+        for (int c = 0; c < NUM_THREADS; c++) total_sum += chunk_sums[c];
+
+        // Guard against pathological degenerate distributions where the
+        // softmax-normalized sum is effectively zero (NaN/Inf inputs):
+        // fall back to argmax-style position 0. The standard sampler kernel
+        // (top_k_top_p_sample_per_seq) clamps to vocab_size-1; we do the
+        // same below by initialising `selected`.
+        float target = rand_val * total_sum;
+
+        // Walk chunks to find the one containing `target` (first chunk
+        // where prefix CDF exceeds target).
+        float cdf = 0.0f;
+        int target_chunk = NUM_THREADS - 1;
+        for (int c = 0; c < NUM_THREADS; c++) {
+            float next_cdf = cdf + chunk_sums[c];
+            if (next_cdf > target) {
+                target_chunk = c;
+                break;
+            }
+            cdf = next_cdf;
+        }
+
+        // Linear scan within target chunk to find first idx where running
+        // CDF crosses target.
+        int chunk_start = target_chunk * chunk_size;
+        int chunk_end = min(chunk_start + chunk_size, vocab_size);
+        uint32_t selected = (uint32_t)(vocab_size - 1);  // clamp fallback
+        for (int i = chunk_start; i < chunk_end; i++) {
+            cdf += seq_probs[i];
+            if (cdf > target) {
+                selected = (uint32_t)i;
+                break;
+            }
+        }
+        output_ids[seq_idx] = selected;
     }
 }

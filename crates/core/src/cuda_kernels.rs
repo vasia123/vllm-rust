@@ -1164,7 +1164,19 @@ struct PagedAttnV2InplaceOp<'a> {
     head_dim: usize,
     block_size: usize,
     partition_size: usize,
+    /// Worst-case partition count from `worst_case_max_seq_len /
+    /// partition_size`. Sizes the pool scratch buffers (`tmp_out`,
+    /// `exp_sums`, `max_logits`) and is passed to the kernel as the
+    /// per-(seq, head) partition **stride** — required to match the
+    /// allocated buffer layout regardless of actual seq_len.
     max_num_partitions: usize,
+    /// Active partition count derived from `actual_max_seq_len`. Drives
+    /// the Stage 1 grid Z dimension so we only launch as many partition
+    /// blocks as can have work. Without this, short decode positions
+    /// (e.g. seq_len=32 with worst_case=131_072 and partition_size=256)
+    /// pay 511 empty-block launches per (head, seq) — the documented
+    /// 5-10× per-call regression at c=8 with prompt=256.
+    active_max_partitions: usize,
 }
 
 impl<'a> InplaceOp2 for PagedAttnV2InplaceOp<'a> {
@@ -1312,6 +1324,16 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
 
         let head_dim = self.head_dim;
         let max_num_partitions = self.max_num_partitions;
+        // Grid Z covers only partitions that can actually have work.
+        // The kernel early-returns at `partition_start_token >= seq_len`
+        // (paged_attention.cu:571) — but block launch itself costs ~µs
+        // per block, and at worst_case=131_072 with partition_size=256
+        // we'd launch 511 such empty blocks per (head, seq) for a
+        // 256-token decode. The kernel reads `partition_idx = blockIdx.z`
+        // for its own math and `max_num_partitions` for buffer stride —
+        // these are independent, so shrinking grid Z is correctness-safe
+        // as long as we keep the stride argument worst-case.
+        let active_max_partitions = self.active_max_partitions;
 
         // Stage 1: partitioned attention kernel. The pooled-V2 path
         // currently supports `Auto` KV cache only — quantized cache flows
@@ -1323,7 +1345,7 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
             grid_dim: (
                 self.num_heads as u32,
                 num_seqs as u32,
-                max_num_partitions as u32,
+                active_max_partitions as u32,
             ),
             block_dim: (128, 1, 1),
             shared_mem_bytes,
@@ -1615,6 +1637,10 @@ pub fn paged_attention_v2_cuda_pooled_with_kv_dtype(
     }
 
     let max_num_partitions = worst_case_max_seq_len.div_ceil(partition_size).max(1);
+    // Active partition count = ceil(actual_max_seq_len / partition_size).
+    // Bounded above by max_num_partitions (the caller-stated worst case
+    // is always ≥ actual). Drives grid Z; see PagedAttnV2InplaceOp doc.
+    let active_max_partitions = max_seq_len.div_ceil(partition_size).max(1);
 
     let seq_lens_c = seq_lens.contiguous()?;
     debug_assert_seq_lens_within_bound(&seq_lens_c, worst_case_max_seq_len)?;
@@ -1671,6 +1697,7 @@ pub fn paged_attention_v2_cuda_pooled_with_kv_dtype(
         block_size,
         partition_size,
         max_num_partitions,
+        active_max_partitions,
     };
 
     output.inplace_op2(&q, &op)?;
@@ -3655,6 +3682,8 @@ impl<'a> InplaceOp2 for RmsNormInplaceOp<'a> {
 /// `num_tokens = batch_size × 1`.
 #[cfg(feature = "cuda-layernorm")]
 pub fn rms_norm_cuda_pooled(input: &Tensor, weight: &Tensor, epsilon: f32) -> Result<Tensor> {
+    use std::sync::atomic::Ordering;
+    RMS_NORM_CUDA_POOLED_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::engine::cr_trace::mark_op("rms_norm_cuda_pooled");
     use crate::engine::output_pool::OutputPool;
 
@@ -3679,6 +3708,15 @@ pub fn rms_norm_cuda_pooled(input: &Tensor, weight: &Tensor, epsilon: f32) -> Re
     output.inplace_op2(&input, &op)?;
     Ok(output)
 }
+
+/// Diagnostic counter for `rms_norm_cuda_pooled` invocations. Kept as
+/// permanent observability infrastructure so future perf sessions can
+/// verify dispatch routing without a fresh code patch — see
+/// `memory/cuda_layernorm_4pct_regression.md` for the investigation
+/// that motivated this. Read via `Ordering::Relaxed`.
+#[cfg(feature = "cuda-layernorm")]
+pub static RMS_NORM_CUDA_POOLED_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Check if CUDA RMSNorm kernel is available.
 #[cfg(feature = "cuda-layernorm")]
@@ -5751,6 +5789,130 @@ mod tests {
         assert!(
             max_diff < 5e-3,
             "V1↔V2 ALiBi parity max_diff={max_diff} (threshold 5e-3)"
+        );
+    }
+
+    /// Regression guard for the active-partitions grid-Z optimisation in
+    /// `PagedAttnV2InplaceOp::cuda_fwd`. Before that change, the pooled
+    /// kernel launched `worst_case_max_seq_len / partition_size` blocks
+    /// in grid Z; now it launches only `actual_max_seq_len /
+    /// partition_size`. Both should produce **bit-identical** output for
+    /// every (head, seq) cell — the un-launched partitions were
+    /// guaranteed-empty (kernel does `partition_start_token >= seq_len ?
+    /// return : ...`) and the reduce kernel only reads
+    /// `ceil(seq_len / partition_size)` partitions anyway. Comparing two
+    /// pooled forwards at worst_case_a vs worst_case_b confirms this
+    /// guarantee survives across regenerations of the kernel or the
+    /// pool's zero-init contract.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attn_v2_pooled_worst_case_invariance() {
+        use crate::cuda_kernels::paged_attention_v2_cuda_pooled;
+        let Ok(dev) = Device::new_cuda(0) else { return };
+
+        // Use a Qwen3-ish shape but kept tiny so the test fits in
+        // pool slots reserved for other tests. Pool capacity is sized
+        // per-process; a >POOL_MAX_NUM_TOKENS request would reroute.
+        let num_q_heads = 8;
+        let num_kv_heads = 2;
+        let head_dim = 64;
+        let block_size = 16;
+        let num_seqs = 2;
+        let actual_seq_len: usize = 256;
+        let max_blocks_per_seq = actual_seq_len.div_ceil(block_size);
+
+        let q_f32: Vec<f32> = (0..num_seqs * num_q_heads * head_dim)
+            .map(|i| (i as f32 * 0.0173).sin() * 0.5)
+            .collect();
+        let kv_elems = max_blocks_per_seq * block_size * num_kv_heads * head_dim;
+        let k_f32: Vec<f32> = (0..kv_elems)
+            .map(|i| (i as f32 * 0.0271).cos() * 0.5)
+            .collect();
+        let v_f32: Vec<f32> = (0..kv_elems)
+            .map(|i| (i as f32 * 0.0411).sin() * 0.5)
+            .collect();
+
+        let q = Tensor::from_vec(q_f32, (num_seqs, num_q_heads, head_dim), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        // Each sequence reads its own copy of the kv blocks. Re-using
+        // the same block ids across sequences is fine — they read
+        // identical data, output diverges via Q only.
+        let k_cache = Tensor::from_vec(
+            k_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let v_cache = Tensor::from_vec(
+            v_f32,
+            (max_blocks_per_seq, block_size, num_kv_heads, head_dim),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+
+        let bt: Vec<u32> = (0..(num_seqs * max_blocks_per_seq) as u32)
+            .map(|i| (i as usize % max_blocks_per_seq) as u32)
+            .collect();
+        let block_tables = Tensor::from_vec(bt, (num_seqs, max_blocks_per_seq), &dev).unwrap();
+        let seq_lens =
+            Tensor::from_vec(vec![actual_seq_len as u32; num_seqs], num_seqs, &dev).unwrap();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // partition_size pinned so the worst-case sweep below produces
+        // a meaningful active/inactive ratio (1 active vs 64 worst).
+        let partition_size = 64;
+
+        let call = |worst_case: usize| {
+            paged_attention_v2_cuda_pooled(
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &seq_lens,
+                scale,
+                num_q_heads,
+                num_kv_heads,
+                max_blocks_per_seq,
+                actual_seq_len,
+                worst_case,
+                head_dim,
+                block_size,
+                partition_size,
+            )
+            .expect("paged_attention_v2_cuda_pooled")
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+        };
+
+        let tight = call(actual_seq_len);
+        let inflated = call(actual_seq_len * 64); // 64× headroom
+        assert_eq!(
+            tight.len(),
+            inflated.len(),
+            "shape mismatch between worst_case values"
+        );
+        let max_diff = tight
+            .iter()
+            .zip(inflated.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        // The kernel does identical math for every active partition; any
+        // diff would mean the grid-Z change is exercising a previously
+        // un-tested code path. Bit-exact tolerance accounts for
+        // BF16↔F32 round-trip noise on tensor.to_dtype.
+        assert!(
+            max_diff < 1e-6,
+            "worst_case-invariance violated: max_diff={max_diff}"
         );
     }
 

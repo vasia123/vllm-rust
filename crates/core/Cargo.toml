@@ -180,3 +180,26 @@ required-features = ["cuda-kernels"]
 name = "quantized_layer_bench"
 harness = false
 required-features = ["cuda-kernels"]
+
+# Tier 1 — KV cache scatter (`reshape_and_cache_cuda`). Called 36×c per
+# token on Qwen3-8B; no prior bench coverage.
+[[bench]]
+name = "kv_cache_write_bench"
+harness = false
+required-features = ["cuda-kernels"]
+
+# Tier 1 — `exl3_gemm` kernel microbench at decode shapes. Isolates the
+# trellis-decode GEMM from `Exl3Linear::forward` trait wrapping so
+# per-call regressions can be told apart from dispatch-side effects.
+[[bench]]
+name = "exl3_gemm_bench"
+harness = false
+required-features = ["cuda-kernels"]
+
+# H2 probe for the marlin-feature EXL3 regression — pure trait-call
+# overhead on a no-op `Box<dyn QuantizedLinear>` mock. CPU-runnable; no
+# `required-features` so it can be compared with and without `marlin`
+# under any superset.
+[[bench]]
+name = "exl3_dispatch_overhead_bench"
+harness = false

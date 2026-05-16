@@ -20,7 +20,10 @@
 use candle_core::{DType, Device, Tensor};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use vllm_core::cuda_kernels::{paged_attention_cuda, paged_attention_v2_cuda_with_partition_size};
+use vllm_core::cuda_kernels::{
+    paged_attention_cuda, paged_attention_v2_cuda_pooled,
+    paged_attention_v2_cuda_with_partition_size, select_v2_partition_size,
+};
 
 // ─── Shape and grid pinned to Qwen3-4B-AWQ ──────────────────────────────────
 // Single-sequence batch=1 (decode hot path).  Vary only `seq_len` and the V2
@@ -219,5 +222,111 @@ fn bench_v2_partition_sweep(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_v1, bench_v2_partition_sweep);
+/// Reproduces the **documented pool worst-case regression** described in
+/// `crates/core/src/models/qwen3_quantized.rs:820-823`:
+///
+/// > Worst-case sizing iterates over ~3× more empty partitions for short
+/// > decode positions — a 5-10× per-call slowdown at c=8 with prompt=256,
+/// > observed empirically in the eager-bench head-to-head.
+///
+/// The pool path uses `worst_case_max_seq_len` to size both the pooled
+/// scratch buffers AND the kernel grid Z dimension
+/// (`PagedAttnV2InplaceOp::cuda_fwd`, `cuda_kernels.rs:1322-1327`). For a
+/// 32-token decode with `worst_case=131_072` and partition_size=64 we
+/// launch 2048 partition blocks while only 1 has work; the other 2047
+/// pay block-launch + scratch-zero cost.
+///
+/// Sweep:
+/// - `actual_max_seq_len ∈ {32, 256, 1024}` (decode buckets)
+/// - `worst_case_max_seq_len ∈ {1024, 8192, 32_768, 131_072}` (typical
+///   engine_limits values; max-model-len=131k matches the production
+///   Qwen3-8B server config)
+///
+/// Baseline reading: `worst_case == actual` is the no-overhead case;
+/// growing `worst_case` while holding `actual` fixed measures the
+/// pure regression caused by empty-partition launches.
+fn bench_v2_pooled_worst_case_sweep(c: &mut Criterion) {
+    const ACTUAL_SEQ_LENS: &[usize] = &[32, 256, 1024];
+    const WORST_CASE_SEQ_LENS: &[usize] = &[1024, 8192, 32_768, 131_072];
+
+    let mut group = c.benchmark_group("paged_attention_v2_pooled_worst_case");
+    // Each sample triggers a pool `reserve` + scratch zero + two kernel
+    // launches; 30 samples keeps wall-clock under a minute even on the
+    // 4-axis sweep, and noise is dominated by GPU clock-up so larger
+    // sample counts don't tighten the mean.
+    group.sample_size(30);
+
+    for &actual_seq_len in ACTUAL_SEQ_LENS {
+        let Some(inputs) = build_inputs(actual_seq_len) else {
+            return;
+        };
+        let max_blocks_per_seq = actual_seq_len.div_ceil(BLOCK_SIZE);
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        for &worst_case_seq_len in WORST_CASE_SEQ_LENS {
+            // worst_case must be ≥ actual or the kernel reads OOB
+            // partitions in the reduce stage.
+            if worst_case_seq_len < actual_seq_len {
+                continue;
+            }
+            let partition_size = select_v2_partition_size(worst_case_seq_len);
+
+            // Warmup: 3 calls prime CUBLAS handles, pool slot reservations,
+            // PTX module load. Without this the first criterion sample
+            // includes one-time setup cost.
+            for _ in 0..3 {
+                let _ = paged_attention_v2_cuda_pooled(
+                    &inputs.q,
+                    &inputs.k_cache,
+                    &inputs.v_cache,
+                    &inputs.block_tables,
+                    &inputs.seq_lens,
+                    scale,
+                    NUM_Q_HEADS,
+                    NUM_KV_HEADS,
+                    max_blocks_per_seq,
+                    actual_seq_len,
+                    worst_case_seq_len,
+                    HEAD_DIM,
+                    BLOCK_SIZE,
+                    partition_size,
+                );
+            }
+            sync(&inputs.dev);
+
+            let label = format!("act{actual_seq_len}_worst{worst_case_seq_len}");
+            group.bench_with_input(BenchmarkId::new("config", &label), &label, |b, _| {
+                b.iter(|| {
+                    let out = paged_attention_v2_cuda_pooled(
+                        &inputs.q,
+                        &inputs.k_cache,
+                        &inputs.v_cache,
+                        &inputs.block_tables,
+                        &inputs.seq_lens,
+                        scale,
+                        NUM_Q_HEADS,
+                        NUM_KV_HEADS,
+                        max_blocks_per_seq,
+                        actual_seq_len,
+                        worst_case_seq_len,
+                        HEAD_DIM,
+                        BLOCK_SIZE,
+                        partition_size,
+                    )
+                    .expect("paged_attention_v2_pooled");
+                    sync(&inputs.dev);
+                    out
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_v1,
+    bench_v2_partition_sweep,
+    bench_v2_pooled_worst_case_sweep,
+);
 criterion_main!(benches);

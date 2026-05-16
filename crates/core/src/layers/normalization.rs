@@ -61,6 +61,17 @@ impl RmsNorm {
     /// allocate F32 intermediates via candle ops, which are not pool-
     /// backed; callers on those variants must fall back to
     /// [`Self::forward`] (eager paths only).
+    ///
+    /// **Capture-state-aware dispatch:** if currently *not* capturing a
+    /// CUDA Graph (i.e. eager decode), routes through
+    /// `candle_nn::ops::rms_norm` which is ~1.7× faster per call than
+    /// the pool-backed custom kernel (`rms_norm_bench`: 10.5 vs 6.2 µs).
+    /// Inside `begin_capture`/`end_capture` brackets, falls back to the
+    /// pool-backed custom kernel so the captured graph encodes a stable
+    /// pool-slot pointer (see ADR 0019 / `pool_tensor_type_safety`).
+    /// Wrapping the candle output via `from_pool_unchecked` is sound in
+    /// the eager branch because no captured graph ever references this
+    /// storage — eager output is dropped after the layer.
     #[cfg(feature = "cuda-layernorm")]
     pub fn forward_pooled(
         &self,
@@ -69,20 +80,32 @@ impl RmsNorm {
         match self.variant {
             RmsNormVariant::Standard => {
                 let weight = self.weight.as_ref().expect("Standard RmsNorm needs weight");
-                if crate::cuda_kernels::rms_norm_cuda_available(xs.as_tensor()) {
-                    let xs_c = xs.contiguous()?;
+                if !crate::cuda_kernels::rms_norm_cuda_available(xs.as_tensor()) {
+                    candle_core::bail!(
+                        "RmsNorm::forward_pooled: cuda kernel unavailable for {:?} on {:?}; \
+                         captured forward requires CUDA",
+                        xs.dtype(),
+                        xs.device()
+                    );
+                }
+                let xs_c = xs.contiguous()?;
+                let capturing = crate::engine::cuda_graph::IN_CUDA_GRAPH_CAPTURE
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if capturing {
                     return crate::cuda_kernels::rms_norm_cuda_pooled_typed(
                         &xs_c,
                         weight,
                         self.eps as f32,
                     );
                 }
-                candle_core::bail!(
-                    "RmsNorm::forward_pooled: cuda kernel unavailable for {:?} on {:?}; \
-                     captured forward requires CUDA",
-                    xs.dtype(),
-                    xs.device()
-                );
+                // Eager path: candle is ~4.3 µs/call faster; safe to wrap
+                // because no captured graph will reference this tensor.
+                let y = candle_nn::ops::rms_norm(xs_c.as_tensor(), weight, self.eps as f32)?;
+                // SAFETY: not in capture; no graph node will encode a
+                // pointer into this storage. Storage's lifetime is the
+                // caller's eager forward — sufficient for the layer
+                // pipeline.
+                Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(y) })
             }
             _ => candle_core::bail!(
                 "RmsNorm::forward_pooled: only Standard variant is pool-backed; \
@@ -111,25 +134,23 @@ impl Module for RmsNorm {
             RmsNormVariant::Standard => {
                 let weight = self.weight.as_ref().expect("Standard RmsNorm needs weight");
 
-                #[cfg(feature = "cuda-layernorm")]
-                {
-                    if crate::cuda_kernels::rms_norm_cuda_available(xs) {
-                        let xs = xs.contiguous()?;
-                        // Pool-backed path: receiver buffer is reserved from the
-                        // process-global OutputPool so its device address is
-                        // stable across forward passes. This is a precondition
-                        // for CUDA Graph capture; it is also perf-neutral on
-                        // the eager path (the pool only saves the per-call
-                        // cuMemAlloc — kernel launch is unchanged).
-                        return crate::cuda_kernels::rms_norm_cuda_pooled(
-                            &xs,
-                            weight,
-                            self.eps as f32,
-                        );
-                    }
-                }
-
-                // Fallback: candle_nn ops (fused CUDA via candle for GPU, pure Rust for CPU)
+                // Eager dispatch uses `candle_nn::ops::rms_norm` — empirically
+                // ~1.7× faster per call than `rms_norm_cuda_pooled` at decode
+                // shape (h=4096 F16, c=1..8: candle 6.2 µs vs custom 10.5 µs
+                // per `rms_norm_bench`; perfectly additive across 4 sequential
+                // calls per `rms_norm_chain_x4`). Validated at layer level via
+                // `quantized_layer_bench` with **explicit GPU sync** in
+                // `b.iter` body: cuda-layernorm enabled → +4.3% c=4 layer
+                // forward (p=0.00 vs synced fused-only baseline). Without
+                // sync, criterion measures CPU enqueue rate where the GPU
+                // delta overlaps with adjacent ops and is hidden — but
+                // production decode is GPU-completion-bound via the per-token
+                // sampler DtoH, so the regression manifests in real TTFT/TPS.
+                //
+                // The custom pool-backed kernel is still selected for CUDA
+                // Graph capture via `forward_pooled` (preserves stable
+                // pool-slot addresses across captures); eager `forward` has
+                // no such requirement.
                 candle_nn::ops::rms_norm(&xs.contiguous()?, weight, self.eps as f32)
             }
             RmsNormVariant::ScalePlusOne => {

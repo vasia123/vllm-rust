@@ -21,7 +21,20 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda-kernels")]
 use std::ptr;
 #[cfg(feature = "cuda-kernels")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "cuda-kernels")]
 use std::sync::Arc;
+
+/// Global flag set to `true` between `CudaGraphCapture::begin_capture` and
+/// `end_capture`. Allows kernel-dispatch sites (e.g. `RmsNorm::forward_pooled`)
+/// to branch between pool-backed (capture-stable) and faster eager paths
+/// without plumbing capture state through every layer call.
+///
+/// **Reader rule:** `Ordering::Relaxed` is sufficient — the flag is set
+/// once per capture session on the caller's thread, before any kernel
+/// dispatch, and read on the same thread.
+#[cfg(feature = "cuda-kernels")]
+pub static IN_CUDA_GRAPH_CAPTURE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "cuda-kernels")]
 use candle_core::cuda::cudarc::driver::sys::{
@@ -505,6 +518,7 @@ impl CudaGraphWrapper {
         }
 
         self.capturing = true;
+        IN_CUDA_GRAPH_CAPTURE.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -526,6 +540,7 @@ impl CudaGraphWrapper {
         let result = cuStreamEndCapture(self.stream, &mut graph);
 
         self.capturing = false;
+        IN_CUDA_GRAPH_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed);
 
         if result != CUresult::CUDA_SUCCESS {
             return Err(CudaGraphError::CaptureEndFailed(result as i32));
