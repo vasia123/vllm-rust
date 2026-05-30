@@ -3491,6 +3491,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap 2.13.0",
  "itoa",
  "memchr",
  "serde",
@@ -4528,6 +4529,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "xgrammar-rs",
 ]
 
 [[package]]
@@ -5076,6 +5078,15 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xgrammar-rs"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "yoke"

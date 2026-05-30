@@ -18,6 +18,7 @@
 //! let result = handle.generate(request).await?;
 //! ```
 
+#[cfg(feature = "cuda")]
 mod async_sampler;
 mod context;
 pub mod cr_trace;

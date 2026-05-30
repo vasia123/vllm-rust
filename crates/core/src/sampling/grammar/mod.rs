@@ -8,11 +8,20 @@
 
 pub mod bitmask;
 pub mod compiler;
-pub mod ebnf_backend;
-pub mod ebnf_parser;
-pub mod json_schema;
-pub mod regex_backend;
 pub mod vocabulary;
+
+// Structured-output compilation. Removed the partial native Rust
+// port (ebnf_backend / ebnf_parser / json_schema / regex_backend)
+// in v1.8 — it never enforced JSON-Schema's `pattern + length` or
+// strict-object key boundaries correctly (Bug 10 root cause).
+// Production now goes through the xgrammar FFI bridge; the
+// `xgrammar` feature gate stays so CPU dev / CI builds without
+// CUDA can opt out of the C++ compile (at the cost of no
+// structured output support in that configuration).
+#[cfg(feature = "xgrammar")]
+pub mod schema_to_ebnf;
+#[cfg(feature = "xgrammar")]
+pub mod xgrammar_backend;
 
 pub use bitmask::PackedBitmask;
 pub use compiler::GrammarCompiler;
@@ -46,6 +55,15 @@ pub trait StructuredOutputGrammar: Send + Sync {
 
     /// Reset the grammar to its initial state.
     fn reset(&mut self);
+
+    /// Expose the underlying xgrammar matcher for batched parallel
+    /// bitmask fill (`xgrammar_rs::BatchMatcher`). Returns `None` for
+    /// non-xgrammar backends. The engine locks several of these at once
+    /// to dispatch one thread-pooled fill across a constrained batch.
+    #[cfg(feature = "xgrammar")]
+    fn xgrammar_matcher(&self) -> Option<&std::sync::Mutex<xgrammar_rs::GrammarMatcher>> {
+        None
+    }
 }
 
 /// Adapter that wraps a `StructuredOutputGrammar` as a `SamplingConstraint`.
@@ -91,6 +109,19 @@ impl SamplingConstraint for GrammarConstraintAdapter {
         self.bitmask_buf.set_all_zeros();
         self.grammar.fill_bitmask(&mut self.bitmask_buf, 0);
         self.bitmask_buf.apply_to_logits(logits, 0);
+        // Padded-vocab tail mask. The grammar bitmask is sized to
+        // the tokenizer's `vocab_size` (e.g. Qwen3 = 151669), but
+        // the actual logits tensor often pads up to the next
+        // multiple supported by the matmul (Qwen3 lm_head emits
+        // 151936). Tokens in `[vocab_size, logits.len())` are
+        // typically reserved/unused padding slots — the bitmask
+        // doesn't touch them, so without an explicit -inf the
+        // sampler can still draw one and produce undefined bytes.
+        if logits.len() > self.vocab_size {
+            for logit in &mut logits[self.vocab_size..] {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
         Ok(())
     }
 
@@ -100,6 +131,65 @@ impl SamplingConstraint for GrammarConstraintAdapter {
 
     fn reset(&mut self) {
         self.grammar.reset();
+    }
+
+    fn accept_token(&mut self, token_id: u32) -> bool {
+        // Advance the underlying xgrammar matcher so the next
+        // `fill_bitmask` reflects the post-`token_id` grammar state.
+        // Without this hook the matcher stays at position 0 for the
+        // entire stream and only the first token gets enforced.
+        self.grammar.accept_tokens(&[token_id])
+    }
+
+    fn supports_gpu(&self) -> bool {
+        // Adapter wraps an xgrammar matcher which produces packed-i32
+        // bitmask rows by construction.
+        true
+    }
+
+    fn fill_cpu_bitmask_for_gpu(&mut self, bitmask_row: &mut [i32]) -> Option<anyhow::Result<()>> {
+        // Grammar-side bitmask covers `[0, self.vocab_size)`. Engine
+        // pre-allocates a row sized to the LOGITS vocab (may be
+        // larger due to lm_head padding) and is responsible for
+        // zero-initialising the whole row before this call — that
+        // way any tail bits past `grammar_words` stay zero and the
+        // GPU apply kernel masks padded tokens to -inf automatically.
+        if self.grammar.is_terminated() {
+            // Terminated: forbid all tokens. Engine row is already
+            // zero, so we just leave it untouched.
+            for w in bitmask_row.iter_mut() {
+                *w = 0;
+            }
+            return Some(Ok(()));
+        }
+        let grammar_words = self.vocab_size.div_ceil(32);
+        if bitmask_row.len() < grammar_words {
+            return Some(Err(anyhow::anyhow!(
+                "fill_cpu_bitmask_for_gpu: row len {} < required {}",
+                bitmask_row.len(),
+                grammar_words
+            )));
+        }
+        // Re-zero the adapter's scratch row; xgrammar will then
+        // OR-in the allowed-token bits.
+        self.bitmask_buf.set_all_zeros();
+        self.grammar.fill_bitmask(&mut self.bitmask_buf, 0);
+        let src = self.bitmask_buf.row(0);
+        bitmask_row[..grammar_words].copy_from_slice(&src[..grammar_words]);
+        Some(Ok(()))
+    }
+
+    #[cfg(feature = "xgrammar")]
+    fn xgrammar_matcher(&self) -> Option<&std::sync::Mutex<xgrammar_rs::GrammarMatcher>> {
+        self.grammar.xgrammar_matcher()
+    }
+
+    #[cfg(feature = "xgrammar")]
+    fn grammar_bitmask_words(&self) -> Option<usize> {
+        // Only meaningful when an xgrammar matcher backs this adapter.
+        self.grammar
+            .xgrammar_matcher()
+            .map(|_| self.vocab_size.div_ceil(32))
     }
 }
 

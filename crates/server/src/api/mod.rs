@@ -30,6 +30,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use vllm_core::lora::LoraRequest;
 use vllm_core::reasoning::ReasoningParser;
+use vllm_core::sampling::grammar::{GrammarCompiler, VocabularyIndex};
 use vllm_core::tokenizer::{ChatTemplateEngine, TokenizerWrapper};
 use vllm_core::tool_parser::ToolCallParser;
 
@@ -144,6 +145,13 @@ pub struct AppState {
     pub tokenizer: Arc<TokenizerWrapper>,
     pub chat_template: Option<Arc<ChatTemplateEngine>>,
     pub eos_token_id: u32,
+    /// Lazily-built, process-shared grammar compiler for structured
+    /// output. Building it decodes the whole vocab into a
+    /// `VocabularyIndex` (~0.5 s for a 151k-token tokenizer) and marshals
+    /// the xgrammar `TokenizerInfo`; doing that once and sharing it across
+    /// requests removes that per-request TTFT tax. `Arc<OnceLock<…>>` so
+    /// every cloned `AppState` (axum clones per request) shares one cell.
+    grammar_compiler: Arc<std::sync::OnceLock<Arc<GrammarCompiler>>>,
     pub max_model_len: usize,
     /// Tool call parser for extracting function calls from model output.
     pub tool_call_parser: Arc<dyn ToolCallParser>,
@@ -217,6 +225,7 @@ impl AppState {
             tokenizer,
             chat_template,
             eos_token_id,
+            grammar_compiler: Arc::new(std::sync::OnceLock::new()),
             max_model_len,
             tool_call_parser,
             reasoning_parser,
@@ -235,6 +244,23 @@ impl AppState {
             enable_lora,
             disable_mm_preprocessor_cache,
         }
+    }
+
+    /// The process-shared structured-output grammar compiler, built on
+    /// first use. The compiler owns the decoded `VocabularyIndex` and the
+    /// marshalled xgrammar `TokenizerInfo`, and is configured with the
+    /// model EOS as a stop token so grammars terminate cleanly at the
+    /// accepting state. Cheap `Arc` clone after the one-time build.
+    pub fn grammar_compiler(&self) -> Arc<GrammarCompiler> {
+        self.grammar_compiler
+            .get_or_init(|| {
+                let vocab_index = Arc::new(VocabularyIndex::from_tokenizer_arc(&self.tokenizer));
+                Arc::new(GrammarCompiler::with_stop_tokens(
+                    vocab_index,
+                    vec![self.eos_token_id],
+                ))
+            })
+            .clone()
     }
 
     pub fn accepting_requests(&self) -> bool {

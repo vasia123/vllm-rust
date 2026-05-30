@@ -9,14 +9,16 @@ use crate::request::{RequestId, RequestStatus};
 use crate::scheduler::SchedulerOutput;
 use crate::tokenizer::TokenizerWrapper;
 
+#[cfg(feature = "cuda")]
 use super::async_sampler::AsyncSamplerInfra;
 use super::context::OwnedExecutionState;
 use super::cuda_graph::CudaGraphDispatcher;
 use super::cuda_graph_runner::CudaGraphRunner;
+#[cfg(feature = "cuda")]
+use super::helpers::execute_pipelined_multi_step_decode;
 use super::helpers::{
-    execute_batched_decode_with_graph, execute_beam_decode, execute_pipelined_multi_step_decode,
-    execute_prefill, finish_request_with_error_deferred, is_beam_request,
-    reclaim_sliding_window_blocks,
+    execute_batched_decode_with_graph, execute_beam_decode, execute_prefill,
+    finish_request_with_error_deferred, is_beam_request, reclaim_sliding_window_blocks,
 };
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
@@ -42,9 +44,11 @@ pub struct StandardExecution<M: ModelForward> {
     /// known. Gated by env var `VLLM_ASYNC_SAMPLING=1`. `None` if env
     /// unset or device is non-CUDA. `Some(Err)` if init failed (we
     /// don't retry; the std path runs forever in that session).
+    #[cfg(feature = "cuda")]
     async_sampler: std::sync::Mutex<AsyncSamplerSlot>,
 }
 
+#[cfg(feature = "cuda")]
 enum AsyncSamplerSlot {
     Uninit,
     Disabled,
@@ -58,6 +62,7 @@ impl<M: ModelForward> StandardExecution<M> {
             graph_runner: None,
             sliding_window: None,
             block_size: 16,
+            #[cfg(feature = "cuda")]
             async_sampler: std::sync::Mutex::new(AsyncSamplerSlot::Uninit),
         }
     }
@@ -70,6 +75,7 @@ impl<M: ModelForward> StandardExecution<M> {
     /// path callers acquire-mutate-release on every multi-step block;
     /// this is cheap because the engine is single-threaded inside
     /// `spawn_blocking` once a step starts.
+    #[cfg(feature = "cuda")]
     fn ensure_async_sampler(
         &self,
         max_batch: usize,
@@ -288,6 +294,10 @@ impl<M: ModelForward> StandardExecution<M> {
         // The captured graph encodes those slot addresses, but production
         // writes its real data into the cursor=0 slots — replay reads stale
         // warmup data and the model generates wrong tokens.
+        // Defensive: re-affirm decode mode in case a previous prefill
+        // forward in this thread leaked its ModeGuard. No-op if the
+        // thread is already in Decode.
+        let _decode_guard = crate::engine::output_pool::ModeGuard::decode();
         crate::engine::output_pool::OutputPool::global().reset_cursors();
         let shared = match crate::layers::attention::build_decode_batch_shared_with_options(
             &sequences, &device, true,
@@ -576,43 +586,50 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             // The pipelined helper runs the multi-step block with
             // sampler-result DtoH on a side stream and pushes tokens
             // only after the multi-step block drains — collapsing N
-            // host stalls into 1.
-            let try_pipelined = num_steps > 1
-                && regular_ids.len() <= 256 // matches infra.max_batch
-                && std::env::var("VLLM_ASYNC_SAMPLING").is_ok();
-            if try_pipelined {
-                let mut slot_guard = self.ensure_async_sampler(256, num_steps.max(8));
-                if let AsyncSamplerSlot::Init(infra) = &mut *slot_guard {
-                    if regular_ids.len() <= infra.max_batch && num_steps <= infra.max_steps {
-                        let mut active = regular_ids.clone();
-                        let mut step_preempted: Vec<RequestId> = Vec::new();
-                        let pipelined_failed = execute_pipelined_multi_step_decode(
-                            &active,
-                            num_steps,
-                            &self.model,
-                            kv_cache_mgr,
-                            &mut state.requests,
-                            Some(&state.cuda_graph_dispatcher),
-                            self.graph_runner.as_ref(),
-                            &mut step_preempted,
-                            infra,
-                        );
-                        for (req_id, err_msg) in pipelined_failed {
-                            active.retain(|&id| id != req_id);
-                            if let Some(id) = finish_request_with_error_deferred(
-                                req_id,
-                                EngineError::Model(format!("pipelined decode failed: {err_msg}")),
-                                &mut state.requests,
+            // host stalls into 1. CUDA-only: cudarc-stream surface
+            // and pinned-host buffers are unavailable on the CPU
+            // build.
+            #[cfg(feature = "cuda")]
+            {
+                let try_pipelined = num_steps > 1
+                    && regular_ids.len() <= 256 // matches infra.max_batch
+                    && std::env::var("VLLM_ASYNC_SAMPLING").is_ok();
+                if try_pipelined {
+                    let mut slot_guard = self.ensure_async_sampler(256, num_steps.max(8));
+                    if let AsyncSamplerSlot::Init(infra) = &mut *slot_guard {
+                        if regular_ids.len() <= infra.max_batch && num_steps <= infra.max_steps {
+                            let mut active = regular_ids.clone();
+                            let mut step_preempted: Vec<RequestId> = Vec::new();
+                            let pipelined_failed = execute_pipelined_multi_step_decode(
+                                &active,
+                                num_steps,
+                                &self.model,
                                 kv_cache_mgr,
-                            ) {
-                                state.errored_ids.push(id);
+                                &mut state.requests,
+                                Some(&state.cuda_graph_dispatcher),
+                                self.graph_runner.as_ref(),
+                                &mut step_preempted,
+                                infra,
+                            );
+                            for (req_id, err_msg) in pipelined_failed {
+                                active.retain(|&id| id != req_id);
+                                if let Some(id) = finish_request_with_error_deferred(
+                                    req_id,
+                                    EngineError::Model(format!(
+                                        "pipelined decode failed: {err_msg}"
+                                    )),
+                                    &mut state.requests,
+                                    kv_cache_mgr,
+                                ) {
+                                    state.errored_ids.push(id);
+                                }
                             }
+                            state.preempted_ids.append(&mut step_preempted);
+                            return;
                         }
-                        state.preempted_ids.append(&mut step_preempted);
-                        return;
                     }
+                    drop(slot_guard);
                 }
-                drop(slot_guard);
             }
 
             let mut active_decode_ids = regular_ids;

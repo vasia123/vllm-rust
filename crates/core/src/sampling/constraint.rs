@@ -42,6 +42,78 @@ pub trait SamplingConstraint: Send + Sync {
 
     /// Reset the constraint state for a new sequence.
     fn reset(&mut self);
+
+    /// Notify the constraint that `token_id` was just sampled, so it
+    /// can advance its internal state machine before the next
+    /// `mask_logits` call.
+    ///
+    /// Default implementation is a no-op: text-based / stateless
+    /// constraints (e.g. legacy `JsonSchemaConstraint`,
+    /// `ChoiceConstraint` which tracks position internally on
+    /// `mask_logits`) don't need per-token hooks.
+    ///
+    /// Stateful grammar constraints (xgrammar via
+    /// `GrammarConstraintAdapter`) MUST override this — without
+    /// advancing the matcher, every step's bitmask reflects the
+    /// initial grammar state and the constraint silently fails to
+    /// enforce anything beyond the first token.
+    ///
+    /// # Returns
+    /// `true` if the token was a valid grammar transition; `false`
+    /// if the token violates the constraint (which shouldn't happen
+    /// in practice because `mask_logits` should have prevented it).
+    fn accept_token(&mut self, _token_id: u32) -> bool {
+        true
+    }
+
+    /// True iff this constraint can produce a packed-i32 token bitmask
+    /// on the CPU that the engine can upload to GPU and apply via
+    /// `gpu_apply_grammar_bitmask`. Returning `true` lets the engine
+    /// keep the sampler entirely on GPU instead of pulling logits to
+    /// host for `mask_logits`.
+    ///
+    /// Default `false` covers all text-driven constraints (ChoiceConstraint,
+    /// RegexConstraint, legacy JsonSchemaConstraint) — they have no
+    /// vocab-indexed bitmask representation and must stay on CPU.
+    fn supports_gpu(&self) -> bool {
+        false
+    }
+
+    /// Fill `bitmask_row` (packed i32, length ≥ ceil(grammar_vocab/32))
+    /// with the allowed-token bitmask for the constraint's current
+    /// position. Returns `Some(Ok(()))` on success, `Some(Err)` on
+    /// fault, or `None` if this constraint doesn't support GPU
+    /// masking (`supports_gpu() == false`).
+    ///
+    /// The CPU side is what fills the bitmask (xgrammar's matcher
+    /// runs on CPU); the engine then handles the HtoD copy and GPU
+    /// apply. Naming the method `_for_gpu` makes that contract
+    /// explicit: the bitmask is *destined* for GPU, even though its
+    /// computation is host-side.
+    fn fill_cpu_bitmask_for_gpu(&mut self, _bitmask_row: &mut [i32]) -> Option<anyhow::Result<()>> {
+        None
+    }
+
+    /// Expose the underlying xgrammar matcher so the engine can batch
+    /// the per-step bitmask fill across multiple constrained requests
+    /// via `xgrammar_rs::BatchMatcher` (one thread-pooled fill instead
+    /// of N sequential `fill_next_token_bitmask` calls). Returns `None`
+    /// for constraints without an xgrammar matcher — they fall back to
+    /// the per-request `fill_cpu_bitmask_for_gpu` path.
+    #[cfg(feature = "xgrammar")]
+    fn xgrammar_matcher(&self) -> Option<&std::sync::Mutex<xgrammar_rs::GrammarMatcher>> {
+        None
+    }
+
+    /// Number of packed-i32 words the xgrammar matcher expects per
+    /// bitmask row (`ceil(tokenizer_vocab / 32)`). Needed to size the
+    /// batched-fill buffer correctly; the grammar's vocab is usually
+    /// smaller than the model's padded lm_head vocab. `None` when
+    /// [`Self::xgrammar_matcher`] is `None`.
+    #[cfg(feature = "xgrammar")]
+    fn grammar_bitmask_words(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Constraint that forces output to be one of predefined choices.

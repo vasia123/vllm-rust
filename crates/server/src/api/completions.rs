@@ -87,6 +87,7 @@ pub async fn create_completion(
             create_constraint_from_structured_outputs(
                 req.structured_outputs.as_ref(),
                 &state.tokenizer,
+                &state.grammar_compiler(),
             )?
         } else {
             create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
@@ -204,6 +205,7 @@ pub async fn create_completion(
                         create_constraint_from_structured_outputs(
                             req.structured_outputs.as_ref(),
                             &state.tokenizer,
+                            &state.grammar_compiler(),
                         )
                         .ok()
                         .flatten()

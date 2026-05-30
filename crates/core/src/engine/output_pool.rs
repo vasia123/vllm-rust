@@ -45,11 +45,221 @@
 //! continue allocating their own buffers — the pool is opt-in per call
 //! site, not a global override.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
 
 use candle_core::{DType, Device, Result, Shape, Tensor};
+
+// ─── Execution-mode gate ────────────────────────────────────────────
+//
+// Pool reservations have one of two semantics:
+//
+// * **Decode mode** (default): every `reserve` / `reserve_pooled` call
+//   goes through the per-shape bucket so device pointers stay stable
+//   across forward passes. This invariant is essential for captured
+//   CUDA Graph replay — a captured kernel records its tensor pointers
+//   once and reads from those same addresses on every subsequent
+//   replay.
+//
+// * **Prefill mode**: prefill is eager (never captured) and per-prompt
+//   `M` (= num_batched_tokens) is unique on every request, so a
+//   pool-retained `[M, hidden]` allocation would wedge for the engine
+//   lifetime. Large reservations under this mode bypass the pool —
+//   `Tensor::zeros` directly, drop on scope end.
+//
+// The mode is thread-local: today the engine task runs forward
+// sequentially on one thread per request, so a `ModeGuard` set at the
+// `execute_prefill` entry point covers every `reserve` site reached
+// through that forward. If a future parallel-forward refactor needs
+// to share guards across threads, switch to an `Atomic` or an explicit
+// argument through `ForwardContext`.
+
+/// Two semantics under which pool reservations operate. See module
+/// comment for the full rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionMode {
+    /// Captured-graph-friendly: every reserve pools-back so device
+    /// pointers stay stable across forwards. The default mode.
+    #[default]
+    Decode,
+    /// Eager prefill / warmup: reservations ≥ [`LARGE_PREFILL_BYTES`]
+    /// bypass the pool and drop on scope exit; smaller reservations
+    /// still pool-back so a later captured decode replays cleanly.
+    Prefill,
+}
+
+thread_local! {
+    static CURRENT_MODE: Cell<ExecutionMode> =
+        const { Cell::new(ExecutionMode::Decode) };
+}
+
+impl ExecutionMode {
+    /// Snapshot of the current thread's execution mode.
+    #[inline]
+    pub fn current() -> Self {
+        CURRENT_MODE.with(|c| c.get())
+    }
+}
+
+/// RAII guard: sets the thread-local execution mode for its lifetime
+/// and restores the previous mode on `Drop`. Re-entrant — nested
+/// guards correctly restore their immediate predecessor.
+#[must_use = "ModeGuard restores the previous mode on Drop; binding it as \
+              `_` would restore immediately and defeat the gate"]
+pub struct ModeGuard {
+    prev: ExecutionMode,
+}
+
+impl ModeGuard {
+    /// Enter [`ExecutionMode::Prefill`] for the lifetime of the guard.
+    pub fn prefill() -> Self {
+        Self::set(ExecutionMode::Prefill)
+    }
+    /// Enter (or re-affirm) [`ExecutionMode::Decode`] for the lifetime
+    /// of the guard. Useful as a defensive barrier at decode entry
+    /// points so a stale `Prefill` mode leaked from a prior forward
+    /// can never bleed into a captured replay.
+    pub fn decode() -> Self {
+        Self::set(ExecutionMode::Decode)
+    }
+    fn set(new: ExecutionMode) -> Self {
+        let prev = CURRENT_MODE.with(|c| c.replace(new));
+        Self { prev }
+    }
+}
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        CURRENT_MODE.with(|c| c.set(self.prev));
+    }
+}
+
+// ─── Capture-region tripwire ────────────────────────────────────────
+//
+// Set by `CudaGraphRunner` for the lifetime of `BeginCapture` →
+// `EndCapture`. The Prefill-bypass branch in `reserve` /
+// `reserve_kind` `debug_assert!`s that this flag is OFF — capturing
+// a kernel that reads a non-pool-backed `Tensor::zeros` pointer would
+// silently violate replay-stability. ModeGuard::prefill is the public
+// gate that ensures it; this tripwire catches accidental gate
+// violations in debug builds at near-zero release cost (asserts go
+// away entirely with `-O`).
+
+thread_local! {
+    static IS_CAPTURING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Mark the current thread as inside a CUDA Graph capture region.
+/// Pair with [`set_capturing(false)`] at `EndCapture`. RAII helper
+/// [`CaptureScope`] is preferred to guarantee balanced flip.
+pub fn set_capturing(on: bool) {
+    IS_CAPTURING.with(|c| c.set(on));
+}
+
+/// True iff the current thread is inside a `BeginCapture`/`EndCapture`
+/// region. Used by the pool's bypass-path `debug_assert!`.
+pub fn is_capturing() -> bool {
+    IS_CAPTURING.with(|c| c.get())
+}
+
+/// RAII helper that flips [`is_capturing`] to `true` for its lifetime
+/// and restores the previous value on `Drop`. Preferred over raw
+/// [`set_capturing`] calls so an early `?` / panic inside the capture
+/// region can't leave the flag dangling.
+#[must_use = "CaptureScope clears the flag on Drop; binding as _ would clear immediately"]
+pub struct CaptureScope {
+    prev: bool,
+}
+
+impl CaptureScope {
+    pub fn enter() -> Self {
+        let prev = IS_CAPTURING.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for CaptureScope {
+    fn drop(&mut self) {
+        IS_CAPTURING.with(|c| c.set(self.prev));
+    }
+}
+
+/// Default auto-bypass threshold for Prefill mode. Reservations whose
+/// tensor byte size meets or exceeds this value are diverted to a
+/// fresh `Tensor::zeros` (not retained in the pool).
+///
+/// Calibrated on Qwen3-8B (vocab=151k) at RTX 4060 8 GB:
+/// - decode-mode worst case reaches `[batch≤32, vocab] F16 ≈ 9.6 MiB`
+///   when captures are sized for the largest registered batch, but in
+///   practice the default capture-batch routing lands much smaller
+///   (`[1, vocab] F16 = 296 KiB`).
+/// - prefill workspaces cross 8 MiB on any per-layer `[M, hidden]`
+///   buffer once `M ≳ 1000` (e.g. lm_head at `M=1179` is 358 MiB).
+///
+/// 8 MiB sits comfortably above the small decode-mode reserves we want
+/// to pool and well below any meaningful prefill workspace we want to
+/// bypass. Override at process start via `VLLM_RUST_PREFILL_BYPASS_BYTES`
+/// (accepts a raw byte count or `K`/`M`/`G` suffix, e.g. `16M`).
+pub const DEFAULT_LARGE_PREFILL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Returns the effective bypass threshold. Reads
+/// `VLLM_RUST_PREFILL_BYPASS_BYTES` on first call and caches it for
+/// the lifetime of the process so the hot path stays env-call-free.
+fn large_prefill_bytes() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("VLLM_RUST_PREFILL_BYPASS_BYTES")
+            .ok()
+            .as_deref()
+            .and_then(parse_byte_size)
+            .unwrap_or(DEFAULT_LARGE_PREFILL_BYTES)
+    })
+}
+
+/// Parse a human-friendly byte-size string. Accepted forms:
+///   - bare integer: `"8388608"` → 8 388 608
+///   - integer + `B` / `K` / `M` / `G` (case-insensitive), with
+///     optional `iB` suffix that's ignored: `"16M"` / `"16Mi"` /
+///     `"16MiB"` → 16 * 1024 * 1024
+///
+/// Returns `None` on any parse failure or overflow — the caller falls
+/// back to [`DEFAULT_LARGE_PREFILL_BYTES`] so a malformed env var
+/// never disables the bypass silently.
+fn parse_byte_size(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    // Strip an optional binary-suffix tail (`iB`, `B`) so both "16M"
+    // and "16MiB" parse the same way.
+    let core: &str = if let Some(stripped) = lower.strip_suffix("ib") {
+        stripped
+    } else if let Some(stripped) = lower.strip_suffix('b') {
+        stripped
+    } else {
+        &lower
+    };
+    let (digits, mul): (&str, usize) = match core.as_bytes().last().copied() {
+        Some(b'k') => (&core[..core.len() - 1], 1024),
+        Some(b'm') => (&core[..core.len() - 1], 1024 * 1024),
+        Some(b'g') => (&core[..core.len() - 1], 1024 * 1024 * 1024),
+        Some(c) if c.is_ascii_digit() => (core, 1),
+        _ => return None,
+    };
+    digits.trim().parse::<usize>().ok()?.checked_mul(mul)
+}
+
+#[inline]
+fn should_bypass_pool(shape: &[usize], dtype: DType) -> bool {
+    if ExecutionMode::current() != ExecutionMode::Prefill {
+        return false;
+    }
+    let elems: usize = shape.iter().product();
+    elems.saturating_mul(dtype.size_in_bytes()) >= large_prefill_bytes()
+}
 
 // ─── Slot kinds ─────────────────────────────────────────────────────
 //
@@ -455,6 +665,22 @@ impl OutputPool {
     /// fall-through case is NOT pool-backed and must not be fed into
     /// a captured graph that records its device pointer.
     pub fn reserve(&self, shape: &[usize], dtype: DType, device: &Device) -> Result<Tensor> {
+        // Prefill-mode auto-bypass: large workspaces in eager prefill
+        // drop on scope exit rather than wedging in the per-shape
+        // bucket for the engine lifetime. See `ExecutionMode` /
+        // `ModeGuard` at the top of this file for the contract; the
+        // gate is the thread-local guard set at `execute_prefill`.
+        if should_bypass_pool(shape, dtype) {
+            debug_assert!(
+                !is_capturing(),
+                "OutputPool prefill bypass fired while CUDA Graph \
+                 capture is active — the returned Tensor::zeros has a \
+                 non-stable device pointer and would be recorded by \
+                 the captured kernel. ModeGuard::prefill MUST NOT \
+                 wrap a capture region.",
+            );
+            return Tensor::zeros(shape, dtype, device);
+        }
         let key = (SlotKind::Generic, dtype, shape.to_vec());
         let mut inner = self.inner.lock().expect("OutputPool: mutex poisoned");
         let entry = inner.entry(key).or_insert_with(|| PoolEntry {
@@ -478,6 +704,33 @@ impl OutputPool {
         Ok(tensor)
     }
 
+    /// Allocate a fresh non-pool-backed tensor for prefill workspaces
+    /// where storage stability is NOT required.
+    ///
+    /// Background: `reserve` / `reserve_pooled` retain every freshly
+    /// allocated buffer in `entry.buffers` for the engine lifetime so
+    /// that captured CUDA Graphs can replay against stable device
+    /// pointers. That invariant is essential for decode (fixed-shape
+    /// `[batch ≤ capture_max, *]`) but counter-productive for prefill:
+    /// prefill is eager (never captured), and a single large-M call
+    /// (e.g. lm_head `[prompt_len, vocab=151k]` F16 ≈ 358 MiB) would
+    /// otherwise wedge that buffer in the pool forever — visible to
+    /// operators as VRAM that never returns after the request finishes.
+    ///
+    /// `reserve_ephemeral` skips the pool entirely: the returned
+    /// tensor's storage drops at end of scope, returning VRAM to the
+    /// CUDA allocator. Use ONLY for prefill workspaces. Must NOT be
+    /// used for any tensor whose device pointer could be recorded by
+    /// a captured graph — if you're unsure, use `reserve`.
+    pub fn reserve_ephemeral(
+        &self,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        Tensor::zeros(shape, dtype, device)
+    }
+
     /// Internal: shared back-end for `reserve_pooled` and the four
     /// tagged reserves. Each `SlotKind` has its own cursor/bucket
     /// namespace, so tagged kinds cannot collide with the generic
@@ -490,6 +743,31 @@ impl OutputPool {
         dtype: DType,
         device: &Device,
     ) -> Result<PooledTensor> {
+        // Prefill-mode auto-bypass — Generic only. Tagged kinds
+        // (Positions/SlotMapping/BlockTables/SeqLens) are small 1-D
+        // decode-batch metadata buffers with their own capture
+        // contract; they never hit the prefill-size threshold and
+        // must keep their pool-backed semantics regardless of mode.
+        //
+        // SAFETY of `from_pool_unchecked` on a fresh `Tensor::zeros`:
+        // the bypass branch only fires under `ModeGuard::prefill`,
+        // and `execute_prefill` (helpers.rs) does not take a
+        // `graph_runner` argument — captured CUDA Graph replay never
+        // enters prefill, so no captured kernel can be holding the
+        // device pointer of the returned tensor. The `PooledTensor`
+        // wrapper here is purely a type marker; the storage lifetime
+        // is whatever the caller does with it.
+        if kind == SlotKind::Generic && should_bypass_pool(shape, dtype) {
+            debug_assert!(
+                !is_capturing(),
+                "OutputPool prefill bypass (reserve_kind/Generic) \
+                 fired while CUDA Graph capture is active — the \
+                 returned PooledTensor wraps a fresh Tensor::zeros \
+                 with a non-stable device pointer.",
+            );
+            let t = Tensor::zeros(shape, dtype, device)?;
+            return Ok(unsafe { PooledTensor::from_pool_unchecked(t) });
+        }
         const MAX_PER_SHAPE: usize = 512;
 
         let key = (kind, dtype, shape.to_vec());
@@ -672,6 +950,142 @@ impl OutputPool {
 mod tests {
     use super::*;
 
+    // ──── byte-size parser (Phase 1) ────
+
+    #[test]
+    fn parse_byte_size_bare_integer() {
+        assert_eq!(parse_byte_size("8388608"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_byte_size("0"), Some(0));
+        assert_eq!(parse_byte_size("  16777216  "), Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_byte_size_with_suffix() {
+        assert_eq!(parse_byte_size("8M"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_byte_size("8m"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_byte_size("8MiB"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_byte_size("8Mib"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_byte_size("1K"), Some(1024));
+        assert_eq!(parse_byte_size("2G"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("512B"), Some(512));
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_malformed() {
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("   "), None);
+        assert_eq!(parse_byte_size("abc"), None);
+        assert_eq!(parse_byte_size("16T"), None); // unsupported suffix
+        assert_eq!(parse_byte_size("M"), None); // empty digits
+    }
+
+    // ──── Capture-active tripwire (Phase 2) ────
+
+    #[test]
+    fn capture_scope_toggles_flag_and_restores_on_drop() {
+        assert!(!is_capturing());
+        {
+            let _g = CaptureScope::enter();
+            assert!(is_capturing());
+        }
+        assert!(!is_capturing());
+    }
+
+    #[test]
+    fn capture_scope_nested_unwinds_correctly() {
+        let _outer = CaptureScope::enter();
+        assert!(is_capturing());
+        {
+            let _inner = CaptureScope::enter();
+            assert!(is_capturing());
+        }
+        // Outer still active.
+        assert!(is_capturing());
+    }
+
+    // ──── ExecutionMode / ModeGuard / bypass routing ────
+
+    #[test]
+    fn prefill_mode_routes_large_reserves_to_ephemeral() {
+        // 10_000 × 256 × 4 (F32) = 10 МиБ — above LARGE_PREFILL_BYTES.
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+        let big_shape = [10_000, 256];
+        {
+            let _g = ModeGuard::prefill();
+            let _ = pool.reserve(&big_shape, DType::F32, &dev).unwrap();
+            let _ = pool.reserve(&big_shape, DType::F32, &dev).unwrap();
+        }
+        assert_eq!(
+            pool.total_slots(),
+            0,
+            "prefill-mode large reserves must not grow the pool"
+        );
+    }
+
+    #[test]
+    fn prefill_mode_small_reserves_still_pool_backed() {
+        // 128 bytes — well below LARGE_PREFILL_BYTES.
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+        {
+            let _g = ModeGuard::prefill();
+            let _ = pool.reserve(&[4, 8], DType::F32, &dev).unwrap();
+        }
+        assert_eq!(
+            pool.total_slots(),
+            1,
+            "prefill-mode small reserves must still pool-back so a \
+             later captured decode replays cleanly"
+        );
+    }
+
+    #[test]
+    fn decode_mode_large_reserves_pool_backed() {
+        // Capture-stability invariant: decode-mode NEVER bypasses,
+        // regardless of size. A captured kernel records the device
+        // pointer of the returned tensor — that pointer must remain
+        // valid across replays.
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+        {
+            let _g = ModeGuard::decode();
+            let _ = pool.reserve(&[10_000, 256], DType::F32, &dev).unwrap();
+        }
+        assert_eq!(
+            pool.total_slots(),
+            1,
+            "decode-mode large reserves MUST pool-back (capture stability)"
+        );
+    }
+
+    #[test]
+    fn mode_guard_restores_on_drop() {
+        // Default mode is Decode; entering Prefill and dropping the
+        // guard must return the thread to Decode.
+        assert_eq!(ExecutionMode::current(), ExecutionMode::Decode);
+        {
+            let _g = ModeGuard::prefill();
+            assert_eq!(ExecutionMode::current(), ExecutionMode::Prefill);
+        }
+        assert_eq!(ExecutionMode::current(), ExecutionMode::Decode);
+    }
+
+    #[test]
+    fn mode_guard_nested_correctly() {
+        // Re-entrant: inner guard restores the immediate predecessor,
+        // not the global default. Used by the defensive
+        // ModeGuard::decode() at decode entry points after an outer
+        // Prefill guard.
+        let _outer = ModeGuard::prefill();
+        assert_eq!(ExecutionMode::current(), ExecutionMode::Prefill);
+        {
+            let _inner = ModeGuard::decode();
+            assert_eq!(ExecutionMode::current(), ExecutionMode::Decode);
+        }
+        assert_eq!(ExecutionMode::current(), ExecutionMode::Prefill);
+    }
+
     #[test]
     fn reserve_grows_pool_on_repeat_within_forward() {
         let pool = OutputPool::default();
@@ -704,6 +1118,32 @@ mod tests {
         let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
         let _ = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
         assert_eq!(pool.total_slots(), 2, "pool should not grow on replay");
+    }
+
+    #[test]
+    fn reserve_ephemeral_never_grows_pool() {
+        let pool = OutputPool::default();
+        let dev = Device::Cpu;
+        // 10 ephemeral reserves of a large shape must not push anything
+        // into the per-shape buckets — that's the whole point: prefill
+        // workspaces are dropped at scope end and never wedged in the
+        // pool. Without this property a single prefill of e.g.
+        // [1500, 151936] would retain ~430 MiB on GPU forever.
+        for _ in 0..10 {
+            let _t = pool
+                .reserve_ephemeral(&[1500, 16384], DType::F32, &dev)
+                .unwrap();
+        }
+        assert_eq!(
+            pool.total_slots(),
+            0,
+            "reserve_ephemeral must not register tensors with the pool"
+        );
+
+        // And a subsequent `reserve_pooled` of an unrelated shape still
+        // works normally — ephemerals don't poison the pool state.
+        let _t = pool.reserve_pooled(&[4, 8], DType::F32, &dev).unwrap();
+        assert_eq!(pool.total_slots(), 1);
     }
 
     #[test]

@@ -236,6 +236,18 @@ const EXL3_GEMM_DECODE_MAX_M: usize = 16;
 /// `SMEM_MAX` in `exl3_gemm_inner.cuh` (90 KiB).
 const EXL3_GEMM_SMEM_MAX: i32 = 90 * 1024;
 
+/// Prefill-vs-decode threshold for `OutputPool` dispatch.
+///
+/// Calls with `M ≤ PREFILL_M_THRESHOLD` use `OutputPool::reserve`
+/// (pool-backed; storage retained for CUDA Graph capture stability).
+/// Calls with `M > PREFILL_M_THRESHOLD` use `OutputPool::reserve_ephemeral`
+/// (fresh `Tensor::zeros`; storage drops at end of scope), so prefill
+/// workspaces like lm_head `[prompt_len, vocab=151k]` (~358 MiB for
+/// Qwen3-8B at prompt_len=1179, F16) do not wedge in the pool forever.
+/// Matches the existing 64-token boundary in `llama_quantized.rs` and
+/// `cuda_kernels.rs` decode-capture sites.
+const PREFILL_M_THRESHOLD: usize = 64;
+
 /// Dispatch the EXL3 GEMM kernel.
 ///
 /// Computes
@@ -369,10 +381,24 @@ pub fn exl3_gemm(
     // poison register allocation in the surrounding cooperative-GEMM
     // launch closure. Inlining is partial — the unwind tables stay
     // even when the body is inlined.
-    let output =
-        crate::engine::output_pool::OutputPool::global().reserve(&[m, n], DType::F16, device)?;
-    let a_had =
-        crate::engine::output_pool::OutputPool::global().reserve(&[m, k], DType::F16, device)?;
+    // Prefill (M > 64) bypasses the pool to avoid wedging large
+    // workspaces (e.g. lm_head [prompt_len, vocab] ≈ 358 MiB) for the
+    // engine lifetime. Decode (M ≤ 64) keeps the pool path so
+    // captured CUDA Graphs replay against stable device pointers.
+    // The 64-token threshold matches the existing decode-capture
+    // boundary used elsewhere (see llama_quantized.rs, cuda_kernels.rs).
+    let pool = crate::engine::output_pool::OutputPool::global();
+    let (output, a_had) = if m > PREFILL_M_THRESHOLD {
+        (
+            pool.reserve_ephemeral(&[m, n], DType::F16, device)?,
+            pool.reserve_ephemeral(&[m, k], DType::F16, device)?,
+        )
+    } else {
+        (
+            pool.reserve(&[m, n], DType::F16, device)?,
+            pool.reserve(&[m, k], DType::F16, device)?,
+        )
+    };
 
     let op = Exl3GemmInplaceOp {
         trellis: trellis.clone(),
@@ -1084,11 +1110,15 @@ pub fn had_r_128_fp16(input: &Tensor, scale: Option<&Tensor>, mode: HadScale) ->
     }
 
     let device = input.device();
-    let output = crate::engine::output_pool::OutputPool::global().reserve(
-        &[rows, cols],
-        DType::F16,
-        device,
-    )?;
+    // See PREFILL_M_THRESHOLD comment near top of file. Prefill (rows
+    // > 64, e.g. lm_head A_had over [prompt_len, vocab]) bypasses
+    // the pool so its storage drops at scope end.
+    let pool = crate::engine::output_pool::OutputPool::global();
+    let output = if rows > PREFILL_M_THRESHOLD {
+        pool.reserve_ephemeral(&[rows, cols], DType::F16, device)?
+    } else {
+        pool.reserve(&[rows, cols], DType::F16, device)?
+    };
     let op = HadR128Fp16InplaceOp {
         scale: scale.cloned(),
         mode,

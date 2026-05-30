@@ -1738,6 +1738,18 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         gpu_memory_utilization_in
     };
 
+    // Parse kv_cache_dtype BEFORE auto-tune so the block-byte calculation
+    // can use the actual KV element size (FP8 = 1 B vs BF16 = 2 B). Sizing
+    // without this halves capacity under `--kv-cache-dtype fp8*`.
+    let parsed_kv_cache_dtype = match kv_cache_dtype.as_str() {
+        "auto" => KVCacheDtype::Auto,
+        "fp8" | "fp8_e4m3" | "fp8_e5m2" => KVCacheDtype::Fp8E4m3,
+        other => anyhow::bail!(
+            "Unknown kv-cache-dtype '{}'. Supported: auto, fp8, fp8_e4m3, fp8_e5m2",
+            other
+        ),
+    };
+
     // Compute num_blocks from GPU memory utilization if specified
     if let Some(utilization) = gpu_memory_utilization {
         if !(0.0..=1.0).contains(&utilization) {
@@ -1747,7 +1759,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         }
         let kv_budget =
             estimate_kv_cache_budget(utilization, &files.config, &files.quantization, dtype)?;
-        let computed_blocks = CacheConfig::from_memory_budget(
+        let computed_blocks = CacheConfig::from_memory_budget_with_kv_dtype(
             kv_budget,
             files.config.num_hidden_layers,
             files.config.num_key_value_heads,
@@ -1755,25 +1767,19 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             block_size,
             dtype,
             device.clone(),
+            parsed_kv_cache_dtype,
         );
         eprintln!(
-            "GPU memory utilization {:.0}%: estimated {:.0} MiB for KV cache → {} blocks",
+            "GPU memory utilization {:.0}%: estimated {:.0} MiB for KV cache \
+             (kv_dtype={:?}, {} B/elem) → {} blocks",
             utilization * 100.0,
             kv_budget as f64 / (1024.0 * 1024.0),
+            parsed_kv_cache_dtype,
+            parsed_kv_cache_dtype.element_size(dtype),
             computed_blocks.num_blocks,
         );
         num_blocks = computed_blocks.num_blocks;
     }
-
-    // Parse kv_cache_dtype
-    let parsed_kv_cache_dtype = match kv_cache_dtype.as_str() {
-        "auto" => KVCacheDtype::Auto,
-        "fp8" | "fp8_e4m3" | "fp8_e5m2" => KVCacheDtype::Fp8E4m3,
-        other => anyhow::bail!(
-            "Unknown kv-cache-dtype '{}'. Supported: auto, fp8, fp8_e4m3, fp8_e5m2",
-            other
-        ),
-    };
 
     // Compute CPU offload config from swap_space or cpu_offload_gb
     let cpu_offload_config = {
@@ -2004,8 +2010,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 &draft_files.quantization,
             )?;
 
-            let draft_num_blocks =
-                compute_draft_kv_blocks(num_blocks, block_size, &draft_files.config, dtype)?;
+            let draft_num_blocks = compute_draft_kv_blocks(
+                num_blocks,
+                block_size,
+                &draft_files.config,
+                dtype,
+                parsed_kv_cache_dtype,
+            )?;
             let draft_cache_config = CacheConfig {
                 block_size,
                 num_blocks: draft_num_blocks,
@@ -2303,7 +2314,16 @@ fn create_cuda_device(ordinal: usize) -> candle_core::Result<Device> {
         );
     } else if let Device::Cuda(cuda) = &device {
         // SAFETY: see doc-comment — engine forward is single-stream.
-        unsafe { cuda.disable_event_tracking() };
+        // The `disable_event_tracking` extension method is only
+        // present on `&CudaDevice` when candle's `cuda` feature is on
+        // (it comes from cudarc); guard it accordingly so non-CUDA
+        // dev builds (`cargo check -p vllm-server --tests`) compile.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            cuda.disable_event_tracking()
+        };
+        #[cfg(not(feature = "cuda"))]
+        let _ = cuda;
         tracing::debug!(
             "cudarc event tracking disabled (default for single-stream forward; \
              enables CUDA Graph capture)"
@@ -2395,15 +2415,17 @@ fn compute_draft_kv_blocks(
     target_block_size: usize,
     draft_config: &vllm_core::config::ModelConfig,
     dtype: DType,
+    kv_cache_dtype: KVCacheDtype,
 ) -> anyhow::Result<usize> {
     #[cfg(feature = "cuda")]
     {
+        let elem_size = kv_cache_dtype.element_size(dtype);
         let per_block_bytes = target_block_size
             * draft_config.num_hidden_layers
             * draft_config.num_key_value_heads
             * draft_config.head_dim
             * 2 // K + V tensors per layer
-            * dtype.size_in_bytes();
+            * elem_size;
 
         let (free_vram, _total) = vllm_core::kv_cache::config::gpu_memory_info()?;
 
@@ -2436,7 +2458,7 @@ fn compute_draft_kv_blocks(
             draft_config.num_hidden_layers,
             draft_config.num_key_value_heads,
             draft_config.head_dim,
-            dtype.size_in_bytes() * 8,
+            elem_size * 8,
             target_block_size,
             blocks,
             target_num_blocks,
@@ -2457,7 +2479,13 @@ fn compute_draft_kv_blocks(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (target_num_blocks, target_block_size, draft_config, dtype);
+        let _ = (
+            target_num_blocks,
+            target_block_size,
+            draft_config,
+            dtype,
+            kv_cache_dtype,
+        );
         anyhow::bail!("draft KV sizing requires the 'cuda' feature")
     }
 }
@@ -2809,8 +2837,13 @@ async fn run_generate(
             // 13-I.4 — see helper docstring for sizing rationale. The
             // run_generate path uses a fixed block_size of 16 (matches
             // the cache_config above this site, kept in sync).
-            let draft_num_blocks =
-                compute_draft_kv_blocks(num_blocks, 16, &draft_files.config, dtype)?;
+            let draft_num_blocks = compute_draft_kv_blocks(
+                num_blocks,
+                16,
+                &draft_files.config,
+                dtype,
+                KVCacheDtype::Auto,
+            )?;
             let draft_cache_config = CacheConfig {
                 block_size: 16,
                 num_blocks: draft_num_blocks,

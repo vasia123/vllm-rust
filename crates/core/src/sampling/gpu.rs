@@ -20,12 +20,147 @@ pub fn gpu_sampling_available(device: &Device) -> bool {
 const SAMPLING_PTX: &str = include_str!("../../kernels/sampling.ptx");
 
 #[cfg(feature = "cuda-kernels")]
+const APPLY_GRAMMAR_BITMASK_PTX: &str = include_str!("../../kernels/apply_grammar_bitmask.ptx");
+
+#[cfg(feature = "cuda-kernels")]
 mod cuda_ops {
     use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda::CudaStorageSlice;
-    use candle_core::{CpuStorage, CudaStorage, CustomOp1, CustomOp2, Layout, Result, Shape};
+    use candle_core::{
+        CpuStorage, CudaStorage, CustomOp1, CustomOp2, InplaceOp2, Layout, Result, Shape,
+    };
 
-    use super::SAMPLING_PTX;
+    use super::{APPLY_GRAMMAR_BITMASK_PTX, SAMPLING_PTX};
+
+    /// In-place "set logits to -inf where bitmask bit is 0".
+    ///
+    /// Receiver tensor (`out_storage`) = logits `[batch, vocab]`,
+    /// any of F32 / BF16 / F16. The second tensor (`a_storage`) = packed
+    /// I32 bitmask `[batch, words_per_row]` where
+    /// `words_per_row = ceil(vocab_grammar / 32)`. Bit `t % 32` of word
+    /// `t / 32` is the "allowed" flag; tokens past `vocab_grammar` are
+    /// implicitly forbidden when the engine zero-fills the tail.
+    pub(super) struct ApplyGrammarBitmaskOp;
+
+    impl InplaceOp2 for ApplyGrammarBitmaskOp {
+        fn name(&self) -> &'static str {
+            "apply_grammar_bitmask"
+        }
+
+        fn cpu_fwd(
+            &self,
+            _: &mut CpuStorage,
+            _: &Layout,
+            _: &CpuStorage,
+            _: &Layout,
+        ) -> Result<()> {
+            candle_core::bail!(
+                "apply_grammar_bitmask: GPU-only op (use SamplingConstraint::mask_logits on CPU)"
+            )
+        }
+
+        fn cuda_fwd(
+            &self,
+            out_storage: &mut CudaStorage,
+            out_layout: &Layout,
+            a_storage: &CudaStorage,
+            a_layout: &Layout,
+        ) -> Result<()> {
+            let dev = a_storage.device.clone();
+            let out_dims = out_layout.shape().dims();
+            let a_dims = a_layout.shape().dims();
+            if out_dims.len() != 2 || a_dims.len() != 2 {
+                candle_core::bail!(
+                    "apply_grammar_bitmask: expected 2D logits and 2D bitmask, got {out_dims:?} / {a_dims:?}"
+                );
+            }
+            let (batch, vocab) = (out_dims[0], out_dims[1]);
+            let words_per_row = a_dims[1];
+            if a_dims[0] < batch {
+                candle_core::bail!(
+                    "apply_grammar_bitmask: bitmask rows {} < logits batch {}",
+                    a_dims[0],
+                    batch
+                );
+            }
+            // ceil(vocab / 32) bits must fit into the supplied row.
+            let required_words = vocab.div_ceil(32);
+            if words_per_row < required_words {
+                candle_core::bail!(
+                    "apply_grammar_bitmask: bitmask words_per_row={} < ceil(vocab={}/32)={}",
+                    words_per_row,
+                    vocab,
+                    required_words
+                );
+            }
+            if out_layout.start_offset() != 0 || a_layout.start_offset() != 0 {
+                candle_core::bail!("apply_grammar_bitmask: tensors must be contiguous at offset 0");
+            }
+
+            let bitmask_slice = match &a_storage.slice {
+                CudaStorageSlice::I32(s) => s,
+                _ => candle_core::bail!("apply_grammar_bitmask: bitmask must be I32"),
+            };
+
+            let cfg = LaunchConfig {
+                grid_dim: (((vocab as u32) + 255) / 256, batch as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let vocab_i32 = vocab as i32;
+            let wpr_i32 = words_per_row as i32;
+
+            match &mut out_storage.slice {
+                CudaStorageSlice::F32(out_slice) => {
+                    let func = dev.get_or_load_custom_func(
+                        "apply_grammar_bitmask_f32",
+                        "apply_grammar_bitmask",
+                        APPLY_GRAMMAR_BITMASK_PTX,
+                    )?;
+                    let mut b = func.builder();
+                    b.arg(out_slice);
+                    b.arg(bitmask_slice);
+                    b.arg(&vocab_i32);
+                    b.arg(&wpr_i32);
+                    unsafe { b.launch(cfg) }.map_err(|e| {
+                        candle_core::Error::Msg(format!("apply_grammar_bitmask_f32: {e}"))
+                    })?;
+                }
+                CudaStorageSlice::BF16(out_slice) => {
+                    let func = dev.get_or_load_custom_func(
+                        "apply_grammar_bitmask_bf16",
+                        "apply_grammar_bitmask",
+                        APPLY_GRAMMAR_BITMASK_PTX,
+                    )?;
+                    let mut b = func.builder();
+                    b.arg(out_slice);
+                    b.arg(bitmask_slice);
+                    b.arg(&vocab_i32);
+                    b.arg(&wpr_i32);
+                    unsafe { b.launch(cfg) }.map_err(|e| {
+                        candle_core::Error::Msg(format!("apply_grammar_bitmask_bf16: {e}"))
+                    })?;
+                }
+                CudaStorageSlice::F16(out_slice) => {
+                    let func = dev.get_or_load_custom_func(
+                        "apply_grammar_bitmask_f16",
+                        "apply_grammar_bitmask",
+                        APPLY_GRAMMAR_BITMASK_PTX,
+                    )?;
+                    let mut b = func.builder();
+                    b.arg(out_slice);
+                    b.arg(bitmask_slice);
+                    b.arg(&vocab_i32);
+                    b.arg(&wpr_i32);
+                    unsafe { b.launch(cfg) }.map_err(|e| {
+                        candle_core::Error::Msg(format!("apply_grammar_bitmask_f16: {e}"))
+                    })?;
+                }
+                _ => candle_core::bail!("apply_grammar_bitmask: logits dtype must be F32/BF16/F16"),
+            }
+            Ok(())
+        }
+    }
 
     /// GPU argmax: logits [num_seqs, vocab_size] → token IDs [num_seqs] as U32.
     pub(super) struct ArgmaxOp;
@@ -404,6 +539,40 @@ pub fn gpu_argmax(logits: &Tensor) -> Result<Tensor> {
 
     // CPU fallback via Candle ops
     logits.argmax(1)?.to_dtype(DType::U32)
+}
+
+/// In-place "apply grammar bitmask" — sets `logits[b, t] = -inf` when
+/// the corresponding bit in the packed I32 bitmask is zero.
+///
+/// `logits`  : `[batch, vocab]`, F32 / BF16 / F16, **contiguous** on CUDA.
+///             Mutated in place via [`Tensor::inplace_op2`]; the storage is
+///             shared with the caller, so the side effect is visible to
+///             every alias of this tensor.
+/// `bitmask` : `[rows, words_per_row]` (`rows ≥ batch`), packed I32,
+///             contiguous on CUDA. Bit `t % 32` of word `t / 32` is the
+///             "allowed" flag. `words_per_row` must be ≥ `ceil(vocab/32)`;
+///             trailing bits in the last word are ignored.
+///
+/// On non-CUDA devices or non-contiguous inputs this errors out — use
+/// [`crate::sampling::SamplingConstraint::mask_logits`] for the CPU path.
+pub fn gpu_apply_grammar_bitmask(logits: &Tensor, bitmask: &Tensor) -> Result<()> {
+    if !logits.device().is_cuda() || !bitmask.device().is_cuda() {
+        candle_core::bail!("gpu_apply_grammar_bitmask: both tensors must be on CUDA");
+    }
+    if !logits.is_contiguous() || !bitmask.is_contiguous() {
+        candle_core::bail!("gpu_apply_grammar_bitmask: tensors must be contiguous");
+    }
+    #[cfg(feature = "cuda-kernels")]
+    {
+        logits.inplace_op2(bitmask, &cuda_ops::ApplyGrammarBitmaskOp)
+    }
+    #[cfg(not(feature = "cuda-kernels"))]
+    {
+        let _ = (logits, bitmask);
+        candle_core::bail!(
+            "gpu_apply_grammar_bitmask: cuda-kernels feature not enabled at build time"
+        )
+    }
 }
 
 /// GPU-accelerated softmax for probability conversion.
@@ -1214,6 +1383,60 @@ mod tests {
         Device::new_cuda(0).ok()
     }
 
+    /// B2.0 gate: measure the per-step cost that a pooled bitmask buffer
+    /// would remove — the `Tensor::from_vec([batch, words_per_row] i32)`
+    /// GPU allocation + HtoD that `apply_grammar_bitmask_to_logits` does
+    /// every constrained decode step. If this is negligible vs a ~40 ms
+    /// decode step, B2 (pooled buffer + capture) is not worth the risk.
+    /// Run with `--ignored --nocapture`.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    #[ignore = "timing measurement, run manually with --nocapture"]
+    fn bench_per_step_bitmask_alloc_upload() {
+        let Some(dev) = cuda_device() else {
+            eprintln!("SKIP: no CUDA device");
+            return;
+        };
+        let candle_core::Device::Cuda(cdev) = &dev else {
+            return;
+        };
+        // Qwen3: logits vocab 151936 → words_per_row 4748.
+        let wpr = 151936usize.div_ceil(32);
+        let sync = || {
+            let _ = cdev.cuda_stream().synchronize();
+        };
+
+        for &batch in &[1usize, 4, 8] {
+            // (a) alloc + HtoD only (what a pooled stable buffer removes).
+            let iters = 500u32;
+            sync();
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let _t = Tensor::from_vec(vec![0i32; batch * wpr], (batch, wpr), &dev).unwrap();
+            }
+            sync();
+            let alloc_up = t0.elapsed() / iters;
+
+            // (b) full apply: build bitmask tensor + run the kernel on a
+            // realistic logits tensor (what one constrained step pays).
+            let logits =
+                Tensor::from_vec(vec![1.0f32; batch * 151936], (batch, 151936), &dev).unwrap();
+            sync();
+            let t1 = std::time::Instant::now();
+            for _ in 0..iters {
+                let bm = Tensor::from_vec(vec![!0i32; batch * wpr], (batch, wpr), &dev).unwrap();
+                gpu_apply_grammar_bitmask(&logits, &bm).unwrap();
+            }
+            sync();
+            let full = t1.elapsed() / iters;
+
+            eprintln!(
+                "batch={batch}: alloc+HtoD={alloc_up:?}/step, full(from_vec+kernel)={full:?}/step"
+            );
+        }
+        eprintln!("(compare to a ~40 ms decode step → B2.0 ceiling = alloc+HtoD / 40ms)");
+    }
+
     #[cfg(feature = "cuda-kernels")]
     #[test]
     fn test_cuda_argmax_f32() {
@@ -1742,5 +1965,94 @@ mod tests {
             .to_vec1::<u32>()
             .unwrap()[0];
         assert_eq!(id, 7, "rand=0.6 expected middle mass (7) got {id}");
+    }
+
+    /// GPU smoke for `gpu_apply_grammar_bitmask`. Verifies that
+    /// allowed-token logits are left untouched while forbidden tokens
+    /// are mapped to `-inf`. Two different bitmask rows ensure the
+    /// kernel correctly indexes per batch.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_gpu_apply_grammar_bitmask_f32() {
+        let Some(dev) = cuda_device() else { return };
+        let vocab = 100usize;
+        let batch = 2usize;
+        let words_per_row = vocab.div_ceil(32);
+
+        // Construct logits filled with `1.0` so we can detect untouched
+        // vs `-inf` slots without floating-point ambiguity.
+        let logits_data = vec![1.0f32; batch * vocab];
+        let logits = Tensor::from_vec(logits_data, (batch, vocab), &dev).unwrap();
+
+        // Row 0 allows {5, 15, 25, 50}; row 1 allows {0, 99}.
+        let mut bitmask = vec![0i32; batch * words_per_row];
+        let mut set = |row: usize, tok: usize| {
+            bitmask[row * words_per_row + tok / 32] |= 1i32 << (tok % 32);
+        };
+        for &tok in &[5usize, 15, 25, 50] {
+            set(0, tok);
+        }
+        for &tok in &[0usize, 99] {
+            set(1, tok);
+        }
+        let bitmask_t = Tensor::from_vec(bitmask, (batch, words_per_row), &dev).unwrap();
+
+        gpu_apply_grammar_bitmask(&logits, &bitmask_t).unwrap();
+        let out: Vec<Vec<f32>> = logits.to_vec2().unwrap();
+
+        let allow0: std::collections::HashSet<usize> = [5, 15, 25, 50].into_iter().collect();
+        let allow1: std::collections::HashSet<usize> = [0, 99].into_iter().collect();
+        for (b, allow) in [(0, &allow0), (1, &allow1)] {
+            for (t, &v) in out[b].iter().enumerate() {
+                if allow.contains(&t) {
+                    assert!(
+                        v.is_finite(),
+                        "batch {b} token {t} should be finite, got {v}"
+                    );
+                    assert!(
+                        (v - 1.0).abs() < 1e-6,
+                        "batch {b} token {t} = {v}, expected 1.0"
+                    );
+                } else {
+                    assert!(
+                        v.is_infinite() && v < 0.0,
+                        "batch {b} token {t} should be -inf, got {v}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// BF16 variant of the bitmask kernel — the EXL3 + Marlin paths
+    /// land here in production, so the dtype dispatch must work.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_gpu_apply_grammar_bitmask_bf16() {
+        let Some(dev) = cuda_device() else { return };
+        let vocab = 64usize;
+        let words_per_row = vocab.div_ceil(32);
+        let logits = Tensor::from_vec(vec![1.0f32; vocab], (1, vocab), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        // Allow only token 7.
+        let mut bitmask = vec![0i32; words_per_row];
+        bitmask[7 / 32] |= 1i32 << (7 % 32);
+        let bitmask_t = Tensor::from_vec(bitmask, (1, words_per_row), &dev).unwrap();
+        gpu_apply_grammar_bitmask(&logits, &bitmask_t).unwrap();
+        let out: Vec<f32> = logits
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (t, &v) in out.iter().enumerate() {
+            if t == 7 {
+                assert!(v.is_finite() && (v - 1.0).abs() < 1e-2, "tok 7 = {v}");
+            } else {
+                assert!(v.is_infinite() && v < 0.0, "tok {t} = {v}, expected -inf");
+            }
+        }
     }
 }

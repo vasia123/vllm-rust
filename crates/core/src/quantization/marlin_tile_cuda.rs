@@ -21,108 +21,15 @@ use candle_core::{
 
 const MARLIN_TILE_MMA_PTX: &str = include_str!("../../kernels/marlin_tile_mma.ptx");
 
-/// CustomOp wrapping the tile-MMA dispatch. The activation `A` is the
-/// Op's primary tensor (so we get its CudaStorage via the trait); the
-/// repacked weight `B` and per-channel scales `S` are held as struct
-/// fields and resolved through `storage_and_layout()` inside `cuda_fwd`.
-struct MarlinTileMmaV1Op {
-    b_tile: Tensor,
-    scales: Tensor,
-    qzeros: Tensor,
-    m: i32,
-    n: i32,
-    k: i32,
-    group_size: i32,
-}
+// v1 (custom DP4A) op was the original Stage 15.D implementation; the
+// tensor-core path `MarlinTileMmaTcM16K16Op` below supersedes it for
+// every valid shape (M≥1, K%16==0, group_size%16==0 — Stage 15.D-body.3a..3d).
+// The v1 op + its CustomOp1 impl were removed when the dispatcher began
+// unconditionally selecting the TC path; the PTX file `marlin_tile_mma.ptx`
+// is still emitted by the build so the symbol stays available if the
+// fallback ever needs to be reinstated for diagnostics.
 
-impl CustomOp1 for MarlinTileMmaV1Op {
-    fn name(&self) -> &'static str {
-        "marlin_tile_mma_int4_bf16"
-    }
-
-    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        candle_core::bail!("marlin_tile_mma requires CUDA")
-    }
-
-    fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
-
-        let dev = &storage.device;
-        let func = dev.get_or_load_custom_func(
-            "marlin_tile_mma_int4_bf16",
-            "marlin_tile_mma",
-            MARLIN_TILE_MMA_PTX,
-        )?;
-
-        let a = match &storage.slice {
-            CudaStorageSlice::BF16(s) => s,
-            _ => candle_core::bail!("marlin_tile_mma: A must be BF16"),
-        };
-
-        let (b_guard, _) = self.b_tile.storage_and_layout();
-        let b = match &*b_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::U32(s) => s,
-                _ => candle_core::bail!("marlin_tile_mma: B must be U32"),
-            },
-            _ => candle_core::bail!("marlin_tile_mma: B must be on CUDA"),
-        };
-
-        let (s_guard, _) = self.scales.storage_and_layout();
-        let scales = match &*s_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::BF16(s) => s,
-                _ => candle_core::bail!("marlin_tile_mma: S must be BF16"),
-            },
-            _ => candle_core::bail!("marlin_tile_mma: S must be on CUDA"),
-        };
-
-        let (z_guard, _) = self.qzeros.storage_and_layout();
-        let qzeros = match &*z_guard {
-            Storage::Cuda(cs) => match &cs.slice {
-                CudaStorageSlice::U32(s) => s,
-                _ => candle_core::bail!("marlin_tile_mma: qzeros must be U32"),
-            },
-            _ => candle_core::bail!("marlin_tile_mma: qzeros must be on CUDA"),
-        };
-
-        // v1: M ≥ 1, N multiple of 64, K multiple of 16. Output [M, N] BF16.
-        let m = self.m as usize;
-        let n = self.n as usize;
-        let elem_count = m * n;
-        let output = dev.alloc_zeros::<half::bf16>(elem_count)?;
-
-        // Block 256 threads; grid covers ceildiv(M*N, 256) blocks.
-        const BLOCK: u32 = 256;
-        let cfg = LaunchConfig {
-            grid_dim: (elem_count.div_ceil(BLOCK as usize) as u32, 1, 1),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let mut builder = func.builder();
-        builder.arg(a);
-        builder.arg(b);
-        builder.arg(scales);
-        builder.arg(qzeros);
-        builder.arg(&output);
-        builder.arg(&self.m);
-        builder.arg(&self.n);
-        builder.arg(&self.k);
-        builder.arg(&self.group_size);
-
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| candle_core::Error::Msg(format!("marlin_tile_mma launch: {e}")))?;
-
-        let out_storage = CudaStorage {
-            slice: CudaStorageSlice::BF16(output),
-            device: dev.clone(),
-        };
-        Ok((out_storage, Shape::from_dims(&[m, n])))
-    }
-}
-
-/// Dispatch the v1 Marlin tile-MMA kernel.
+/// Dispatch the Marlin tile-MMA kernel.
 ///
 /// # Arguments
 /// * `a` — `[M, K]` BF16 activations on CUDA. `M ≥ 1`, `K` multiple of 16.
@@ -211,17 +118,6 @@ pub fn dispatch_marlin_tile_mma_v1(
         m: m as i32,
         k: k as i32,
         n: n as i32,
-        group_size: group_size as i32,
-    };
-    return a.apply_op1(op);
-
-    let op = MarlinTileMmaV1Op {
-        b_tile: b_tile.clone(),
-        scales: scales.clone(),
-        qzeros: qzeros.clone(),
-        m: m as i32,
-        n: n as i32,
-        k: k as i32,
         group_size: group_size as i32,
     };
     a.apply_op1(op)

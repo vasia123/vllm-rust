@@ -10,7 +10,7 @@ cuda-kernels = ["cuda", "vllm-core/cuda-kernels"]
 # (Marlin, fused norms, fused activations, MoE kernels, FlashInfer).
 # Recommended command for actual inference:
 #   cargo run --release -p vllm-server --features cuda-full -- serve ...
-cuda-full = ["cuda", "vllm-core/cuda-default"]
+cuda-full = ["cuda", "vllm-core/cuda-default", "vllm-core/xgrammar"]
 
 [dependencies]
 vllm-core = { path = "../core", features = ["audio"] }

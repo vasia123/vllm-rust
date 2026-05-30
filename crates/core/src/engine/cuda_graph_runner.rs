@@ -520,6 +520,12 @@ impl CudaGraphRunner {
         // Real runtime forwards (engine/helpers.rs) also reset cursors
         // at the start, so they reuse the same slot 0..N buffers as
         // the captured pass — addresses match.
+        // Defensive: assert decode mode for the warmup forward. The
+        // warmup pass shares the runtime decode pool-slot order, so a
+        // stale Prefill mode leaking in from a previous forward on
+        // this thread would route warmup's pool reserves to the
+        // ephemeral bypass and break capture-replay address parity.
+        let _decode_guard = super::output_pool::ModeGuard::decode();
         super::output_pool::OutputPool::global().reset_cursors();
         let warmup_output = capture_fn(&input_ids)
             .map_err(|e| CudaGraphRunnerError::WarmupFailed(format!("Warmup forward: {e}")))?;
@@ -549,6 +555,12 @@ impl CudaGraphRunner {
         // cursors; without this reset, captured slot indices were N+1, N+2
         // etc. while replay used 0, 1, 2, … and the graph dereferenced
         // stale pool slots.
+        //
+        // Mode invariant: capture must run under Decode so the
+        // recorded device pointers come from pool slots (not the
+        // Prefill bypass). This guard is in scope for the entire
+        // capture region below.
+        let _decode_guard = super::output_pool::ModeGuard::decode();
         super::output_pool::OutputPool::global().reset_cursors();
 
         // RELAXED capture mode: GLOBAL aborts the capture the moment any
@@ -571,6 +583,14 @@ impl CudaGraphRunner {
             );
             return Ok(false);
         }
+
+        // Tripwire: any pool reserve that hits the Prefill bypass
+        // while this scope is alive will fire a debug_assert. Pool
+        // bypass returns fresh non-stable device pointers; a captured
+        // kernel reading one would replay against freed memory. The
+        // ModeGuard::decode() above already enforces this for the
+        // intended path; the tripwire catches future regressions.
+        let _capture_scope = super::output_pool::CaptureScope::enter();
 
         let capture_output = match capture_fn(&input_ids) {
             Ok(out) => out,

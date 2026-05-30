@@ -460,10 +460,23 @@ mod decode_profile {
     pub static MLP_NS: AtomicU64 = AtomicU64::new(0);
     pub static IN_NORM_NS: AtomicU64 = AtomicU64::new(0);
     pub static POST_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static EMBED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FINAL_NORM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LM_HEAD_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 
     /// CPU-only build: profiling is a no-op and falls through to `f`.
     #[inline(always)]
     pub fn time<T>(
+        _dev: &candle_core::Device,
+        _slot: &AtomicU64,
+        f: impl FnOnce() -> candle_core::Result<T>,
+    ) -> candle_core::Result<T> {
+        f()
+    }
+
+    #[inline(always)]
+    pub fn time_sync<T>(
         _dev: &candle_core::Device,
         _slot: &AtomicU64,
         f: impl FnOnce() -> candle_core::Result<T>,

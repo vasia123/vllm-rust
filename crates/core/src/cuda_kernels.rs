@@ -325,7 +325,7 @@ where
 /// Extract a native-dtype (`T`) K/V cache slice from a storage guard.
 /// Used on the Auto path where K/V cache shares Q's dtype.
 fn expect_native_kv_slice<'g, T: PagedAttnDtype>(
-    guard: &'g (impl std::ops::Deref<Target = Storage>),
+    guard: &'g impl std::ops::Deref<Target = Storage>,
     name: &str,
 ) -> Result<&'g candle_core::cuda::cudarc::driver::CudaSlice<T>> {
     match &**guard {
@@ -346,7 +346,7 @@ fn expect_native_kv_slice<'g, T: PagedAttnDtype>(
 /// signed-vs-FP8 reinterpretation is done kernel-side by the matching
 /// `load_kv_to_f32` template specialization.
 fn expect_u8_kv_slice<'g>(
-    guard: &'g (impl std::ops::Deref<Target = Storage>),
+    guard: &'g impl std::ops::Deref<Target = Storage>,
     name: &str,
 ) -> Result<&'g candle_core::cuda::cudarc::driver::CudaSlice<u8>> {
     match &**guard {

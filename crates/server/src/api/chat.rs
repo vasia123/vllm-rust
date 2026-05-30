@@ -8,7 +8,7 @@ use axum::Json;
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
 use vllm_core::multimodal::{ContentPart, ImageData};
-use vllm_core::sampling::grammar::{GrammarCompiler, VocabularyIndex};
+use vllm_core::sampling::grammar::GrammarCompiler;
 use vllm_core::sampling::{
     BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
 };
@@ -119,9 +119,14 @@ pub async fn create_chat_completion(
         create_constraint_from_structured_outputs(
             req.structured_outputs.as_ref(),
             &state.tokenizer,
+            &state.grammar_compiler(),
         )?
     } else {
-        create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+        create_constraint_from_response_format(
+            req.response_format.as_ref(),
+            &state.tokenizer,
+            &state.grammar_compiler(),
+        )
     };
 
     // Convert logit_bias once, before branching on stream vs non-stream
@@ -261,6 +266,7 @@ pub async fn create_chat_completion(
                 create_constraint_from_structured_outputs(
                     req.structured_outputs.as_ref(),
                     &state.tokenizer,
+                    &state.grammar_compiler(),
                 )
                 .ok()
                 .flatten()
@@ -268,6 +274,7 @@ pub async fn create_chat_completion(
                 create_constraint_from_response_format(
                     req.response_format.as_ref(),
                     &state.tokenizer,
+                    &state.grammar_compiler(),
                 )
             };
             let beam = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
@@ -598,20 +605,68 @@ fn build_chat_logprobs(
 pub(crate) fn create_constraint_from_response_format(
     response_format: Option<&ResponseFormat>,
     tokenizer: &Arc<TokenizerWrapper>,
+    compiler: &GrammarCompiler,
 ) -> Option<Box<dyn SamplingConstraint>> {
+    use vllm_core::sampling::grammar::compiler::StructuredOutputOption;
+    use vllm_core::sampling::grammar::GrammarConstraintAdapter;
+
     match response_format {
         None | Some(ResponseFormat::Text) | Some(ResponseFormat::StructuralTag { .. }) => None,
         Some(ResponseFormat::JsonObject) => {
-            // Basic JSON object constraint
+            // `json_object` mode: no schema, just "valid JSON". Keep
+            // the legacy text-validation path — there's no grammar
+            // to drive the matcher with.
             let schema = serde_json::json!({"type": "object"});
             Some(Box::new(JsonSchemaConstraint::new(
                 schema,
                 tokenizer.clone(),
             )))
         }
-        Some(ResponseFormat::JsonSchema { json_schema }) => Some(Box::new(
-            JsonSchemaConstraint::new(json_schema.schema.clone(), tokenizer.clone()),
-        )),
+        Some(ResponseFormat::JsonSchema { json_schema }) => {
+            // OpenAI-compatible `response_format.json_schema` path.
+            // Route through the grammar compiler so xgrammar
+            // (under `feature = "xgrammar"`) enforces the schema at
+            // the token-bitmask level — same backend the dedicated
+            // `structured_outputs` API uses.
+            //
+            // On compile failure, log and fall back to the legacy
+            // text-validation constraint so the request still gets
+            // server-side post-validation rather than dropping the
+            // constraint silently.
+            let spec = match serde_json::to_string(&json_schema.schema) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vllm_server::xgrammar",
+                        error = %e,
+                        "response_format.json_schema serialisation failed; \
+                         falling back to legacy text validation"
+                    );
+                    return Some(Box::new(JsonSchemaConstraint::new(
+                        json_schema.schema.clone(),
+                        tokenizer.clone(),
+                    )));
+                }
+            };
+            match compiler.compile_sync(&StructuredOutputOption::JsonSchema, &spec) {
+                Ok(grammar) => Some(Box::new(GrammarConstraintAdapter::new(
+                    grammar,
+                    tokenizer.vocab_size(),
+                ))),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vllm_server::xgrammar",
+                        error = %e,
+                        "response_format.json_schema grammar compile failed; \
+                         falling back to legacy text validation"
+                    );
+                    Some(Box::new(JsonSchemaConstraint::new(
+                        json_schema.schema.clone(),
+                        tokenizer.clone(),
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -622,6 +677,7 @@ pub(crate) fn create_constraint_from_response_format(
 pub(crate) fn create_constraint_from_structured_outputs(
     structured_outputs: Option<&super::types::StructuredOutputs>,
     tokenizer: &Arc<TokenizerWrapper>,
+    compiler: &GrammarCompiler,
 ) -> Result<Option<Box<dyn SamplingConstraint>>, super::error::ApiError> {
     use vllm_core::sampling::grammar::compiler::StructuredOutputOption;
     use vllm_core::sampling::grammar::GrammarConstraintAdapter;
@@ -630,9 +686,6 @@ pub(crate) fn create_constraint_from_structured_outputs(
         Some(so) => so,
         None => return Ok(None),
     };
-
-    let vocab_index = Arc::new(VocabularyIndex::from_tokenizer_arc(tokenizer));
-    let compiler = GrammarCompiler::new(vocab_index.clone());
 
     if let Some(ref regex_pattern) = so.regex {
         let grammar = compiler

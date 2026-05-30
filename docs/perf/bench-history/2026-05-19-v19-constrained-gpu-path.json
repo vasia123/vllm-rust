@@ -1,0 +1,42 @@
+{
+  "label": "v1.9",
+  "model": "turboderp/Qwen3-8B-exl3",
+  "max_tokens": 80,
+  "runs": 5,
+  "results": [
+    {
+      "concurrency": 1,
+      "unconstrained": {
+        "med_tps_per_req": 25.206722590110164,
+        "p99_tps_per_req": 25.26945818259545,
+        "best_agg_tps": 25.26945818259545,
+        "num_samples": 5
+      },
+      "constrained": {
+        "med_tps_per_req": 23.381211742074782,
+        "p99_tps_per_req": 25.474952705412278,
+        "best_agg_tps": 25.474952705412278,
+        "num_samples": 5
+      },
+      "slowdown_ratio_unc_over_con": 1.0780759726302103,
+      "slowdown_pct": 7.807597263021027
+    },
+    {
+      "concurrency": 4,
+      "unconstrained": {
+        "med_tps_per_req": 19.033726541825345,
+        "p99_tps_per_req": 24.64727915538394,
+        "best_agg_tps": 98.52963680174375,
+        "num_samples": 20
+      },
+      "constrained": {
+        "med_tps_per_req": 14.999361300598109,
+        "p99_tps_per_req": 15.285997640901098,
+        "best_agg_tps": 54.14876577812723,
+        "num_samples": 20
+      },
+      "slowdown_ratio_unc_over_con": 1.2689691354435448,
+      "slowdown_pct": 26.896913544354483
+    }
+  ]
+}

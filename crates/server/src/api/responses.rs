@@ -74,6 +74,7 @@ pub async fn create_response(
     let constraint = super::chat::create_constraint_from_response_format(
         req.response_format.as_ref(),
         &state.tokenizer,
+        &state.grammar_compiler(),
     );
 
     let response_id = generate_response_id();

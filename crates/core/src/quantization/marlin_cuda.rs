@@ -1716,7 +1716,19 @@ pub fn marlin_gemm_pooled(
     // shows the same `Result<PooledTensor>` ABI-boundary regression
     // (~26% c=8 throughput drop on Qwen3-4B-AWQ). Keep on legacy
     // `reserve()` returning `Result<Tensor>`.
-    let output_2d = OutputPool::global().reserve(&[m, size_n], DType::BF16, input.device())?;
+    //
+    // Prefill (M > 64) bypasses the pool so large lm_head outputs
+    // (e.g. `[prompt_len, vocab=151k]` BF16 ≈ 358 MiB) don't wedge
+    // in the pool for the engine lifetime. Decode (M ≤ 64) keeps
+    // the pool path for capture stability. Threshold matches
+    // `exl3_cuda::PREFILL_M_THRESHOLD`.
+    const PREFILL_M_THRESHOLD: usize = 64;
+    let pool = OutputPool::global();
+    let output_2d = if m > PREFILL_M_THRESHOLD {
+        pool.reserve_ephemeral(&[m, size_n], DType::BF16, input.device())?
+    } else {
+        pool.reserve(&[m, size_n], DType::BF16, input.device())?
+    };
 
     let op = MarlinGemmInplaceOp {
         qweight,

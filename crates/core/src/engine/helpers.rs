@@ -115,9 +115,12 @@ pub(crate) mod step_profile {
         }
         let t0 = Instant::now();
         let out = f();
+        #[cfg(feature = "cuda")]
         if let Some(candle_core::Device::Cuda(cd)) = dev {
             let _ = cd.cuda_stream().synchronize();
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = dev;
         stage.ns[bucket_idx].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         out
     }
@@ -463,6 +466,14 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     requests: &mut HashMap<RequestId, ActiveRequest>,
     tokenizer: &TokenizerWrapper,
 ) -> Result<(), EngineError> {
+    // Mark this forward as prefill so any large pool reserve reached
+    // through it (lm_head outputs, per-layer activations, etc.)
+    // auto-bypasses the pool and drops on scope exit. See
+    // `crate::engine::output_pool::ExecutionMode` for the contract.
+    // Captured CUDA Graph replay never enters this function (no
+    // `graph_runner` parameter), so bypassing the pool is safe.
+    let _mode_guard = crate::engine::output_pool::ModeGuard::prefill();
+
     let req = requests
         .get_mut(&req_id)
         .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
@@ -806,6 +817,194 @@ fn forward_grouped_by_adapter<M: ModelForward>(
     Tensor::stack(&ordered_rows, 0)
 }
 
+/// v1.9: build a packed-i32 bitmask covering every row in the active
+/// batch and apply it in-place to `last_logits` via the native CUDA
+/// `apply_grammar_bitmask` kernel.
+///
+/// Rows for requests without a constraint get an all-1s mask (no-op
+/// on logits — preserves their values). Rows for requests with a
+/// constraint are filled by `fill_cpu_bitmask_for_gpu`; the tail past
+/// the grammar's `vocab_size` stays zero so padded lm_head tokens are
+/// implicitly forbidden.
+///
+/// One CPU vec + one HtoD copy per step; cheaper than the legacy
+/// `to_vec2::<f32>` of the entire logits tensor (≈ batch × vocab × 4
+/// bytes). Holds the engine's mutable `requests` map because each
+/// constraint advances no state here — only `fill_cpu_bitmask_for_gpu`
+/// is called, which is a query.
+fn apply_grammar_bitmask_to_logits(
+    last_logits: &Tensor,
+    batch_ids: &[RequestId],
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+) -> anyhow::Result<()> {
+    let dims = last_logits.dims();
+    if dims.len() != 2 {
+        anyhow::bail!("apply_grammar_bitmask_to_logits: logits must be 2D, got {dims:?}",);
+    }
+    let (batch, logits_vocab) = (dims[0], dims[1]);
+    if batch != batch_ids.len() {
+        anyhow::bail!(
+            "apply_grammar_bitmask_to_logits: logits batch {batch} ≠ batch_ids {}",
+            batch_ids.len(),
+        );
+    }
+    let words_per_row = logits_vocab.div_ceil(32);
+    let mut cpu_bitmask = vec![0i32; batch * words_per_row];
+
+    let prof = std::env::var("VLLM_PROFILE_GRAMMAR").is_ok();
+    let t_fill_start = prof.then(std::time::Instant::now);
+
+    // First, mark unconstrained rows all-allowed (no-op on the apply
+    // kernel) so only constrained rows need a real fill.
+    for (i, &req_id) in batch_ids.iter().enumerate() {
+        let unconstrained = requests
+            .get(&req_id)
+            .map(|r| r.state.constraint.is_none())
+            .unwrap_or(false);
+        if unconstrained {
+            let row = &mut cpu_bitmask[i * words_per_row..(i + 1) * words_per_row];
+            for w in row.iter_mut() {
+                *w = !0;
+            }
+        }
+    }
+
+    // Batched parallel fill for xgrammar-backed constrained rows.
+    // `xgrammar_rs::BatchMatcher` dispatches one `fill_next_token_bitmask`
+    // per matcher across a thread pool — replacing the O(batch) sequential
+    // CPU fill that dominates constrained decode at c≥2 (profiled at
+    // ~4 ms/matcher on Qwen3's 151k vocab). Rows whose constraint has no
+    // xgrammar matcher fall through to the per-request path below.
+    #[cfg(feature = "xgrammar")]
+    let mut handled: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    #[cfg(feature = "xgrammar")]
+    let batch_enabled = std::env::var("VLLM_DISABLE_GRAMMAR_BATCH").is_err();
+    #[cfg(feature = "xgrammar")]
+    if batch_enabled {
+        // Collect (row_idx, matcher, grammar_words) for xgrammar rows.
+        // Scoped immutable borrow of `requests` — released before the
+        // per-request mutable fallback below.
+        let mut row_idx: Vec<usize> = Vec::new();
+        let mut guards: Vec<std::sync::MutexGuard<'_, xgrammar_rs::GrammarMatcher>> = Vec::new();
+        let mut grammar_words: Option<usize> = None;
+        for (i, &req_id) in batch_ids.iter().enumerate() {
+            if let Some(req) = requests.get(&req_id) {
+                if let Some(c) = req.state.constraint.as_ref() {
+                    if let (Some(m), Some(gw)) = (c.xgrammar_matcher(), c.grammar_bitmask_words()) {
+                        if let Ok(guard) = m.lock() {
+                            // xgrammar aborts (LogFatalError) if asked to
+                            // fill a bitmask after the stop token was
+                            // accepted. Terminated matchers are left for
+                            // the per-request path, which emits an
+                            // all-forbidden row without touching xgrammar.
+                            if guard.is_terminated() {
+                                continue;
+                            }
+                            row_idx.push(i);
+                            guards.push(guard);
+                            grammar_words.get_or_insert(gw);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(gw) = grammar_words {
+            if guards.len() >= 2 && gw <= words_per_row {
+                let matchers: Vec<&xgrammar_rs::GrammarMatcher> =
+                    guards.iter().map(|g| &**g).collect();
+                let mut tmp = vec![0i32; matchers.len() * gw];
+                match crate::sampling::grammar::xgrammar_backend::batch_matcher_handle()
+                    .fill_bitmasks(&matchers, &mut tmp, gw)
+                {
+                    Ok(()) => {
+                        // Scatter each grammar-sized row into the
+                        // logits-sized cpu_bitmask slot; the tail
+                        // [gw..words_per_row] stays zero (padded vocab
+                        // forbidden).
+                        for (k, &i) in row_idx.iter().enumerate() {
+                            let dst = &mut cpu_bitmask[i * words_per_row..i * words_per_row + gw];
+                            dst.copy_from_slice(&tmp[k * gw..k * gw + gw]);
+                            handled.insert(i);
+                        }
+                    }
+                    Err(e) => {
+                        // Fall through to per-request fill on batch error.
+                        tracing::warn!(
+                            error = %e,
+                            "BatchMatcher fill failed; using per-request fill",
+                        );
+                    }
+                }
+            }
+        }
+        // `guards` drop here → matcher locks released, immutable borrow ends.
+    }
+
+    // Per-request fill for any constrained row not handled by the batch
+    // path (single constrained request, non-xgrammar constraint, or
+    // batch-fill error fallback).
+    for (i, &req_id) in batch_ids.iter().enumerate() {
+        #[cfg(feature = "xgrammar")]
+        if handled.contains(&i) {
+            continue;
+        }
+        let Some(req) = requests.get_mut(&req_id) else {
+            continue;
+        };
+        if let Some(ref mut constraint) = req.state.constraint {
+            let row = &mut cpu_bitmask[i * words_per_row..(i + 1) * words_per_row];
+            match constraint.fill_cpu_bitmask_for_gpu(row) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => anyhow::bail!(
+                    "constraint claims supports_gpu=true but \
+                     fill_cpu_bitmask_for_gpu returned None",
+                ),
+            }
+        }
+    }
+
+    let t_fill_ns = t_fill_start.map(|t| t.elapsed().as_nanos() as u64);
+
+    let dev = last_logits.device();
+    let t_up_start = prof.then(std::time::Instant::now);
+    let bitmask_t = Tensor::from_vec(cpu_bitmask, (batch, words_per_row), dev)
+        .map_err(|e| anyhow::anyhow!("bitmask Tensor::from_vec: {e}"))?;
+    crate::sampling::gpu::gpu_apply_grammar_bitmask(last_logits, &bitmask_t)
+        .map_err(|e| anyhow::anyhow!("gpu_apply_grammar_bitmask: {e}"))?;
+
+    if prof {
+        // Force a device sync so the apply-kernel time is attributed
+        // here rather than leaking into the next sampler op.
+        #[cfg(feature = "cuda")]
+        if let candle_core::Device::Cuda(cd) = dev {
+            let _ = cd.cuda_stream().synchronize();
+        }
+        let t_up_ns = t_up_start
+            .map(|t| t.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        // Accumulate into process-global counters; dump every 64 calls.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FILL_NS: AtomicU64 = AtomicU64::new(0);
+        static UP_NS: AtomicU64 = AtomicU64::new(0);
+        static N: AtomicU64 = AtomicU64::new(0);
+        FILL_NS.fetch_add(t_fill_ns.unwrap_or(0), Ordering::Relaxed);
+        UP_NS.fetch_add(t_up_ns, Ordering::Relaxed);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(64) {
+            tracing::info!(
+                target: "vllm_core::engine::helpers",
+                batch,
+                calls = n,
+                fill_us_avg = FILL_NS.load(Ordering::Relaxed) / n / 1000,
+                upload_apply_us_avg = UP_NS.load(Ordering::Relaxed) / n / 1000,
+                "grammar bitmask profile",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Execute batched decode with optional CUDA graph support.
 /// When a dispatcher is provided, dispatches to cached graphs when available.
 /// When a graph runner is provided, uses it for optimized execution.
@@ -931,6 +1130,15 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     let mut sequences: Vec<DecodeSequenceMetadata> = Vec::with_capacity(batch_ids.len());
     // Per-sequence adapter name (None = base model), in same order as token_ids/sequences
     let mut adapter_names: Vec<Option<String>> = Vec::with_capacity(batch_ids.len());
+    // Authoritative processed set, built in lockstep with token_ids /
+    // sequences. A sequence allocated in Step 1 but lacking a last token
+    // (e.g. just-(re)prefilled and not yet sampled) is excluded here; it
+    // MUST also drop out of `batch_ids` so that `batch_size`, the input
+    // tensor, and the attention metadata all describe the same number of
+    // rows. Otherwise the `prev_sampled` GPU pass-through (sized to the
+    // pre-filter `batch_ids`) feeds an N-row input into an (N-1)-row
+    // attention build → `shape mismatch in reshape [N,1,H] vs [N-1,…]`.
+    let mut processed_ids: Vec<RequestId> = Vec::with_capacity(batch_ids.len());
 
     let bucket = step_profile::bucket(batch_ids.len());
     step_profile::time_plain(step_dev_ref, &step_profile::METADATA, bucket, || {
@@ -939,12 +1147,32 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 continue;
             };
             let Some(&last_token) = req.state.generated_token_ids.last() else {
+                // Normal operation never hits this (a decode-set sequence
+                // has at least its prefill-sampled token). It appears only
+                // under heavy KV-exhaustion preemption thrash, where a
+                // just-preempted sequence can momentarily reappear with its
+                // generated tokens already folded back into the prompt. We
+                // exclude it for this step (it re-prefills next), but
+                // rate-limit the log so a thrash storm can't flood it.
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n.is_power_of_two() {
+                    tracing::warn!(
+                        request_id = req_id,
+                        total_skips = n + 1,
+                        "decode-batch sequence has no generated token; \
+                         excluding from this step to keep batch dims \
+                         consistent (rate-limited log)"
+                    );
+                }
                 continue;
             };
             let slot_mapping = req
                 .state
                 .block_table
                 .slot_mapping(req.state.seqlen_offset, 1);
+            processed_ids.push(req_id);
             token_ids.push(last_token);
             sequences.push(DecodeSequenceMetadata {
                 request_id: req_id,
@@ -955,6 +1183,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             adapter_names.push(req.state.lora_request.as_ref().map(|lr| lr.name.clone()));
         }
     });
+
+    // Adopt the filtered set as the batch for the rest of this step.
+    batch_ids = processed_ids;
+    if batch_ids.is_empty() {
+        return (failed, None);
+    }
 
     // Step 3: Batched forward pass with multi-adapter grouping
     let batch_size = batch_ids.len();
@@ -1041,6 +1275,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                     static ONCE_POS: std::sync::Once = std::sync::Once::new();
                     ONCE_POS.call_once(|| {
                         if let Some(pt) = shared.positions_device.as_ref() {
+                            #[cfg(feature = "cuda")]
                             if let candle_core::Device::Cuda(c) = model.device() {
                                 let _ = c.cuda_stream().synchronize();
                             }
@@ -1122,7 +1357,16 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 Ok(l) => l,
                 Err(e) => {
                     let msg = format!("forward_decode_batch_with_ctx: {e}");
-                    tracing::error!(error = %e, "batched decode forward failed");
+                    tracing::error!(
+                        error = %e,
+                        input_dims = ?input.dims(),
+                        batch_ids_len = batch_ids.len(),
+                        sequences_len = sequences.len(),
+                        decode_request_ids_len = decode_request_ids.len(),
+                        seqlen_offsets = ?sequences.iter().map(|s| s.seqlen_offset).collect::<Vec<_>>(),
+                        block_id_counts = ?sequences.iter().map(|s| s.block_ids.len()).collect::<Vec<_>>(),
+                        "batched decode forward failed"
+                    );
                     failed.extend(failed_batch(msg, &batch_ids));
                     return (failed, None);
                 }
@@ -1133,9 +1377,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // Stamp the forward stage. We sync the device once here so the elapsed
     // time captures actual GPU work rather than just kernel launches.
     if let (Some(t0), Some(dev)) = (t_forward_start, step_dev_ref) {
+        #[cfg(feature = "cuda")]
         if let candle_core::Device::Cuda(cd) = dev {
             let _ = cd.cuda_stream().synchronize();
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = dev;
         step_profile::FORWARD.ns[bucket].fetch_add(
             t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -1224,11 +1471,17 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     // (logit_bias, freq+pres penalties, banned tokens, bad words) get
     // folded into a single `index_add` on the GPU before temperature
     // scaling, so they no longer force a full logits → CPU transfer.
+    // v1.9: constraint is no longer a hard blocker for the GPU
+    // sampler — `SamplingConstraint::supports_gpu()` returning `true`
+    // means the constraint can produce a packed-i32 bitmask that the
+    // engine uploads to GPU and applies via `gpu_apply_grammar_bitmask`
+    // before sampling, keeping the rest of the pipeline (softmax,
+    // top-k/top-p, multinomial) on-device.
     let all_gpu_eligible = batch_ids.iter().all(|&id| {
         requests.get(&id).is_some_and(|r| {
             r.state.sampling_params.gpu_eligible_strict()
                 && r.state.num_top_logprobs.is_none()
-                && r.state.constraint.is_none()
+                && r.state.constraint.as_ref().is_none_or(|c| c.supports_gpu())
         })
     });
 
@@ -1348,55 +1601,53 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             })
             .collect();
 
-        // Substep 2.1 / ADR 0017: sample to GPU tensor (no host trip
-        // inside the sampler). Phase 1 still does a `to_vec1` here for
-        // host-side bookkeeping (`generated_token_ids`); this is
-        // perf-neutral on its own. Substep 2.2 will move the DtoH onto
-        // a separate stream to actually overlap with the next forward.
-        match sampling::gpu::gpu_sample_batch_with_diffs_to_tensor(&last_logits, &configs, &diffs) {
-            Ok(token_tensor) => {
-                if defer_dtoh {
-                    // ADR 0017 / Substep 2.2: skip the host-blocking
-                    // `to_vec1` and `generated_token_ids.push`. Caller
-                    // will sync a side-stream DtoH event and push the
-                    // tokens once they land in pinned host memory. We
-                    // still advance block-table and seqlen_offset
-                    // because those are pure host counters that don't
-                    // depend on the token value, and the next decode
-                    // step's metadata reads them.
-                    for &req_id in &batch_ids {
-                        if let Some(req) = requests.get_mut(&req_id) {
-                            req.state.block_table.advance(1);
-                            req.state.seqlen_offset += 1;
-                        }
-                    }
-                    // No SAMPLING profile sync — that would block on
-                    // the very stream we're trying to keep busy.
-                    if step_profile::enabled() {
-                        step_profile::step_done(batch_size, step_start.elapsed().as_nanos() as u64);
-                    }
-                    return (failed, Some(token_tensor));
-                }
-                match token_tensor.to_vec1::<u32>() {
-                    Ok(token_ids_out) => {
-                        for (i, &req_id) in batch_ids.iter().enumerate() {
-                            let Some(req) = requests.get_mut(&req_id) else {
-                                failed.push((req_id, "request no longer active".to_string()));
-                                continue;
-                            };
-                            req.state.block_table.advance(1);
-                            req.state.seqlen_offset += 1;
-                            req.state.generated_token_ids.push(token_ids_out[i]);
-                        }
-                        if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
-                            if let candle_core::Device::Cuda(cd) = dev {
-                                let _ = cd.cuda_stream().synchronize();
+        // v1.9 constrained GPU path: any sequence in the batch
+        // carrying a grammar constraint gets its per-step bitmask
+        // built on CPU (one call per request — sequential for now;
+        // `xgrammar_rs::BatchMatcher` is wired in the FFI but not
+        // dispatched here yet, pending a Phase-7 perf measurement),
+        // uploaded as a single `[batch, words_per_row]` int32 tensor,
+        // and applied in-place to `last_logits` via the native
+        // `apply_grammar_bitmask` CUDA kernel before sampling.
+        let any_constrained = batch_ids.iter().any(|&id| {
+            requests
+                .get(&id)
+                .is_some_and(|r| r.state.constraint.is_some())
+        });
+        let mut constrained_apply_failed = false;
+        if any_constrained {
+            if let Err(e) = apply_grammar_bitmask_to_logits(&last_logits, &batch_ids, requests) {
+                tracing::warn!(
+                    error = %e,
+                    "GPU grammar bitmask apply failed; falling back to CPU sampler",
+                );
+                constrained_apply_failed = true;
+            }
+        }
+        if !constrained_apply_failed {
+            match sampling::gpu::gpu_sample_batch_with_diffs_to_tensor(
+                &last_logits,
+                &configs,
+                &diffs,
+            ) {
+                Ok(token_tensor) => {
+                    if defer_dtoh {
+                        // ADR 0017 / Substep 2.2: skip the host-blocking
+                        // `to_vec1` and `generated_token_ids.push`. Caller
+                        // will sync a side-stream DtoH event and push the
+                        // tokens once they land in pinned host memory. We
+                        // still advance block-table and seqlen_offset
+                        // because those are pure host counters that don't
+                        // depend on the token value, and the next decode
+                        // step's metadata reads them.
+                        for &req_id in &batch_ids {
+                            if let Some(req) = requests.get_mut(&req_id) {
+                                req.state.block_table.advance(1);
+                                req.state.seqlen_offset += 1;
                             }
-                            step_profile::SAMPLING.ns[bucket].fetch_add(
-                                t0.elapsed().as_nanos() as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
                         }
+                        // No SAMPLING profile sync — that would block on
+                        // the very stream we're trying to keep busy.
                         if step_profile::enabled() {
                             step_profile::step_done(
                                 batch_size,
@@ -1405,16 +1656,55 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                         }
                         return (failed, Some(token_tensor));
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "GPU sampler tensor->vec failed; falling back to CPU");
+                    match token_tensor.to_vec1::<u32>() {
+                        Ok(token_ids_out) => {
+                            for (i, &req_id) in batch_ids.iter().enumerate() {
+                                let Some(req) = requests.get_mut(&req_id) else {
+                                    failed.push((req_id, "request no longer active".to_string()));
+                                    continue;
+                                };
+                                // v1.9: advance grammar constraint state
+                                // post-sample so the next step's bitmask
+                                // reflects the freshly-committed token —
+                                // mirrors the CPU path at lines 1499 / 1538.
+                                if let Some(ref mut constraint) = req.state.constraint {
+                                    constraint.accept_token(token_ids_out[i]);
+                                }
+                                req.state.block_table.advance(1);
+                                req.state.seqlen_offset += 1;
+                                req.state.generated_token_ids.push(token_ids_out[i]);
+                            }
+                            if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
+                                #[cfg(feature = "cuda")]
+                                if let candle_core::Device::Cuda(cd) = dev {
+                                    let _ = cd.cuda_stream().synchronize();
+                                }
+                                #[cfg(not(feature = "cuda"))]
+                                let _ = dev;
+                                step_profile::SAMPLING.ns[bucket].fetch_add(
+                                    t0.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            if step_profile::enabled() {
+                                step_profile::step_done(
+                                    batch_size,
+                                    step_start.elapsed().as_nanos() as u64,
+                                );
+                            }
+                            return (failed, Some(token_tensor));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "GPU sampler tensor->vec failed; falling back to CPU");
+                        }
                     }
                 }
+                Err(e) => {
+                    // Fall through to CPU path on GPU sampling failure
+                    tracing::warn!(error = %e, "GPU batched sampling failed; falling back to CPU");
+                }
             }
-            Err(e) => {
-                // Fall through to CPU path on GPU sampling failure
-                tracing::warn!(error = %e, "GPU batched sampling failed; falling back to CPU");
-            }
-        }
+        } // end `if !constrained_apply_failed`
     }
 
     // CPU path: transfer logits and sample per-sequence.
@@ -1453,13 +1743,33 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 failed.push((req_id, "request no longer active".to_string()));
                 continue;
             };
-            let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];
-            let token_id = logit_slice
+            // Copy the logit row so we can mutate it (apply constraint mask).
+            // Cheap: vocab_size × 4 bytes ≈ 600 KB for Qwen3.
+            let mut logits: Vec<f32> = logits_cpu[i * vocab_size..(i + 1) * vocab_size].to_vec();
+            if let Some(ref mut constraint) = req.state.constraint {
+                // Pass empty `generated_text` — the constraints that
+                // care about per-step state advance via `accept_token`
+                // (grammar adapter / future per-token-state ones), not
+                // via re-decoding the full sequence. Legacy text-only
+                // constraints (`JsonSchemaConstraint`) only validate
+                // the final output and don't mask intra-stream, so
+                // they don't need the running text either. If a future
+                // constraint needs the live text it should plumb the
+                // tokenizer in through `ActiveRequest`.
+                if let Err(e) = constraint.mask_logits(&mut logits, "") {
+                    failed.push((req_id, format!("constraint error: {e}")));
+                    continue;
+                }
+            }
+            let token_id = logits
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as u32)
                 .unwrap_or(0);
+            if let Some(ref mut constraint) = req.state.constraint {
+                constraint.accept_token(token_id);
+            }
             req.state.block_table.advance(1);
             req.state.seqlen_offset += 1;
             req.state.generated_token_ids.push(token_id);
@@ -1470,15 +1780,33 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                 failed.push((req_id, "request no longer active".to_string()));
                 continue;
             };
-            let logit_slice = &logits_cpu[i * vocab_size..(i + 1) * vocab_size];
+            let mut logits: Vec<f32> = logits_cpu[i * vocab_size..(i + 1) * vocab_size].to_vec();
+            if let Some(ref mut constraint) = req.state.constraint {
+                // Pass empty `generated_text` — the constraints that
+                // care about per-step state advance via `accept_token`
+                // (grammar adapter / future per-token-state ones), not
+                // via re-decoding the full sequence. Legacy text-only
+                // constraints (`JsonSchemaConstraint`) only validate
+                // the final output and don't mask intra-stream, so
+                // they don't need the running text either. If a future
+                // constraint needs the live text it should plumb the
+                // tokenizer in through `ActiveRequest`.
+                if let Err(e) = constraint.mask_logits(&mut logits, "") {
+                    failed.push((req_id, format!("constraint error: {e}")));
+                    continue;
+                }
+            }
             let result = sampling::sample(
-                logit_slice,
+                &logits,
                 &req.state.sampling_params,
                 &req.state.generated_token_ids,
                 &mut req.state.sampler_state,
                 req.state.num_top_logprobs,
                 &req.state.stop_token_ids,
             );
+            if let Some(ref mut constraint) = req.state.constraint {
+                constraint.accept_token(result.token_id);
+            }
             req.state.block_table.advance(1);
             req.state.seqlen_offset += 1;
             req.state.generated_token_ids.push(result.token_id);
@@ -1493,9 +1821,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
     }
 
     if let (Some(t0), Some(dev)) = (t_sampling_start, step_dev_ref) {
+        #[cfg(feature = "cuda")]
         if let candle_core::Device::Cuda(cd) = dev {
             let _ = cd.cuda_stream().synchronize();
         }
+        #[cfg(not(feature = "cuda"))]
+        let _ = dev;
         step_profile::SAMPLING.ns[bucket].fetch_add(
             t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -1527,6 +1858,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
 /// - Push of `generated_token_ids` is deferred until the drain phase;
 ///   block-table / seqlen counters advance per step (they don't
 ///   depend on the token value).
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_pipelined_multi_step_decode<M: ModelForward>(
     decode_request_ids: &[RequestId],
@@ -1541,6 +1873,32 @@ pub(crate) fn execute_pipelined_multi_step_decode<M: ModelForward>(
 ) -> Vec<(RequestId, String)> {
     let prof_enabled = std::env::var("VLLM_PROFILE_PIPELINED").is_ok();
     let prof_total_start = prof_enabled.then(std::time::Instant::now);
+
+    // v1.9: any request with a grammar constraint MUST observe its
+    // freshly-sampled token before the next step's bitmask is built —
+    // otherwise the xgrammar matcher never advances and the GPU path
+    // emits broken output (initial-state bitmask reused every step).
+    // The pipelined async path defers the sampler-tensor DtoH past
+    // the next forward, breaking that invariant. Fall back to the
+    // synchronous serial decoder, which runs accept_token inline.
+    let any_constrained = decode_request_ids.iter().any(|id| {
+        requests
+            .get(id)
+            .map(|r| r.state.constraint.is_some())
+            .unwrap_or(false)
+    });
+    if any_constrained {
+        return run_serial_fallback_decode(
+            decode_request_ids,
+            num_steps,
+            model,
+            kv_cache_mgr,
+            requests,
+            dispatcher,
+            graph_runner,
+            preempted_out,
+        );
+    }
 
     let mut failed: Vec<(RequestId, String)> = Vec::new();
     let mut active: Vec<RequestId> = decode_request_ids.to_vec();
@@ -1738,6 +2096,7 @@ pub(crate) fn execute_pipelined_multi_step_decode<M: ModelForward>(
 /// `main_stream` and `wait` on `dtoh_stream` — non-blocking on the host.
 /// On `Ok(())` the pinned slot's internal event tracks the memcpy
 /// completion; the caller reads via `pinned.as_slice()` later.
+#[cfg(feature = "cuda")]
 fn dispatch_async_dtoh_for_sampler(
     tensor: &Tensor,
     n_elems: usize,
@@ -1801,6 +2160,7 @@ fn dispatch_async_dtoh_for_sampler(
 /// Defensive serial fallback used by the pipelined helper only when
 /// the device unexpectedly turns out non-CUDA (env gate should
 /// prevent this; here as a last-resort safety net).
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn run_serial_fallback_decode<M: ModelForward>(
     decode_request_ids: &[RequestId],
@@ -1987,6 +2347,14 @@ pub(crate) fn sample_token(
         state.num_top_logprobs,
         &state.stop_token_ids,
     );
+
+    // Advance the constraint's state machine with the freshly-sampled
+    // token so the next step's `mask_logits` reflects the grammar's
+    // post-token position. Default `accept_token` impl is a no-op for
+    // text-based constraints; stateful grammar adapters override.
+    if let Some(ref mut constraint) = state.constraint {
+        constraint.accept_token(result.token_id);
+    }
 
     if state.num_top_logprobs.is_some() {
         state.token_logprobs.push(result.logprob);

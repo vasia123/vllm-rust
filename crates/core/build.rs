@@ -95,6 +95,13 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/sampling.ptx",
         min_sm: 80,
     },
+    // In-place apply of structured-output grammar bitmask to logits
+    // (f32 / bf16 / f16). Sets `-inf` on tokens whose bit is 0.
+    KernelDef {
+        source: "kernels/apply_grammar_bitmask.cu",
+        output: "kernels/apply_grammar_bitmask.ptx",
+        min_sm: 80,
+    },
     // Marlin fused dequant+GEMM for GPTQ/AWQ INT4/INT8 — uses bf16
     KernelDef {
         source: "kernels/marlin_gemm.cu",

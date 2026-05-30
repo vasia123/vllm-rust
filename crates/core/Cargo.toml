@@ -52,6 +52,13 @@ cuda-default = [
 ]
 image-loading = ["dep:image", "dep:base64"]
 audio = ["dep:symphonia"]
+# Route JSON-Schema / regex / EBNF structured-output compilation through
+# the upstream xgrammar (mlc-ai/xgrammar) C++ library via our owned
+# sibling `xgrammar-rs` FFI crate. Default-off; off-build keeps the
+# native Rust port that only supports a subset of JSON Schema.
+# When on, enforces `pattern`, `minLength`/`maxLength`, `minimum`/`maximum`,
+# `additionalProperties:false`, etc. with parity to Python vLLM.
+xgrammar = ["dep:xgrammar-rs"]
 # Phase 1 of the architecture refactor (registry-based dispatch). Off by
 # default until Phase 2 ships and the registry is populated; legacy
 # match-arm dispatch remains the live path until then.
@@ -78,6 +85,7 @@ minijinja-contrib.workspace = true
 ahash.workspace = true
 candle-flash-attn = { workspace = true, optional = true }
 flashinfer-rs = { git = "https://github.com/vasia123/flashinfer-rs", optional = true }
+xgrammar-rs = { path = "../../../xgrammar-rs", optional = true }
 image = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
