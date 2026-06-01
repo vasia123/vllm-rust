@@ -44,6 +44,10 @@ struct CompiledTemplate {
 /// feature is off — it has a smaller dependency footprint at the
 /// cost of partial JSON-Schema enforcement.
 pub struct GrammarCompiler {
+    // Both fields are consumed only by the `xgrammar`-gated compile paths
+    // (`xgrammar_compiler_handle`, `compile`, `compile_sync`). Without the
+    // feature there is no backend, so they are intentionally unread.
+    #[cfg_attr(not(feature = "xgrammar"), allow(dead_code))]
     vocab_index: Arc<VocabularyIndex>,
     /// Token ids that terminate the grammar at an accepting state. The
     /// model EOS belongs here: xgrammar only marks a stop token as
@@ -54,6 +58,7 @@ pub struct GrammarCompiler {
     /// which need not match the model's real EOS — greedy then can't
     /// reach EOS at the accepting state and the engine emits trailing
     /// garbage (see the `diag_eos_termination_needs_stop_token_ids` test).
+    #[cfg_attr(not(feature = "xgrammar"), allow(dead_code))]
     stop_token_ids: Vec<u32>,
     cache: Arc<Mutex<HashMap<u64, Arc<CompiledTemplate>>>>,
     /// Lazily-built upstream xgrammar compiler, shared across all
