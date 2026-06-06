@@ -114,6 +114,8 @@ pub static REGISTRY: phf::Map<&'static str, &'static dyn ArchFactory> = phf_map!
     "Gemma4ForCausalLM" => &factories::gemma4_for_causal_lm::FACTORY as &dyn ArchFactory,
     "Gemma4ForConditionalGeneration" => &factories::gemma4_for_conditional_generation::FACTORY as &dyn ArchFactory,
     "Gemma4TextModel" => &factories::gemma4_for_causal_lm::FACTORY as &dyn ArchFactory,
+    "Gemma4UnifiedForConditionalGeneration" => &factories::gemma4_unified_for_conditional_generation::FACTORY as &dyn ArchFactory,
+    "Gemma4UnifiedTextModel" => &factories::gemma4_unified_for_conditional_generation::FACTORY as &dyn ArchFactory,
     "GemmaForCausalLM" => &factories::gemma::FACTORY as &dyn ArchFactory,
     "Glm4ForCausalLM" => &factories::glm4::FACTORY as &dyn ArchFactory,
     "Glm4MoeForCausalLM" => &factories::glm4_moe::FACTORY as &dyn ArchFactory,
@@ -366,5 +368,16 @@ mod tests {
         ] {
             assert!(lookup(arch).is_some(), "missing: {arch}");
         }
+    }
+
+    #[test]
+    fn registry_resolves_gemma4_unified() {
+        // Released Gemma 4 12B EXL3 quant (turboderp/gemma-4-12B-it-exl3)
+        // ships `architectures: ["Gemma4UnifiedForConditionalGeneration"]`.
+        assert!(
+            lookup("Gemma4UnifiedForConditionalGeneration").is_some(),
+            "Gemma4UnifiedForConditionalGeneration must be registered"
+        );
+        assert!(lookup("Gemma4UnifiedTextModel").is_some());
     }
 }

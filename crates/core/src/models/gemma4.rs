@@ -138,6 +138,11 @@ struct Gemma4ExtraConfig {
     use_double_wide_mlp: bool,
     // Global head dim (may differ from default head_dim for full-attention layers)
     global_head_dim: Option<usize>,
+    /// Number of KV heads on full-attention layers. The released Gemma 4
+    /// 12B/31B use far fewer KV heads on full layers than on sliding ones
+    /// (12B: 1 vs 8, 31B: 4 vs 16). `None` falls back to
+    /// `cfg.num_key_value_heads` (the homogeneous E2B case).
+    num_global_key_value_heads: Option<usize>,
 }
 
 impl Gemma4ExtraConfig {
@@ -286,6 +291,12 @@ impl Gemma4ExtraConfig {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
+        let num_global_key_value_heads = cfg
+            .extra
+            .get("num_global_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
         Self {
             attn_logit_softcap,
             final_logit_softcap,
@@ -305,6 +316,7 @@ impl Gemma4ExtraConfig {
             num_kv_shared_layers,
             use_double_wide_mlp,
             global_head_dim,
+            num_global_key_value_heads,
         }
     }
 
@@ -414,6 +426,25 @@ impl Gemma4ExtraConfig {
         } else {
             default_head_dim
         }
+    }
+
+    /// Number of KV heads for the given layer. Full-attention layers use
+    /// `num_global_key_value_heads` when set (released 12B/31B), sliding
+    /// layers always use the base `num_key_value_heads`.
+    fn kv_heads_for_layer(&self, layer_idx: usize, default_kv_heads: usize) -> usize {
+        if self.is_full_attention_layer(layer_idx) {
+            self.num_global_key_value_heads.unwrap_or(default_kv_heads)
+        } else {
+            default_kv_heads
+        }
+    }
+
+    /// Maximum KV-head count across all layers — the stride the shared KV
+    /// cache must be sized for. With `num_global_key_value_heads < num_kv_heads`
+    /// (the usual case) this is just the base count; the helper stays robust
+    /// if a future config inverts that.
+    fn max_kv_heads(&self, default_kv_heads: usize) -> usize {
+        default_kv_heads.max(self.num_global_key_value_heads.unwrap_or(default_kv_heads))
     }
 
     fn is_kv_shared_layer(&self, layer_idx: usize, num_hidden_layers: usize) -> bool {
@@ -687,6 +718,29 @@ fn pad_last_dim(x: &Tensor, from: usize, to: usize) -> Result<Tensor> {
     Tensor::cat(&[x, &zeros], 3)
 }
 
+/// Zero-pad the KV-head dimension (dim 1 of a `[b, heads, seq, head_dim]`
+/// tensor) from `from` to `to`. Full-attention layers use fewer KV heads
+/// than the shared cache stride; the extra heads are zero on write and
+/// sliced off on read. Symmetric to [`pad_last_dim`] but on the head axis.
+fn pad_kv_heads(x: &Tensor, from: usize, to: usize) -> Result<Tensor> {
+    if from == to {
+        return Ok(x.clone());
+    }
+    if to < from {
+        return Err(candle_core::Error::Msg(format!(
+            "pad_kv_heads: to ({to}) must be >= from ({from})"
+        )));
+    }
+    let (b, h, s, d) = x.dims4()?;
+    if h != from {
+        return Err(candle_core::Error::Msg(format!(
+            "pad_kv_heads: tensor head dim is {h}, expected {from}"
+        )));
+    }
+    let zeros = Tensor::zeros((b, to - from, s, d), x.dtype(), x.device())?;
+    Tensor::cat(&[x, &zeros], 1)
+}
+
 struct Gemma4Attention {
     q_proj: TpLinear,
     /// KV-shared layers (layers in the last `num_kv_shared_layers`) have
@@ -707,6 +761,11 @@ struct Gemma4Attention {
     /// Padded head dimension stored in the shared KV cache. Equal to
     /// `max(head_dim, global_head_dim)` across all layers.
     cache_head_dim: usize,
+    /// Padded KV-head count stored in the shared KV cache. Equal to
+    /// `max(num_key_value_heads, num_global_key_value_heads)` across all
+    /// layers. Full-attention layers with fewer KV heads zero-pad up to
+    /// this stride on write and slice back on read.
+    cache_num_kv_heads: usize,
     attn_logit_softcap: Option<f64>,
     sliding_window: Option<usize>,
     /// `true` when this layer reuses another layer's KV cache — no K/V
@@ -721,12 +780,13 @@ impl Gemma4Attention {
         extra_cfg: &Gemma4ExtraConfig,
         layer_idx: usize,
         cache_head_dim: usize,
+        cache_num_kv_heads: usize,
         is_kv_shared: bool,
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_heads = extra_cfg.kv_heads_for_layer(layer_idx, cfg.num_key_value_heads);
         let head_dim = extra_cfg.head_dim_for_layer(layer_idx, cfg.head_dim);
         let world_size = pg.world_size();
 
@@ -847,6 +907,7 @@ impl Gemma4Attention {
             num_kv_heads: num_kv_heads_per_gpu,
             head_dim,
             cache_head_dim,
+            cache_num_kv_heads: cache_num_kv_heads / world_size,
             attn_logit_softcap: extra_cfg.attn_logit_softcap,
             sliding_window,
             is_kv_shared,
@@ -929,9 +990,13 @@ impl Gemma4Attention {
 
             let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
-            // Pad K/V from layer head_dim to the shared cache head_dim.
+            // Pad K/V to the shared cache geometry: head_dim → cache_head_dim
+            // and (for full-attention layers with fewer KV heads) the KV-head
+            // count → cache_num_kv_heads.
             let k_padded = pad_last_dim(&k, self.head_dim, self.cache_head_dim)?;
             let v_padded = pad_last_dim(&v, self.head_dim, self.cache_head_dim)?;
+            let k_padded = pad_kv_heads(&k_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
+            let v_padded = pad_kv_heads(&v_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
 
             let k_for_cache = k_padded.squeeze(0)?.contiguous()?;
             let v_for_cache = v_padded.squeeze(0)?.contiguous()?;
@@ -966,17 +1031,28 @@ impl Gemma4Attention {
         let device = q.device();
         let dtype = q.dtype();
 
-        // K/V are stored at cache_head_dim; trim back to this layer's
-        // actual head_dim so the matmul shapes line up with Q.
+        // K/V are stored at the shared cache geometry; trim back to this
+        // layer's actual KV-head count (dim 1) and head_dim (dim 3) so the
+        // matmul shapes line up with Q.
+        let k_full = if k_full.dim(1)? != self.num_kv_heads {
+            k_full.narrow(1, 0, self.num_kv_heads)?
+        } else {
+            k_full.clone()
+        };
+        let v_full = if v_full.dim(1)? != self.num_kv_heads {
+            v_full.narrow(1, 0, self.num_kv_heads)?
+        } else {
+            v_full.clone()
+        };
         let k_full = if k_full.dim(3)? != self.head_dim {
             k_full.narrow(3, 0, self.head_dim)?
         } else {
-            k_full.clone()
+            k_full
         };
         let v_full = if v_full.dim(3)? != self.head_dim {
             v_full.narrow(3, 0, self.head_dim)?
         } else {
-            v_full.clone()
+            v_full
         };
 
         let kv_len = k_full.dim(2)?;
@@ -1072,6 +1148,8 @@ impl Gemma4Attention {
                 let (q_i, k_i) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
                 let k_padded = pad_last_dim(&k_i, self.head_dim, self.cache_head_dim)?;
                 let v_padded = pad_last_dim(&v_i, self.head_dim, self.cache_head_dim)?;
+                let k_padded = pad_kv_heads(&k_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
+                let v_padded = pad_kv_heads(&v_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
                 let k_for_cache = k_padded.squeeze(0)?.contiguous()?;
                 let v_for_cache = v_padded.squeeze(0)?.contiguous()?;
                 cache_engine
@@ -1085,7 +1163,18 @@ impl Gemma4Attention {
                 .read(&seq.block_ids, kv_len)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
 
-            // Slice padded cache back to this layer's real head_dim.
+            // Slice padded cache back to this layer's real KV-head count
+            // (dim 1) and head_dim (dim 3).
+            let k_full = if k_full.dim(1)? != self.num_kv_heads {
+                k_full.narrow(1, 0, self.num_kv_heads)?
+            } else {
+                k_full
+            };
+            let v_full = if v_full.dim(1)? != self.num_kv_heads {
+                v_full.narrow(1, 0, self.num_kv_heads)?
+            } else {
+                v_full
+            };
             let k_full = if k_full.dim(3)? != self.head_dim {
                 k_full.narrow(3, 0, self.head_dim)?
             } else {
@@ -1161,6 +1250,7 @@ impl Gemma4DecoderLayer {
         extra_cfg: &Gemma4ExtraConfig,
         layer_idx: usize,
         cache_head_dim: usize,
+        cache_num_kv_heads: usize,
         vb: VarBuilder,
         pg: &dyn ProcessGroup,
     ) -> Result<Self> {
@@ -1172,6 +1262,7 @@ impl Gemma4DecoderLayer {
             extra_cfg,
             layer_idx,
             cache_head_dim,
+            cache_num_kv_heads,
             is_kv_shared,
             vb.pp("self_attn"),
             pg,
@@ -1525,6 +1616,7 @@ impl Gemma4ForCausalLM {
             };
 
         let cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
+        let cache_num_kv_heads = extra_cfg.max_kv_heads(cfg.num_key_value_heads);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for i in 0..cfg.num_hidden_layers {
@@ -1533,6 +1625,7 @@ impl Gemma4ForCausalLM {
                 &extra_cfg,
                 i,
                 cache_head_dim,
+                cache_num_kv_heads,
                 vb_l.pp(i),
                 pg,
             )?);

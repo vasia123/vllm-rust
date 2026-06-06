@@ -121,8 +121,9 @@ enum Command {
         /// Reasoning parser for extracting chain-of-thought content from model output.
         /// Supported: deepseek_r1, deepseek_v3, qwen3, mistral, step3, step3p5,
         /// ernie45, granite, olmo3, seed_oss, minimax_m2, hunyuan_a13b,
-        /// glm45, holo2, kimi_k2, identity.
-        /// Empty string or "identity" disables reasoning extraction.
+        /// glm45, holo2, kimi_k2, gemma4, identity.
+        /// Empty string auto-selects per model family (Gemma 4 → `gemma4`);
+        /// "identity" disables reasoning extraction.
         #[arg(long, default_value = "")]
         reasoning_parser: String,
 
@@ -1357,7 +1358,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     eprintln!("Loading model: {model_id}");
     let cache_dir = download_dir.as_deref().map(std::path::Path::new);
-    let files = loader::fetch_model_with_options(
+    let mut files = loader::fetch_model_with_options(
         &model_id,
         &revision,
         hf_token.as_deref(),
@@ -1365,6 +1366,20 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         parsed_load_format,
         max_parallel_loading_workers,
     )?;
+
+    // `--max-model-len` overrides the model's `max_position_embeddings`.
+    // Apply it to the config BEFORE building the model: several models
+    // (notably Gemma 4, which builds a *per-layer* RoPE table) precompute
+    // rotary cos/sin tables sized to `max_position_embeddings`. Gemma 4's
+    // 262144-position default × 48 layers would allocate many GiB of RoPE
+    // tables and OOM before the weights even load. Clamping here caps the
+    // precompute to the context the user actually requested; requests
+    // beyond `max_model_len` are already rejected by the engine limits.
+    if let Some(mml) = max_model_len_override {
+        if mml < files.config.max_position_embeddings {
+            files.config.max_position_embeddings = mml;
+        }
+    }
 
     let device = create_cuda_device(0)?;
 
@@ -1698,6 +1713,35 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             .tokenizer_config
             .as_ref()
             .and_then(|path| ChatTemplateEngine::from_tokenizer_config(path).ok())
+            .or_else(|| {
+                // Newer HF checkpoints (Gemma 4 among them) ship the chat
+                // template as a standalone `chat_template.jinja` next to the
+                // tokenizer instead of a `chat_template` field inside
+                // `tokenizer_config.json`. Fall back to that file so the
+                // chat endpoint works out of the box.
+                let dir = files.tokenizer.parent()?;
+                let template = std::fs::read_to_string(dir.join("chat_template.jinja")).ok()?;
+                let token_str = |key: &str| -> String {
+                    files
+                        .tokenizer_config
+                        .as_ref()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| match &v[key] {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            obj => obj
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .map(String::from),
+                        })
+                        .unwrap_or_default()
+                };
+                Some(ChatTemplateEngine::new(
+                    template,
+                    token_str("bos_token"),
+                    token_str("eos_token"),
+                ))
+            })
             .map(Arc::new)
     };
 
@@ -1762,8 +1806,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         let computed_blocks = CacheConfig::from_memory_budget_with_kv_dtype(
             kv_budget,
             files.config.num_hidden_layers,
-            files.config.num_key_value_heads,
-            files.config.head_dim,
+            files.config.kv_cache_num_kv_heads(),
+            files.config.kv_cache_head_dim(),
             block_size,
             dtype,
             device.clone(),
@@ -1793,8 +1837,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             let bytes = (offload_gb * 1024.0 * 1024.0 * 1024.0) as usize;
             let bytes_per_block = 2
                 * files.config.num_hidden_layers
-                * files.config.num_key_value_heads
-                * files.config.head_dim
+                * files.config.kv_cache_num_kv_heads()
+                * files.config.kv_cache_head_dim()
                 * block_size
                 * dtype.size_in_bytes();
             let max_blocks = if bytes_per_block > 0 {
@@ -1822,8 +1866,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         block_size,
         num_blocks,
         num_layers: kv_cache_num_layers,
-        num_kv_heads: files.config.num_key_value_heads,
-        head_dim: files.config.head_dim,
+        num_kv_heads: files.config.kv_cache_num_kv_heads(),
+        head_dim: files.config.kv_cache_head_dim(),
         dtype,
         device: device.clone(),
         kv_cache_dtype: parsed_kv_cache_dtype,
@@ -1941,7 +1985,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // base). Fall back to 0; stop logic still honors stop_strings +
     // max_tokens + chat template markers when EOS is unset.
     let eos_token_id = files.config.eos_token_id.unwrap_or(0);
-    let engine_tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
+    // Prompts fed to the engine are tokenized via `encode_prompt`, which
+    // guarantees a leading BOS when the model declares one. Gemma in
+    // particular degenerates into prior-only output without `<bos>`, and its
+    // EXL3 `tokenizer.json` ships a stripped post-processor that adds none.
+    let engine_tokenizer =
+        TokenizerWrapper::from_file(&tokenizer_path)?.with_bos_token_id(files.config.bos_token_id);
 
     // Build speculative config once; acceptance_method is always carried through.
     let spec_config_base = SpeculativeConfig {
@@ -2021,8 +2070,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 block_size,
                 num_blocks: draft_num_blocks,
                 num_layers: draft_files.config.num_hidden_layers,
-                num_kv_heads: draft_files.config.num_key_value_heads,
-                head_dim: draft_files.config.head_dim,
+                num_kv_heads: draft_files.config.kv_cache_num_kv_heads(),
+                head_dim: draft_files.config.kv_cache_head_dim(),
                 dtype,
                 device: device.clone(),
                 kv_cache_dtype: KVCacheDtype::Auto,
@@ -2126,6 +2175,22 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // reuse it here so AppState and the engine's pool sizing observe a
     // single source of truth.
     let max_model_len = engine_limits.max_model_len();
+    // Auto-select the reasoning parser by model family when not given
+    // explicitly. Gemma 4 emits a `<|channel>thought\n…<channel|>` thinking
+    // channel (or a bare `thought\n` label once special tokens are stripped)
+    // that must be parsed out of chat responses.
+    let reasoning_parser = if reasoning_parser.is_empty()
+        && files
+            .config
+            .architectures
+            .iter()
+            .any(|a| a.starts_with("Gemma4"))
+    {
+        "gemma4".to_string()
+    } else {
+        reasoning_parser
+    };
+
     let state = AppState::new(
         atomic_engine.clone(),
         served_model_name,
@@ -2145,7 +2210,8 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         enable_lora,
         max_cpu_loras,
         disable_mm_preprocessor_cache,
-    );
+    )
+    .with_additional_eos_token_ids(files.config.eos_token_ids());
 
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2422,8 +2488,8 @@ fn compute_draft_kv_blocks(
         let elem_size = kv_cache_dtype.element_size(dtype);
         let per_block_bytes = target_block_size
             * draft_config.num_hidden_layers
-            * draft_config.num_key_value_heads
-            * draft_config.head_dim
+            * draft_config.kv_cache_num_kv_heads()
+            * draft_config.kv_cache_head_dim()
             * 2 // K + V tensors per layer
             * elem_size;
 
@@ -2456,8 +2522,8 @@ fn compute_draft_kv_blocks(
             kv_budget as f64 / (1024.0 * 1024.0),
             per_block_bytes,
             draft_config.num_hidden_layers,
-            draft_config.num_key_value_heads,
-            draft_config.head_dim,
+            draft_config.kv_cache_num_kv_heads(),
+            draft_config.kv_cache_head_dim(),
             elem_size * 8,
             target_block_size,
             blocks,
@@ -2557,8 +2623,8 @@ async fn run_pipeline_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         block_size: cfg.block_size,
         num_blocks: cfg.num_blocks,
         num_layers: stage.num_layers,
-        num_kv_heads: files.config.num_key_value_heads,
-        head_dim: files.config.head_dim,
+        num_kv_heads: files.config.kv_cache_num_kv_heads(),
+        head_dim: files.config.kv_cache_head_dim(),
         dtype: cfg.dtype,
         device: device.clone(),
         kv_cache_dtype: match cfg.kv_cache_dtype.as_str() {
@@ -2644,8 +2710,8 @@ async fn run_tensor_worker(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         block_size: cfg.block_size,
         num_blocks: cfg.num_blocks,
         num_layers: files.config.num_hidden_layers,
-        num_kv_heads: files.config.num_key_value_heads,
-        head_dim: files.config.head_dim,
+        num_kv_heads: files.config.kv_cache_num_kv_heads(),
+        head_dim: files.config.kv_cache_head_dim(),
         dtype: cfg.dtype,
         device: device.clone(),
         kv_cache_dtype: match cfg.kv_cache_dtype.as_str() {
@@ -2741,14 +2807,15 @@ async fn run_generate(
     // Note: `report_gpu_mem` is defined below; we call it twice so the
     // user sees VRAM right after load + after any warmup / graph capture.
 
-    let tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
+    let tokenizer =
+        TokenizerWrapper::from_file(&files.tokenizer)?.with_bos_token_id(files.config.bos_token_id);
 
     let cache_config = CacheConfig {
         block_size: 16,
         num_blocks,
         num_layers: files.config.num_hidden_layers,
-        num_kv_heads: files.config.num_key_value_heads,
-        head_dim: files.config.head_dim,
+        num_kv_heads: files.config.kv_cache_num_kv_heads(),
+        head_dim: files.config.kv_cache_head_dim(),
         dtype,
         device: device.clone(),
         kv_cache_dtype: KVCacheDtype::Auto,
@@ -2848,8 +2915,8 @@ async fn run_generate(
                 block_size: 16,
                 num_blocks: draft_num_blocks,
                 num_layers: draft_files.config.num_hidden_layers,
-                num_kv_heads: draft_files.config.num_key_value_heads,
-                head_dim: draft_files.config.head_dim,
+                num_kv_heads: draft_files.config.kv_cache_num_kv_heads(),
+                head_dim: draft_files.config.kv_cache_head_dim(),
                 dtype,
                 device: device.clone(),
                 kv_cache_dtype: KVCacheDtype::Auto,

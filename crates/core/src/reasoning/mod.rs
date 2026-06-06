@@ -1000,6 +1000,98 @@ impl ReasoningParser for GptOssReasoningParser {
     }
 }
 
+// ─── Gemma 4 thinking-channel parser ────────────────────────────────────────
+
+/// Gemma 4 wraps chain-of-thought in a thinking channel:
+/// `<|channel>thought\n…reasoning…<channel|>…answer…`. The `thought\n`
+/// directly after the start tag is a role label (analogous to `user\n` in a
+/// turn) and is stripped. When thinking is disabled some Gemma 4 builds still
+/// emit a bare `thought\n` prefix with no channel tags — that is stripped too.
+///
+/// Ported from vLLM `reasoning/gemma4_utils.py::parse_thinking_output`.
+/// Streaming re-parses the accumulated text and diffs (same approach as the
+/// GPT-OSS parser), which is robust to the channel tags arriving split across
+/// deltas.
+struct Gemma4ReasoningParser;
+
+impl Gemma4ReasoningParser {
+    const START_TAG: &'static str = "<|channel>";
+    const END_TAG: &'static str = "<channel|>";
+    const THOUGHT_LABEL: &'static str = "thought\n";
+    const TURN_END: &'static str = "<turn|>";
+
+    fn strip_thought_label(text: &str) -> &str {
+        text.strip_prefix(Self::THOUGHT_LABEL).unwrap_or(text)
+    }
+
+    fn clean_answer(text: &str) -> String {
+        let mut t = text.trim();
+        if let Some(s) = t.strip_suffix(Self::TURN_END) {
+            t = s.trim_end();
+        }
+        if let Some(s) = t.strip_suffix("<eos>") {
+            t = s.trim_end();
+        }
+        t.to_string()
+    }
+
+    fn parse(text: &str) -> ReasoningOutput {
+        if let Some(end_pos) = text.find(Self::END_TAG) {
+            let thinking_block = &text[..end_pos];
+            let answer = Self::clean_answer(&text[end_pos + Self::END_TAG.len()..]);
+            // Reasoning is everything after the (optional) start tag.
+            let thinking_raw = match thinking_block.find(Self::START_TAG) {
+                Some(p) => &thinking_block[p + Self::START_TAG.len()..],
+                None => thinking_block,
+            };
+            let thinking = Self::strip_thought_label(thinking_raw.trim()).trim();
+            ReasoningOutput {
+                reasoning: if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking.to_string())
+                },
+                content: Some(answer),
+            }
+        } else {
+            // No channel tags: strip a spurious bare `thought\n` prefix.
+            let answer = Self::clean_answer(Self::strip_thought_label(text));
+            ReasoningOutput {
+                reasoning: None,
+                content: Some(answer),
+            }
+        }
+    }
+
+    fn delta(prev: Option<&str>, cur: Option<&str>) -> Option<String> {
+        let cur = cur?;
+        match prev {
+            None => Some(cur.to_string()),
+            Some(p) if cur.starts_with(p) => {
+                let tail = &cur[p.len()..];
+                (!tail.is_empty()).then(|| tail.to_string())
+            }
+            Some(_) => Some(cur.to_string()),
+        }
+    }
+}
+
+impl ReasoningParser for Gemma4ReasoningParser {
+    fn extract_reasoning(&self, output: &str) -> ReasoningOutput {
+        Self::parse(output)
+    }
+
+    fn extract_reasoning_streaming(&self, previous_text: &str, delta_text: &str) -> ReasoningDelta {
+        let current = format!("{previous_text}{delta_text}");
+        let prev = Self::parse(previous_text);
+        let cur = Self::parse(&current);
+        ReasoningDelta {
+            reasoning: Self::delta(prev.reasoning.as_deref(), cur.reasoning.as_deref()),
+            content: Self::delta(prev.content.as_deref(), cur.content.as_deref()),
+        }
+    }
+}
+
 // ─── Factory ──────────────────────────────────────────────────────────────
 
 /// Create a reasoning parser by name.
@@ -1096,6 +1188,7 @@ pub fn create_reasoning_parser(name: &str) -> Box<dyn ReasoningParser> {
             TagParserMode::DeepSeekR1,
         )),
         "gpt_oss" | "gpt-oss" | "gptoss" => Box::new(GptOssReasoningParser),
+        "gemma4" | "gemma_4" | "gemma-4" => Box::new(Gemma4ReasoningParser),
         // No-op: all output is content
         "identity" | "" => Box::new(IdentityReasoningParser),
         unknown => {
@@ -1601,5 +1694,48 @@ mod tests {
                 "alias '{name}' failed"
             );
         }
+    }
+
+    #[test]
+    fn gemma4_tagged_channel_splits_reasoning_and_answer() {
+        let parser = create_reasoning_parser("gemma4");
+        let out = "<|channel>thought\nLet me think about France.<channel|>The capital is Paris.";
+        let r = parser.extract_reasoning(out);
+        assert_eq!(r.reasoning.as_deref(), Some("Let me think about France."));
+        assert_eq!(r.content.as_deref(), Some("The capital is Paris."));
+    }
+
+    #[test]
+    fn gemma4_bare_thought_prefix_is_stripped() {
+        // The case our EXL3 pipeline actually produces (channel tags are
+        // stripped by skip-special decode, leaving a bare `thought\n`).
+        let parser = create_reasoning_parser("gemma4");
+        let r = parser.extract_reasoning("thought\nThe capital of France is Paris.");
+        assert_eq!(r.reasoning, None);
+        assert_eq!(
+            r.content.as_deref(),
+            Some("The capital of France is Paris.")
+        );
+    }
+
+    #[test]
+    fn gemma4_clean_output_untouched_and_sentinels_trimmed() {
+        let parser = create_reasoning_parser("gemma4");
+        let r = parser.extract_reasoning("Just the answer.<turn|>");
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("Just the answer."));
+    }
+
+    #[test]
+    fn gemma4_streaming_diffs_content() {
+        let parser = create_reasoning_parser("gemma4");
+        // Bare-prefix case streamed token by token: the `thought\n` label
+        // alone yields no visible content delta; the first real token after
+        // it streams as content.
+        let d1 = parser.extract_reasoning_streaming("", "thought\n");
+        assert_eq!(d1.content, None);
+        assert_eq!(d1.reasoning, None);
+        let d2 = parser.extract_reasoning_streaming("thought\n", "Paris");
+        assert_eq!(d2.content.as_deref(), Some("Paris"));
     }
 }

@@ -114,6 +114,10 @@ name = "attention_bench"
 harness = false
 
 [[bench]]
+name = "gemma4_hetero_kv_bench"
+harness = false
+
+[[bench]]
 name = "quantization_bench"
 harness = false
 

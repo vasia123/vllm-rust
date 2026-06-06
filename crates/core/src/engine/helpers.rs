@@ -370,7 +370,7 @@ fn admit_request(
     block_size: usize,
     kv_cache_mgr: &mut KVCacheManager,
 ) {
-    let prompt_ids = match tokenizer.encode(&request.prompt) {
+    let prompt_ids = match tokenizer.encode_prompt(&request.prompt) {
         Ok(ids) => ids,
         Err(e) => {
             send_error(response, EngineError::Tokenization(e.to_string()));

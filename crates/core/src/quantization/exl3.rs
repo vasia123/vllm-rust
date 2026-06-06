@@ -88,16 +88,25 @@ impl Exl3Config {
     /// regression on ExLlamaV3 head_bits checkpoints (declared 2bpw,
     /// lm_head actually 6bpw).
     pub fn from_detected(raw: &HashMap<String, Value>) -> Self {
-        let mcg_default = raw
-            .get("mcg_multiplier")
-            .and_then(|v| v.as_u64())
-            .map(|m| m as u32 == EXL3_MCG_MULTIPLIER)
-            .unwrap_or(false);
-        let mul1_default = raw
-            .get("mul1_multiplier")
-            .and_then(|v| v.as_u64())
-            .map(|m| m as u32 == EXL3_MUL1_MULTIPLIER)
-            .unwrap_or(false);
+        // Newer ExLlamaV3 quants (≥ 0.0.3x) record the codebook by name in
+        // `quantization_config.json` as `"codebook": "mcg" | "mul1"` rather
+        // than an explicit `mcg_multiplier` integer. Honour both: the string
+        // form is the global default, and per-linear `.mcg` / `.mul1` flag
+        // tensors (probed in `Exl3WeightLoader::load_linear`) can still
+        // override it. The released Gemma 4 quants use `"codebook": "mcg"`.
+        let codebook = raw.get("codebook").and_then(|v| v.as_str());
+        let mcg_default = codebook == Some("mcg")
+            || raw
+                .get("mcg_multiplier")
+                .and_then(|v| v.as_u64())
+                .map(|m| m as u32 == EXL3_MCG_MULTIPLIER)
+                .unwrap_or(false);
+        let mul1_default = codebook == Some("mul1")
+            || raw
+                .get("mul1_multiplier")
+                .and_then(|v| v.as_u64())
+                .map(|m| m as u32 == EXL3_MUL1_MULTIPLIER)
+                .unwrap_or(false);
 
         let ignored_layers = raw
             .get("modules_to_not_convert")
@@ -336,6 +345,23 @@ mod tests {
         let cfg = Exl3Config::from_detected(&raw);
         assert!(cfg.mcg_default);
         assert!(cfg.mul1_default);
+    }
+
+    #[test]
+    fn config_picks_up_codebook_by_name() {
+        // Released Gemma 4 quants record `"codebook": "mcg"` (no explicit
+        // `mcg_multiplier` integer). The string form must enable mcg.
+        let mut raw = HashMap::new();
+        raw.insert("codebook".to_string(), json!("mcg"));
+        let cfg = Exl3Config::from_detected(&raw);
+        assert!(cfg.mcg_default, "codebook=\"mcg\" must set mcg_default");
+        assert!(!cfg.mul1_default);
+
+        let mut raw_mul1 = HashMap::new();
+        raw_mul1.insert("codebook".to_string(), json!("mul1"));
+        let cfg_mul1 = Exl3Config::from_detected(&raw_mul1);
+        assert!(cfg_mul1.mul1_default);
+        assert!(!cfg_mul1.mcg_default);
     }
 
     #[test]

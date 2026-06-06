@@ -96,8 +96,8 @@ impl EngineBuilder for ProductionEngineBuilder {
             block_size: config.block_size,
             num_blocks: config.num_blocks,
             num_layers: files.config.num_hidden_layers,
-            num_kv_heads: files.config.num_key_value_heads,
-            head_dim: files.config.head_dim,
+            num_kv_heads: files.config.kv_cache_num_kv_heads(),
+            head_dim: files.config.kv_cache_head_dim(),
             dtype,
             device: device.clone(),
             kv_cache_dtype: KVCacheDtype::Auto,
@@ -109,7 +109,8 @@ impl EngineBuilder for ProductionEngineBuilder {
         );
         let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
 
-        let engine_tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?;
+        let engine_tokenizer = TokenizerWrapper::from_file(&files.tokenizer)?
+            .with_bos_token_id(files.config.bos_token_id);
 
         let handle = if let Some(ref draft_id) = config.draft_model {
             eprintln!("Loading draft model: {draft_id}");
@@ -128,8 +129,8 @@ impl EngineBuilder for ProductionEngineBuilder {
                 block_size: config.block_size,
                 num_blocks: config.num_blocks,
                 num_layers: draft_files.config.num_hidden_layers,
-                num_kv_heads: draft_files.config.num_key_value_heads,
-                head_dim: draft_files.config.head_dim,
+                num_kv_heads: draft_files.config.kv_cache_num_kv_heads(),
+                head_dim: draft_files.config.kv_cache_head_dim(),
                 dtype,
                 device: device.clone(),
                 kv_cache_dtype: KVCacheDtype::Auto,

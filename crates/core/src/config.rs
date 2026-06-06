@@ -72,11 +72,23 @@ pub fn flatten_hf_model_config(raw: &str) -> Result<String, serde_json::Error> {
         }
     }
 
-    // `eos_token_id` can be an array (e.g. Gemma 4 has `[1, 106]`).
-    // `ModelConfig::eos_token_id` is a single `u32`, so take the first.
+    // `eos_token_id` can be an array (e.g. Gemma 4 has `[1, 106]` —
+    // `<eos>` and `<end_of_turn>`). `ModelConfig::eos_token_id` is a single
+    // `u32`, so collapse to the first, but preserve the full set under
+    // `eos_token_ids` so the engine can stop on ALL of them (otherwise an
+    // instruct model that ends a turn with `<end_of_turn>` runs past the
+    // answer and degenerates — see `ModelConfig::eos_token_ids`).
     if let Some(eos) = obj.get("eos_token_id").cloned() {
-        if let Some(first) = eos.as_array().and_then(|a| a.first().cloned()) {
-            obj.insert("eos_token_id".to_string(), first);
+        if let Some(arr) = eos.as_array() {
+            if !obj.contains_key("eos_token_ids") {
+                obj.insert(
+                    "eos_token_ids".to_string(),
+                    serde_json::Value::Array(arr.clone()),
+                );
+            }
+            if let Some(first) = arr.first().cloned() {
+                obj.insert("eos_token_id".to_string(), first);
+            }
         }
     }
 
@@ -247,6 +259,53 @@ impl ModelConfig {
     /// Check if this is a MoE (Mixture of Experts) model.
     pub fn is_moe(&self) -> bool {
         self.extra.contains_key("n_routed_experts")
+    }
+
+    /// All end-of-sequence token ids. HF configs may list several (Gemma 4
+    /// ships `[1, 106]` = `<eos>` + `<end_of_turn>`); generation must stop on
+    /// any of them. Falls back to the single `eos_token_id` when no array is
+    /// present. Empty only if the model declares no EOS at all.
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        if let Some(arr) = self.extra.get("eos_token_ids").and_then(|v| v.as_array()) {
+            let ids: Vec<u32> = arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect();
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+        self.eos_token_id.into_iter().collect()
+    }
+
+    /// KV-cache head dimension. Most models return `head_dim`, but some
+    /// (Gemma 4) use a larger `head_dim` on full-attention layers
+    /// (`global_head_dim`). All layers share one paged KV cache, so it must
+    /// be allocated at the maximum per-layer head_dim; the model pads/slices
+    /// per layer. Returns `head_dim` when no heterogeneity is declared.
+    pub fn kv_cache_head_dim(&self) -> usize {
+        let global = self
+            .extra
+            .get("global_head_dim")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(self.head_dim);
+        self.head_dim.max(global)
+    }
+
+    /// KV-cache key/value head count. Mirrors [`Self::kv_cache_head_dim`]:
+    /// Gemma 4 full-attention layers use fewer KV heads
+    /// (`num_global_key_value_heads`) than sliding layers, so the shared
+    /// cache is sized at the maximum and per-layer reads/writes pad/slice.
+    /// Returns `num_key_value_heads` when no heterogeneity is declared.
+    pub fn kv_cache_num_kv_heads(&self) -> usize {
+        let global = self
+            .extra
+            .get("num_global_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(self.num_key_value_heads);
+        self.num_key_value_heads.max(global)
     }
 
     /// Get the number of routed experts (for MoE models).
@@ -647,8 +706,30 @@ mod tests {
         // collapser picks the first element. (`text_config.eos_token_id`
         // is 1, so both paths agree here.)
         assert_eq!(cfg.eos_token_id, Some(1));
+        // …but the full set is preserved so generation stops on BOTH `<eos>`
+        // (1) and `<end_of_turn>` (106) — without 106 an instruct model runs
+        // past the answer and degenerates.
+        assert_eq!(cfg.eos_token_ids(), vec![1, 106]);
+        // BOS is pulled up from text_config (Gemma needs a leading <bos>).
+        assert_eq!(cfg.bos_token_id, Some(2));
         // Architecture is preserved so the VLM dispatch still fires.
         assert_eq!(cfg.architectures, vec!["Gemma4ForConditionalGeneration"]);
+    }
+
+    #[test]
+    fn eos_token_ids_falls_back_to_single() {
+        // A model with a scalar `eos_token_id` and no array → single-element
+        // set (no spurious extra stop tokens).
+        let raw = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+            "num_hidden_layers": 2, "intermediate_size": 128, "vocab_size": 256,
+            "max_position_embeddings": 256, "head_dim": 16, "hidden_act": "silu",
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "eos_token_id": 7
+        }"#;
+        let cfg: ModelConfig =
+            serde_json::from_str(&flatten_hf_model_config(raw).unwrap()).unwrap();
+        assert_eq!(cfg.eos_token_ids(), vec![7]);
     }
 
     #[test]

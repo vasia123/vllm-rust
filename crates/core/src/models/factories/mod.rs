@@ -68,6 +68,7 @@ pub mod gemma3n_for_causal_lm;
 pub mod gemma3n_for_conditional_generation;
 pub mod gemma4_for_causal_lm;
 pub mod gemma4_for_conditional_generation;
+pub mod gemma4_unified_for_conditional_generation;
 pub mod glm;
 pub mod glm4;
 pub mod glm4_moe;

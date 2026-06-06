@@ -145,6 +145,11 @@ pub struct AppState {
     pub tokenizer: Arc<TokenizerWrapper>,
     pub chat_template: Option<Arc<ChatTemplateEngine>>,
     pub eos_token_id: u32,
+    /// Extra end-of-sequence token ids beyond `eos_token_id` (e.g. Gemma 4's
+    /// `<end_of_turn>` = 106 alongside `<eos>` = 1). Merged into every
+    /// request's stop-token set so instruct models terminate cleanly instead
+    /// of running past the answer. Empty for single-EOS models.
+    pub additional_eos_token_ids: Vec<u32>,
     /// Lazily-built, process-shared grammar compiler for structured
     /// output. Building it decodes the whole vocab into a
     /// `VocabularyIndex` (~0.5 s for a 151k-token tokenizer) and marshals
@@ -225,6 +230,7 @@ impl AppState {
             tokenizer,
             chat_template,
             eos_token_id,
+            additional_eos_token_ids: Vec::new(),
             grammar_compiler: Arc::new(std::sync::OnceLock::new()),
             max_model_len,
             tool_call_parser,
@@ -246,6 +252,29 @@ impl AppState {
         }
     }
 
+    /// Attach extra EOS token ids (beyond `eos_token_id`) that should also
+    /// terminate generation. See [`Self::additional_eos_token_ids`].
+    pub fn with_additional_eos_token_ids(mut self, ids: Vec<u32>) -> Self {
+        self.additional_eos_token_ids = ids
+            .into_iter()
+            .filter(|&t| t != self.eos_token_id)
+            .collect();
+        self
+    }
+
+    /// Merge the request's explicit stop-token ids with the model's extra EOS
+    /// tokens (e.g. Gemma 4 `<end_of_turn>`), de-duplicating. Used by the
+    /// completion/chat handlers so every request stops on a turn terminator
+    /// even when the caller passes none.
+    pub fn merge_stop_token_ids(&self, mut req_ids: Vec<u32>) -> Vec<u32> {
+        for &t in &self.additional_eos_token_ids {
+            if !req_ids.contains(&t) {
+                req_ids.push(t);
+            }
+        }
+        req_ids
+    }
+
     /// The process-shared structured-output grammar compiler, built on
     /// first use. The compiler owns the decoded `VocabularyIndex` and the
     /// marshalled xgrammar `TokenizerInfo`, and is configured with the
@@ -255,16 +284,27 @@ impl AppState {
         self.grammar_compiler
             .get_or_init(|| {
                 let vocab_index = Arc::new(VocabularyIndex::from_tokenizer_arc(&self.tokenizer));
-                Arc::new(GrammarCompiler::with_stop_tokens(
-                    vocab_index,
-                    vec![self.eos_token_id],
-                ))
+                let mut stop = vec![self.eos_token_id];
+                stop.extend(self.additional_eos_token_ids.iter().copied());
+                Arc::new(GrammarCompiler::with_stop_tokens(vocab_index, stop))
             })
             .clone()
     }
 
     pub fn accepting_requests(&self) -> bool {
         self.accepting.load(Ordering::SeqCst)
+    }
+
+    /// Append the model's extra EOS tokens (e.g. Gemma 4's `<end_of_turn>`)
+    /// to a request's `stop_token_ids` so generation terminates at a turn
+    /// boundary even when the caller didn't list them. Idempotent.
+    pub fn merge_additional_eos(&self, mut stop_token_ids: Vec<u32>) -> Vec<u32> {
+        for &t in &self.additional_eos_token_ids {
+            if !stop_token_ids.contains(&t) {
+                stop_token_ids.push(t);
+            }
+        }
+        stop_token_ids
     }
 
     /// Increment the in-flight GPU request counter.

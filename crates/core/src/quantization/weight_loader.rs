@@ -515,12 +515,23 @@ impl QuantizedWeightLoader for Exl3WeightLoader {
             None
         };
 
+        // Codebook selection. ExLlamaV3 emits a per-linear `.mcg` / `.mul1`
+        // flag tensor (int32 scalar) when the corresponding codebook
+        // multiplier is active. Probing the tensor directly is more robust
+        // than the global `quantization_config.json` default — a checkpoint
+        // can mix codebooks per layer. Presence of the tensor → flag on;
+        // when absent we fall back to the config-level default. We must use
+        // `get_unchecked_dtype` (errors when missing) rather than the
+        // zero-filling `get_with_hints_dtype` so absence is detectable.
+        let mcg = vb.get_unchecked_dtype("mcg", DType::I32).is_ok() || self.config.mcg_default;
+        let mul1 = vb.get_unchecked_dtype("mul1", DType::I32).is_ok() || self.config.mul1_default;
+
         Ok(Box::new(Exl3Linear {
             trellis,
             suh,
             svh,
-            mcg: self.config.mcg_default,
-            mul1: self.config.mul1_default,
+            mcg,
+            mul1,
             bias: bias_tensor,
             in_features,
             out_features,

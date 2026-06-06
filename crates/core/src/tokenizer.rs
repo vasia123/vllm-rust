@@ -10,6 +10,12 @@ pub struct TokenizerWrapper {
     /// Used for early-fail validation: a text of C characters produces
     /// at least ceil(C / max_chars_per_token) tokens.
     max_chars_per_token: usize,
+    /// Beginning-of-sequence token from the model config, if any. Used by
+    /// [`Self::encode_prompt`] to guarantee a leading BOS for models that
+    /// require it (Gemma is famously degenerate without `<bos>`) but whose
+    /// `tokenizer.json` post-processor does not add one — common in EXL3
+    /// quants where the post-processor is stripped.
+    bos_token_id: Option<u32>,
 }
 
 impl TokenizerWrapper {
@@ -25,7 +31,15 @@ impl TokenizerWrapper {
         Ok(Self {
             inner,
             max_chars_per_token,
+            bos_token_id: None,
         })
+    }
+
+    /// Attach the model's BOS token id (from `ModelConfig::bos_token_id`).
+    /// Builder-style so call sites can chain after `from_file`.
+    pub fn with_bos_token_id(mut self, bos_token_id: Option<u32>) -> Self {
+        self.bos_token_id = bos_token_id;
+        self
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -49,6 +63,7 @@ impl TokenizerWrapper {
         Self {
             inner: tokenizer,
             max_chars_per_token,
+            bos_token_id: None,
         }
     }
 
@@ -58,6 +73,26 @@ impl TokenizerWrapper {
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Encode a generation prompt, applying the tokenizer's special-token
+    /// post-processor (so models with a BOS/EOS template get them) and
+    /// guaranteeing a leading BOS when the model config declares one but the
+    /// post-processor did not add it. This is the correct path for prompts
+    /// fed to the engine; [`Self::encode`] (no special tokens) remains for
+    /// vocabulary/grammar/bad-word lookups that must not gain a BOS.
+    pub fn encode_prompt(&self, text: &str) -> anyhow::Result<Vec<u32>> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("encode_prompt: {e}"))?;
+        let mut ids = encoding.get_ids().to_vec();
+        if let Some(bos) = self.bos_token_id {
+            if ids.first() != Some(&bos) {
+                ids.insert(0, bos);
+            }
+        }
+        Ok(ids)
     }
 
     pub fn decode(&self, ids: &[u32]) -> anyhow::Result<String> {
@@ -387,6 +422,37 @@ mod tests {
             ids.len() >= 3 && ids.len() <= 6,
             "unexpected token count: {}",
             ids.len()
+        );
+    }
+
+    #[test]
+    fn encode_prompt_prepends_bos_when_configured() {
+        // Gemma-class case: config declares a BOS, tokenizer post-processor
+        // does not add one → encode_prompt must prepend it.
+        let tok = TokenizerWrapper::for_testing(16).with_bos_token_id(Some(5));
+        let ids = tok.encode_prompt("t1 t2 t3").expect("encode_prompt");
+        assert_eq!(ids, vec![5, 1, 2, 3], "BOS must lead the prompt tokens");
+    }
+
+    #[test]
+    fn encode_prompt_no_bos_when_unconfigured() {
+        // Models without a configured BOS (or whose post-processor handles
+        // it) must not gain a spurious leading token.
+        let tok = TokenizerWrapper::for_testing(16);
+        let ids = tok.encode_prompt("t1 t2 t3").expect("encode_prompt");
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn encode_prompt_does_not_double_bos() {
+        // Idempotent: when the encoded sequence already starts with BOS
+        // (e.g. a chat template emitted it), do not prepend a second one.
+        let tok = TokenizerWrapper::for_testing(16).with_bos_token_id(Some(5));
+        let ids = tok.encode_prompt("t5 t1").expect("encode_prompt");
+        assert_eq!(
+            ids,
+            vec![5, 1],
+            "must not duplicate an existing leading BOS"
         );
     }
 

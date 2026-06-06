@@ -305,7 +305,7 @@ pub fn generate<M: ModelForward>(
     kv_cache_mgr: &mut KVCacheManager,
     device: &Device,
 ) -> anyhow::Result<String> {
-    let prompt_ids = tokenizer.encode(prompt)?;
+    let prompt_ids = tokenizer.encode_prompt(prompt)?;
     let generated_ids = generate_tokens(model, &prompt_ids, params, kv_cache_mgr, device)?;
     let output = tokenizer.decode(&generated_ids)?;
     Ok(output)

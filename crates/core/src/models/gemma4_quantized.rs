@@ -121,6 +121,9 @@ struct Gemma4ExtraConfig {
     num_kv_shared_layers: usize,
     use_double_wide_mlp: bool,
     global_head_dim: Option<usize>,
+    /// KV heads on full-attention layers (released 12B/31B use fewer than
+    /// sliding layers; 12B: 1 vs 8). `None` → homogeneous E2B case.
+    num_global_key_value_heads: Option<usize>,
 }
 
 impl Gemma4ExtraConfig {
@@ -265,6 +268,12 @@ impl Gemma4ExtraConfig {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
+        let num_global_key_value_heads = cfg
+            .extra
+            .get("num_global_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
         Self {
             attn_logit_softcap,
             final_logit_softcap,
@@ -284,6 +293,7 @@ impl Gemma4ExtraConfig {
             num_kv_shared_layers,
             use_double_wide_mlp,
             global_head_dim,
+            num_global_key_value_heads,
         }
     }
 
@@ -392,6 +402,16 @@ impl Gemma4ExtraConfig {
         }
     }
 
+    /// KV-head count for the given layer. Full-attention layers use
+    /// `num_global_key_value_heads` when set; sliding layers use the base.
+    fn kv_heads_for_layer(&self, layer_idx: usize, default_kv_heads: usize) -> usize {
+        if self.is_full_attention_layer(layer_idx) {
+            self.num_global_key_value_heads.unwrap_or(default_kv_heads)
+        } else {
+            default_kv_heads
+        }
+    }
+
     fn is_kv_shared_layer(&self, layer_idx: usize, num_hidden_layers: usize) -> bool {
         if self.num_kv_shared_layers == 0 {
             return false;
@@ -421,6 +441,13 @@ impl Gemma4ExtraConfig {
     /// back to their true `head_dim`.
     fn max_cache_head_dim(&self, default_head_dim: usize) -> usize {
         default_head_dim.max(self.global_head_dim.unwrap_or(default_head_dim))
+    }
+
+    /// Largest per-layer KV-head count across all layers — the KV cache
+    /// stride. Full-attention layers with fewer heads pad up on write and
+    /// slice back on read.
+    fn max_kv_heads(&self, default_kv_heads: usize) -> usize {
+        default_kv_heads.max(self.num_global_key_value_heads.unwrap_or(default_kv_heads))
     }
 }
 
@@ -663,6 +690,28 @@ fn pad_last_dim(x: &Tensor, from: usize, to: usize) -> Result<Tensor> {
     Tensor::cat(&[x, &zeros], 3)
 }
 
+/// Zero-pad the KV-head dimension (dim 1 of `[b, heads, seq, head_dim]`)
+/// from `from` to `to`. Full-attention layers use fewer KV heads than the
+/// shared cache stride; the extra heads are zero on write, sliced on read.
+fn pad_kv_heads(x: &Tensor, from: usize, to: usize) -> Result<Tensor> {
+    if from == to {
+        return Ok(x.clone());
+    }
+    if to < from {
+        return Err(candle_core::Error::Msg(format!(
+            "pad_kv_heads: to ({to}) must be >= from ({from})"
+        )));
+    }
+    let (b, h, s, d) = x.dims4()?;
+    if h != from {
+        return Err(candle_core::Error::Msg(format!(
+            "pad_kv_heads: tensor head dim is {h}, expected {from}"
+        )));
+    }
+    let zeros = Tensor::zeros((b, to - from, s, d), x.dtype(), x.device())?;
+    Tensor::cat(&[x, &zeros], 1)
+}
+
 struct QuantizedGemma4Attention {
     q_proj: Box<dyn QuantizedLinear>,
     /// KV-shared layers (last `num_kv_shared_layers` in the stack) carry
@@ -681,6 +730,9 @@ struct QuantizedGemma4Attention {
     head_dim: usize,
     /// Shared KV cache head_dim = max across all layers in the model.
     cache_head_dim: usize,
+    /// Shared KV cache KV-head stride = max across all layers. Full layers
+    /// with fewer KV heads pad up on write and slice back on read.
+    cache_num_kv_heads: usize,
     attn_logit_softcap: Option<f64>,
     sliding_window: Option<usize>,
     is_kv_shared: bool,
@@ -693,13 +745,14 @@ impl QuantizedGemma4Attention {
         extra_cfg: &Gemma4ExtraConfig,
         layer_idx: usize,
         cache_head_dim: usize,
+        cache_num_kv_heads: usize,
         is_kv_shared: bool,
         loader: &dyn QuantizedWeightLoader,
         vb: VarBuilder,
         prefix: &str,
     ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_heads = extra_cfg.kv_heads_for_layer(layer_idx, cfg.num_key_value_heads);
         let head_dim = extra_cfg.head_dim_for_layer(layer_idx, cfg.head_dim);
 
         let q_proj = loader.load_linear(
@@ -787,6 +840,7 @@ impl QuantizedGemma4Attention {
             num_kv_heads,
             head_dim,
             cache_head_dim,
+            cache_num_kv_heads,
             attn_logit_softcap: extra_cfg.attn_logit_softcap,
             sliding_window,
             is_kv_shared,
@@ -865,6 +919,8 @@ impl QuantizedGemma4Attention {
 
             let k_padded = pad_last_dim(&k, self.head_dim, self.cache_head_dim)?;
             let v_padded = pad_last_dim(&v, self.head_dim, self.cache_head_dim)?;
+            let k_padded = pad_kv_heads(&k_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
+            let v_padded = pad_kv_heads(&v_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
             let k_for_cache = k_padded.squeeze(0)?.contiguous()?;
             let v_for_cache = v_padded.squeeze(0)?.contiguous()?;
             cache_engine
@@ -890,6 +946,19 @@ impl QuantizedGemma4Attention {
     ) -> Result<Tensor> {
         let device = q.device();
         let dtype = q.dtype();
+
+        // Slice the shared cache geometry back to this layer's KV-head
+        // count (dim 1) before head_dim (dim 3).
+        let k_full = if k_full.dim(1)? != self.num_kv_heads {
+            k_full.narrow(1, 0, self.num_kv_heads)?
+        } else {
+            k_full.clone()
+        };
+        let v_full = if v_full.dim(1)? != self.num_kv_heads {
+            v_full.narrow(1, 0, self.num_kv_heads)?
+        } else {
+            v_full.clone()
+        };
 
         let k_full = if k_full.dim(3)? != self.head_dim {
             k_full.narrow(3, 0, self.head_dim)?
@@ -991,6 +1060,8 @@ impl QuantizedGemma4Attention {
                 let (q_rot, k_rot) = self.rotary_emb.apply(&q_i, &k_i, seq.seqlen_offset)?;
                 let k_padded = pad_last_dim(&k_rot, self.head_dim, self.cache_head_dim)?;
                 let v_padded = pad_last_dim(&v_i, self.head_dim, self.cache_head_dim)?;
+                let k_padded = pad_kv_heads(&k_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
+                let v_padded = pad_kv_heads(&v_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
                 let k_for_cache = k_padded.squeeze(0)?.contiguous()?;
                 let v_for_cache = v_padded.squeeze(0)?.contiguous()?;
                 cache_engine
@@ -1004,6 +1075,16 @@ impl QuantizedGemma4Attention {
                 .read(&seq.block_ids, kv_len)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
 
+            let k_full = if k_full.dim(1)? != self.num_kv_heads {
+                k_full.narrow(1, 0, self.num_kv_heads)?
+            } else {
+                k_full
+            };
+            let v_full = if v_full.dim(1)? != self.num_kv_heads {
+                v_full.narrow(1, 0, self.num_kv_heads)?
+            } else {
+                v_full
+            };
             let k_full = if k_full.dim(3)? != self.head_dim {
                 k_full.narrow(3, 0, self.head_dim)?
             } else {
@@ -1122,6 +1203,7 @@ impl QuantizedGemma4DecoderLayer {
         extra_cfg: &Gemma4ExtraConfig,
         layer_idx: usize,
         cache_head_dim: usize,
+        cache_num_kv_heads: usize,
         loader: &dyn QuantizedWeightLoader,
         vb_m: VarBuilder,
     ) -> Result<Self> {
@@ -1142,6 +1224,7 @@ impl QuantizedGemma4DecoderLayer {
             extra_cfg,
             layer_idx,
             cache_head_dim,
+            cache_num_kv_heads,
             is_kv_shared,
             loader,
             vb_layer.pp("self_attn"),
@@ -1322,7 +1405,7 @@ impl QuantizedGemma4DecoderLayer {
         let hidden_states = self.input_layernorm.forward(xs)?;
 
         let cache_layer_idx = self.kv_sharing_target.unwrap_or(layer_idx);
-        let hidden_states = self.self_attn.forward(
+        let attn_out = self.self_attn.forward(
             &hidden_states,
             seqlen_offset,
             kv_cache_mgr.engine_mut(cache_layer_idx),
@@ -1330,7 +1413,7 @@ impl QuantizedGemma4DecoderLayer {
             slot_mapping,
         )?;
 
-        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
+        let hidden_states = self.post_attention_layernorm.forward(&attn_out)?;
         let hidden_states = (hidden_states + residual)?;
         let residual = &hidden_states;
 
@@ -1522,6 +1605,7 @@ impl QuantizedGemma4ForCausalLM {
             };
 
         let cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
+        let cache_num_kv_heads = extra_cfg.max_kv_heads(cfg.num_key_value_heads);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             layers.push(QuantizedGemma4DecoderLayer::new(
@@ -1529,6 +1613,7 @@ impl QuantizedGemma4ForCausalLM {
                 &extra_cfg,
                 i,
                 cache_head_dim,
+                cache_num_kv_heads,
                 weight_loader,
                 vb_m.clone(),
             )?);
@@ -1537,8 +1622,26 @@ impl QuantizedGemma4ForCausalLM {
         let norm = gemma4_rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
         let lm_head: Box<dyn QuantizedLinear> = if cfg.tie_word_embeddings {
-            Box::new(TiedEmbeddingHead {
-                weight: embed_tokens.embeddings().clone(),
+            // Released Gemma 4 EXL3 checkpoints set `tie_word_embeddings=true`
+            // yet still ship a separately-quantized `lm_head` (its `head_bits`
+            // differ from the body bits — e.g. 6-bit head over a 2-4-bit body)
+            // while `embed_tokens` stays unquantized bf16. Prefer the real
+            // quantized head when present. We only probe for EXL3 loaders: the
+            // EXL3 `load_linear` errors cleanly when `lm_head.trellis` is
+            // absent (it never zero-fills the trellis), whereas other loaders
+            // may synthesise a zero weight, so for them we keep the tied path.
+            let separate_head =
+                if weight_loader.method() == crate::quantization::QuantizationMethod::Exl3 {
+                    weight_loader
+                        .load_linear("lm_head", cfg.hidden_size, cfg.vocab_size, false)
+                        .ok()
+                } else {
+                    None
+                };
+            separate_head.unwrap_or_else(|| {
+                Box::new(TiedEmbeddingHead {
+                    weight: embed_tokens.embeddings().clone(),
+                })
             })
         } else {
             weight_loader.load_linear("lm_head", cfg.hidden_size, cfg.vocab_size, false)?
@@ -1885,6 +1988,197 @@ mod tests {
         assert!(!extra.is_sliding_layer(1));
         assert!(extra.is_sliding_layer(2));
         assert!(!extra.is_sliding_layer(3));
+    }
+
+    /// Config mirroring the released Gemma 4 12B head geometry at toy
+    /// dimensions: full-attention layers use a larger head_dim AND fewer KV
+    /// heads than sliding layers. Exercises both heterogeneity axes.
+    fn test_config_heterogeneous_heads() -> ModelConfig {
+        let mut cfg = test_config();
+        // 4 q-heads everywhere; sliding kv=2 @ head_dim 16, full kv=1 @ 32.
+        cfg.num_key_value_heads = 2;
+        cfg.head_dim = 16;
+        cfg.extra
+            .insert("global_head_dim".to_string(), serde_json::json!(32u64));
+        cfg.extra.insert(
+            "num_global_key_value_heads".to_string(),
+            serde_json::json!(1u64),
+        );
+        cfg.extra.insert(
+            "layer_types".to_string(),
+            serde_json::json!([
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+        );
+        // PLE off keeps the test focused on the attention/cache path.
+        cfg.extra.insert(
+            "hidden_size_per_layer_input".to_string(),
+            serde_json::json!(0u64),
+        );
+        cfg
+    }
+
+    #[test]
+    fn test_kv_head_heterogeneity_config() {
+        let cfg = test_config_heterogeneous_heads();
+        let extra = Gemma4ExtraConfig::from_model_config(&cfg);
+
+        // Layer 0 sliding: 2 kv heads @ head_dim 16.
+        assert!(extra.is_sliding_layer(0));
+        assert_eq!(extra.kv_heads_for_layer(0, cfg.num_key_value_heads), 2);
+        assert_eq!(extra.head_dim_for_layer(0, cfg.head_dim), 16);
+        // Layer 1 full: 1 kv head @ head_dim 32.
+        assert!(extra.is_full_attention_layer(1));
+        assert_eq!(extra.kv_heads_for_layer(1, cfg.num_key_value_heads), 1);
+        assert_eq!(extra.head_dim_for_layer(1, cfg.head_dim), 32);
+        // Shared cache stride = max across layers.
+        assert_eq!(extra.max_kv_heads(cfg.num_key_value_heads), 2);
+        assert_eq!(extra.max_cache_head_dim(cfg.head_dim), 32);
+        // ModelConfig helpers used by the server to size the paged cache.
+        assert_eq!(cfg.kv_cache_num_kv_heads(), 2);
+        assert_eq!(cfg.kv_cache_head_dim(), 32);
+    }
+
+    #[test]
+    fn test_padded_cache_roundtrip_preserves_values() {
+        // Isolates the head_dim-padding cache path used for Gemma 4's
+        // heterogeneous layers: write K/V at head_dim < cache_head_dim
+        // (zero-padded), read back, slice to the real head_dim, and assert
+        // the real slice survived the paged-cache round-trip bit-for-bit.
+        let device = Device::Cpu;
+        let head_dim = 16usize;
+        let cache_head_dim = 32usize; // global_head_dim > head_dim
+        let kv_heads = 2usize;
+        let tokens = 5usize;
+
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: 1,
+            num_kv_heads: kv_heads,
+            head_dim: cache_head_dim,
+            dtype: DType::F32,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut mgr = KVCacheManager::new(&cache_config).expect("cache mgr");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+        mgr.allocate_for_request(&mut block_table, tokens)
+            .expect("alloc");
+        let slot_mapping = block_table.slot_mapping(0, tokens);
+
+        // Deterministic non-trivial K/V at the real head_dim: [1, kv_heads, tokens, head_dim].
+        let k = Tensor::arange(0u32, (kv_heads * tokens * head_dim) as u32, &device)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .reshape((1, kv_heads, tokens, head_dim))
+            .unwrap();
+        let v = (&k + 100.0).unwrap();
+
+        let k_pad = pad_last_dim(&k, head_dim, cache_head_dim).unwrap();
+        let v_pad = pad_last_dim(&v, head_dim, cache_head_dim).unwrap();
+        let engine = mgr.engine_mut(0);
+        engine
+            .write(
+                &k_pad.squeeze(0).unwrap().contiguous().unwrap(),
+                &v_pad.squeeze(0).unwrap().contiguous().unwrap(),
+                &slot_mapping,
+            )
+            .expect("write");
+        let (k_full, v_full) = engine.read(block_table.block_ids(), tokens).expect("read");
+        let k_back = k_full.narrow(3, 0, head_dim).unwrap();
+        let v_back = v_full.narrow(3, 0, head_dim).unwrap();
+
+        let kd = (k_back - &k)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let vd = (v_back - &v)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            kd < 1e-5,
+            "padded-cache K round-trip corrupted real slice (max|Δ|={kd})"
+        );
+        assert!(
+            vd < 1e-5,
+            "padded-cache V round-trip corrupted real slice (max|Δ|={vd})"
+        );
+    }
+
+    #[test]
+    fn test_kv_head_heterogeneity_forward() {
+        // End-to-end prefill + decode through a 4-layer model whose full
+        // layers have fewer KV heads and a wider head_dim than sliding
+        // layers. Proves the cache pad-on-write / slice-on-read path
+        // (`pad_kv_heads` + `narrow`) keeps shapes consistent.
+        let cfg = test_config_heterogeneous_heads();
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let loader = create_weight_loader_with_params(vb.clone(), &DetectedQuantConfig::default());
+        let model = QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref())
+            .expect("build heterogeneous-head Gemma 4");
+
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 8,
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.kv_cache_num_kv_heads(),
+            head_dim: cfg.kv_cache_head_dim(),
+            dtype: DType::F32,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let seq_len = 6;
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).expect("input_ids");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, seq_len + 1)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let logits = model
+            .forward(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("prefill forward with heterogeneous KV heads");
+        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+
+        // One decode step — reads the padded cache back and slices to the
+        // per-layer KV-head count.
+        let next = Tensor::zeros((1, 1), DType::U32, &device).expect("next id");
+        let decode_slots = block_table.slot_mapping(seq_len, 1);
+        let logits2 = model
+            .forward(
+                &next,
+                seq_len,
+                &mut kv_cache_mgr,
+                &block_table,
+                &decode_slots,
+            )
+            .expect("decode forward with heterogeneous KV heads");
+        assert_eq!(logits2.dims(), &[1, 1, cfg.vocab_size]);
     }
 
     #[test]
