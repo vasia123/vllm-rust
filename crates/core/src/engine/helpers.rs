@@ -537,6 +537,22 @@ pub(crate) fn execute_prefill<M: ModelForward>(
             actual_chunk
         };
 
+        // Models with very large vocabularies (Gemma 4: 262k) return only
+        // the final position's logits from prefill — full-sequence logits
+        // would cost hundreds of MB per cached shape. Echo prompt-logprobs
+        // need every position, so they are unavailable for such models;
+        // degrade explicitly instead of indexing out of bounds.
+        let logits_positions = logits.dims()[1];
+        let last_pos = if logits_positions < last_pos {
+            tracing::warn!(
+                "prompt_logprobs (echo) unavailable: model returned logits for \
+                 {logits_positions} of {last_pos} prompt positions"
+            );
+            0
+        } else {
+            last_pos
+        };
+
         for i in 0..last_pos {
             let target_token_idx = offset + i + 1;
             if target_token_idx < prompt_len {

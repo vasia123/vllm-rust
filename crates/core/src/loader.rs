@@ -696,7 +696,8 @@ mod tests {
         let logits = model
             .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
             .expect("BnB Gemma 4 prefill forward");
-        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
 
         let last: Vec<f32> = logits
             .narrow(1, seq_len - 1, 1)
@@ -1512,7 +1513,8 @@ mod tests {
         let logits = model
             .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
             .expect("Gemma 4 BF16 prefill");
-        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
 
         let last: Vec<f32> = logits
             .narrow(1, seq_len - 1, 1)

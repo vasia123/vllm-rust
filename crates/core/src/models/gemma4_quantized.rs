@@ -1760,6 +1760,20 @@ impl QuantizedGemma4ForCausalLM {
             )?;
         }
 
+        // Only the final position's logits are consumed downstream (the
+        // engine samples the next token from it; full-sequence logits are
+        // needed solely for echo+prompt_logprobs, see engine/helpers.rs).
+        // Slicing BEFORE the lm_head matters enormously for Gemma 4: its
+        // 262 144-token vocab makes a full-sequence logits buffer (and the
+        // EXL3 kernel's fp32 staging) ~300 MB per distinct prompt length,
+        // all of which the CUDA allocator caches per shape — several
+        // differently-sized requests then OOM an 8 GB card.
+        let seq_len = xs.dim(1)?;
+        let xs = if seq_len > 1 {
+            xs.narrow(1, seq_len - 1, 1)?
+        } else {
+            xs
+        };
         let xs = self.norm.forward(&xs)?;
         let mut logits = self.lm_head.forward(&xs)?;
 
@@ -1806,6 +1820,13 @@ impl QuantizedGemma4ForCausalLM {
             )?;
         }
 
+        // Last-position-only lm_head — see `forward` for the rationale.
+        let seq_len = xs.dim(1)?;
+        let xs = if seq_len > 1 {
+            xs.narrow(1, seq_len - 1, 1)?
+        } else {
+            xs
+        };
         let xs = self.norm.forward(&xs)?;
         let mut logits = self.lm_head.forward(&xs)?;
         if let Some(cap) = self.final_logit_softcap {
@@ -2163,7 +2184,8 @@ mod tests {
                 &slot_mapping,
             )
             .expect("prefill forward with heterogeneous KV heads");
-        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
 
         // One decode step — reads the padded cache back and slices to the
         // per-layer KV-head count.
@@ -2238,10 +2260,11 @@ mod tests {
             )
             .expect("forward");
 
+        // prefill returns last-position-only logits (262k-vocab memory)
         assert_eq!(
             logits.dims(),
-            &[batch_size, seq_len, cfg.vocab_size],
-            "logits shape should be [batch, seq_len, vocab_size]"
+            &[batch_size, 1, cfg.vocab_size],
+            "prefill logits shape should be [batch, 1, vocab_size]"
         );
     }
 
@@ -2278,7 +2301,8 @@ mod tests {
                 &slot_mapping,
             )
             .expect("MoE forward");
-        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }
 
     #[test]
@@ -2316,7 +2340,8 @@ mod tests {
                 &slot_mapping,
             )
             .expect("forward");
-        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }
 
     #[test]
@@ -2342,7 +2367,8 @@ mod tests {
         let logits = model
             .forward(&prompt, 0, &mut kv_cache_mgr, &block_table, &slot_mapping)
             .expect("prefill");
-        assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
         block_table.advance(3);
 
         kv_cache_mgr
@@ -2531,7 +2557,7 @@ mod tests {
 
         assert_eq!(
             logits.dims(),
-            &[1, seq_len, cfg.vocab_size],
+            &[1, 1, cfg.vocab_size], // prefill returns last-position-only logits (262k-vocab memory)
             "logits shape must be [batch, seq_len, vocab_size]"
         );
 

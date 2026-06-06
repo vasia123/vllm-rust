@@ -440,7 +440,8 @@ mod tests {
             .forward(&input_ids, 0, &mut kv_cache, &block_table, &slot_mapping)
             .unwrap();
 
-        assert_eq!(logits.dims(), &[1, 4, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }
 
     #[test]
@@ -474,7 +475,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(logits.dims(), &[1, seq_len, cfg.vocab_size]);
+        // prefill returns last-position-only logits (262k-vocab memory)
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
     }
 
     #[test]

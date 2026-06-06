@@ -653,14 +653,31 @@ pub(crate) fn create_constraint_from_response_format(
     match response_format {
         None | Some(ResponseFormat::Text) | Some(ResponseFormat::StructuralTag { .. }) => None,
         Some(ResponseFormat::JsonObject) => {
-            // `json_object` mode: no schema, just "valid JSON". Keep
-            // the legacy text-validation path — there's no grammar
-            // to drive the matcher with.
+            // `json_object` mode: enforce "any JSON object" with the SAME
+            // token-bitmask grammar backend as `json_schema` (compiled from
+            // `{"type":"object"}`). The legacy text-validation-only path
+            // rejected weak models' near-JSON after the fact instead of
+            // constraining generation — visible as hard 400s on Gemma 4 @
+            // 2.0bpw, whose free-running JSON is slightly malformed.
             let schema = serde_json::json!({"type": "object"});
-            Some(Box::new(JsonSchemaConstraint::new(
-                schema,
-                tokenizer.clone(),
-            )))
+            match compiler.compile_sync(&StructuredOutputOption::JsonSchema, &schema.to_string()) {
+                Ok(grammar) => Some(Box::new(GrammarConstraintAdapter::new(
+                    grammar,
+                    tokenizer.vocab_size(),
+                ))),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vllm_server::xgrammar",
+                        error = %e,
+                        "response_format.json_object grammar compile failed; \
+                         falling back to legacy text validation"
+                    );
+                    Some(Box::new(JsonSchemaConstraint::new(
+                        schema,
+                        tokenizer.clone(),
+                    )))
+                }
+            }
         }
         Some(ResponseFormat::JsonSchema { json_schema }) => {
             // OpenAI-compatible `response_format.json_schema` path.

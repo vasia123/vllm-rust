@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::State;
@@ -9,9 +8,7 @@ use axum::Json;
 use super::chat::create_constraint_from_structured_outputs;
 use vllm_core::engine::{GenerationRequest, GenerationResult};
 use vllm_core::lora::LoraRequest;
-use vllm_core::sampling::{
-    BeamSearchConfig, JsonSchemaConstraint, SamplingConstraint, SamplingParams,
-};
+use vllm_core::sampling::{BeamSearchConfig, SamplingParams};
 use vllm_core::tokenizer::TokenizerWrapper;
 
 use super::admin::prometheus;
@@ -90,7 +87,11 @@ pub async fn create_completion(
                 &state.grammar_compiler(),
             )?
         } else {
-            create_constraint_from_response_format(req.response_format.as_ref(), &state.tokenizer)
+            super::chat::create_constraint_from_response_format(
+                req.response_format.as_ref(),
+                &state.tokenizer,
+                &state.grammar_compiler(),
+            )
         };
 
         let beam_search = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
@@ -186,11 +187,12 @@ pub async fn create_completion(
 
         // Check if response_format or structured_outputs requires constraints
         let has_constraint = req.structured_outputs.is_some()
-            || create_constraint_from_response_format(
-                req.response_format.as_ref(),
-                &state.tokenizer,
-            )
-            .is_some();
+            || req.response_format.as_ref().is_some_and(|rf| {
+                !matches!(
+                    rf,
+                    ResponseFormat::Text | ResponseFormat::StructuralTag { .. }
+                )
+            });
 
         for input in inputs {
             let (prompt, prompt_tokens) = resolve_prompt_input(&state, input, req.max_tokens)?;
@@ -210,9 +212,10 @@ pub async fn create_completion(
                         .ok()
                         .flatten()
                     } else {
-                        create_constraint_from_response_format(
+                        super::chat::create_constraint_from_response_format(
                             req.response_format.as_ref(),
                             &state.tokenizer,
+                            &state.grammar_compiler(),
                         )
                     }
                 } else {
@@ -472,26 +475,6 @@ fn sum_token_logprobs(result: &GenerationResult) -> f64 {
 }
 
 /// Create a sampling constraint from response_format.
-fn create_constraint_from_response_format(
-    response_format: Option<&ResponseFormat>,
-    tokenizer: &Arc<TokenizerWrapper>,
-) -> Option<Box<dyn SamplingConstraint>> {
-    match response_format {
-        None | Some(ResponseFormat::Text) | Some(ResponseFormat::StructuralTag { .. }) => None,
-        Some(ResponseFormat::JsonObject) => {
-            // Basic JSON object constraint
-            let schema = serde_json::json!({"type": "object"});
-            Some(Box::new(JsonSchemaConstraint::new(
-                schema,
-                tokenizer.clone(),
-            )))
-        }
-        Some(ResponseFormat::JsonSchema { json_schema }) => Some(Box::new(
-            JsonSchemaConstraint::new(json_schema.schema.clone(), tokenizer.clone()),
-        )),
-    }
-}
-
 /// Build CompletionLogProbs from GenerationResult.
 fn build_logprobs(
     result: &GenerationResult,
