@@ -101,6 +101,19 @@ impl TokenizerWrapper {
             .map_err(|e| anyhow::anyhow!("decode: {e}"))
     }
 
+    /// Decode with special tokens preserved in the output text.
+    ///
+    /// Needed by parsers whose structural markers ARE special tokens —
+    /// Gemma 4 delimits thinking (`<|channel>`…`<channel|>`) and tool calls
+    /// (`<|tool_call>`…`<tool_call|>`, `<|"|>` escapes) with them, so the
+    /// skip-special [`Self::decode`] destroys the boundaries before the
+    /// reasoning/tool parsers can split on them.
+    pub fn decode_with_special_tokens(&self, ids: &[u32]) -> anyhow::Result<String> {
+        self.inner
+            .decode(ids, false)
+            .map_err(|e| anyhow::anyhow!("decode_with_special_tokens: {e}"))
+    }
+
     /// Maximum character length of any single token in the vocabulary.
     pub fn max_chars_per_token(&self) -> usize {
         self.max_chars_per_token

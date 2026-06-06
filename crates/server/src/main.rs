@@ -113,8 +113,9 @@ enum Command {
         /// Tool call parser for extracting function calls from model output.
         /// Supported: hermes, glm4, json, llama, mistral, deepseek_v3, deepseek_v31,
         /// internlm2, jamba, pythonic, granite, granite-20b-fc, kimi_k2, phi4mini,
-        /// longcat, xlam, gigachat3, functiongemma, hunyuan, ernie45, seed_oss,
-        /// deepseek_v32, step3, qwen3coder
+        /// longcat, xlam, gigachat3, gemma4, functiongemma, hunyuan, ernie45,
+        /// seed_oss, deepseek_v32, step3, qwen3coder.
+        /// The default auto-switches to `gemma4` for Gemma 4 architectures.
         #[arg(long, default_value = "hermes")]
         tool_call_parser: String,
 
@@ -2179,16 +2180,24 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // explicitly. Gemma 4 emits a `<|channel>thought\n…<channel|>` thinking
     // channel (or a bare `thought\n` label once special tokens are stripped)
     // that must be parsed out of chat responses.
-    let reasoning_parser = if reasoning_parser.is_empty()
-        && files
-            .config
-            .architectures
-            .iter()
-            .any(|a| a.starts_with("Gemma4"))
-    {
+    let is_gemma4 = files
+        .config
+        .architectures
+        .iter()
+        .any(|a| a.starts_with("Gemma4"));
+    let reasoning_parser = if reasoning_parser.is_empty() && is_gemma4 {
         "gemma4".to_string()
     } else {
         reasoning_parser
+    };
+    // Same auto-selection for the tool-call parser: Gemma 4 emits
+    // `<|tool_call>call:name{…}<tool_call|>` which the default hermes parser
+    // can never match, so the un-overridden default is switched. An explicit
+    // `--tool-call-parser` (any non-default value) is always respected.
+    let tool_call_parser = if tool_call_parser == "hermes" && is_gemma4 {
+        "gemma4".to_string()
+    } else {
+        tool_call_parser
     };
 
     let state = AppState::new(

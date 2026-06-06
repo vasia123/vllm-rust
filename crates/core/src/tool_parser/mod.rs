@@ -43,6 +43,7 @@ mod deepseek_v31;
 mod deepseek_v32;
 mod ernie45;
 mod functiongemma;
+mod gemma4;
 mod gigachat3;
 mod glm4;
 mod granite;
@@ -71,6 +72,7 @@ pub use deepseek_v31::DeepSeekV31ToolParser;
 pub use deepseek_v32::DeepSeekV32ToolParser;
 pub use ernie45::Ernie45ToolParser;
 pub use functiongemma::FunctionGemmaToolParser;
+pub use gemma4::Gemma4ToolParser;
 pub use gigachat3::GigaChat3ToolParser;
 pub use glm4::Glm4ToolParser;
 pub use granite::{Granite20bFCToolParser, GraniteToolParser};
@@ -253,6 +255,16 @@ pub trait ToolCallParser: Send + Sync {
     /// Check if the output contains any tool calls.
     fn has_tool_calls(&self, output: &str) -> bool {
         self.parse(output).map(|c| !c.is_empty()).unwrap_or(false)
+    }
+
+    /// Whether this parser needs the model output decoded WITH special
+    /// tokens preserved. Gemma 4 delimits tool calls with special tokens
+    /// (`<|tool_call>`, `<|"|>`, `<tool_call|>`) that the default
+    /// skip-special detokenisation strips, destroying the boundaries before
+    /// parsing. Parsers returning `true` take responsibility for stripping
+    /// their own markers from anything they return as content.
+    fn prefers_raw_decode(&self) -> bool {
+        false
     }
 }
 

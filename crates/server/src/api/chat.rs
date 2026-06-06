@@ -226,6 +226,13 @@ pub async fn create_chat_completion(
             return_token_ids: req
                 .return_tokens_as_token_ids
                 .unwrap_or(state.return_tokens_as_token_ids),
+            // NOTE: the streaming pipeline feeds the parser skip-special
+            // deltas, so raw-decode-preferring parsers (Gemma 4) cannot see
+            // their special-token channel markers here and degrade to the
+            // bare `thought\n` label heuristic — with `enable_thinking` the
+            // chain-of-thought streams as content. Token-id-aware streaming
+            // detokenisation would be required to split it properly; the
+            // non-streaming path (above the stream branch) handles it fully.
             reasoning_parser: if req.include_reasoning {
                 state.reasoning_parser.clone()
             } else {
@@ -367,26 +374,59 @@ pub async fn create_chat_completion(
         for (i, result) in selected.into_iter().enumerate() {
             total_completion_tokens += result.generated_token_ids.len();
 
-            // Extract reasoning content if a reasoning parser is configured
-            let (reasoning, reasoning_content, effective_text) = if req.include_reasoning {
-                if let Some(ref rp) = state.reasoning_parser {
-                    let ro = rp.extract_reasoning(&result.generated_text);
-                    let r = ro.reasoning.clone();
-                    let text = ro.content.unwrap_or_default();
-                    (r.clone(), r, text)
-                } else {
-                    (None, None, result.generated_text.clone())
-                }
-            } else {
-                (None, None, result.generated_text.clone())
+            // Gemma 4 structures its output with SPECIAL tokens
+            // (`<|channel>thought…<channel|>`, `<|tool_call>…<tool_call|>`,
+            // `<|"|>` escapes). The default detokenisation strips special
+            // tokens, destroying those boundaries before the parsers see
+            // them. Parsers that opt in via `prefers_raw_decode()` receive a
+            // specials-preserved re-decode and strip their own markers from
+            // whatever they return.
+            let raw_text = || {
+                state
+                    .tokenizer
+                    .decode_with_special_tokens(&result.generated_token_ids)
+                    .unwrap_or_else(|_| result.generated_text.clone())
             };
+
+            // Extract reasoning content if a reasoning parser is configured.
+            // `effective_is_raw` tracks whether `effective_text` still
+            // carries special tokens (i.e. it came out of a raw-decode-aware
+            // parser, which preserves downstream tool-call markers).
+            let (reasoning, reasoning_content, effective_text, effective_is_raw) =
+                if req.include_reasoning {
+                    if let Some(ref rp) = state.reasoning_parser {
+                        let raw = rp.prefers_raw_decode();
+                        let input = if raw {
+                            raw_text()
+                        } else {
+                            result.generated_text.clone()
+                        };
+                        let ro = rp.extract_reasoning(&input);
+                        let r = ro.reasoning.clone();
+                        let text = ro.content.unwrap_or_default();
+                        (r.clone(), r, text, raw)
+                    } else {
+                        (None, None, result.generated_text.clone(), false)
+                    }
+                } else {
+                    (None, None, result.generated_text.clone(), false)
+                };
 
             // Parse tool calls if tools were provided and parsing is enabled
             let (content, tool_calls, finish_reason) = if should_parse_tools {
                 let parser = &state.tool_call_parser;
-                if let Ok(calls) = parser.parse(&effective_text) {
+                // A raw-preferring tool parser needs the specials-preserved
+                // text unless the reasoning stage already produced one. When
+                // no calls match, fall back to the CLEAN effective_text so
+                // special tokens never leak into user-visible content.
+                let tool_input = if parser.prefers_raw_decode() && !effective_is_raw {
+                    raw_text()
+                } else {
+                    effective_text.clone()
+                };
+                if let Ok(calls) = parser.parse(&tool_input) {
                     if !calls.is_empty() {
-                        let content = parser.extract_content(&effective_text);
+                        let content = parser.extract_content(&tool_input);
                         (content, Some(calls), "tool_calls".to_string())
                     } else {
                         (

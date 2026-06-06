@@ -69,6 +69,16 @@ pub trait ReasoningParser: Send + Sync {
     /// Returns a `ReasoningDelta` with either `reasoning` or `content` set
     /// (mutually exclusive — a single delta carries one or the other, never both).
     fn extract_reasoning_streaming(&self, previous_text: &str, delta_text: &str) -> ReasoningDelta;
+
+    /// Whether this parser needs the model output decoded WITH special
+    /// tokens preserved. Gemma 4 wraps thinking in special-token channel
+    /// markers (`<|channel>` … `<channel|>`) that the default skip-special
+    /// detokenisation strips, losing the reasoning/content boundary.
+    /// Parsers returning `true` strip their own markers from anything they
+    /// return.
+    fn prefers_raw_decode(&self) -> bool {
+        false
+    }
 }
 
 // ─── Tag-based parser (shared logic for <think>/<\think> and similar) ─────
@@ -1021,7 +1031,15 @@ impl Gemma4ReasoningParser {
     const TURN_END: &'static str = "<turn|>";
 
     fn strip_thought_label(text: &str) -> &str {
-        text.strip_prefix(Self::THOUGHT_LABEL).unwrap_or(text)
+        if let Some(rest) = text.strip_prefix(Self::THOUGHT_LABEL) {
+            return rest;
+        }
+        // A block holding just the bare role label (no trailing newline —
+        // truncated or degenerate output) is empty reasoning.
+        if text.trim() == "thought" {
+            return "";
+        }
+        text
     }
 
     fn clean_answer(text: &str) -> String {
@@ -1035,32 +1053,83 @@ impl Gemma4ReasoningParser {
         t.to_string()
     }
 
+    /// Walk ALL thinking channels in the text. Handles, in one pass:
+    /// - the normal single `<|channel>thought\n…<channel|>answer` shape;
+    /// - an UNCLOSED trailing channel (generation truncated mid-thought) —
+    ///   its body is in-progress reasoning, never content;
+    /// - degenerate outputs that repeat (empty) channels — every block is
+    ///   consumed so no raw marker can leak into user-visible content;
+    /// - a leading END tag with no START (start tag lost upstream).
     fn parse(text: &str) -> ReasoningOutput {
-        if let Some(end_pos) = text.find(Self::END_TAG) {
-            let thinking_block = &text[..end_pos];
-            let answer = Self::clean_answer(&text[end_pos + Self::END_TAG.len()..]);
-            // Reasoning is everything after the (optional) start tag.
-            let thinking_raw = match thinking_block.find(Self::START_TAG) {
-                Some(p) => &thinking_block[p + Self::START_TAG.len()..],
-                None => thinking_block,
-            };
-            let thinking = Self::strip_thought_label(thinking_raw.trim()).trim();
-            ReasoningOutput {
-                reasoning: if thinking.is_empty() {
-                    None
-                } else {
-                    Some(thinking.to_string())
-                },
-                content: Some(answer),
-            }
-        } else {
-            // No channel tags: strip a spurious bare `thought\n` prefix.
-            let answer = Self::clean_answer(Self::strip_thought_label(text));
-            ReasoningOutput {
-                reasoning: None,
-                content: Some(answer),
+        let mut reasoning_parts: Vec<&str> = Vec::new();
+        let mut content = String::new();
+        let mut rest = text;
+
+        // END before any START: the prefix is reasoning (start tag lost).
+        if let (Some(e), s) = (rest.find(Self::END_TAG), rest.find(Self::START_TAG)) {
+            if s.is_none_or(|s| e < s) {
+                let part = Self::strip_thought_label(rest[..e].trim()).trim();
+                if !part.is_empty() {
+                    reasoning_parts.push(part);
+                }
+                rest = &rest[e + Self::END_TAG.len()..];
             }
         }
+
+        loop {
+            match rest.find(Self::START_TAG) {
+                None => {
+                    content.push_str(rest);
+                    break;
+                }
+                Some(s) => {
+                    content.push_str(&rest[..s]);
+                    let body = &rest[s + Self::START_TAG.len()..];
+                    // A block is terminated by the end tag OR by the next
+                    // start tag (degenerate outputs open channels without
+                    // ever closing them) OR by end-of-text (truncated).
+                    let next_start = body.find(Self::START_TAG);
+                    match body.find(Self::END_TAG) {
+                        Some(e) if next_start.is_none_or(|ns| e < ns) => {
+                            let part = Self::strip_thought_label(body[..e].trim()).trim();
+                            if !part.is_empty() {
+                                reasoning_parts.push(part);
+                            }
+                            rest = &body[e + Self::END_TAG.len()..];
+                        }
+                        _ => {
+                            let block_end = next_start.unwrap_or(body.len());
+                            let part = Self::strip_thought_label(body[..block_end].trim()).trim();
+                            if !part.is_empty() {
+                                reasoning_parts.push(part);
+                            }
+                            rest = &body[block_end..];
+                        }
+                    }
+                }
+            }
+        }
+
+        let had_tags = text.contains(Self::START_TAG) || text.contains(Self::END_TAG);
+        let answer = if had_tags {
+            Self::clean_answer(&content)
+        } else {
+            // No channel tags: strip a spurious bare `thought\n` prefix.
+            Self::clean_answer(Self::strip_thought_label(&content))
+        };
+        let reasoning = if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join("\n"))
+        };
+        // A truncated pure-thought response has no content at all; report
+        // `None` rather than an empty string so callers can distinguish.
+        let content = if answer.is_empty() && reasoning.is_some() {
+            None
+        } else {
+            Some(answer)
+        };
+        ReasoningOutput { reasoning, content }
     }
 
     fn delta(prev: Option<&str>, cur: Option<&str>) -> Option<String> {
@@ -1077,6 +1146,12 @@ impl Gemma4ReasoningParser {
 }
 
 impl ReasoningParser for Gemma4ReasoningParser {
+    /// The `<|channel>`/`<channel|>` markers are special tokens; the
+    /// reasoning/content split needs the raw decode.
+    fn prefers_raw_decode(&self) -> bool {
+        true
+    }
+
     fn extract_reasoning(&self, output: &str) -> ReasoningOutput {
         Self::parse(output)
     }
@@ -1724,6 +1799,64 @@ mod tests {
         let r = parser.extract_reasoning("Just the answer.<turn|>");
         assert_eq!(r.reasoning, None);
         assert_eq!(r.content.as_deref(), Some("Just the answer."));
+    }
+
+    #[test]
+    fn gemma4_unclosed_thinking_goes_to_reasoning() {
+        // Generation truncated mid-thought (finish_reason=length): the
+        // channel never closes. Everything after the start tag is
+        // in-progress reasoning; no raw markers may leak into content.
+        let parser = create_reasoning_parser("gemma4");
+        let r = parser.extract_reasoning("<|channel>thought\nStep 1: add the numbers");
+        assert_eq!(r.reasoning.as_deref(), Some("Step 1: add the numbers"));
+        assert_eq!(r.content, None);
+    }
+
+    #[test]
+    fn gemma4_degenerate_repeated_empty_channels_scrubbed() {
+        // 2-bit quants can loop on empty thought channels; none of the
+        // markers may survive into content.
+        let parser = create_reasoning_parser("gemma4");
+        let out = "<|channel>thought\n<channel|><|channel>thought\n<channel|>Paris.";
+        let r = parser.extract_reasoning(out);
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("Paris."));
+        let content = r.content.unwrap();
+        assert!(!content.contains("<|channel>") && !content.contains("<channel|>"));
+    }
+
+    #[test]
+    fn gemma4_bare_thought_label_without_newline() {
+        // A thinking block holding just the role label (no newline) must
+        // not surface "thought" as reasoning text.
+        let parser = create_reasoning_parser("gemma4");
+        let r = parser.extract_reasoning("<|channel>thought<channel|>Done.");
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn gemma4_multiple_thinking_blocks_join() {
+        let parser = create_reasoning_parser("gemma4");
+        let out = "<|channel>thought\nfirst<channel|>mid<|channel>thought\nsecond<channel|>end";
+        let r = parser.extract_reasoning(out);
+        assert_eq!(r.reasoning.as_deref(), Some("first\nsecond"));
+        assert_eq!(r.content.as_deref(), Some("midend"));
+    }
+
+    #[test]
+    fn gemma4_degenerate_unclosed_repeats_keep_markers_out_of_reasoning() {
+        // 2-bit tool prompts can produce `_<|channel>_<|channel>_…` loops
+        // with no end tag at all. Neither reasoning nor content may carry
+        // raw channel markers.
+        let parser = create_reasoning_parser("gemma4");
+        let r = parser.extract_reasoning("_<|channel>_<|channel>_<|channel>_");
+        let reasoning = r.reasoning.unwrap_or_default();
+        let content = r.content.unwrap_or_default();
+        assert!(
+            !reasoning.contains("<|channel>") && !content.contains("<|channel>"),
+            "markers leaked: reasoning={reasoning:?} content={content:?}"
+        );
     }
 
     #[test]
