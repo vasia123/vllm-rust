@@ -1130,6 +1130,32 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                     state.num_computed_tokens = 0;
                     state.token_logprobs.clear();
                     state.top_logprobs.clear();
+                    // Guard: if the folded context can never fit the pool
+                    // (more blocks than EXIST, not merely more than are
+                    // free), re-admission is impossible — compute_schedule
+                    // would refuse it forever and, under FCFS, head-of-line
+                    // starve every request behind it (live wedge observed
+                    // on an 8 GB GPU: 22-block pool, request crossed
+                    // 352 tokens at a block boundary). Fail it explicitly.
+                    let blocks_for_recompute = state
+                        .block_table
+                        .blocks_needed(state.prompt_token_ids.len());
+                    let total_blocks = kv_cache_mgr.num_total_blocks();
+                    if blocks_for_recompute > total_blocks {
+                        failed.push((
+                            req_id,
+                            format!(
+                                "sequence of {} tokens needs {} KV cache blocks but the pool \
+                                 has only {} in total — recompute after preemption can never \
+                                 be scheduled (lower --max-model-len or raise \
+                                 --gpu-memory-utilization)",
+                                state.prompt_token_ids.len(),
+                                blocks_for_recompute,
+                                total_blocks,
+                            ),
+                        ));
+                        continue;
+                    }
                     state.status = RequestStatus::Preempted;
                     preempted_out.push(req_id);
                 }
@@ -2775,6 +2801,8 @@ pub(crate) fn is_beam_request(req: &ActiveRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_cache::BlockTable;
+    use candle_core::Device;
 
     fn make_state(eos: u32, max_new: usize) -> SequenceState {
         SequenceState::new(0, vec![1, 2, 3], max_new, eos, 16, 0)
@@ -2782,6 +2810,196 @@ mod tests {
 
     fn dummy_tokenizer() -> TokenizerWrapper {
         TokenizerWrapper::for_testing(100)
+    }
+
+    /// Build a request that has exhausted a KV pool of `num_blocks`
+    /// 16-token blocks exactly at a block boundary: `prompt_len`
+    /// prompt + 2 generated tokens, all pool blocks held and full, so
+    /// the next decode step must allocate one more block.
+    fn boundary_exhausted_request(
+        prompt_len: usize,
+        num_blocks: usize,
+    ) -> (KVCacheManager, HashMap<RequestId, ActiveRequest>, RequestId) {
+        use crate::engine::types::ResponseChannel;
+        use crate::kv_cache::{CacheConfig, KVCacheDtype};
+
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks,
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: candle_core::DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mut kv = KVCacheManager::new(&cache_config).unwrap();
+
+        let req_id: RequestId = 0;
+        let mut state = SequenceState::new(req_id, (0..prompt_len as u32).collect(), 64, 99, 16, 0);
+        state.generated_token_ids = vec![7, 8];
+        state.status = RequestStatus::Decoding;
+        // Occupy `num_blocks` blocks, all full: stored = num_blocks*16
+        // tokens (prompt + first generated token's KV), so writing the
+        // second generated token's KV needs a new block.
+        kv.allocate_for_request(&mut state.block_table, num_blocks * 16)
+            .unwrap();
+        state.block_table.advance(num_blocks * 16);
+        state.seqlen_offset = num_blocks * 16;
+        state.num_computed_tokens = prompt_len;
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut requests = HashMap::new();
+        requests.insert(
+            req_id,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        (kv, requests, req_id)
+    }
+
+    /// Regression: live wedge on gemma-4 (2026-06-07). A sole running
+    /// request exhausted the 22-block KV pool exactly at a block
+    /// boundary; preempt-for-recompute folded the generated tokens into
+    /// the prompt, after which the re-prefill needed MORE blocks than
+    /// the whole pool. The request sat in the waiting queue forever and
+    /// (FCFS head-of-line) starved every request queued behind it.
+    /// A request whose folded context can never fit must FAIL with an
+    /// explicit error instead of being preempted.
+    #[test]
+    fn preempt_at_capacity_boundary_fails_request_instead_of_wedging() {
+        struct NoopModel(Device);
+        impl ModelForward for NoopModel {
+            fn forward(
+                &self,
+                _input_ids: &Tensor,
+                _seqlen_offset: usize,
+                _kv_cache_mgr: &mut KVCacheManager,
+                _block_table: &BlockTable,
+                _slot_mapping: &[usize],
+            ) -> candle_core::Result<Tensor> {
+                unreachable!("allocation must fail before forward")
+            }
+            fn device(&self) -> &Device {
+                &self.0
+            }
+        }
+
+        // Pool: 2 blocks × 16. Request: 31-token prompt + 2 generated;
+        // 32 KV entries stored (prompt + first generated token — both
+        // blocks full), the second generated token's KV needs a third
+        // block. Folded recompute prompt = 33 tokens ⇒ 3 blocks > 2
+        // total ⇒ impossible.
+        let (mut kv, mut requests, req_id) = boundary_exhausted_request(31, 2);
+        let mut preempted: Vec<RequestId> = Vec::new();
+        let (failed, _next) = execute_batched_decode_with_graph(
+            &[req_id],
+            None,
+            false,
+            &NoopModel(Device::Cpu),
+            &mut kv,
+            &mut requests,
+            None,
+            None,
+            &mut preempted,
+        );
+
+        assert!(
+            preempted.is_empty(),
+            "impossible request must not be preempted (it would wedge the queue): {preempted:?}"
+        );
+        assert_eq!(failed.len(), 1, "expected exactly one failure: {failed:?}");
+        assert_eq!(failed[0].0, req_id);
+        assert!(
+            failed[0].1.contains("KV cache"),
+            "error should explain capacity: {}",
+            failed[0].1
+        );
+        // All pool blocks must be back in the free pool.
+        assert_eq!(kv.num_free_blocks(), 2);
+    }
+
+    /// Companion: when the folded context still fits the pool (other
+    /// requests' blocks will free up), preemption-for-recompute must
+    /// keep working as before.
+    #[test]
+    fn preempt_when_refit_possible_still_preempts() {
+        struct NoopModel(Device);
+        impl ModelForward for NoopModel {
+            fn forward(
+                &self,
+                _input_ids: &Tensor,
+                _seqlen_offset: usize,
+                _kv_cache_mgr: &mut KVCacheManager,
+                _block_table: &BlockTable,
+                _slot_mapping: &[usize],
+            ) -> candle_core::Result<Tensor> {
+                unreachable!("allocation must fail before forward")
+            }
+            fn device(&self) -> &Device {
+                &self.0
+            }
+        }
+
+        // Pool: 3 blocks × 16, but one block is held by another request
+        // (simulated by allocating it out of the pool) → the running
+        // request holds 2 full blocks and allocation of a 3rd fails.
+        // Folded prompt = 32 tokens ⇒ 2 blocks ≤ 3 total ⇒ recompute is
+        // possible once the other block frees: must preempt, not fail.
+        let (mut kv, mut requests, req_id) = boundary_exhausted_request(30, 2);
+        // Rebuild with a 3-block pool: take the same geometry but hold
+        // one block externally.
+        use crate::kv_cache::{CacheConfig, KVCacheDtype};
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 3,
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: candle_core::DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        kv = KVCacheManager::new(&cache_config).unwrap();
+        let mut other_table = BlockTable::new(16);
+        kv.allocate_for_request(&mut other_table, 16).unwrap();
+        {
+            let state = &mut requests.get_mut(&req_id).unwrap().state;
+            state.block_table = BlockTable::new(16);
+            kv.allocate_for_request(&mut state.block_table, 32).unwrap();
+            state.block_table.advance(32);
+        }
+
+        let mut preempted: Vec<RequestId> = Vec::new();
+        let (failed, _next) = execute_batched_decode_with_graph(
+            &[req_id],
+            None,
+            false,
+            &NoopModel(Device::Cpu),
+            &mut kv,
+            &mut requests,
+            None,
+            None,
+            &mut preempted,
+        );
+
+        assert!(
+            failed.is_empty(),
+            "refittable request must not fail: {failed:?}"
+        );
+        assert_eq!(preempted, vec![req_id]);
+        let state = &requests[&req_id].state;
+        assert_eq!(state.status, RequestStatus::Preempted);
+        // Generated tokens folded into the prompt for recompute.
+        assert_eq!(state.prompt_token_ids.len(), 32);
+        assert!(state.generated_token_ids.is_empty());
     }
 
     #[test]

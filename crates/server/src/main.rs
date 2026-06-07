@@ -1975,6 +1975,13 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             files.config.max_position_embeddings,
         );
         let mml = max_model_len_override.unwrap_or(default_max_model_len);
+        // vLLM-parity startup check. The default above already clamps to
+        // pool capacity, but an explicit --max-model-len bypasses it — and
+        // a sequence growing past capacity wedges the engine (preempted
+        // into a context that can never be rescheduled, FCFS head-of-line
+        // starves the queue). Refuse the configuration up front.
+        vllm_server::config::validate_kv_capacity(mml, num_blocks, block_size)
+            .map_err(|e| anyhow::anyhow!(e))?;
         // The builder clamps capture_cap <= mml so we never advertise a
         // larger capture window than the model actually supports.
         vllm_core::engine::EngineLimitsBuilder::new(mml)
