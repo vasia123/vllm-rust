@@ -598,36 +598,45 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Validate that the KV cache pool can hold at least one sequence of
-/// `max_model_len` tokens. Mirrors Python vLLM's startup check ("The
-/// model's max seq len is larger than the maximum number of tokens that
-/// can be stored in KV cache").
+/// Clamp `max_model_len` to what the KV cache pool can actually store
+/// (`num_blocks × block_size`).
 ///
-/// Without this guard a request that grows past the pool capacity is
-/// preempted-for-recompute into a context that needs more blocks than
-/// the pool HAS — it can never be rescheduled, and under FCFS it
-/// head-of-line starves every request behind it (observed live: 22-block
-/// pool = 352 tokens vs --max-model-len 1024; the engine served nothing
-/// until restart). The engine also fails such requests at preempt time
-/// (defense in depth), but refusing the configuration up front is the
-/// honest contract: the server must not advertise a context length it
-/// cannot store.
-pub fn validate_kv_capacity(
+/// A sequence may never exceed what the pool can hold: a request that
+/// grows past capacity is preempted-for-recompute into a context that
+/// needs more blocks than EXIST, can never be rescheduled, and under
+/// FCFS head-of-line starves the whole queue (observed live: 22-block
+/// pool = 352 tokens vs `--max-model-len 1024`; the engine served
+/// nothing until restart).
+///
+/// The DEFAULT `max_model_len` already clamps to capacity; only an
+/// explicit `--max-model-len` could exceed it. Rather than refuse the
+/// launch (which would also block the common short-request workflow on
+/// a small GPU), we clamp down to capacity and return a warning for the
+/// operator. Short requests keep working; a request whose prompt +
+/// `max_tokens` exceeds the clamped length is rejected gracefully
+/// per-request by [`validate_prompt_char_length`], never wedging the
+/// engine.
+///
+/// Returns the effective (possibly reduced) `max_model_len` and, when a
+/// clamp happened, a human-readable warning to log.
+pub fn clamp_max_model_len_to_capacity(
     max_model_len: usize,
     num_blocks: usize,
     block_size: usize,
-) -> Result<(), String> {
+) -> (usize, Option<String>) {
     let capacity_tokens = num_blocks * block_size;
     if max_model_len > capacity_tokens {
-        return Err(format!(
+        let warning = format!(
             "max_model_len ({max_model_len}) exceeds KV cache capacity ({capacity_tokens} \
-             tokens = {num_blocks} blocks × {block_size}). A single sequence reaching that \
-             length could never be stored. Decrease --max-model-len to ≤ {capacity_tokens}, \
-             or increase capacity via --gpu-memory-utilization / --num-blocks / \
-             --kv-cache-dtype fp8."
-        ));
+             tokens = {num_blocks} blocks × {block_size}); clamping effective context to \
+             {capacity_tokens}. Requests longer than {capacity_tokens} tokens will be \
+             rejected. To serve a longer context, raise --gpu-memory-utilization / \
+             --num-blocks, or use --kv-cache-dtype fp8."
+        );
+        (capacity_tokens, Some(warning))
+    } else {
+        (max_model_len, None)
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -636,18 +645,20 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn kv_capacity_rejects_max_model_len_above_pool() {
+    fn clamp_reduces_max_model_len_above_pool() {
         // Live wedge configuration: 22 blocks × 16 = 352 tokens vs 1024.
-        let err = validate_kv_capacity(1024, 22, 16).unwrap_err();
-        assert!(err.contains("352"), "actionable message: {err}");
-        assert!(err.contains("1024"), "actionable message: {err}");
+        let (eff, warn) = clamp_max_model_len_to_capacity(1024, 22, 16);
+        assert_eq!(eff, 352);
+        let warn = warn.expect("a clamp must warn");
+        assert!(warn.contains("352"), "actionable message: {warn}");
+        assert!(warn.contains("1024"), "actionable message: {warn}");
     }
 
     #[test]
-    fn kv_capacity_accepts_exact_fit_and_below() {
-        assert!(validate_kv_capacity(352, 22, 16).is_ok());
-        assert!(validate_kv_capacity(351, 22, 16).is_ok());
-        assert!(validate_kv_capacity(1024, 64, 16).is_ok());
+    fn clamp_is_noop_at_exact_fit_and_below() {
+        assert_eq!(clamp_max_model_len_to_capacity(352, 22, 16), (352, None));
+        assert_eq!(clamp_max_model_len_to_capacity(351, 22, 16), (351, None));
+        assert_eq!(clamp_max_model_len_to_capacity(1024, 64, 16), (1024, None));
     }
 
     #[test]

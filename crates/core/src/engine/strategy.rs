@@ -421,6 +421,22 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
             }
         }
 
+        // Phase 1b: Reclaim requests whose client disconnected. Runs
+        // BEFORE the frozen/idle waits and scheduling so an abandoned
+        // request is dropped instead of being scheduled or left to rot
+        // in the waiting queue (the bug: num_waiting climbed forever for
+        // non-streaming / not-yet-running requests). Any reclamation
+        // changes the running/waiting sets, so the optimistic
+        // pre-schedule is no longer valid.
+        if super::helpers::reap_disconnected_requests(
+            &mut scheduler,
+            &mut state.requests,
+            &mut kv_cache_mgr,
+        ) > 0
+        {
+            pending_decision = None;
+        }
+
         // Phase 2: If frozen (Keep mode), block-wait for commands only.
         // No scheduling occurs while frozen — requests stay in the queue.
         if frozen {

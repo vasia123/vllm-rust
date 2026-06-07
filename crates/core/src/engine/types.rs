@@ -418,6 +418,24 @@ pub(crate) enum ResponseChannel {
     Stream(mpsc::Sender<StreamEvent>),
 }
 
+impl ResponseChannel {
+    /// Whether the client has gone away: the receiving half of this
+    /// channel has been dropped. True once the HTTP handler future is
+    /// cancelled (curl timeout / client disconnect), for BOTH the
+    /// non-streaming `oneshot` and the streaming `mpsc` variants.
+    ///
+    /// The engine loop polls this for every active request — including
+    /// those still in the scheduler's waiting queue — so an abandoned
+    /// request is reclaimed instead of occupying a slot forever (see
+    /// the disconnect scan in `run_engine_loop`).
+    pub(crate) fn is_disconnected(&self) -> bool {
+        match self {
+            ResponseChannel::Complete(tx) => tx.is_closed(),
+            ResponseChannel::Stream(tx) => tx.is_closed(),
+        }
+    }
+}
+
 pub(crate) enum EngineCommand {
     Generate {
         request: GenerationRequest,

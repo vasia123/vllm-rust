@@ -1974,14 +1974,23 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
             num_blocks * block_size,
             files.config.max_position_embeddings,
         );
-        let mml = max_model_len_override.unwrap_or(default_max_model_len);
-        // vLLM-parity startup check. The default above already clamps to
-        // pool capacity, but an explicit --max-model-len bypasses it — and
-        // a sequence growing past capacity wedges the engine (preempted
-        // into a context that can never be rescheduled, FCFS head-of-line
-        // starves the queue). Refuse the configuration up front.
-        vllm_server::config::validate_kv_capacity(mml, num_blocks, block_size)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let requested_mml = max_model_len_override.unwrap_or(default_max_model_len);
+        // The default above already clamps to pool capacity, but an explicit
+        // --max-model-len can exceed it — and a sequence growing past
+        // capacity wedges the engine (preempted into a context that can never
+        // be rescheduled, FCFS head-of-line starves the queue). Clamp the
+        // effective context to capacity with a loud warning instead of
+        // refusing the launch, so short-request workflows on small GPUs keep
+        // working; over-long requests are rejected gracefully per-request.
+        let (mml, clamp_warning) = vllm_server::config::clamp_max_model_len_to_capacity(
+            requested_mml,
+            num_blocks,
+            block_size,
+        );
+        if let Some(warning) = clamp_warning {
+            tracing::warn!(target: "vllm_server", "{warning}");
+            eprintln!("WARNING: {warning}");
+        }
         // The builder clamps capture_cap <= mml so we never advertise a
         // larger capture window than the model actually supports.
         vllm_core::engine::EngineLimitsBuilder::new(mml)

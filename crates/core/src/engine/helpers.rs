@@ -359,6 +359,42 @@ pub(crate) fn handle_command(
     }
 }
 
+/// Reclaim every request whose client has disconnected — the HTTP
+/// handler future was dropped (curl timeout / client gone), closing the
+/// receiving half of its [`ResponseChannel`].
+///
+/// This is the authoritative cancellation path. The per-step
+/// `send_stream_token` disconnect check only inspects requests that are
+/// SCHEDULED that step (and only the streaming variant), so a request
+/// abandoned while sitting in the scheduler's WAITING queue — or a
+/// non-streaming request whose client gave up — was never noticed:
+/// `num_waiting` climbed across retries and never drained. Scanning all
+/// active requests once per engine iteration closes both gaps.
+///
+/// Returns the number reaped so the caller can invalidate any
+/// optimistic pre-schedule (the running/waiting sets changed).
+pub(crate) fn reap_disconnected_requests(
+    scheduler: &mut Scheduler,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+    kv_cache_mgr: &mut KVCacheManager,
+) -> usize {
+    let dead: Vec<RequestId> = requests
+        .iter()
+        .filter(|(_, req)| req.response.is_disconnected())
+        .map(|(&id, _)| id)
+        .collect();
+    for &id in &dead {
+        if let Some(mut req) = requests.remove(&id) {
+            // Free KV blocks the request may already hold (it could have
+            // been mid-decode when the client vanished).
+            let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
+        }
+        scheduler.remove_request(id);
+        tracing::debug!(request_id = id, "client disconnected; request reclaimed");
+    }
+    dead.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_request(
     request: GenerationRequest,
@@ -3000,6 +3036,174 @@ mod tests {
         // Generated tokens folded into the prompt for recompute.
         assert_eq!(state.prompt_token_ids.len(), 32);
         assert!(state.generated_token_ids.is_empty());
+    }
+
+    // ─── reap_disconnected_requests (client-disconnect cancellation) ──────
+
+    use crate::scheduler::{Scheduler, SchedulerConfig};
+
+    /// Minimal 8-block pool + scheduler for disconnect-scan tests.
+    fn reap_fixture() -> (Scheduler, KVCacheManager) {
+        use crate::kv_cache::{CacheConfig, KVCacheDtype};
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 8,
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: candle_core::DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        (
+            Scheduler::new(SchedulerConfig::default()),
+            KVCacheManager::new(&cache_config).unwrap(),
+        )
+    }
+
+    /// Insert a waiting request holding `held_blocks` KV blocks, with the
+    /// given response channel, and register it with the scheduler.
+    fn insert_waiting(
+        scheduler: &mut Scheduler,
+        kv: &mut KVCacheManager,
+        requests: &mut HashMap<RequestId, ActiveRequest>,
+        id: RequestId,
+        response: ResponseChannel,
+        held_blocks: usize,
+    ) {
+        let mut state = SequenceState::new(id, vec![1, 2, 3], 64, 99, 16, id);
+        if held_blocks > 0 {
+            kv.allocate_for_request(&mut state.block_table, held_blocks * 16)
+                .unwrap();
+            state.block_table.advance(held_blocks * 16);
+        }
+        scheduler.add_request(id);
+        requests.insert(
+            id,
+            ActiveRequest {
+                state,
+                response,
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+    }
+
+    /// A non-streaming (Complete) request whose client gave up — receiver
+    /// dropped — must be reaped from BOTH the requests map and the
+    /// scheduler's waiting queue, and its KV blocks freed. This is the
+    /// num_waiting-climbs-forever leak.
+    #[test]
+    fn reap_drops_disconnected_nonstreaming_waiting_request() {
+        let (mut scheduler, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<GenerationResult, EngineError>>();
+        insert_waiting(
+            &mut scheduler,
+            &mut kv,
+            &mut requests,
+            7,
+            ResponseChannel::Complete(tx),
+            2,
+        );
+        let free_before = kv.num_free_blocks();
+        drop(rx); // client disconnects while the request is still waiting
+
+        let reaped = reap_disconnected_requests(&mut scheduler, &mut requests, &mut kv);
+
+        assert_eq!(reaped, 1);
+        assert!(!requests.contains_key(&7));
+        assert!(scheduler.is_idle(), "waiting queue must be drained");
+        assert_eq!(kv.num_free_blocks(), free_before + 2, "KV blocks freed");
+    }
+
+    /// Same for a streaming (Stream) request — the engine scan is the
+    /// authoritative backstop even though streaming also has an
+    /// AbortGuard on the HTTP side.
+    #[test]
+    fn reap_drops_disconnected_streaming_request() {
+        let (mut scheduler, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<super::super::types::StreamEvent>(4);
+        insert_waiting(
+            &mut scheduler,
+            &mut kv,
+            &mut requests,
+            9,
+            ResponseChannel::Stream(tx),
+            1,
+        );
+        drop(rx);
+
+        let reaped = reap_disconnected_requests(&mut scheduler, &mut requests, &mut kv);
+
+        assert_eq!(reaped, 1);
+        assert!(!requests.contains_key(&9));
+        assert!(scheduler.is_idle());
+    }
+
+    /// A live client (receiver still held) must NOT be reaped.
+    #[test]
+    fn reap_keeps_connected_requests() {
+        let (mut scheduler, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+
+        let (tx, _rx_alive) =
+            tokio::sync::oneshot::channel::<Result<GenerationResult, EngineError>>();
+        insert_waiting(
+            &mut scheduler,
+            &mut kv,
+            &mut requests,
+            3,
+            ResponseChannel::Complete(tx),
+            1,
+        );
+
+        let reaped = reap_disconnected_requests(&mut scheduler, &mut requests, &mut kv);
+
+        assert_eq!(reaped, 0);
+        assert!(requests.contains_key(&3));
+        assert!(!scheduler.is_idle());
+        // _rx_alive holds the channel open until end of scope.
+    }
+
+    /// Mixed batch: only the disconnected ones go, the live one stays.
+    #[test]
+    fn reap_only_removes_disconnected_in_mixed_batch() {
+        let (mut scheduler, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+
+        let (tx_dead, rx_dead) =
+            tokio::sync::oneshot::channel::<Result<GenerationResult, EngineError>>();
+        let (tx_live, _rx_live) =
+            tokio::sync::oneshot::channel::<Result<GenerationResult, EngineError>>();
+        insert_waiting(
+            &mut scheduler,
+            &mut kv,
+            &mut requests,
+            1,
+            ResponseChannel::Complete(tx_dead),
+            1,
+        );
+        insert_waiting(
+            &mut scheduler,
+            &mut kv,
+            &mut requests,
+            2,
+            ResponseChannel::Complete(tx_live),
+            1,
+        );
+        drop(rx_dead);
+
+        let reaped = reap_disconnected_requests(&mut scheduler, &mut requests, &mut kv);
+
+        assert_eq!(reaped, 1);
+        assert!(!requests.contains_key(&1));
+        assert!(requests.contains_key(&2));
     }
 
     #[test]
