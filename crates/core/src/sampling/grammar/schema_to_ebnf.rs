@@ -64,7 +64,14 @@ pub fn try_schema_to_ebnf(schema: &Value) -> Result<Option<String>> {
     let mut builder = EbnfBuilder::new();
     let root_rule = match builder.emit(schema) {
         Ok(name) => name,
-        Err(UnsupportedKind::Unsupported(_)) => return Ok(None),
+        Err(UnsupportedKind::Unsupported(reason)) => {
+            tracing::debug!(
+                target: "vllm_core::xgrammar",
+                reason,
+                "schema outside EBNF-translator scope; falling back to compile_json_schema"
+            );
+            return Ok(None);
+        }
         Err(UnsupportedKind::Malformed(msg)) => bail!("{msg}"),
     };
 

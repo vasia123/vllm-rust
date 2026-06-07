@@ -172,7 +172,7 @@ impl GrammarCompiler {
                 let mut cache = self.cache.lock().await;
                 cache.insert(spec_hash, template.clone());
             }
-            return Ok((template.factory)());
+            Ok((template.factory)())
         }
 
         // ── No backend without xgrammar ────────────────────────────
@@ -204,13 +204,13 @@ impl GrammarCompiler {
         {
             let xgr_compiler = self.xgrammar_compiler_handle()?;
             let arc = xgrammar_compile_to_arc(&xgr_compiler, option, spec)?;
-            return Ok(Box::new(
+            Ok(Box::new(
                 super::xgrammar_backend::XGrammarGrammar::from_compiled(
                     arc,
                     self.vocab_index.vocab_size(),
                     64,
                 )?,
-            ));
+            ))
         }
         #[cfg(not(feature = "xgrammar"))]
         {

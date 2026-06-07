@@ -131,6 +131,21 @@ impl TokenizerWrapper {
     pub fn get_vocab(&self) -> std::collections::HashMap<String, u32> {
         self.inner.get_vocab(true)
     }
+
+    /// JSON form of the tokenizer's decoder definition — the same shape
+    /// as the `decoder` field of `tokenizer.json` (e.g.
+    /// `{"type":"ByteLevel",...}` or a `Sequence` of decoders).
+    ///
+    /// xgrammar's vocab-type detection keys off this field (see
+    /// `HFTokenizerAnalyzer::DetectVocabType` upstream): a `ByteFallback`
+    /// decoder marks a SentencePiece-style vocab (`▁` + `<0xNN>`), a
+    /// `ByteLevel` decoder marks a GPT-2-style byte-alias vocab (`Ġ`/`Ċ`).
+    /// `None` when no decoder is configured (synthetic/test tokenizers).
+    pub fn decoder_json(&self) -> Option<serde_json::Value> {
+        self.inner
+            .get_decoder()
+            .and_then(|d| serde_json::to_value(d).ok())
+    }
 }
 
 // ─── Chat Template ────────────────────────────────────────────────────────

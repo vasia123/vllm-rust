@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 
-use super::vocabulary::VocabularyIndex;
+use super::vocabulary::{RawVocabKind, VocabularyIndex};
 use super::{PackedBitmask, StructuredOutputGrammar};
 
 /// Pick the xgrammar `VocabType` for a vocabulary.
@@ -64,17 +64,36 @@ pub(crate) fn detect_vocab_type(vocab: &VocabularyIndex) -> xgrammar_rs::VocabTy
         }
     }
 
-    let mut saw_sp_marker = false;
-    let mut saw_bpe_marker = false;
+    detect_vocab_type_from_pieces(vocab.iter().map(|(_, b)| b))
+}
+
+/// Heuristic core shared by the decoded and raw-HF-vocab paths.
+///
+/// Marker counting instead of any-single-token matching: Gemma's raw
+/// SentencePiece vocab contains exactly one literal `Ġ` piece (a rare
+/// character, not a byte-alias) — a "saw any Ġ ⇒ ByteLevel" rule would
+/// misclassify the whole vocab on that single glyph, making xgrammar
+/// decode it as a 0x20 space and forcing it into grammar-constrained
+/// output. Priority:
+///   1. `<0xNN>` byte-fallback pieces present ⇒ `ByteFallback`
+///   2. `▁`-prefixed pieces outnumber `Ġ`/`Ċ`-prefixed ⇒ `ByteFallback`
+///   3. `Ġ`/`Ċ`-prefixed pieces outnumber `▁`-prefixed ⇒ `ByteLevel`
+///   4. otherwise ⇒ `Raw`
+pub(crate) fn detect_vocab_type_from_pieces<'a>(
+    pieces: impl Iterator<Item = &'a [u8]>,
+) -> xgrammar_rs::VocabType {
+    let mut saw_sp_byte_marker = false;
+    let mut sp_space_count: usize = 0;
+    let mut bpe_glyph_count: usize = 0;
     let mut non_ascii_count: usize = 0;
     let mut sample_count: usize = 0;
 
-    for (_id, bytes) in vocab.iter() {
+    for bytes in pieces {
         if bytes.is_empty() {
             continue;
         }
         sample_count += 1;
-        // Cheap byte-window scan first — both markers are short.
+        // Cheap byte-window scan first — all markers are short.
         // SentencePiece byte-fallback tokens are exactly "<0xNN>" —
         // 6 ASCII bytes, easy substring match.
         if bytes.len() == 6
@@ -85,12 +104,17 @@ pub(crate) fn detect_vocab_type(vocab: &VocabularyIndex) -> xgrammar_rs::VocabTy
             && bytes[3].is_ascii_hexdigit()
             && bytes[4].is_ascii_hexdigit()
         {
-            saw_sp_marker = true;
+            saw_sp_byte_marker = true;
         }
-        // HF BPE byte alphabet: any token starting with U+0120 (Ġ,
+        // SentencePiece space marker: piece starting with U+2581 (▁,
+        // UTF-8 = 0xE2 0x96 0x81).
+        if bytes.len() >= 3 && bytes[0] == 0xE2 && bytes[1] == 0x96 && bytes[2] == 0x81 {
+            sp_space_count += 1;
+        }
+        // HF BPE byte alphabet: piece starting with U+0120 (Ġ,
         // UTF-8 = 0xC4 0xA0) or U+010A (Ċ, UTF-8 = 0xC4 0x8A).
         if bytes.len() >= 2 && bytes[0] == 0xC4 && (bytes[1] == 0xA0 || bytes[1] == 0x8A) {
-            saw_bpe_marker = true;
+            bpe_glyph_count += 1;
         }
         // Track non-ASCII byte fraction so we can flag suspicious
         // "all-ASCII vocab" decisions below.
@@ -99,10 +123,10 @@ pub(crate) fn detect_vocab_type(vocab: &VocabularyIndex) -> xgrammar_rs::VocabTy
         }
     }
 
-    if saw_sp_marker {
+    if saw_sp_byte_marker || sp_space_count > bpe_glyph_count {
         return xgrammar_rs::VocabType::ByteFallback;
     }
-    if saw_bpe_marker {
+    if bpe_glyph_count > 0 {
         return xgrammar_rs::VocabType::ByteLevel;
     }
 
@@ -135,9 +159,15 @@ pub(crate) fn detect_vocab_type(vocab: &VocabularyIndex) -> xgrammar_rs::VocabTy
 /// Routing:
 ///   - If the `VocabularyIndex` carries a `raw_token_bytes` view
 ///     (built from `tokenizer.get_vocab()`), pass those raw byte
-///     strings + `VocabType::ByteLevel`. xgrammar then maps the BPE
-///     byte-alias chars (`Ġ`/`Ċ`/etc.) back to grammar bytes and
-///     correctly enforces multi-byte BPE tokens against the grammar.
+///     strings + the vocab type derived from the tokenizer's `decoder`
+///     definition (`RawVocabKind`, the same signal upstream xgrammar's
+///     `HFTokenizerAnalyzer::DetectVocabType` keys off): `ByteLevel`
+///     decoder (GPT-2/Qwen `Ġ`/`Ċ` aliases) ⇒ `ByteLevel`,
+///     `ByteFallback` decoder (SentencePiece `▁` + `<0xNN>`, e.g.
+///     Gemma) ⇒ `ByteFallback`. If no decoder kind is available, fall
+///     back to the piece-content heuristic. Hardcoding `ByteLevel`
+///     here made xgrammar read Gemma's single literal `Ġ` piece as a
+///     space and emit it for grammar space literals.
 ///   - Otherwise (synthetic vocab built via `from_token_bytes`),
 ///     pass the decoded form + heuristic `detect_vocab_type`.
 ///
@@ -156,10 +186,19 @@ pub(crate) fn tokenizer_info_from_vocab(
             let enc: Vec<Vec<u8>> = vocab.iter().map(|(_, b)| b.to_vec()).collect();
             (enc, detect_vocab_type(vocab))
         }
-        // Raw HF vocab available → ByteLevel path.
+        // Raw HF vocab available → vocab type from the tokenizer's
+        // decoder definition (authoritative, mirrors upstream
+        // xgrammar); piece-content heuristic only when the tokenizer
+        // exposed no decoder.
         (None, Some(raw_iter)) => {
             let enc: Vec<Vec<u8>> = raw_iter.map(|(_, b)| b.to_vec()).collect();
-            (enc, xgrammar_rs::VocabType::ByteLevel)
+            let vocab_type = match vocab.decoder_vocab_kind() {
+                Some(RawVocabKind::ByteLevel) => xgrammar_rs::VocabType::ByteLevel,
+                Some(RawVocabKind::ByteFallback) => xgrammar_rs::VocabType::ByteFallback,
+                Some(RawVocabKind::Raw) => xgrammar_rs::VocabType::Raw,
+                None => detect_vocab_type_from_pieces(enc.iter().map(|v| v.as_slice())),
+            };
+            (enc, vocab_type)
         }
         // No raw vocab and no override → decoded + heuristic.
         (None, None) => {
@@ -171,6 +210,7 @@ pub(crate) fn tokenizer_info_from_vocab(
     tracing::info!(
         target: "vllm_core::xgrammar",
         ?vocab_type,
+        decoder_kind = ?vocab.decoder_vocab_kind(),
         vocab_size = vocab.vocab_size(),
         source = if vocab.raw_token_bytes_iter().is_some() && env_override.is_none() {
             "raw_hf_vocab"
@@ -418,5 +458,59 @@ mod tests {
         // Pure-ASCII vocab — heuristic would land on Raw.
         let v = vocab_from(&["abc", "def"]);
         assert_eq!(detect_vocab_type(&v), xgrammar_rs::VocabType::ByteFallback);
+    }
+
+    #[test]
+    fn raw_sentencepiece_vocab_with_stray_g_glyph_is_byte_fallback() {
+        // Gemma 4's RAW HF vocab is SentencePiece-style: `▁`-prefixed
+        // pieces + `<0xNN>` byte-fallback markers — and it ALSO contains a
+        // single literal `Ġ` piece (a genuine rare character, id 245237).
+        // Classifying this vocab as ByteLevel makes xgrammar decode that
+        // `Ġ` piece as a 0x20 space, so a grammar with a literal space
+        // happily forces token `Ġ` into the output (observed live:
+        // `{"chosen":Ġ"2"}`). The stray glyph must not flip the decision.
+        let pieces: Vec<&[u8]> = vec![
+            "\u{2581}the".as_bytes(),
+            "\u{2581}\"".as_bytes(),
+            "<0x0A>".as_bytes(),
+            "hello".as_bytes(),
+            "\u{0120}".as_bytes(), // the stray Ġ
+        ];
+        assert_eq!(
+            detect_vocab_type_from_pieces(pieces.into_iter()),
+            xgrammar_rs::VocabType::ByteFallback
+        );
+    }
+
+    #[test]
+    fn raw_sentencepiece_vocab_without_byte_markers_is_byte_fallback() {
+        // Even with the `<0xNN>` markers absent, a vocab dominated by
+        // `▁`-prefixed pieces is SentencePiece-style.
+        let pieces: Vec<&[u8]> = vec![
+            "\u{2581}the".as_bytes(),
+            "\u{2581}world".as_bytes(),
+            "\u{2581}a".as_bytes(),
+            "hello".as_bytes(),
+            "\u{0120}".as_bytes(),
+        ];
+        assert_eq!(
+            detect_vocab_type_from_pieces(pieces.into_iter()),
+            xgrammar_rs::VocabType::ByteFallback
+        );
+    }
+
+    #[test]
+    fn raw_byte_level_vocab_stays_byte_level() {
+        // GPT-2-style raw vocab: Ġ-prefixed pieces dominate, no ▁/<0xNN>.
+        let pieces: Vec<&[u8]> = vec![
+            "\u{0120}the".as_bytes(),
+            "\u{0120}world".as_bytes(),
+            "\u{010A}".as_bytes(),
+            "hello".as_bytes(),
+        ];
+        assert_eq!(
+            detect_vocab_type_from_pieces(pieces.into_iter()),
+            xgrammar_rs::VocabType::ByteLevel
+        );
     }
 }
