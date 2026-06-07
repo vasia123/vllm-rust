@@ -22,3 +22,23 @@ the change costs nothing on the common path. The full-attention pad
 EXL3 GEMMs. This is the *before* baseline; the padding is required for
 correctness (shared cache stride), so there is no "after" to beat — the
 snapshot guards against future regressions in the no-op fast path.
+
+## Addendum 2026-06-07 — prefill length bucketing
+
+Prefill activations are now padded to `PREFILL_LEN_BUCKET = 32` (capped at the
+RoPE horizon), so candle's per-shape CUDA buffer cache holds at most
+`max_model_len / 32` distinct prefill shape sets instead of one per prompt
+length. K/V padding rows are dropped before the cache write; the KV read-back
+is zero-padded to the bucket and masked (`bucketed_prefill_mask`, padding rows
+keep column 0 open as a softmax-NaN guard).
+
+Live measurement (gemma-4-12B-it-exl3 @ 2.00bpw, 8 GB, --enforce-eager):
+
+| scenario                                   | before        | after  |
+|--------------------------------------------|---------------|--------|
+| VRAM after 8 requests of distinct lengths  | +~30 MB each  | flat (6201 → 6201 MiB) |
+| coherence ("Paris", thinking "42")         | ok            | ok (unchanged) |
+
+Compute overhead: ≤31 extra prefill tokens per request (bucket rounding);
+decode path untouched. Mask construction is O(q·kv) per layer — same class as
+the causal/sliding masks it replaces.

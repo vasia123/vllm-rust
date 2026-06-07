@@ -22,3 +22,4 @@ model_cache/
 # >>> visual-plan
 .plans/sessions/
 # <<< visual-plan
+.claude/worktrees/

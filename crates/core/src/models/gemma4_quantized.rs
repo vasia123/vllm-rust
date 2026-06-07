@@ -68,6 +68,66 @@ fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
 
 // ─── Sliding window causal mask ────────────────────────────────────────────
 
+/// Prefill activations are padded up to a multiple of this so candle's
+/// per-shape CUDA buffer cache sees at most `max_model_len / 32` distinct
+/// prefill shapes instead of one per prompt length. Each distinct Gemma 4
+/// prefill shape pins ~30 MB of cached activation buffers; unbounded
+/// distinct lengths slowly exhaust an 8 GB card on a long-running server.
+const PREFILL_LEN_BUCKET: usize = 32;
+
+/// Bucketed prefill length: `real_len` rounded up to the bucket, capped at
+/// `max_positions` (RoPE tables are precomputed only that far) and never
+/// below `real_len`.
+fn prefill_bucket_len(real_len: usize, max_positions: usize) -> usize {
+    if real_len <= 1 {
+        return real_len;
+    }
+    real_len
+        .div_ceil(PREFILL_LEN_BUCKET)
+        .saturating_mul(PREFILL_LEN_BUCKET)
+        .min(max_positions)
+        .max(real_len)
+}
+
+/// Attention mask for a bucket-padded prefill.
+///
+/// Rows are query positions `seqlen_offset + i` for `i < q_len` (the first
+/// `real_q` rows are real tokens, the rest right-padding); columns are KV
+/// positions `j < kv_len` (`real_kv` real cache entries, the rest zero
+/// padding). Real rows follow the causal (+ optional sliding-window) rule
+/// over real columns and mask everything else. Padding rows attend solely
+/// to column 0 — their outputs are discarded, but an all-`-inf` row would
+/// turn softmax into NaN, which the next layer's row-mixing ops could
+/// surface.
+#[allow(clippy::too_many_arguments)]
+fn bucketed_prefill_mask(
+    q_len: usize,
+    kv_len: usize,
+    real_q: usize,
+    real_kv: usize,
+    seqlen_offset: usize,
+    window_size: Option<usize>,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut mask = vec![f32::NEG_INFINITY; q_len * kv_len];
+    for i in 0..q_len {
+        if i >= real_q {
+            mask[i * kv_len] = 0.0;
+            continue;
+        }
+        let query_pos = seqlen_offset + i;
+        for j in 0..real_kv.min(kv_len) {
+            let is_causal = j <= query_pos;
+            let is_in_window = window_size.is_none_or(|w| query_pos < w || j > query_pos - w);
+            if is_causal && is_in_window {
+                mask[i * kv_len + j] = 0.0;
+            }
+        }
+    }
+    Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
+}
+
 fn sliding_window_mask(
     q_len: usize,
     kv_len: usize,
@@ -865,6 +925,7 @@ impl QuantizedGemma4Attention {
     fn forward(
         &self,
         xs: &Tensor,
+        real_q_len: usize,
         seqlen_offset: usize,
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
@@ -882,11 +943,11 @@ impl QuantizedGemma4Attention {
             // Shared layer: rotate Q only, read K/V from the target layer's
             // cache (already populated by an earlier layer of the same type).
             let (q, _) = self.rotary_emb.apply(&q, &q, seqlen_offset)?;
-            let num_tokens = seqlen_offset + q_len;
+            let num_tokens = seqlen_offset + real_q_len;
             let (k_full, v_full) = cache_engine
                 .read(block_table.block_ids(), num_tokens)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset)
+            self.finalize_attention(&q, &k_full, &v_full, q_len, real_q_len, b_sz, seqlen_offset)
         } else {
             let k = self
                 .k_proj
@@ -917,6 +978,16 @@ impl QuantizedGemma4Attention {
 
             let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
+            // Bucketed prefill pads the sequence; the padding rows of K/V
+            // are dropped here — nothing ever attends to them (real queries
+            // are causally earlier, pad queries are discarded), so they
+            // must not reach the cache.
+            let (k, v) = if real_q_len < q_len {
+                (k.narrow(2, 0, real_q_len)?, v.narrow(2, 0, real_q_len)?)
+            } else {
+                (k, v)
+            };
+
             let k_padded = pad_last_dim(&k, self.head_dim, self.cache_head_dim)?;
             let v_padded = pad_last_dim(&v, self.head_dim, self.cache_head_dim)?;
             let k_padded = pad_kv_heads(&k_padded, self.num_kv_heads, self.cache_num_kv_heads)?;
@@ -927,20 +998,22 @@ impl QuantizedGemma4Attention {
                 .write(&k_for_cache, &v_for_cache, slot_mapping)
                 .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
 
-            let num_tokens = seqlen_offset + q_len;
+            let num_tokens = seqlen_offset + real_q_len;
             let (k_full, v_full) = cache_engine
                 .read(block_table.block_ids(), num_tokens)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset)
+            self.finalize_attention(&q, &k_full, &v_full, q_len, real_q_len, b_sz, seqlen_offset)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_attention(
         &self,
         q: &Tensor,
         k_full: &Tensor,
         v_full: &Tensor,
         q_len: usize,
+        real_q_len: usize,
         b_sz: usize,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
@@ -971,7 +1044,25 @@ impl QuantizedGemma4Attention {
             v_full.clone()
         };
 
-        let kv_len = k_full.dim(2)?;
+        // Bucket the KV length to match the (possibly padded) query length
+        // class, keeping the attention-score buffer shapes bounded. Zero
+        // K/V columns beyond `real_kv` are masked off below.
+        let real_kv = k_full.dim(2)?;
+        let kv_len = if real_q_len < q_len {
+            prefill_bucket_len(real_kv, usize::MAX)
+        } else {
+            real_kv
+        };
+        let (k_full, v_full) = if kv_len > real_kv {
+            let (b, h, _, d) = k_full.dims4()?;
+            let pad = Tensor::zeros((b, h, kv_len - real_kv, d), k_full.dtype(), device)?;
+            (
+                Tensor::cat(&[&k_full, &pad], 2)?,
+                Tensor::cat(&[&v_full, &pad], 2)?,
+            )
+        } else {
+            (k_full, v_full)
+        };
         let num_kv_groups = self.num_heads / self.num_kv_heads;
         let k_full = repeat_kv(k_full, num_kv_groups)?;
         let v_full = repeat_kv(v_full, num_kv_groups)?;
@@ -982,7 +1073,18 @@ impl QuantizedGemma4Attention {
             attn_weights = soft_cap(&attn_weights, cap)?;
         }
 
-        let mask = if let Some(window_size) = self.sliding_window {
+        let mask = if real_q_len < q_len || kv_len > real_kv {
+            bucketed_prefill_mask(
+                q_len,
+                kv_len,
+                real_q_len,
+                real_kv,
+                seqlen_offset,
+                self.sliding_window,
+                dtype,
+                device,
+            )?
+        } else if let Some(window_size) = self.sliding_window {
             sliding_window_mask(q_len, kv_len, seqlen_offset, window_size, dtype, device)?
         } else {
             crate::layers::causal_mask(q_len, seqlen_offset, dtype, device)?
@@ -1391,10 +1493,12 @@ impl QuantizedGemma4DecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         per_layer_input: Option<&Tensor>,
+        real_q_len: usize,
         seqlen_offset: usize,
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
@@ -1407,6 +1511,7 @@ impl QuantizedGemma4DecoderLayer {
         let cache_layer_idx = self.kv_sharing_target.unwrap_or(layer_idx);
         let attn_out = self.self_attn.forward(
             &hidden_states,
+            real_q_len,
             seqlen_offset,
             kv_cache_mgr.engine_mut(cache_layer_idx),
             block_table,
@@ -1529,6 +1634,9 @@ pub struct QuantizedGemma4ForCausalLM {
     num_hidden_layers: usize,
     hidden_size_per_layer_input: usize,
     final_logit_softcap: Option<f64>,
+    /// RoPE tables are precomputed to this many positions; prefill
+    /// bucketing must not pad past it.
+    max_position_embeddings: usize,
     device: Device,
 }
 
@@ -1659,6 +1767,7 @@ impl QuantizedGemma4ForCausalLM {
             num_hidden_layers: cfg.num_hidden_layers,
             hidden_size_per_layer_input: extra_cfg.hidden_size_per_layer_input,
             final_logit_softcap: extra_cfg.final_logit_softcap,
+            max_position_embeddings: cfg.max_position_embeddings,
             device: vb_m.device().clone(),
         })
     }
@@ -1746,12 +1855,37 @@ impl QuantizedGemma4ForCausalLM {
 
         let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
 
+        // Bucket the prefill length so candle's per-shape CUDA buffer cache
+        // sees a bounded set of activation shapes (see PREFILL_LEN_BUCKET).
+        // Right-padding is invisible to the real tokens: pads are strictly
+        // in the causal future, their K/V rows are dropped before the cache
+        // write, and their outputs are discarded by the final-position
+        // slice. Skipped when PLE is active (per-layer inputs are sized to
+        // the real length).
+        let real_len = xs.dim(1)?;
+        let bucket_len = if self.embed_tokens_per_layer.is_none() {
+            prefill_bucket_len(
+                real_len,
+                self.max_position_embeddings.saturating_sub(seqlen_offset),
+            )
+        } else {
+            real_len
+        };
+        let xs = if bucket_len > real_len {
+            let (b, _, h) = xs.dims3()?;
+            let pad = Tensor::zeros((b, bucket_len - real_len, h), xs.dtype(), xs.device())?;
+            Tensor::cat(&[&xs, &pad], 1)?
+        } else {
+            xs
+        };
+
         let mut xs = xs;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
             xs = layer.forward(
                 &xs,
                 pli.as_ref(),
+                real_len,
                 seqlen_offset,
                 kv_cache_mgr,
                 layer_idx,
@@ -1768,9 +1902,8 @@ impl QuantizedGemma4ForCausalLM {
         // EXL3 kernel's fp32 staging) ~300 MB per distinct prompt length,
         // all of which the CUDA allocator caches per shape — several
         // differently-sized requests then OOM an 8 GB card.
-        let seq_len = xs.dim(1)?;
-        let xs = if seq_len > 1 {
-            xs.narrow(1, seq_len - 1, 1)?
+        let xs = if real_len > 1 || xs.dim(1)? > 1 {
+            xs.narrow(1, real_len - 1, 1)?
         } else {
             xs
         };
@@ -1806,12 +1939,33 @@ impl QuantizedGemma4ForCausalLM {
         let dummy_ids = Tensor::zeros(&dummy_shape[..], DType::U32, &self.device)?;
         let per_layer_inputs = self.compute_per_layer_inputs(&dummy_ids, embeddings)?;
 
-        let mut xs = embeddings.clone();
+        // Bucketed prefill — see `forward` for the rationale.
+        let real_len = embeddings.dim(1)?;
+        let bucket_len = if self.embed_tokens_per_layer.is_none() {
+            prefill_bucket_len(
+                real_len,
+                self.max_position_embeddings.saturating_sub(seqlen_offset),
+            )
+        } else {
+            real_len
+        };
+        let mut xs = if bucket_len > real_len {
+            let (b, _, h) = embeddings.dims3()?;
+            let pad = Tensor::zeros(
+                (b, bucket_len - real_len, h),
+                embeddings.dtype(),
+                embeddings.device(),
+            )?;
+            Tensor::cat(&[embeddings, &pad], 1)?
+        } else {
+            embeddings.clone()
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
             xs = layer.forward(
                 &xs,
                 pli.as_ref(),
+                real_len,
                 seqlen_offset,
                 kv_cache_mgr,
                 layer_idx,
@@ -1821,9 +1975,8 @@ impl QuantizedGemma4ForCausalLM {
         }
 
         // Last-position-only lm_head — see `forward` for the rationale.
-        let seq_len = xs.dim(1)?;
-        let xs = if seq_len > 1 {
-            xs.narrow(1, seq_len - 1, 1)?
+        let xs = if real_len > 1 || xs.dim(1)? > 1 {
+            xs.narrow(1, real_len - 1, 1)?
         } else {
             xs
         };
@@ -2064,6 +2217,84 @@ mod tests {
     }
 
     #[test]
+    fn test_prefill_bucket_len() {
+        // Multiples of 32, capped at max_positions, never below real_len.
+        assert_eq!(prefill_bucket_len(1, 1024), 1); // decode-sized: untouched
+        assert_eq!(prefill_bucket_len(5, 1024), 32);
+        assert_eq!(prefill_bucket_len(32, 1024), 32);
+        assert_eq!(prefill_bucket_len(33, 1024), 64);
+        assert_eq!(prefill_bucket_len(1000, 1024), 1024);
+        // Cap below the bucket boundary: pad only as far as RoPE reaches.
+        assert_eq!(prefill_bucket_len(5, 20), 20);
+        // Cap below real_len must not shrink the input.
+        assert_eq!(prefill_bucket_len(5, 3), 5);
+    }
+
+    #[test]
+    fn test_bucketed_prefill_mask_matches_unpadded_semantics() {
+        // The real-token region of the bucketed mask must agree exactly with
+        // the legacy masks the unpadded path used.
+        let device = Device::Cpu;
+        let (real_q, real_kv, offset) = (3usize, 5usize, 2usize);
+        let (q_len, kv_len) = (8usize, 8usize);
+
+        for window in [None, Some(2usize)] {
+            let bucketed = bucketed_prefill_mask(
+                q_len,
+                kv_len,
+                real_q,
+                real_kv,
+                offset,
+                window,
+                DType::F32,
+                &device,
+            )
+            .unwrap()
+            .to_vec2_like_4d();
+            let reference = match window {
+                Some(w) => sliding_window_mask(real_q, real_kv, offset, w, DType::F32, &device)
+                    .unwrap()
+                    .to_vec2_like_4d(),
+                None => crate::layers::causal_mask(real_q, offset, DType::F32, &device)
+                    .unwrap()
+                    .to_vec2_like_4d(),
+            };
+            for i in 0..real_q {
+                for j in 0..real_kv.min(reference[i].len()) {
+                    assert_eq!(
+                        bucketed[i][j], reference[i][j],
+                        "mismatch at ({i},{j}) window={window:?}"
+                    );
+                }
+                // Padded KV columns must be masked for real rows.
+                for j in real_kv..kv_len {
+                    assert_eq!(bucketed[i][j], f32::NEG_INFINITY, "pad col ({i},{j})");
+                }
+            }
+            // Padding rows: only column 0 open (NaN guard), rest -inf.
+            for (i, row) in bucketed.iter().enumerate().take(q_len).skip(real_q) {
+                assert_eq!(row[0], 0.0, "pad row {i} col 0 must be open");
+                for (j, &v) in row.iter().enumerate().skip(1) {
+                    assert_eq!(v, f32::NEG_INFINITY, "pad row ({i},{j})");
+                }
+            }
+        }
+    }
+
+    /// Test helper: flatten a `[1,1,q,kv]` mask into rows.
+    trait MaskRows {
+        fn to_vec2_like_4d(&self) -> Vec<Vec<f32>>;
+    }
+    impl MaskRows for Tensor {
+        fn to_vec2_like_4d(&self) -> Vec<Vec<f32>> {
+            self.squeeze(0)
+                .and_then(|t| t.squeeze(0))
+                .and_then(|t| t.to_vec2::<f32>())
+                .expect("mask to rows")
+        }
+    }
+
+    #[test]
     fn test_padded_cache_roundtrip_preserves_values() {
         // Isolates the head_dim-padding cache path used for Gemma 4's
         // heterogeneous layers: write K/V at head_dim < cache_head_dim
@@ -2186,6 +2417,20 @@ mod tests {
             .expect("prefill forward with heterogeneous KV heads");
         // prefill returns last-position-only logits (262k-vocab memory)
         assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+        // Prefill runs the bucketed path (6 tokens → bucket 32); padding
+        // rows are NaN-guarded via the mask's column-0 escape — the real
+        // position's logits must come out finite.
+        let flat: Vec<f32> = logits
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "bucketed prefill produced non-finite logits"
+        );
 
         // One decode step — reads the padded cache back and slices to the
         // per-layer KV-head count.

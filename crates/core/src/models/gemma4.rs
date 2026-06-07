@@ -76,6 +76,56 @@ fn soft_cap(xs: &Tensor, cap: f64) -> Result<Tensor> {
 
 // ─── Sliding Window Mask ────────────────────────────────────────────────────
 
+/// See `gemma4_quantized.rs::PREFILL_LEN_BUCKET` — duplicated here per the
+/// file-independence convention of the gemma4 family.
+const PREFILL_LEN_BUCKET: usize = 32;
+
+/// Bucketed prefill length — multiple of [`PREFILL_LEN_BUCKET`], capped at
+/// `max_positions`, never below `real_len`.
+fn prefill_bucket_len(real_len: usize, max_positions: usize) -> usize {
+    if real_len <= 1 {
+        return real_len;
+    }
+    real_len
+        .div_ceil(PREFILL_LEN_BUCKET)
+        .saturating_mul(PREFILL_LEN_BUCKET)
+        .min(max_positions)
+        .max(real_len)
+}
+
+/// Attention mask for a bucket-padded prefill — real rows follow the
+/// causal/sliding rule over real KV columns; padding rows attend only to
+/// column 0 (NaN guard); everything else is `-inf`. See the quantized
+/// twin for details.
+#[allow(clippy::too_many_arguments)]
+fn bucketed_prefill_mask(
+    q_len: usize,
+    kv_len: usize,
+    real_q: usize,
+    real_kv: usize,
+    seqlen_offset: usize,
+    window_size: Option<usize>,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut mask = vec![f32::NEG_INFINITY; q_len * kv_len];
+    for i in 0..q_len {
+        if i >= real_q {
+            mask[i * kv_len] = 0.0;
+            continue;
+        }
+        let query_pos = seqlen_offset + i;
+        for j in 0..real_kv.min(kv_len) {
+            let is_causal = j <= query_pos;
+            let is_in_window = window_size.is_none_or(|w| query_pos < w || j > query_pos - w);
+            if is_causal && is_in_window {
+                mask[i * kv_len + j] = 0.0;
+            }
+        }
+    }
+    Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
+}
+
 fn sliding_window_mask(
     q_len: usize,
     kv_len: usize,
@@ -929,10 +979,12 @@ impl Gemma4Attention {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         _attention_mask: Option<&Tensor>,
+        real_q_len: usize,
         seqlen_offset: usize,
         cache_engine: &mut CacheEngine,
         block_table: &BlockTable,
@@ -954,11 +1006,20 @@ impl Gemma4Attention {
             // target layer's cache (at `cache_head_dim`), no new write.
             let (q, _) = self.rotary_emb.apply(&q, &q, seqlen_offset)?;
 
-            let num_tokens = seqlen_offset + q_len;
+            let num_tokens = seqlen_offset + real_q_len;
             let (k_full, v_full) = cache_engine
                 .read(block_table.block_ids(), num_tokens)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
-            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset, tp_ctx)
+            self.finalize_attention(
+                &q,
+                &k_full,
+                &v_full,
+                q_len,
+                real_q_len,
+                b_sz,
+                seqlen_offset,
+                tp_ctx,
+            )
         } else {
             // Non-shared: full K/V computation + cache write.
             let k = self
@@ -990,6 +1051,14 @@ impl Gemma4Attention {
 
             let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
+            // Bucketed-prefill padding rows of K/V are dropped — nothing
+            // ever attends to them, so they must not reach the cache.
+            let (k, v) = if real_q_len < q_len {
+                (k.narrow(2, 0, real_q_len)?, v.narrow(2, 0, real_q_len)?)
+            } else {
+                (k, v)
+            };
+
             // Pad K/V to the shared cache geometry: head_dim → cache_head_dim
             // and (for full-attention layers with fewer KV heads) the KV-head
             // count → cache_num_kv_heads.
@@ -1004,13 +1073,22 @@ impl Gemma4Attention {
                 .write(&k_for_cache, &v_for_cache, slot_mapping)
                 .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
 
-            let num_tokens = seqlen_offset + q_len;
+            let num_tokens = seqlen_offset + real_q_len;
             let (k_full, v_full) = cache_engine
                 .read(block_table.block_ids(), num_tokens)
                 .map_err(|e| candle_core::Error::Msg(format!("cache read: {e}")))?;
 
             let _ = (device, dtype);
-            self.finalize_attention(&q, &k_full, &v_full, q_len, b_sz, seqlen_offset, tp_ctx)
+            self.finalize_attention(
+                &q,
+                &k_full,
+                &v_full,
+                q_len,
+                real_q_len,
+                b_sz,
+                seqlen_offset,
+                tp_ctx,
+            )
         }
     }
 
@@ -1024,6 +1102,7 @@ impl Gemma4Attention {
         k_full: &Tensor,
         v_full: &Tensor,
         q_len: usize,
+        real_q_len: usize,
         b_sz: usize,
         seqlen_offset: usize,
         tp_ctx: &TpContext,
@@ -1055,7 +1134,25 @@ impl Gemma4Attention {
             v_full
         };
 
-        let kv_len = k_full.dim(2)?;
+        // Bucket the KV length alongside the padded query length so the
+        // attention-score buffer shapes stay bounded; zero columns beyond
+        // `real_kv` are masked off below.
+        let real_kv = k_full.dim(2)?;
+        let kv_len = if real_q_len < q_len {
+            prefill_bucket_len(real_kv, usize::MAX)
+        } else {
+            real_kv
+        };
+        let (k_full, v_full) = if kv_len > real_kv {
+            let (b, h, _, d) = k_full.dims4()?;
+            let pad = Tensor::zeros((b, h, kv_len - real_kv, d), k_full.dtype(), device)?;
+            (
+                Tensor::cat(&[&k_full, &pad], 2)?,
+                Tensor::cat(&[&v_full, &pad], 2)?,
+            )
+        } else {
+            (k_full, v_full)
+        };
         let num_kv_groups = self.num_heads / self.num_kv_heads;
         let k_full = repeat_kv(k_full, num_kv_groups)?;
         let v_full = repeat_kv(v_full, num_kv_groups)?;
@@ -1067,7 +1164,18 @@ impl Gemma4Attention {
             attn_weights = soft_cap(&attn_weights, cap)?;
         }
 
-        let mask = if let Some(window_size) = self.sliding_window {
+        let mask = if real_q_len < q_len || kv_len > real_kv {
+            bucketed_prefill_mask(
+                q_len,
+                kv_len,
+                real_q_len,
+                real_kv,
+                seqlen_offset,
+                self.sliding_window,
+                dtype,
+                device,
+            )?
+        } else if let Some(window_size) = self.sliding_window {
             sliding_window_mask(q_len, kv_len, seqlen_offset, window_size, dtype, device)?
         } else {
             crate::layers::causal_mask(q_len, seqlen_offset, dtype, device)?
@@ -1430,11 +1538,13 @@ impl Gemma4DecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         xs: &Tensor,
         per_layer_input: Option<&Tensor>,
         _attention_mask: Option<&Tensor>,
+        real_q_len: usize,
         seqlen_offset: usize,
         kv_cache_mgr: &mut KVCacheManager,
         layer_idx: usize,
@@ -1452,6 +1562,7 @@ impl Gemma4DecoderLayer {
         let hidden_states = self.self_attn.forward(
             &hidden_states,
             None,
+            real_q_len,
             seqlen_offset,
             kv_cache_mgr.engine_mut(cache_layer_idx),
             block_table,
@@ -1535,6 +1646,8 @@ pub struct Gemma4ForCausalLM {
     num_hidden_layers: usize,
     hidden_size_per_layer_input: usize,
     final_logit_softcap: Option<f64>,
+    /// RoPE precompute horizon — prefill bucketing must not pad past it.
+    max_position_embeddings: usize,
     tp_ctx: TpContext,
     device: Device,
     dtype: DType,
@@ -1680,6 +1793,7 @@ impl Gemma4ForCausalLM {
             num_hidden_layers: cfg.num_hidden_layers,
             hidden_size_per_layer_input: extra_cfg.hidden_size_per_layer_input,
             final_logit_softcap: extra_cfg.final_logit_softcap,
+            max_position_embeddings: cfg.max_position_embeddings,
             tp_ctx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
@@ -1776,6 +1890,24 @@ impl Gemma4ForCausalLM {
         // Compute PLE per-layer inputs
         let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
 
+        // Bucketed prefill — see QuantizedGemma4ForCausalLM::forward.
+        let real_len = seq_len;
+        let bucket_len = if self.hidden_size_per_layer_input == 0 {
+            prefill_bucket_len(
+                real_len,
+                self.max_position_embeddings.saturating_sub(seqlen_offset),
+            )
+        } else {
+            real_len
+        };
+        let xs = if bucket_len > real_len {
+            let (b, _, h) = xs.dims3()?;
+            let pad = Tensor::zeros((b, bucket_len - real_len, h), xs.dtype(), xs.device())?;
+            Tensor::cat(&[&xs, &pad], 1)?
+        } else {
+            xs
+        };
+
         let attention_mask = if seq_len <= 1 {
             None
         } else {
@@ -1795,6 +1927,7 @@ impl Gemma4ForCausalLM {
                 &xs,
                 pli.as_ref(),
                 attention_mask.as_ref(),
+                real_len,
                 seqlen_offset,
                 kv_cache_mgr,
                 layer_idx,
@@ -1808,9 +1941,8 @@ impl Gemma4ForCausalLM {
         // consumed for sampling, and Gemma 4's 262k vocab makes full-sequence
         // logits (~seq x 262144) prohibitively large per cached shape.
         // See QuantizedGemma4ForCausalLM::forward for the full rationale.
-        let seq_len = xs.dim(1)?;
-        let xs = if seq_len > 1 {
-            xs.narrow(1, seq_len - 1, 1)?
+        let xs = if real_len > 1 || xs.dim(1)? > 1 {
+            xs.narrow(1, real_len - 1, 1)?
         } else {
             xs
         };
@@ -1857,7 +1989,27 @@ impl Gemma4ForCausalLM {
         let dummy_ids = Tensor::zeros(&dummy_shape[..], DType::U32, &self.device)?;
         let per_layer_inputs = self.compute_per_layer_inputs(&dummy_ids, embeddings)?;
 
-        let mut xs = embeddings.clone();
+        // Bucketed prefill — see QuantizedGemma4ForCausalLM::forward.
+        let real_len = seq_len;
+        let bucket_len = if self.hidden_size_per_layer_input == 0 {
+            prefill_bucket_len(
+                real_len,
+                self.max_position_embeddings.saturating_sub(seqlen_offset),
+            )
+        } else {
+            real_len
+        };
+        let mut xs = if bucket_len > real_len {
+            let (b, _, h) = embeddings.dims3()?;
+            let pad = Tensor::zeros(
+                (b, bucket_len - real_len, h),
+                embeddings.dtype(),
+                embeddings.device(),
+            )?;
+            Tensor::cat(&[embeddings, &pad], 1)?
+        } else {
+            embeddings.clone()
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
 
@@ -1865,6 +2017,7 @@ impl Gemma4ForCausalLM {
                 &xs,
                 pli.as_ref(),
                 attention_mask.as_ref(),
+                real_len,
                 seqlen_offset,
                 kv_cache_mgr,
                 layer_idx,
@@ -1878,9 +2031,8 @@ impl Gemma4ForCausalLM {
         // consumed for sampling, and Gemma 4's 262k vocab makes full-sequence
         // logits (~seq x 262144) prohibitively large per cached shape.
         // See QuantizedGemma4ForCausalLM::forward for the full rationale.
-        let seq_len = xs.dim(1)?;
-        let xs = if seq_len > 1 {
-            xs.narrow(1, seq_len - 1, 1)?
+        let xs = if real_len > 1 || xs.dim(1)? > 1 {
+            xs.narrow(1, real_len - 1, 1)?
         } else {
             xs
         };
