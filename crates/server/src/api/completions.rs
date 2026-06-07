@@ -402,6 +402,18 @@ fn resolve_prompt_input(
                 .encode(&text)
                 .map(|ids| ids.len())
                 .unwrap_or(0);
+            // Exact guard: a prompt past the capacity-clamped max_model_len
+            // can never be scheduled (the engine would leave it stuck in
+            // the waiting queue until the client times out). Reject with a
+            // 400. Reuses the token count just computed.
+            if token_count.saturating_add(1) > state.max_model_len {
+                return Err(ApiError::InvalidRequest(format!(
+                    "prompt too long: {token_count} tokens exceeds the usable context of \
+                     {} tokens (KV cache capacity). Shorten the prompt, raise \
+                     --gpu-memory-utilization / --num-blocks, or use --kv-cache-dtype fp8.",
+                    state.max_model_len
+                )));
+            }
             Ok((text, token_count))
         }
         PromptInput::TokenIds(ids) => {

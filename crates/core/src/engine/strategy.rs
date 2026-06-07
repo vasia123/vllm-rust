@@ -272,6 +272,20 @@ fn execute_engine_step<S: ExecutionStrategy>(
     step_result.errored.append(&mut state.errored_ids);
     step_result.preempted.append(&mut state.preempted_ids);
 
+    // Return retained CUDA mem-pool memory to the OS when free VRAM is low.
+    // The driver hoards async-freed buffers (candle frees promptly, the
+    // stream-ordered pool keeps them), so a burst of varied-shape transients
+    // creeps toward the device limit and OOMs later allocations even though
+    // little is live. This runs on the spawn_blocking GPU thread (context
+    // bound, stream synchronized by the step's DtoH copy), so the trim
+    // actually releases this step's transients. Cheap above the watermark
+    // (one mem_get_info); a synchronize + trim only fires under pressure.
+    // No-op on non-CUDA builds.
+    super::cuda_mem::trim_under_pressure(
+        super::cuda_mem::watermark_bytes(),
+        super::cuda_mem::keep_bytes(),
+    );
+
     step_result
 }
 
@@ -436,6 +450,13 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
         {
             pending_decision = None;
         }
+
+        // NOTE: CUDA mem-pool reclaim under memory pressure runs at the END
+        // of `execute_engine_step` — inside the spawn_blocking GPU thread,
+        // where the CUDA context is bound and the step's stream is already
+        // synchronized. Doing it here on the async-loop thread is
+        // ineffective: `cuCtxSynchronize` has no current context here and
+        // the trim would not release the forward's just-freed transients.
 
         // Phase 2: If frozen (Keep mode), block-wait for commands only.
         // No scheduling occurs while frozen — requests stay in the queue.

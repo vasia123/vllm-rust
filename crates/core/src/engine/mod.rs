@@ -24,6 +24,7 @@ mod context;
 pub mod cr_trace;
 pub mod cuda_graph;
 pub mod cuda_graph_runner;
+pub mod cuda_mem;
 pub mod debug_dump;
 mod embedding_forward;
 mod encoder_decoder;

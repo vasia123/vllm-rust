@@ -731,10 +731,15 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 &mut state.requests,
                 tokenizer,
             ) {
-                if let Some(id) =
-                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
-                {
-                    state.errored_ids.push(id);
+                match super::helpers::handle_prefill_error(
+                    req_id,
+                    e,
+                    &mut state.requests,
+                    kv_cache_mgr,
+                ) {
+                    Ok(preempted) => state.preempted_ids.push(preempted),
+                    Err(Some(id)) => state.errored_ids.push(id),
+                    Err(None) => {}
                 }
                 continue;
             }

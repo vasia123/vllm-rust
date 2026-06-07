@@ -1826,6 +1826,14 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         num_blocks = computed_blocks.num_blocks;
     }
 
+    // Bound the CUDA stream-ordered memory pool so async-freed buffers
+    // are returned to the OS instead of being hoarded indefinitely (the
+    // pool would otherwise creep to the device limit under a burst of
+    // varied-shape allocations and OOM a tight GPU). The engine also
+    // trims under pressure per step; this just caps the steady-state
+    // cache. No-op on non-CUDA builds.
+    vllm_core::engine::cuda_mem::init(0, vllm_core::engine::cuda_mem::keep_bytes() as u64);
+
     // Compute CPU offload config from swap_space or cpu_offload_gb
     let cpu_offload_config = {
         let offload_gb = if cpu_offload_gb > 0.0 {

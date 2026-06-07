@@ -18,7 +18,8 @@ use super::cuda_graph_runner::CudaGraphRunner;
 use super::helpers::execute_pipelined_multi_step_decode;
 use super::helpers::{
     execute_batched_decode_with_graph, execute_beam_decode, execute_prefill,
-    finish_request_with_error_deferred, is_beam_request, reclaim_sliding_window_blocks,
+    finish_request_with_error_deferred, handle_prefill_error, is_beam_request,
+    reclaim_sliding_window_blocks,
 };
 use super::model_forward::{DecodeSequenceMetadata, ModelForward};
 use super::strategy::ExecutionStrategy;
@@ -516,10 +517,10 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
                 &mut state.requests,
                 tokenizer,
             ) {
-                if let Some(id) =
-                    finish_request_with_error_deferred(req_id, e, &mut state.requests, kv_cache_mgr)
-                {
-                    state.errored_ids.push(id);
+                match handle_prefill_error(req_id, e, &mut state.requests, kv_cache_mgr) {
+                    Ok(preempted) => state.preempted_ids.push(preempted),
+                    Err(Some(id)) => state.errored_ids.push(id),
+                    Err(None) => {}
                 }
             }
         }

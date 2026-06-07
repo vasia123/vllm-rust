@@ -303,6 +303,35 @@ pub fn validate_prompt_char_length(
     Ok(())
 }
 
+/// Exact check: tokenize the prompt and reject (400) when it alone, plus
+/// one token of generation headroom, exceeds `max_model_len`.
+///
+/// `max_model_len` is clamped at startup to the KV pool capacity, so a
+/// prompt past it can never be scheduled — the engine would otherwise
+/// leave it stuck in the waiting queue until the client times out
+/// (HTTP 000 / empty body). The cheap [`validate_prompt_char_length`]
+/// pre-check only bounds from below and lets borderline prompts through;
+/// this is the authoritative gate. One tokenization at admission is
+/// negligible next to generation.
+pub fn validate_prompt_token_length(
+    prompt: &str,
+    max_model_len: usize,
+    tokenizer: &vllm_core::tokenizer::TokenizerWrapper,
+) -> Result<(), ApiError> {
+    let prompt_tokens = tokenizer
+        .encode_prompt(prompt)
+        .map(|ids| ids.len())
+        .map_err(|e| ApiError::InvalidRequest(format!("tokenization failed: {e}")))?;
+    if prompt_tokens.saturating_add(1) > max_model_len {
+        return Err(ApiError::InvalidRequest(format!(
+            "prompt too long: {prompt_tokens} tokens exceeds the usable context of \
+             {max_model_len} tokens (KV cache capacity). Shorten the prompt, raise \
+             --gpu-memory-utilization / --num-blocks, or use --kv-cache-dtype fp8."
+        )));
+    }
+    Ok(())
+}
+
 fn validate_beam_search(
     beam_width: Option<usize>,
     response_format: Option<&ResponseFormat>,
@@ -806,6 +835,26 @@ mod tests {
     #[test]
     fn prompt_char_length_empty_prompt_passes() {
         assert!(validate_prompt_char_length(0, 64, 4096, 20).is_ok());
+    }
+
+    #[test]
+    fn prompt_token_length_rejects_over_capacity() {
+        // for_testing tokenizer encodes ~1 token per whitespace word.
+        let tok = vllm_core::tokenizer::TokenizerWrapper::for_testing(1000);
+        // max_model_len clamped tiny (KV pool capacity). A long prompt
+        // must be rejected with a 400, not admitted.
+        let long = "word ".repeat(50);
+        let err = validate_prompt_token_length(&long, 8, &tok).unwrap_err();
+        match err {
+            ApiError::InvalidRequest(m) => assert!(m.contains("too long"), "{m}"),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_token_length_allows_within_capacity() {
+        let tok = vllm_core::tokenizer::TokenizerWrapper::for_testing(1000);
+        assert!(validate_prompt_token_length("hello world", 4096, &tok).is_ok());
     }
 
     // ─── beam_width + response_format ───────────────────────────────

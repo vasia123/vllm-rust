@@ -395,6 +395,105 @@ pub(crate) fn reap_disconnected_requests(
     dead.len()
 }
 
+/// True if a candle / cudarc error string denotes a CUDA out-of-memory.
+/// The error is stringified at the model→engine boundary (the structured
+/// `candle_core::Error` variant is lost), so we match on the message —
+/// both the cudarc form (`CUDA_ERROR_OUT_OF_MEMORY`) and the generic
+/// `out of memory` wording.
+pub(crate) fn is_cuda_oom(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("out_of_memory") || e.contains("out of memory")
+}
+
+/// Pick the victim to fail on a CUDA OOM during batched decode, and
+/// reclaim retained mem-pool memory.
+///
+/// The engine must not OOM-KILL a whole concurrent batch for one
+/// allocation failure. Instead we trim the pool and fail only the NEWEST
+/// (highest arrival_order) sequence — least progress lost, fairest to
+/// shed under FCFS. The survivors are left untouched and retry next step
+/// in a smaller batch.
+///
+/// We deliberately do NOT preempt-for-recompute here: recompute folds
+/// generated tokens back into the prompt and resets the generation
+/// budget, which under heavy preemption regrows the sequence past
+/// `max_model_len` (and loses already-streamed tokens) — a pre-existing
+/// limitation of the recompute path (see ADR / known-gap). Failing the
+/// newest bounds the blast radius to one request without that hazard.
+///
+/// Returns the victim id (`Some` for any non-empty batch). The caller
+/// adds it to `failed` and returns the survivors for retry.
+fn select_decode_oom_victim(
+    batch_ids: &[RequestId],
+    requests: &HashMap<RequestId, ActiveRequest>,
+) -> Option<RequestId> {
+    crate::engine::cuda_mem::trim(crate::engine::cuda_mem::keep_bytes());
+    let victim = batch_ids
+        .iter()
+        .copied()
+        .max_by_key(|id| requests.get(id).map(|r| r.state.arrival_order).unwrap_or(0));
+    if let Some(v) = victim {
+        tracing::warn!(
+            request_id = v,
+            batch = batch_ids.len(),
+            "decode OOM — failing newest of batch (survivors retry next step)"
+        );
+    }
+    victim
+}
+
+/// Max times a request may be preempted-and-requeued after a prefill OOM
+/// before we give up and fail it. Sequential serving on a tight GPU
+/// succeeds, so a prefill that OOMs under concurrent load almost always
+/// fits once peers finish; this bound only catches the genuinely-too-big
+/// case (no concurrent load and still OOM).
+const MAX_PREFILL_OOM_RETRIES: u32 = 8;
+
+/// Handle a prefill error as backpressure when possible. If it is a CUDA
+/// OOM and the request still has retries left, reclaim pool memory and
+/// preempt-requeue it (free KV, reset to re-prefill, mark Preempted) so it
+/// retries on a later step once concurrent decodes free their working set
+/// — the engine queues/serializes under memory pressure instead of
+/// OOM-killing. Returns `Ok(id)` to push into `preempted_ids`, or
+/// `Err(finalized)` (a real error, or OOM-retry budget exhausted) where
+/// `finalized` is the `finish_request_with_error_deferred` result the
+/// caller pushes into `errored_ids`.
+pub(crate) fn handle_prefill_error(
+    req_id: RequestId,
+    err: EngineError,
+    requests: &mut HashMap<RequestId, ActiveRequest>,
+    kv_cache_mgr: &mut KVCacheManager,
+) -> Result<RequestId, Option<RequestId>> {
+    let is_oom = is_cuda_oom(&err.to_string());
+    let retries = requests
+        .get(&req_id)
+        .map(|r| r.state.oom_retries)
+        .unwrap_or(u32::MAX);
+    if is_oom && retries < MAX_PREFILL_OOM_RETRIES {
+        crate::engine::cuda_mem::trim(crate::engine::cuda_mem::keep_bytes());
+        if let Some(req) = requests.get_mut(&req_id) {
+            let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
+            let state = &mut req.state;
+            state.oom_retries += 1;
+            state.seqlen_offset = 0;
+            state.num_computed_tokens = 0;
+            state.status = RequestStatus::Preempted;
+        }
+        tracing::warn!(
+            request_id = req_id,
+            retry = retries + 1,
+            "prefill OOM — preempting request for retry (backpressure)"
+        );
+        return Ok(req_id);
+    }
+    Err(finish_request_with_error_deferred(
+        req_id,
+        err,
+        requests,
+        kv_cache_mgr,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_request(
     request: GenerationRequest,
@@ -413,6 +512,31 @@ fn admit_request(
             return;
         }
     };
+
+    // Admission guard: a prompt that needs more KV blocks than the pool
+    // HAS can never be scheduled (`compute_schedule` requires
+    // blocks_needed <= free_blocks <= total). Left in the waiting queue
+    // it would hang until the client times out (HTTP 000 / empty), so
+    // fail it immediately with an actionable error. Mirrors the
+    // decode-time recompute guard and the startup max_model_len clamp.
+    // +1 token of headroom so the first generated token has a slot.
+    let blocks_for_prompt = prompt_ids.len().saturating_add(1).div_ceil(block_size);
+    let total_blocks = kv_cache_mgr.num_total_blocks();
+    if blocks_for_prompt > total_blocks {
+        send_error(
+            response,
+            EngineError::Cache(format!(
+                "prompt of {} tokens needs {} KV cache blocks but the pool has only {} \
+                 in total ({} tokens) — it can never be scheduled. Shorten the prompt, \
+                 raise --gpu-memory-utilization / --num-blocks, or use --kv-cache-dtype fp8.",
+                prompt_ids.len(),
+                blocks_for_prompt,
+                total_blocks,
+                total_blocks * block_size,
+            )),
+        );
+        return;
+    }
 
     let id = *next_id;
     *next_id += 1;
@@ -553,7 +677,17 @@ pub(crate) fn execute_prefill<M: ModelForward>(
             &slot_mapping,
             &lora_ctx,
         )
-        .map_err(|e| EngineError::Model(e.to_string()))?;
+        .map_err(|e| {
+            // On a prefill OOM, reclaim retained CUDA mem-pool memory so
+            // the next admitted request isn't starved by buffers this
+            // failed forward left pooled. Prefill is single-request, so we
+            // surface a clean error rather than shrinking a batch.
+            let s = e.to_string();
+            if is_cuda_oom(&s) {
+                crate::engine::cuda_mem::trim(crate::engine::cuda_mem::keep_bytes());
+            }
+            EngineError::Model(s)
+        })?;
 
     req.state.block_table.advance(actual_chunk);
     req.state.num_computed_tokens = chunk_end;
@@ -1295,6 +1429,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
         ) {
             Ok(l) => l,
             Err(e) => {
+                if is_cuda_oom(&e.to_string()) {
+                    if let Some(v) = select_decode_oom_victim(&batch_ids, requests) {
+                        failed.push((v, format!("decode out of memory: {e}")));
+                        return (failed, None);
+                    }
+                }
                 let msg = format!("forward_grouped_by_adapter: {e}");
                 tracing::error!(error = %e, "batched decode forward failed");
                 failed.extend(failed_batch(msg, &batch_ids));
@@ -1417,6 +1557,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                     match model.forward_decode_batch(&input, &sequences, kv_cache_mgr) {
                         Ok(l) => l,
                         Err(e) => {
+                            if is_cuda_oom(&e.to_string()) {
+                                if let Some(v) = select_decode_oom_victim(&batch_ids, requests) {
+                                    failed.push((v, format!("decode out of memory: {e}")));
+                                    return (failed, None);
+                                }
+                            }
                             let msg = format!("forward_decode_batch (eager fallback): {e}");
                             tracing::error!(error = %e, "eager decode fallback failed");
                             failed.extend(failed_batch(msg, &batch_ids));
@@ -1434,6 +1580,12 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
             ) {
                 Ok(l) => l,
                 Err(e) => {
+                    if is_cuda_oom(&e.to_string()) {
+                        if let Some(v) = select_decode_oom_victim(&batch_ids, requests) {
+                            failed.push((v, format!("decode out of memory: {e}")));
+                            return (failed, None);
+                        }
+                    }
                     let msg = format!("forward_decode_batch_with_ctx: {e}");
                     tracing::error!(
                         error = %e,
@@ -3204,6 +3356,165 @@ mod tests {
         assert_eq!(reaped, 1);
         assert!(!requests.contains_key(&1));
         assert!(requests.contains_key(&2));
+    }
+
+    // ─── is_cuda_oom + OOM backpressure ───────────────────────────────────
+
+    #[test]
+    fn is_cuda_oom_matches_driver_and_generic_wording() {
+        assert!(is_cuda_oom(
+            "forward_decode_batch_with_ctx: cache read: candle error: \
+             DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+        assert!(is_cuda_oom(
+            "model error: DriverError(CUDA_ERROR_OUT_OF_MEMORY, ...)"
+        ));
+        assert!(is_cuda_oom("Out Of Memory"));
+        assert!(!is_cuda_oom("shape mismatch in reshape"));
+        assert!(!is_cuda_oom("cache read: invalid block id"));
+    }
+
+    /// OOM on a multi-sequence batch selects the NEWEST request (highest
+    /// arrival_order) as the single victim to fail — survivors are left
+    /// untouched and retry next step. The whole batch is never killed.
+    #[test]
+    fn decode_oom_victim_is_newest_of_batch() {
+        let (_sched, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+        // Three running requests, arrival_order 10/20/30; id=3 is newest.
+        for (id, arrival) in [(1u64, 10u64), (2, 20), (3, 30)] {
+            let mut state = SequenceState::new(id, vec![1, 2, 3], 64, 99, 16, arrival);
+            state.generated_token_ids = vec![7];
+            kv.allocate_for_request(&mut state.block_table, 16).unwrap();
+            state.block_table.advance(16);
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            requests.insert(
+                id,
+                ActiveRequest {
+                    state,
+                    response: ResponseChannel::Complete(tx),
+                    num_streamed_tokens: 0,
+                    streamed_text_len: 0,
+                    beam_state: None,
+                },
+            );
+        }
+        let victim = select_decode_oom_victim(&[1u64, 2, 3], &requests);
+        assert_eq!(victim, Some(3), "newest (arrival_order 30) is the victim");
+        // Selection does not mutate the requests map (caller fails the victim).
+        assert!(requests.contains_key(&1));
+        assert!(requests.contains_key(&2));
+        assert!(requests.contains_key(&3));
+    }
+
+    /// Single-sequence batch: the lone request is the victim.
+    #[test]
+    fn decode_oom_victim_single_sequence() {
+        let (_sched, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+        let mut state = SequenceState::new(1, vec![1, 2, 3], 64, 99, 16, 0);
+        kv.allocate_for_request(&mut state.block_table, 16).unwrap();
+        state.block_table.advance(16);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        requests.insert(
+            1,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        assert_eq!(select_decode_oom_victim(&[1u64], &requests), Some(1));
+        assert_eq!(select_decode_oom_victim(&[], &requests), None);
+    }
+
+    /// Prefill OOM with retries left → preempt-requeue (Ok), KV freed,
+    /// status Preempted, oom_retries incremented. So concurrent prefills
+    /// serialize under memory pressure instead of OOM-killing.
+    #[test]
+    fn prefill_oom_preempts_and_requeues_within_budget() {
+        let (_sched, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+        let mut state = SequenceState::new(1, vec![1, 2, 3, 4], 64, 99, 16, 0);
+        kv.allocate_for_request(&mut state.block_table, 16).unwrap();
+        state.block_table.advance(16);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        requests.insert(
+            1,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let free_before = kv.num_free_blocks();
+        let oom = EngineError::Model(
+            "cache write: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into(),
+        );
+        let r = handle_prefill_error(1, oom, &mut requests, &mut kv);
+        assert_eq!(r, Ok(1), "OOM within budget must requeue");
+        let s = &requests[&1].state;
+        assert_eq!(s.status, RequestStatus::Preempted);
+        assert_eq!(s.oom_retries, 1);
+        assert_eq!(s.num_computed_tokens, 0);
+        assert_eq!(kv.num_free_blocks(), free_before + 1, "KV freed for retry");
+        assert!(requests.contains_key(&1), "kept for retry, not removed");
+    }
+
+    /// A non-OOM prefill error fails the request immediately (no requeue).
+    #[test]
+    fn prefill_non_oom_error_fails_immediately() {
+        let (_sched, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+        let state = SequenceState::new(1, vec![1, 2, 3], 64, 99, 16, 0);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        requests.insert(
+            1,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let r = handle_prefill_error(
+            1,
+            EngineError::Model("shape mismatch in reshape".into()),
+            &mut requests,
+            &mut kv,
+        );
+        assert_eq!(r, Err(Some(1)), "non-OOM error must fail (finalize)");
+        assert!(!requests.contains_key(&1), "failed request removed");
+    }
+
+    /// Once the OOM retry budget is exhausted, a further OOM fails cleanly
+    /// instead of requeueing forever.
+    #[test]
+    fn prefill_oom_fails_after_retry_budget() {
+        let (_sched, mut kv) = reap_fixture();
+        let mut requests = HashMap::new();
+        let mut state = SequenceState::new(1, vec![1, 2, 3], 64, 99, 16, 0);
+        state.oom_retries = MAX_PREFILL_OOM_RETRIES;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        requests.insert(
+            1,
+            ActiveRequest {
+                state,
+                response: ResponseChannel::Complete(tx),
+                num_streamed_tokens: 0,
+                streamed_text_len: 0,
+                beam_state: None,
+            },
+        );
+        let oom = EngineError::Model("DriverError(CUDA_ERROR_OUT_OF_MEMORY, ...)".into());
+        let r = handle_prefill_error(1, oom, &mut requests, &mut kv);
+        assert_eq!(r, Err(Some(1)), "exhausted budget must fail");
+        assert!(!requests.contains_key(&1));
     }
 
     #[test]

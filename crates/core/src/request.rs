@@ -72,6 +72,11 @@ pub struct SequenceState {
     pub prompt_adapter_request: Option<PromptAdapterRequest>,
     /// Sampling constraint for structured output (JSON schema, regex, etc.).
     pub constraint: Option<Box<dyn SamplingConstraint>>,
+    /// How many times this request has been preempted-and-requeued after a
+    /// CUDA OOM during prefill. Bounds the retry loop so a request that
+    /// genuinely cannot fit (even with no concurrent load) eventually fails
+    /// cleanly instead of busy-looping. Reset implicitly on success.
+    pub oom_retries: u32,
 }
 
 impl SequenceState {
@@ -108,6 +113,7 @@ impl SequenceState {
             lora_request: None,
             prompt_adapter_request: None,
             constraint: None,
+            oom_retries: 0,
         }
     }
 

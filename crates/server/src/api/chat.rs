@@ -90,6 +90,17 @@ pub async fn create_chat_completion(
         state.max_model_len,
         state.tokenizer.max_chars_per_token(),
     )?;
+    // Exact check: the char heuristic above is a loose lower bound and
+    // lets prompts through that still exceed the (capacity-clamped)
+    // max_model_len. A prompt longer than the KV pool can hold can never
+    // be scheduled, so reject it here with a 400 instead of letting the
+    // engine fail it. One tokenization at admission is negligible next to
+    // generation. See `validation::validate_prompt_token_length`.
+    super::validation::validate_prompt_token_length(
+        &prompt,
+        state.max_model_len,
+        &state.tokenizer,
+    )?;
 
     // Determine if we should parse tool calls from the output.
     // Rules (mirrors vLLM `--enable-auto-tool-choice` behavior):
