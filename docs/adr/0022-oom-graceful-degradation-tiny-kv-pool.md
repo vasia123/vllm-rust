@@ -108,13 +108,30 @@ burst drops from dozens of preempt/exhaust events to ~2. fp8 is the recommended
 way to give Gemma more **concurrency** headroom on 8 GB. Covered by the
 `write_read_roundtrip_fp8_padded_het_kv` unit test (het-KV padding × fp8).
 
-**Limit (naive attention path):** Gemma 4's `QuantizedGemma4Attention` reads
-the cache via `CacheEngine::read()`, which **dequantizes the entire KV history
-to the compute dtype every decode step** before the matmul. So while fp8 stores
-KV at half size, *decoding* a long sequence transiently recreates the bf16
-footprint — a single long generation (~500 tokens) still exhausts the headroom
-and falls into (now-correct, but slow) preempt-recompute. fp8 therefore extends
-*concurrency of short sequences*, not *single-sequence length*, on Gemma. The
-paged-attention kernel path does inline dequant without materializing (genuine
-context extension), but Gemma doesn't use it — routing Gemma through an
-inline-dequant attention is future work.
+**~~Limit (naive attention path)~~ RESOLVED — Gemma 4 now decodes through the
+paged-attention kernel (commits 28c041e + dcc7813).** The old
+`QuantizedGemma4Attention` decode read the cache via `CacheEngine::read()`,
+which **dequantized the entire KV history to the compute dtype every step**
+before a naive matmul — so a long fp8 generation transiently recreated the
+bf16 footprint and OOM/thrashed (a 500-token gen timed out > 150 s). Two
+changes lifted this ceiling:
+
+1. **Honest per-layer KV cache** (`KVCacheManager::new_heterogeneous`): Gemma 4
+   no longer pads its mixed full/sliding geometry up to a uniform max
+   (1-KV-head 512-dim full layers were padded to 8×512). The pool grew from
+   **22 → 51 blocks** (816 tok) at bf16, **→ 102 blocks** (1632 tok) at fp8 —
+   up to 4.6× — on the same 8 GB budget, with no quantization, purely from
+   dropping the padding waste + deduping KV-shared layers.
+2. **Paged decode** (`paged_attention_auto_with_kv_dtype`): decode attends
+   against the cache with **inline dequant** — no full-history materialization,
+   GQA, head_dim 256/512. Full-attention layers always use it; sliding layers
+   use it while every sequence stays within the window (then windowing is a
+   provable no-op), else fall back to the naive windowed path.
+
+Verified on gemma-4-12B-it-exl3 @2.00bpw: the fp8 500-token generation now
+completes in **26.5 s (~18.8 tps)** (was > 150 s timeout); paged output is
+bit-identical to the naive path on coherent prompts. So on Gemma, fp8 now
+extends **both** short-sequence concurrency **and** single-sequence length.
+(Remaining narrow gap: sliding layers with a context *longer than the window*
+still take the naive windowed fallback — a future FlashInfer-windowed-decode
+follow-up would give them inline-fp8 too.)
