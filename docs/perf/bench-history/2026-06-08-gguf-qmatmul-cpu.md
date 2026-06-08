@@ -37,8 +37,28 @@ is amortized across M matmul rows and the gap closes.
 
 ## CUDA
 
-The CUDA half of the bench (`#[cfg(feature="cuda")]`, MMVQ fused kernel)
-is recorded separately after a `cuda-full` build — see the e2e decode
-tok/s via `scripts/bench_decode.py` on a real Q4_K_M checkpoint. The CPU
-result already proves the algorithmic win; CUDA MMVQ widens it further
-at decode.
+## CUDA results (RTX 4060 Laptop, sm_89)
+
+Recorded after a `cuda-full` build via the bench's `#[cfg(feature="cuda")]`
+half (MMVQ fused decode kernel, q8_1 GEMM for prefill).
+
+| Shape | M (mode) | dense baseline | **QMatMul** | speedup |
+|---|---|---|---|---|
+| 4096×4096   | 1 (decode)   | 1.82 ms  | **52.7 µs** | **34.6×** |
+| 4096×4096   | 32 (prefill) | 1.91 ms  | **246 µs**  | **7.8×** |
+| 14336×4096  | 1 (decode)   | 8.87 ms  | **103 µs**  | **85.7×** |
+
+On CUDA even prefill wins ~8× — the dense path's whole-weight dequant is a
+separate memory-bound kernel that dominates, while MMVQ/q8_1 fuses dequant
+into the matmul. Decode (M=1) is the dominant generation-speed case and
+wins 35-86×.
+
+## e2e validation
+
+GGUF served end-to-end on GPU via the new `--gguf-file` path
+(SmolLM-135M-Instruct.Q4_K_M, Llama arch, eager): loads quantized-resident,
+produces grammatical text ("The capital of France is the country of
+France"), ~89 tok/s wall-clock incl. HTTP for an 80-token greedy decode.
+(SmolLM-135M itself degenerates into repetition at greedy temp=0 — a known
+trait of the 135M model, not the GGUF path; the QMatMul parity test and the
+coherent leading sentence confirm correctness.)
