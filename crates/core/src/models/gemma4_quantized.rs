@@ -1107,6 +1107,21 @@ impl QuantizedGemma4Attention {
         sequences: &[DecodeSequenceMetadata],
         cache_engine: &mut CacheEngine,
     ) -> Result<Tensor> {
+        // Phase B: route decode through the paged_attention V2 CUDA kernel
+        // (inline fp8 dequant, GQA, head_dim 256/512) instead of reading and
+        // materialising the full KV history every step. This is the fix for
+        // the ADR 0022 decode-materialisation ceiling: the kernel dequantises
+        // each cached byte inline, so fp8 genuinely extends context instead of
+        // recreating the bf16 footprint per step. Full-attention layers always
+        // qualify; sliding layers qualify only while every sequence stays
+        // within the window (then windowing is a provable no-op). soft-cap /
+        // non-CUDA / unsupported fall through to the naive matmul path below
+        // (correct, windowed, materialising).
+        #[cfg(feature = "cuda-kernels")]
+        if self.can_use_paged_decode(xs, sequences) {
+            return self.forward_decode_batch_paged(xs, sequences, cache_engine);
+        }
+
         let batch_size = sequences.len();
         let device = xs.device();
         let dtype = xs.dtype();
@@ -1224,6 +1239,166 @@ impl QuantizedGemma4Attention {
 
         let attn_output = Tensor::cat(&outputs, 0)?;
         self.o_proj.forward(&attn_output)
+    }
+
+    /// Whether this layer's decode step can use the paged_attention V2
+    /// kernel for this batch (see [`Self::forward_decode_batch_paged`]).
+    ///
+    /// - non-CUDA → no (kernel is CUDA-only).
+    /// - attn soft-cap present → no (the kernel has no soft-cap hook).
+    /// - sliding-window layer → only while every sequence stays within the
+    ///   window: paged V2 has no window masking, but when no token is beyond
+    ///   the window the masked and unmasked results are bit-identical. Full
+    ///   layers (no window) always qualify.
+    #[cfg(feature = "cuda-kernels")]
+    fn can_use_paged_decode(&self, xs: &Tensor, sequences: &[DecodeSequenceMetadata]) -> bool {
+        if !xs.device().is_cuda() {
+            return false;
+        }
+        // Escape hatch + A/B parity lever: `VLLM_GEMMA_PAGED_DECODE=0` forces
+        // the naive matmul decode (e.g. to diff paged vs naive outputs on one
+        // build, or fall back in production if the kernel path misbehaves).
+        if std::env::var("VLLM_GEMMA_PAGED_DECODE")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self.attn_logit_softcap.is_some() {
+            return false;
+        }
+        if let Some(window) = self.sliding_window {
+            let max_kv_len = sequences
+                .iter()
+                .map(|s| s.seqlen_offset + 1)
+                .max()
+                .unwrap_or(0);
+            if max_kv_len > window {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Decode through the paged_attention V2 CUDA kernel: write the new K/V
+    /// into the (honest per-layer) cache, then attend against the cache with
+    /// inline dequantisation — no full-history materialisation.
+    ///
+    /// Front-end (projections, per-head q/k/v RMSNorm, RoPE) is identical to
+    /// the naive path; only the attention core changes. Scaling is **1.0**
+    /// (Gemma 4's q/k norms carry the magnitude — the naive path applies no
+    /// `1/sqrt(d)` factor, and this must match it byte-for-byte). KV-shared
+    /// layers rotate Q only and read the target layer's already-written cache.
+    #[cfg(feature = "cuda-kernels")]
+    fn forward_decode_batch_paged(
+        &self,
+        xs: &Tensor,
+        sequences: &[DecodeSequenceMetadata],
+        cache_engine: &mut CacheEngine,
+    ) -> Result<Tensor> {
+        let batch_size = sequences.len();
+        let device = xs.device();
+
+        // Q projection + per-head q-norm, then drop the seq=1 axis →
+        // [batch, num_heads, head_dim] for varlen RoPE and the paged kernel.
+        let q = self
+            .q_proj
+            .forward(xs)?
+            .reshape((batch_size, 1, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q = Self::apply_per_head_norm(&q, &self.q_norm)?;
+        let q = q.squeeze(2)?; // [batch, num_heads, head_dim]
+
+        let positions: Vec<usize> = sequences.iter().map(|s| s.seqlen_offset).collect();
+
+        let q = if self.is_kv_shared {
+            // Shared layer: rotate Q only. K/V for this step were already
+            // written into this (shared) cache engine by the target layer,
+            // which runs earlier in the forward.
+            let (q_rot, _) = self.rotary_emb.apply_varlen(&q, &q, &positions)?;
+            q_rot
+        } else {
+            let k = self
+                .k_proj
+                .as_ref()
+                .expect("non-shared layer must have k_proj")
+                .forward(xs)?
+                .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = self
+                .v_proj
+                .as_ref()
+                .expect("non-shared layer must have v_proj")
+                .forward(xs)?
+                .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let k = Self::apply_per_head_norm(
+                &k,
+                self.k_norm.as_ref().expect("non-shared layer has k_norm"),
+            )?;
+            let v = Self::apply_per_head_norm_unweighted(
+                &v,
+                self.v_norm.as_ref().expect("non-shared layer has v_norm"),
+            )?;
+            let k = k.squeeze(2)?; // [batch, num_kv_heads, head_dim]
+            let v = v.squeeze(2)?;
+            let (q_rot, k_rot) = self.rotary_emb.apply_varlen(&q, &k, &positions)?;
+
+            let all_slot_mapping: Vec<usize> = sequences
+                .iter()
+                .flat_map(|s| s.slot_mapping.iter().copied())
+                .collect();
+            cache_engine
+                .write_batch(&k_rot, &v, &all_slot_mapping)
+                .map_err(|e| candle_core::Error::Msg(format!("cache write: {e}")))?;
+            q_rot
+        };
+
+        // block_tables [batch, max_blocks_per_seq] + seq_lens [batch].
+        let max_blocks_per_seq = sequences
+            .iter()
+            .map(|s| s.block_ids.len())
+            .max()
+            .unwrap_or(1);
+        let mut bt_data = vec![0u32; batch_size * max_blocks_per_seq];
+        for (i, seq) in sequences.iter().enumerate() {
+            for (j, &block_id) in seq.block_ids.iter().enumerate() {
+                bt_data[i * max_blocks_per_seq + j] = block_id as u32;
+            }
+        }
+        let block_tables = Tensor::from_vec(bt_data, (batch_size, max_blocks_per_seq), device)?;
+        let seq_lens_data: Vec<u32> = sequences
+            .iter()
+            .map(|s| (s.seqlen_offset + 1) as u32)
+            .collect();
+        let max_seq_len = *seq_lens_data.iter().max().unwrap_or(&1) as usize;
+        let seq_lens = Tensor::from_vec(seq_lens_data, (batch_size,), device)?;
+
+        // Gemma 4: scale = 1.0 (q/k RMSNorms carry the magnitude; the naive
+        // path applies no 1/sqrt(d) factor — match it exactly).
+        let scale = 1.0f32;
+        let kv_cache_dtype = cache_engine.kv_cache_dtype();
+        let k_scale = cache_engine.k_scale();
+        let v_scale = cache_engine.v_scale();
+        let attn_output = crate::cuda_kernels::paged_attention_auto_with_kv_dtype(
+            &q,
+            cache_engine.k_cache(),
+            cache_engine.v_cache(),
+            &block_tables,
+            &seq_lens,
+            scale,
+            self.num_heads,
+            self.num_kv_heads,
+            max_blocks_per_seq,
+            max_seq_len,
+            self.head_dim,
+            cache_engine.block_size(),
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )?;
+        // [batch, num_heads*head_dim] → o_proj → [batch, hidden] → [batch, 1, hidden]
+        self.o_proj.forward(&attn_output)?.unsqueeze(1)
     }
 }
 
