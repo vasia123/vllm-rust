@@ -536,12 +536,13 @@ impl GgufWeightLoader {
 /// Returns `None` when the input is not a recognised pattern — the caller
 /// should then fall back to the literal path or report "tensor not found".
 ///
-/// Gemma 4 specifics (PLE `per_layer_*`, MoE stacked experts `ffn_*_exps`,
-/// `layer_scalar`) are NOT yet mapped here: stacked-expert loading requires
-/// slicing an [N_experts, out, in] tensor into per-expert quantized blocks,
-/// which the current `load_linear` signature does not support. Support will
-/// be added once a real Gemma 4 GGUF checkpoint surfaces and the exact
-/// tensor names are confirmed.
+/// Gemma 4 E4B PLE tensors ARE mapped (confirmed against the real
+/// `gemma-4-E4B-it-Q4_K_M.gguf` header): `per_layer_token_embd`,
+/// `per_layer_model_proj`, `per_layer_proj_norm`, and the per-layer
+/// `inp_gate` / `proj` / `post_norm`. E4B has no MoE (dense FFN), so no
+/// stacked-expert mapping is needed. The llama.cpp-only `rope_freqs` and
+/// `layer_output_scale` tensors are intentionally unmapped (our model
+/// computes RoPE itself and does not use a per-layer output scale).
 fn to_llama_cpp_prefix(prefix: &str) -> Option<String> {
     to_llama_cpp_prefixes(prefix).into_iter().next()
 }
@@ -556,6 +557,10 @@ fn to_llama_cpp_prefixes(prefix: &str) -> Vec<String> {
         "model.embed_tokens" => return vec!["token_embd".to_string()],
         "model.norm" => return vec!["output_norm".to_string()],
         "lm_head" => return vec!["output".to_string()],
+        // Gemma 4 Per-Layer Embeddings (PLE), top-level tensors.
+        "model.embed_tokens_per_layer" => return vec!["per_layer_token_embd".to_string()],
+        "model.per_layer_model_projection" => return vec!["per_layer_model_proj".to_string()],
+        "model.per_layer_projection_norm" => return vec!["per_layer_proj_norm".to_string()],
         _ => {}
     }
 
@@ -581,6 +586,10 @@ fn to_llama_cpp_prefixes(prefix: &str) -> Vec<String> {
         "mlp.gate_proj" => vec!["ffn_gate"],
         "mlp.up_proj" => vec!["ffn_up"],
         "mlp.down_proj" => vec!["ffn_down"],
+        // Gemma 4 PLE per-layer tensors.
+        "per_layer_input_gate" => vec!["inp_gate"],
+        "per_layer_projection" => vec!["proj"],
+        "post_per_layer_input_norm" => vec!["post_norm"],
         "input_layernorm" => vec!["attn_norm"],
         // Llama/Mistral: post-attention IS the pre-FFN norm → `ffn_norm`.
         // Gemma/Gemma2/Gemma3: separate `post_attention_norm` tensor.
@@ -604,6 +613,9 @@ fn to_llama_cpp_top_level(name: &str) -> Option<&'static str> {
         "model.embed_tokens" => Some("token_embd"),
         "model.norm" => Some("output_norm"),
         "lm_head" => Some("output"),
+        "model.embed_tokens_per_layer" => Some("per_layer_token_embd"),
+        "model.per_layer_model_projection" => Some("per_layer_model_proj"),
+        "model.per_layer_projection_norm" => Some("per_layer_proj_norm"),
         _ => None,
     }
 }
@@ -970,9 +982,37 @@ mod tests {
     }
 
     #[test]
+    fn test_to_llama_cpp_prefix_gemma4_ple() {
+        // Gemma 4 E4B Per-Layer Embedding tensors (real GGUF names).
+        assert_eq!(
+            to_llama_cpp_prefix("model.embed_tokens_per_layer").as_deref(),
+            Some("per_layer_token_embd")
+        );
+        assert_eq!(
+            to_llama_cpp_prefix("model.per_layer_model_projection").as_deref(),
+            Some("per_layer_model_proj")
+        );
+        assert_eq!(
+            to_llama_cpp_prefix("model.per_layer_projection_norm").as_deref(),
+            Some("per_layer_proj_norm")
+        );
+        assert_eq!(
+            to_llama_cpp_prefix("model.layers.3.per_layer_input_gate").as_deref(),
+            Some("blk.3.inp_gate")
+        );
+        assert_eq!(
+            to_llama_cpp_prefix("model.layers.3.per_layer_projection").as_deref(),
+            Some("blk.3.proj")
+        );
+        assert_eq!(
+            to_llama_cpp_prefix("model.layers.3.post_per_layer_input_norm").as_deref(),
+            Some("blk.3.post_norm")
+        );
+    }
+
+    #[test]
     fn test_to_llama_cpp_prefix_unknown_returns_none() {
-        assert!(to_llama_cpp_prefix("model.per_layer_model_projection").is_none());
-        assert!(to_llama_cpp_prefix("model.layers.0.per_layer_input_gate").is_none());
+        // E4B has no MoE; stacked-expert names stay unmapped.
         assert!(to_llama_cpp_prefix("model.layers.0.moe.experts.0.gate_proj").is_none());
         assert!(to_llama_cpp_prefix("model.layers.not_a_number.self_attn.q_proj").is_none());
         assert!(to_llama_cpp_prefix("random_tensor").is_none());
