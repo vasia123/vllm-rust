@@ -92,6 +92,66 @@ fn build_kv_cache_manager(
     }
 }
 
+/// Resolve the on-disk path to a GGUF checkpoint, or `None` when this is
+/// not a GGUF launch.
+///
+/// Two triggers:
+///  - `--gguf-file <name>`: `model_id` is an HF repo; fetch that `.gguf`
+///    variant from it.
+///  - `model_id` is itself a local path ending in `.gguf`.
+fn resolve_gguf_path(
+    model_id: &str,
+    gguf_file: Option<&str>,
+    revision: &str,
+    hf_token: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if let Some(name) = gguf_file {
+        let path = loader::fetch_gguf_file(model_id, name, revision, hf_token, cache_dir)?;
+        return Ok(Some(path));
+    }
+    let p = std::path::Path::new(model_id);
+    if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        if p.is_file() {
+            return Ok(Some(p.to_path_buf()));
+        }
+        anyhow::bail!("--model ends in .gguf but is not a readable file: {model_id}");
+    }
+    Ok(None)
+}
+
+/// Best-effort locate a `tokenizer.json` for a GGUF checkpoint. GGUF
+/// embeds the tokenizer as metadata, but our `TokenizerWrapper` consumes
+/// a HuggingFace `tokenizer.json`; most GGUF repos ship one alongside the
+/// weights. Returns `None` when none is found — the caller then requires a
+/// `--tokenizer <repo-or-path>` override.
+fn resolve_gguf_tokenizer(
+    model_id: &str,
+    from_repo: bool,
+    gguf_path: &std::path::Path,
+    revision: &str,
+    hf_token: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    // A sibling next to the local `.gguf` (also covers the HF cache dir,
+    // where the repo's own tokenizer.json lands after a fetch).
+    if let Some(dir) = gguf_path.parent() {
+        let sib = dir.join("tokenizer.json");
+        if sib.is_file() {
+            return Some(sib);
+        }
+    }
+    // HF repo: try to fetch tokenizer.json from the same repo.
+    if from_repo {
+        if let Ok(p) =
+            loader::fetch_gguf_file(model_id, "tokenizer.json", revision, hf_token, cache_dir)
+        {
+            return Some(p);
+        }
+    }
+    None
+}
+
 #[derive(Parser)]
 #[command(name = "vllm-server", about = "Rust LLM inference engine")]
 struct Cli {
@@ -449,6 +509,15 @@ enum Command {
         /// (Gemma 4, etc.) text-only on a tight GPU.
         #[arg(long, default_value_t = false)]
         text_only: bool,
+
+        /// Load a GGUF checkpoint. Value is the `.gguf` filename inside the
+        /// HuggingFace repo named by `--model` (repos ship several quant
+        /// variants, e.g. `model-Q4_K_M.gguf`). When `--model` is itself a
+        /// local path ending in `.gguf`, this flag is unnecessary. GGUF
+        /// runs eager (CUDA graphs disabled — candle's fused quantized
+        /// kernel allocates scratch per call and cannot be captured).
+        #[arg(long)]
+        gguf_file: Option<String>,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -591,6 +660,7 @@ async fn main() -> anyhow::Result<()> {
             enable_auto_tool_choice,
             return_tokens_as_token_ids,
             text_only,
+            gguf_file,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = model.or(file_config.model);
@@ -1031,6 +1101,7 @@ async fn main() -> anyhow::Result<()> {
                 pipeline_parallel_size,
                 tensor_parallel_size,
                 text_only,
+                gguf_file,
             })
             .await
         }
@@ -1147,6 +1218,8 @@ struct ServerLaunchConfig {
     tensor_parallel_size: usize,
     /// Skip vision / audio towers when loading a multimodal checkpoint.
     text_only: bool,
+    /// GGUF filename inside the `--model` repo (picks a quant variant).
+    gguf_file: Option<String>,
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
@@ -1239,6 +1312,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         pipeline_parallel_size,
         tensor_parallel_size,
         text_only,
+        gguf_file,
     } = cfg;
 
     // ── Idle mode: no model specified ─────────────────────────────────────
@@ -1431,14 +1505,67 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
     eprintln!("Loading model: {model_id}");
     let cache_dir = download_dir.as_deref().map(std::path::Path::new);
-    let mut files = loader::fetch_model_with_options(
+    let device = create_cuda_device(0)?;
+
+    // ── GGUF production path ──────────────────────────────────────────
+    // A `.gguf` carries config + quantized weights + tokenizer metadata
+    // in one file, so it bypasses the safetensors `fetch_model_with_options`
+    // path: parse the header into a `ModelConfig`, load every tensor onto
+    // the device as a quantized-resident `QTensor`, and build the model
+    // from the resulting GGUF-backed VarBuilder + loader. Triggered by
+    // `--gguf-file <name>` (variant inside the `--model` repo) or a local
+    // `.gguf` `--model` path.
+    let gguf_path = resolve_gguf_path(
         &model_id,
+        gguf_file.as_deref(),
         &revision,
         hf_token.as_deref(),
         cache_dir,
-        parsed_load_format,
-        max_parallel_loading_workers,
     )?;
+
+    let mut gguf_vb = None;
+    let mut gguf_loader: Option<Box<dyn vllm_core::quantization::QuantizedWeightLoader>> = None;
+
+    let mut files = if let Some(ref path) = gguf_path {
+        eprintln!("GGUF checkpoint: {}", path.display());
+        let (cfg, vb, gloader, quant) = loader::load_gguf_model(path, device.clone(), dtype)?;
+        // GGUF embeds the tokenizer as metadata, but our TokenizerWrapper
+        // consumes a HF `tokenizer.json`; most GGUF repos ship one. Fall
+        // back to a `--tokenizer` override when they don't.
+        let tokenizer = resolve_gguf_tokenizer(
+            &model_id,
+            gguf_file.is_some(),
+            path,
+            &revision,
+            hf_token.as_deref(),
+            cache_dir,
+        )
+        .unwrap_or_else(|| path.with_file_name("tokenizer.json"));
+        if !tokenizer.is_file() && tokenizer_override.is_none() {
+            anyhow::bail!(
+                "GGUF checkpoint has no tokenizer.json next to it or in the repo; \
+                 pass --tokenizer <hf-repo-or-path> (e.g. the base model's repo)"
+            );
+        }
+        gguf_vb = Some(vb);
+        gguf_loader = Some(gloader);
+        loader::ModelFiles {
+            config: cfg,
+            weights: vec![path.clone()],
+            tokenizer,
+            tokenizer_config: None,
+            quantization: quant,
+        }
+    } else {
+        loader::fetch_model_with_options(
+            &model_id,
+            &revision,
+            hf_token.as_deref(),
+            cache_dir,
+            parsed_load_format,
+            max_parallel_loading_workers,
+        )?
+    };
 
     // `--max-model-len` overrides the model's `max_position_embeddings`.
     // Apply it to the config BEFORE building the model: several models
@@ -1465,7 +1592,15 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         );
     }
 
-    let device = create_cuda_device(0)?;
+    // GGUF runs eager: candle's fused quantized matmul allocates scratch
+    // per call (MMVQ dequant buffers), so its device pointers are not
+    // stable across a CUDA Graph replay — capturing would record stale
+    // memory. Mirror the EXL3 `MAX_M=0` escape hatch but unconditional.
+    // (Capture support is deferred to a future scratch-from-pool wrapper.)
+    if gguf_path.is_some() && cuda_graph_config.enabled {
+        tracing::info!("GGUF quantization detected — disabling CUDA graphs (eager execution)");
+        cuda_graph_config.enabled = false;
+    }
 
     // EXL3 needs two adjustments vs the default path:
     //   1. fp16 activations (kernels are fp16-only).
@@ -1553,7 +1688,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // quantized tensor is loaded in its native storage (U8 for NF4 packs,
     // I32 for AWQ qweight, F8 for FP8, …) via the quantization loader.
     eprintln!("Mmap'ing weights (compute dtype={dtype_label}, quantization={quant_label})...");
-    let vb = if parsed_load_format == loader::LoadFormat::Dummy {
+    let vb = if let Some(vb) = gguf_vb.take() {
+        // GGUF: the VarBuilder (backed by `GgufVarBuilderBackend`) was
+        // built together with the quantized loader from the same parsed
+        // `.gguf` — both share one device-resident tensor map.
+        vb
+    } else if parsed_load_format == loader::LoadFormat::Dummy {
         tracing::info!("Using dummy zero-filled weights (--load-format dummy)");
         loader::load_dummy_weights(dtype, &device)
     } else {
@@ -1737,12 +1877,17 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
 
         eprintln!("Registered adapters: {:?}", lora_model.lora_adapters());
         Box::new(lora_model)
+    } else if let Some(gloader) = gguf_loader.take() {
+        // GGUF: feed the loader built up front from the `.gguf` directly,
+        // rather than re-deriving one from the VarBuilder (there is no
+        // safetensors archive). Shares the same device-resident tensor map.
+        models::from_config_with_loader(&files.config, vb, &files.quantization, gloader.as_ref())?
     } else {
         // Route through the quant-aware dispatcher so BnB / AWQ / GPTQ /
-        // GGUF / Marlin checkpoints build their proper quantized model
-        // instead of trying to load packed tensors through the plain
-        // unquantized `from_config` path (which silently fails to
-        // match HF packed shapes). Falls through to `from_config` when
+        // Marlin checkpoints build their proper quantized model instead of
+        // trying to load packed tensors through the plain unquantized
+        // `from_config` path (which silently fails to match HF packed
+        // shapes). Falls through to `from_config` when
         // `quantization.method == None`.
         models::from_config_with_quant(&files.config, vb, &files.quantization)?
     };

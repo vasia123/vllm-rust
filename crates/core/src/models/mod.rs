@@ -712,6 +712,43 @@ pub fn from_config_with_quant(
     Err(ModelError::UnsupportedArchitecture(arch.into()))
 }
 
+/// Construct a quantized model from an already-built weight loader.
+///
+/// Identical dispatch to [`from_config_with_quant`] except the caller
+/// supplies the [`QuantizedWeightLoader`] directly instead of having one
+/// derived from the `VarBuilder` via `create_weight_loader_with_params`.
+///
+/// This is the GGUF production path: a `.gguf` file carries both the
+/// quantized weights and the dense norms/embeddings, so the loader
+/// (`GgufWeightLoader`) and the `VarBuilder` (backed by
+/// `GgufVarBuilderBackend`) are constructed together up front from the
+/// same parsed file — there is no safetensors archive to re-derive a
+/// loader from. See `loader::load_gguf_model`.
+pub fn from_config_with_loader(
+    cfg: &ModelConfig,
+    vb: VarBuilder<'static>,
+    quant_config: &DetectedQuantConfig,
+    weight_loader: &dyn crate::quantization::QuantizedWeightLoader,
+) -> Result<Box<dyn ModelForward>, ModelError> {
+    let arch = get_arch(cfg)?;
+
+    if quant_config.method == QuantizationMethod::None {
+        return from_config(cfg, vb);
+    }
+
+    #[cfg(feature = "model-registry-v2")]
+    {
+        use factory::Capabilities;
+        if let Some(factory) = registry_v2::lookup(arch) {
+            if factory.info().supports(Capabilities::QUANTIZED) {
+                return factory.build_quant(cfg, vb, weight_loader);
+            }
+        }
+    }
+
+    Err(ModelError::UnsupportedArchitecture(arch.into()))
+}
+
 /// Get the detected quantization method for a model directory.
 ///
 /// This is useful for checking quantization before loading.
