@@ -88,7 +88,9 @@ pub use fp8::Fp8Config;
 #[cfg(feature = "cuda-kernels")]
 pub use fp8_cuda::{fp8_dequantize, fp8_gemm, fp8_quantize_dynamic_per_token, fp8_quantize_static};
 pub use fp_quant::{FpQuantConfig, FpQuantForwardDtype, FpQuantLinear};
-pub use gguf::{GgufConfig, GgufLinear, GgufVarBuilderBackend, GgufWeightLoader};
+pub use gguf::{
+    GgufConfig, GgufLinear, GgufVarBuilderBackend, GgufWeightLoader, QuantizedEmbedding,
+};
 pub use gptq::GptqConfig;
 #[cfg(feature = "cuda-kernels")]
 pub use gptq_cuda::{gptq_dequantize, gptq_gemm};

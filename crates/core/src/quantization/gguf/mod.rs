@@ -24,11 +24,12 @@
 //!
 //! - [GGUF Specification](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::quantized::{gguf_file, QMatMul, QTensor};
+use candle_core::quantized::{gguf_file, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
@@ -267,6 +268,111 @@ fn warn_if_dequantize_all() {
             }
         }
     });
+}
+
+/// Quantized embedding table kept resident as a [`QTensor`], gathering and
+/// dequantizing only the requested rows per forward.
+///
+/// This exists for Gemma 4's Per-Layer Embedding table: dense f16 it is
+/// ~5.6 GB ([262144, 42·256]) and would OOM an 8 GB GPU at construction if
+/// served through candle's `embedding()` (which materializes the whole
+/// weight via `VarBuilder::get`). Here the table stays quantized-resident
+/// (q6_k ~2.3 GB) on `table_device` — typically CPU, to spare VRAM — and a
+/// forward gathers only the rows for the batch's token ids.
+///
+/// Row `r` occupies a contiguous run of `embedding_dim / block_size`
+/// quantized blocks (Gemma's PLE row = 10752 / 256 = 42 Q6_K blocks —
+/// exact block alignment), so a gather is a byte-range copy of those
+/// blocks followed by a small dequant — never a full-table dequant.
+pub struct QuantizedEmbedding {
+    /// Quantized table, shape `[num_embeddings, embedding_dim]`.
+    qt: Arc<QTensor>,
+    num_embeddings: usize,
+    embedding_dim: usize,
+    /// Output dtype/device for the gathered dense rows (the compute side).
+    out_dtype: DType,
+    out_device: Device,
+}
+
+impl QuantizedEmbedding {
+    /// Wrap a 2-D quantized embedding table. `embedding_dim` must be a
+    /// multiple of the quant block size (true for GGUF embeddings).
+    pub fn new(qt: Arc<QTensor>, out_dtype: DType, out_device: Device) -> Result<Self> {
+        let dims = qt.shape().dims().to_vec();
+        let (num_embeddings, embedding_dim) = match dims.as_slice() {
+            [n, d] => (*n, *d),
+            _ => candle_core::bail!("QuantizedEmbedding expects a 2-D table, got {dims:?}"),
+        };
+        if embedding_dim % qt.dtype().block_size() != 0 {
+            candle_core::bail!(
+                "QuantizedEmbedding: embedding_dim {embedding_dim} not a multiple of block size {}",
+                qt.dtype().block_size()
+            );
+        }
+        Ok(Self {
+            qt,
+            num_embeddings,
+            embedding_dim,
+            out_dtype,
+            out_device,
+        })
+    }
+
+    /// Number of embedding rows.
+    pub fn num_embeddings(&self) -> usize {
+        self.num_embeddings
+    }
+
+    /// Embedding dimension.
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    /// Gather rows for `ids` (any shape) → `[*ids.shape, embedding_dim]` in
+    /// `out_dtype` on `out_device`. Dequantizes only the gathered rows.
+    pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let block = self.qt.dtype().block_size();
+        let tsize = self.qt.dtype().type_size();
+        let blocks_per_row = self.embedding_dim / block;
+        let row_bytes = blocks_per_row * tsize;
+
+        let mut out_shape = ids.dims().to_vec();
+        let flat = ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+
+        // `data()` on a CPU-resident QTensor borrows the block bytes (no
+        // copy); gathering is a byte-range memcpy per row.
+        let data = self.qt.data()?;
+        let mut buf: Vec<u8> = Vec::with_capacity(flat.len() * row_bytes);
+        for &id in &flat {
+            let id = id as usize;
+            if id >= self.num_embeddings {
+                candle_core::bail!(
+                    "QuantizedEmbedding: id {id} out of range (num_embeddings={})",
+                    self.num_embeddings
+                );
+            }
+            let start = id * row_bytes;
+            buf.extend_from_slice(&data[start..start + row_bytes]);
+        }
+
+        // Dequantize the gathered rows only (CPU), then cast + move.
+        //
+        // NOTE: `Cow::Borrowed`, not `Cow::Owned`. candle's internal
+        // `as_t_slice` takes the `Cow` by value and returns a `&[Block]`
+        // into it; with `Cow::Owned` the buffer drops when that helper
+        // returns and the subsequent `.to_vec()` reads freed memory
+        // (observed as garbage rows). Borrowing keeps `buf` (this scope's
+        // local) alive across the call so the slice stays valid.
+        let storage = QStorage::from_data(Cow::Borrowed(&buf), &Device::Cpu, self.qt.dtype())?;
+        let gathered = QTensor::new(storage, (flat.len(), self.embedding_dim))?;
+        let dense = gathered.dequantize(&Device::Cpu)?;
+
+        out_shape.push(self.embedding_dim);
+        dense
+            .reshape(out_shape)?
+            .to_dtype(self.out_dtype)?
+            .to_device(&self.out_device)
+    }
 }
 
 /// Weight loader for GGUF files.
@@ -1095,6 +1201,51 @@ mod tests {
             to_llama_cpp_prefix("model.layers.0.post_feedforward_layernorm").as_deref(),
             Some("blk.0.post_ffw_norm")
         );
+    }
+
+    #[test]
+    fn test_quantized_embedding_gather_matches_full_dequant() {
+        // A gathered row must equal the corresponding row of the full
+        // dequantized table (gather is a byte-range slice of the same
+        // blocks, then the identical dequant) — bit-for-bit.
+        use candle_core::quantized::{GgmlDType, QTensor};
+        let device = Device::Cpu;
+        let (num, dim) = (8usize, 256usize); // QK_K=256 → 1 block per row
+        let table = Tensor::randn(0.0f32, 1.0, (num, dim), &device).unwrap();
+        let qt = Arc::new(QTensor::quantize(&table, GgmlDType::Q4K).unwrap());
+        let full = qt.dequantize(&device).unwrap(); // [num, dim]
+
+        let emb = QuantizedEmbedding::new(Arc::clone(&qt), DType::F32, device.clone()).unwrap();
+
+        // Single-id gathers must be bit-exact (same blocks, same dequant).
+        for id in [0u32, 2, 5, 7] {
+            let ids = Tensor::from_vec(vec![id], (1,), &device).unwrap();
+            let g = emb.forward(&ids).unwrap().reshape((1, dim)).unwrap();
+            let r = full.narrow(0, id as usize, 1).unwrap();
+            let d = (g - r).unwrap().abs().unwrap().max_all().unwrap();
+            assert_eq!(
+                d.to_scalar::<f32>().unwrap(),
+                0.0,
+                "single id {id} mismatch"
+            );
+        }
+
+        // Multi-id, multi-dim shape: [2,2] ids → [2,2,dim], each row
+        // matching the full table including a repeated id.
+        let ids = Tensor::from_vec(vec![2u32, 5, 2, 0], (2, 2), &device).unwrap();
+        let got = emb.forward(&ids).unwrap();
+        assert_eq!(got.dims(), &[2, 2, dim]);
+        let got2d = got.reshape((4, dim)).unwrap();
+        for (row, &id) in [2usize, 5, 2, 0].iter().enumerate() {
+            let g = got2d.narrow(0, row, 1).unwrap();
+            let r = full.narrow(0, id, 1).unwrap();
+            let d = (g - r).unwrap().abs().unwrap().max_all().unwrap();
+            assert_eq!(
+                d.to_scalar::<f32>().unwrap(),
+                0.0,
+                "row {row} (id {id}) mismatch"
+            );
+        }
     }
 
     #[test]
