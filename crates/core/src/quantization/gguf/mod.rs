@@ -648,11 +648,15 @@ impl GgufWeightLoader {
                 candle_core::Error::Msg("GGUF missing tokenizer.ggml.tokens array".into())
             })?;
 
-        // head_dim: derive from the q_proj output width (out / num_heads),
-        // which is robust for models where head_dim != hidden/heads (Gemma
-        // 4 E4B: hidden 2560, 8 heads → 320 by the naive split, but the
-        // real head_dim is 256). The llama.cpp `key_length` key is NOT the
-        // q head_dim on Gemma (it is 512 there), so it is not used.
+        // head_dim: the DEFAULT (sliding-attention) head dim. Derive from
+        // layer 0's q_proj width (out / num_heads) — robust where head_dim
+        // != hidden/heads (Gemma 4 E4B: 2560/8 = 320 naive, real 256).
+        //
+        // Gemma 4 is heterogeneous: full-attention layers use a LARGER head
+        // dim (E4B sliding 256, full 512) — that is `global_head_dim`, set
+        // from `{arch}.attention.key_length` in `gemma4_config_extras`,
+        // while this `head_dim` is the sliding one (`key_length_swa`). Layer
+        // 0 is a sliding layer in E4B, so the q_proj derivation yields 256.
         let head_dim = self
             .qtensor_out_dim("model.layers.0.self_attn.q_proj")
             .filter(|_| num_attention_heads > 0)
@@ -738,6 +742,16 @@ impl GgufWeightLoader {
         // KV-cache sharing: the last N layers reuse an earlier layer's KV.
         if let Some(shared) = self.meta_u64(&format!("{arch}.attention.shared_kv_layers")) {
             extra.insert("num_kv_shared_layers".into(), json!(shared));
+        }
+
+        // Heterogeneous head_dim: full-attention layers use a larger head
+        // dim than sliding layers (E4B: sliding 256 = key_length_swa, full
+        // 512 = key_length). `global_head_dim` drives the full-layer q/k/v
+        // and q_norm/k_norm sizing plus the per-layer KV cache geometry;
+        // the typed `head_dim` is the sliding one. Only meaningful when it
+        // differs from the sliding head dim.
+        if let Some(full_hd) = self.meta_u64(&format!("{arch}.attention.key_length")) {
+            extra.insert("global_head_dim".into(), json!(full_hd));
         }
 
         // Soft-capping.
