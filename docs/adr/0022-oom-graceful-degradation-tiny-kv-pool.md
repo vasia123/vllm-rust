@@ -98,3 +98,23 @@ the kvpool-OOM repro burst no longer produces "353 tokens" failures.
 Use `--kv-cache-dtype fp8` (roughly doubles the pool → far less preemption),
 keep concurrency low, or use a larger GPU. `max_model_len` is auto-clamped to
 pool capacity with a warning.
+
+## `--kv-cache-dtype fp8` on Gemma 4 — verified, with a path-specific limit
+
+Verified on gemma-4-12B-it-exl3 @2.00bpw (RTX 4060, cc 8.9): fp8 doubles the
+pool (22→44 blocks, 352→704 usable tokens), output stays coherent at the
+default `--kv-headroom-factor 1.5` (no tuning needed), and a short-structured
+burst drops from dozens of preempt/exhaust events to ~2. fp8 is the recommended
+way to give Gemma more **concurrency** headroom on 8 GB. Covered by the
+`write_read_roundtrip_fp8_padded_het_kv` unit test (het-KV padding × fp8).
+
+**Limit (naive attention path):** Gemma 4's `QuantizedGemma4Attention` reads
+the cache via `CacheEngine::read()`, which **dequantizes the entire KV history
+to the compute dtype every decode step** before the matmul. So while fp8 stores
+KV at half size, *decoding* a long sequence transiently recreates the bf16
+footprint — a single long generation (~500 tokens) still exhausts the headroom
+and falls into (now-correct, but slow) preempt-recompute. fp8 therefore extends
+*concurrency of short sequences*, not *single-sequence length*, on Gemma. The
+paged-attention kernel path does inline dequant without materializing (genuine
+context extension), but Gemma doesn't use it — routing Gemma through an
+inline-dequant attention is future work.

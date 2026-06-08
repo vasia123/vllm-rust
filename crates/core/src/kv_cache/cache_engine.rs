@@ -849,6 +849,72 @@ mod tests {
         }
     }
 
+    /// Gemma 4 het-KV × fp8: a full-attention layer writes 1 real KV head
+    /// padded to the shared cache stride (8 heads here) with a real
+    /// head_dim padded to the cache head_dim (8→16 here) — the padding is
+    /// zeros (see `pad_kv_heads`/`pad_last_dim` in gemma4_quantized.rs).
+    /// fp8 first-write calibration computes a per-tensor scale from the
+    /// absmax over real+zero data; the zeros must not corrupt the scale,
+    /// and the real head's values must survive the fp8 roundtrip after the
+    /// reader slices the padding back off.
+    #[test]
+    fn write_read_roundtrip_fp8_padded_het_kv() {
+        let config = CacheConfig {
+            block_size: 4,
+            num_blocks: 8,
+            num_layers: 1,
+            num_kv_heads: 8, // shared cache stride (max over layers)
+            head_dim: 16,    // shared cache head_dim (max over layers)
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Fp8E4m3,
+            cpu_offload: None,
+        };
+        let mut engine = CacheEngine::new(&config).unwrap();
+
+        // Real layer: 1 KV head, head_dim 8. Build the PADDED write tensor
+        // [cache_heads=8, tokens=3, cache_head_dim=16]: head 0 carries real
+        // values in dims 0..8, everything else is zero padding.
+        let tokens = 3usize;
+        let real_head_dim = 8usize;
+        let real: Vec<f32> = (0..tokens * real_head_dim)
+            .map(|i| (i as f32) * 0.1 + 0.05)
+            .collect();
+        let mut padded = vec![0f32; 8 * tokens * 16];
+        for t in 0..tokens {
+            for d in 0..real_head_dim {
+                // head 0, token t, dim d  → index in [8, tokens, 16]
+                padded[(0 * tokens + t) * 16 + d] = real[t * real_head_dim + d];
+            }
+        }
+        let k = Tensor::from_vec(padded.clone(), (8, tokens, 16), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(padded, (8, tokens, 16), &Device::Cpu).unwrap();
+        let slot_mapping = vec![8, 9, 10];
+
+        engine.write(&k, &v, &slot_mapping).unwrap();
+        let (k_out, _) = engine.read(&[2], tokens).unwrap();
+        assert_eq!(k_out.dims(), &[1, 8, tokens, 16]);
+
+        // Reader slices padding back: head 0, dims 0..real_head_dim.
+        let sliced = k_out
+            .narrow(1, 0, 1)
+            .and_then(|t| t.narrow(3, 0, real_head_dim))
+            .unwrap();
+        let got: Vec<f32> = sliced.flatten_all().unwrap().to_vec1().unwrap();
+        for (orig, read) in real.iter().zip(got.iter()) {
+            let abs_error = (orig - read).abs();
+            let rel_error = if orig.abs() > 1e-6 {
+                abs_error / orig.abs()
+            } else {
+                abs_error
+            };
+            assert!(
+                rel_error < 0.2 || abs_error < 0.5,
+                "padded het-KV fp8 roundtrip error: orig={orig}, read={read}, rel={rel_error}"
+            );
+        }
+    }
+
     #[test]
     fn write_read_roundtrip_int8() {
         let config = test_config_int8(8);
