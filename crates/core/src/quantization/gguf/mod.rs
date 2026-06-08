@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "cuda-kernels")]
+use candle_core::quantized::GgmlDType;
 use candle_core::quantized::{gguf_file, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 
@@ -270,23 +272,37 @@ fn warn_if_dequantize_all() {
     });
 }
 
-/// Quantized embedding table kept resident as a [`QTensor`], gathering and
-/// dequantizing only the requested rows per forward.
+/// Backing store for a [`QuantizedEmbedding`].
+enum EmbTable {
+    /// CPU-resident `QTensor`; gather by slicing the row's block bytes and
+    /// dequantizing the small slice. Works for any GGUF quant type.
+    CpuQTensor(Arc<QTensor>),
+    /// GPU-resident raw Q6_K block bytes (U8 `Tensor`, row-major over
+    /// `[num_embeddings, embedding_dim]`); gather via the
+    /// `gather_dequant_q6k` CUDA kernel. No host residency, no full-table
+    /// dequant.
+    GpuQ6kBytes(Tensor),
+}
+
+/// Quantized embedding table that materializes only the rows a forward
+/// selects, instead of dequantizing the whole `[num_embeddings,
+/// embedding_dim]` table.
 ///
 /// This exists for Gemma 4's Per-Layer Embedding table: dense f16 it is
 /// ~5.6 GB ([262144, 42·256]) and would OOM an 8 GB GPU at construction if
 /// served through candle's `embedding()` (which materializes the whole
-/// weight via `VarBuilder::get`). Here the table stays quantized-resident
-/// (q6_k ~2.3 GB) on `table_device` — typically CPU, to spare VRAM — and a
-/// forward gathers only the rows for the batch's token ids.
+/// weight via `VarBuilder::get`). Two backings:
 ///
-/// Row `r` occupies a contiguous run of `embedding_dim / block_size`
-/// quantized blocks (Gemma's PLE row = 10752 / 256 = 42 Q6_K blocks —
-/// exact block alignment), so a gather is a byte-range copy of those
-/// blocks followed by a small dequant — never a full-table dequant.
+/// - [`EmbTable::GpuQ6kBytes`] (production): the Q6_K table stays
+///   quantized-resident in VRAM (~2.3 GB) and a forward runs the
+///   `gather_dequant_q6k` kernel over just the batch's rows.
+/// - [`EmbTable::CpuQTensor`] (fallback / CPU / tests): the table is a
+///   CPU `QTensor`; a forward slices the row blocks and dequantizes the
+///   slice. Row `r` is a contiguous run of `embedding_dim / block_size`
+///   blocks (Gemma PLE row = 10752/256 = 42 Q6_K blocks, exact block
+///   alignment), so a gather is a byte-range copy + small dequant.
 pub struct QuantizedEmbedding {
-    /// Quantized table, shape `[num_embeddings, embedding_dim]`.
-    qt: Arc<QTensor>,
+    table: EmbTable,
     num_embeddings: usize,
     embedding_dim: usize,
     /// Output dtype/device for the gathered dense rows (the compute side).
@@ -295,7 +311,7 @@ pub struct QuantizedEmbedding {
 }
 
 impl QuantizedEmbedding {
-    /// Wrap a 2-D quantized embedding table. `embedding_dim` must be a
+    /// CPU-backed embedding from a 2-D `QTensor`. `embedding_dim` must be a
     /// multiple of the quant block size (true for GGUF embeddings).
     pub fn new(qt: Arc<QTensor>, out_dtype: DType, out_device: Device) -> Result<Self> {
         let dims = qt.shape().dims().to_vec();
@@ -310,7 +326,31 @@ impl QuantizedEmbedding {
             );
         }
         Ok(Self {
-            qt,
+            table: EmbTable::CpuQTensor(qt),
+            num_embeddings,
+            embedding_dim,
+            out_dtype,
+            out_device,
+        })
+    }
+
+    /// GPU-backed Q6_K embedding from raw block bytes (U8 `Tensor` on
+    /// CUDA), gathered via the custom kernel. The table never goes dense
+    /// and never touches host RAM.
+    pub fn new_gpu_q6k(
+        bytes: Tensor,
+        num_embeddings: usize,
+        embedding_dim: usize,
+        out_dtype: DType,
+        out_device: Device,
+    ) -> Result<Self> {
+        if !embedding_dim.is_multiple_of(256) {
+            candle_core::bail!(
+                "QuantizedEmbedding(Q6_K): embedding_dim {embedding_dim} not a multiple of 256"
+            );
+        }
+        Ok(Self {
+            table: EmbTable::GpuQ6kBytes(bytes),
             num_embeddings,
             embedding_dim,
             out_dtype,
@@ -329,10 +369,17 @@ impl QuantizedEmbedding {
     }
 
     /// Gather rows for `ids` (any shape) → `[*ids.shape, embedding_dim]` in
-    /// `out_dtype` on `out_device`. Dequantizes only the gathered rows.
+    /// `out_dtype` on `out_device`. Materializes only the gathered rows.
     pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
-        let block = self.qt.dtype().block_size();
-        let tsize = self.qt.dtype().type_size();
+        match &self.table {
+            EmbTable::CpuQTensor(qt) => self.forward_cpu(qt, ids),
+            EmbTable::GpuQ6kBytes(bytes) => self.forward_gpu_q6k(bytes, ids),
+        }
+    }
+
+    fn forward_cpu(&self, qt: &Arc<QTensor>, ids: &Tensor) -> Result<Tensor> {
+        let block = qt.dtype().block_size();
+        let tsize = qt.dtype().type_size();
         let blocks_per_row = self.embedding_dim / block;
         let row_bytes = blocks_per_row * tsize;
 
@@ -341,7 +388,7 @@ impl QuantizedEmbedding {
 
         // `data()` on a CPU-resident QTensor borrows the block bytes (no
         // copy); gathering is a byte-range memcpy per row.
-        let data = self.qt.data()?;
+        let data = qt.data()?;
         let mut buf: Vec<u8> = Vec::with_capacity(flat.len() * row_bytes);
         for &id in &flat {
             let id = id as usize;
@@ -363,7 +410,7 @@ impl QuantizedEmbedding {
         // returns and the subsequent `.to_vec()` reads freed memory
         // (observed as garbage rows). Borrowing keeps `buf` (this scope's
         // local) alive across the call so the slice stays valid.
-        let storage = QStorage::from_data(Cow::Borrowed(&buf), &Device::Cpu, self.qt.dtype())?;
+        let storage = QStorage::from_data(Cow::Borrowed(&buf), &Device::Cpu, qt.dtype())?;
         let gathered = QTensor::new(storage, (flat.len(), self.embedding_dim))?;
         let dense = gathered.dequantize(&Device::Cpu)?;
 
@@ -372,6 +419,27 @@ impl QuantizedEmbedding {
             .reshape(out_shape)?
             .to_dtype(self.out_dtype)?
             .to_device(&self.out_device)
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn forward_gpu_q6k(&self, bytes: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let mut out_shape = ids.dims().to_vec();
+        let dense = crate::quantization::gguf_cuda::gather_dequant_q6k(
+            bytes,
+            ids,
+            self.num_embeddings,
+            self.embedding_dim,
+        )?;
+        out_shape.push(self.embedding_dim);
+        dense
+            .reshape(out_shape)?
+            .to_dtype(self.out_dtype)?
+            .to_device(&self.out_device)
+    }
+
+    #[cfg(not(feature = "cuda-kernels"))]
+    fn forward_gpu_q6k(&self, _bytes: &Tensor, _ids: &Tensor) -> Result<Tensor> {
+        candle_core::bail!("QuantizedEmbedding GPU Q6_K path requires the cuda-kernels feature")
     }
 }
 
@@ -386,7 +454,13 @@ pub struct GgufWeightLoader {
     /// Parsed GGUF header (metadata + tensor infos).
     content: Arc<gguf_file::Content>,
     /// Every tensor, loaded once onto `device`, kept quantized-resident.
+    /// Large embedding tables routed to a [`QuantizedEmbedding`] (see
+    /// [`EMBED_TABLES`]) are NOT in here — they would waste VRAM as unused
+    /// QTensors; they are read from the file on demand instead.
     tensors: Arc<HashMap<String, Arc<QTensor>>>,
+    /// Path to the GGUF file, for on-demand reads of skipped embedding
+    /// tables.
+    path: std::path::PathBuf,
     /// Device to load tensors to
     device: Device,
     /// Compute dtype for activations
@@ -395,6 +469,12 @@ pub struct GgufWeightLoader {
     #[allow(dead_code)]
     config: GgufConfig,
 }
+
+/// GGUF tensor names whose tables are huge embeddings served through a
+/// [`QuantizedEmbedding`] (per-row gather) rather than a dense QTensor —
+/// so they are skipped during the bulk load to avoid wasting VRAM/host
+/// RAM on a copy that is never used as a dense tensor.
+const EMBED_TABLES: &[&str] = &["per_layer_token_embd.weight"];
 
 impl GgufWeightLoader {
     /// Open a GGUF file, parse its header, and load every tensor onto
@@ -407,10 +487,16 @@ impl GgufWeightLoader {
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| candle_core::Error::Msg(format!("Failed to parse GGUF header: {e}")))?;
 
-        // Single pass: load each tensor onto the device, quantized.
+        // Single pass: load each tensor onto the device, quantized. Large
+        // embedding tables (EMBED_TABLES) are skipped — they are served by
+        // a `QuantizedEmbedding` that reads them from the file on demand,
+        // so a dense QTensor copy here would only waste memory.
         let names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         let mut tensors: HashMap<String, Arc<QTensor>> = HashMap::with_capacity(names.len());
         for name in names {
+            if EMBED_TABLES.contains(&name.as_str()) {
+                continue;
+            }
             let qt = content.tensor(&mut reader, &name, &device).map_err(|e| {
                 candle_core::Error::Msg(format!("Failed to load tensor {name}: {e}"))
             })?;
@@ -420,10 +506,36 @@ impl GgufWeightLoader {
         Ok(Self {
             content: Arc::new(content),
             tensors: Arc::new(tensors),
+            path: path.to_path_buf(),
             device,
             dtype,
             config: GgufConfig::default(),
         })
+    }
+
+    /// Read a tensor's raw quantized bytes straight from the GGUF file
+    /// (used for embedding tables skipped during the bulk load). candle's
+    /// `TensorInfo` is not `Clone`, so this returns only the bytes; the
+    /// caller reads dtype/shape from the borrowed `tensor_infos` entry.
+    fn read_tensor_bytes(&self, gguf_name: &str) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let info = self.content.tensor_infos.get(gguf_name).ok_or_else(|| {
+            candle_core::Error::Msg(format!("GGUF tensor '{gguf_name}' not found in header"))
+        })?;
+        let elem_count = info.shape.elem_count();
+        let block_size = info.ggml_dtype.block_size();
+        let n_bytes = elem_count / block_size * info.ggml_dtype.type_size();
+
+        let mut f = std::fs::File::open(&self.path)
+            .map_err(|e| candle_core::Error::Msg(format!("reopen GGUF: {e}")))?;
+        f.seek(SeekFrom::Start(
+            self.content.tensor_data_offset + info.offset,
+        ))
+        .map_err(|e| candle_core::Error::Msg(format!("seek GGUF tensor: {e}")))?;
+        let mut buf = vec![0u8; n_bytes];
+        f.read_exact(&mut buf)
+            .map_err(|e| candle_core::Error::Msg(format!("read GGUF tensor: {e}")))?;
+        Ok(buf)
     }
 
     /// Shared handle to the parsed content, so a `VarBuilder` backend can
@@ -975,6 +1087,57 @@ impl QuantizedWeightLoader for GgufWeightLoader {
             in_features,
             out_features,
         )))
+    }
+
+    fn load_quantized_embedding(
+        &self,
+        prefix: &str,
+        out_dtype: DType,
+        out_device: &Device,
+    ) -> Result<Option<crate::quantization::QuantizedEmbedding>> {
+        // Resolve the GGUF tensor name for this embedding prefix.
+        let gguf_name = match to_llama_cpp_prefix(prefix) {
+            Some(mapped) => format!("{mapped}.weight"),
+            None => return Ok(None),
+        };
+        let info = match self.content.tensor_infos.get(&gguf_name) {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+        let dims = info.shape.dims().to_vec();
+        if dims.len() != 2 {
+            return Ok(None); // not a 2-D embedding table
+        }
+        let ggml_dtype = info.ggml_dtype;
+
+        // Fast GPU path: Q6_K table + CUDA device + the gather kernel.
+        // Keep the quantized bytes resident in VRAM and gather per-row via
+        // the custom kernel — the table never goes dense (would be 5.6 GB
+        // for Gemma PLE).
+        #[cfg(feature = "cuda-kernels")]
+        if ggml_dtype == GgmlDType::Q6K && out_device.is_cuda() {
+            let bytes = self.read_tensor_bytes(&gguf_name)?;
+            let n_bytes = bytes.len();
+            let table = Tensor::from_vec(bytes, (n_bytes,), out_device)?;
+            return Ok(Some(crate::quantization::QuantizedEmbedding::new_gpu_q6k(
+                table,
+                dims[0],
+                dims[1],
+                out_dtype,
+                out_device.clone(),
+            )?));
+        }
+
+        // Fallback: CPU-resident QTensor, per-row block-slice gather. Works
+        // for any quant type / non-CUDA devices.
+        let bytes = self.read_tensor_bytes(&gguf_name)?;
+        let storage = QStorage::from_data(Cow::Borrowed(&bytes), &Device::Cpu, ggml_dtype)?;
+        let qt = Arc::new(QTensor::new(storage, dims)?);
+        Ok(Some(crate::quantization::QuantizedEmbedding::new(
+            qt,
+            out_dtype,
+            out_device.clone(),
+        )?))
     }
 
     fn method(&self) -> QuantizationMethod {

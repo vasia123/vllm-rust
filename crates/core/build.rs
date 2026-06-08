@@ -36,6 +36,12 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/gptq_dequant.ptx",
         min_sm: 75,
     },
+    // Per-row gather + dequant for quantized embedding tables (GGUF PLE).
+    KernelDef {
+        source: "kernels/gather_dequant.cu",
+        output: "kernels/gather_dequant.ptx",
+        min_sm: 75,
+    },
     // MoE kernels use bf16
     KernelDef {
         source: "kernels/fused_moe_align.cu",

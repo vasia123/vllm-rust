@@ -1795,11 +1795,30 @@ impl QuantizedLinear for TiedEmbeddingHead {
 
 /// Quantized Gemma 4 text model.
 ///
+/// Per-Layer Embedding table source. Most quantization schemes ship the
+/// PLE table as a dense (bf16) tensor → a candle [`Embedding`]. GGUF ships
+/// it quantized (Q6_K) and, at ~5.6 GB dense, must NOT be materialized:
+/// the GGUF loader returns a [`QuantizedEmbedding`](crate::quantization::QuantizedEmbedding)
+/// that gathers only the rows a forward selects.
+enum PleEmbedding {
+    Dense(Embedding),
+    Quantized(crate::quantization::QuantizedEmbedding),
+}
+
+impl PleEmbedding {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(e) => e.forward(ids),
+            Self::Quantized(q) => q.forward(ids),
+        }
+    }
+}
+
 /// Supports AWQ, BitsAndBytes, GPTQ, FP8, GGUF, and the pass-through
 /// unquantized loader via the `QuantizedWeightLoader` trait.
 pub struct QuantizedGemma4ForCausalLM {
     embed_tokens: Embedding,
-    embed_tokens_per_layer: Option<Embedding>,
+    embed_tokens_per_layer: Option<PleEmbedding>,
     per_layer_model_projection: Option<Box<dyn QuantizedLinear>>,
     per_layer_projection_norm: Option<Gemma4RmsNorm>,
     layers: Vec<QuantizedGemma4DecoderLayer>,
@@ -1863,11 +1882,22 @@ impl QuantizedGemma4ForCausalLM {
             if extra_cfg.hidden_size_per_layer_input > 0 {
                 let total_ple_dim = extra_cfg.hidden_size_per_layer_input * cfg.num_hidden_layers;
 
-                let ple_embed = embedding(
-                    extra_cfg.vocab_size_per_layer_input,
-                    total_ple_dim,
-                    vb_m.pp("embed_tokens_per_layer"),
-                )?;
+                // GGUF ships the PLE table quantized (Q6_K) and ~5.6 GB
+                // dense — too big to materialize on 8 GB. The loader hook
+                // returns a `QuantizedEmbedding` (per-row gather) when it
+                // can; other schemes fall back to a dense candle Embedding.
+                let ple_embed = match weight_loader.load_quantized_embedding(
+                    "model.embed_tokens_per_layer",
+                    vb_m.dtype(),
+                    vb_m.device(),
+                )? {
+                    Some(q) => PleEmbedding::Quantized(q),
+                    None => PleEmbedding::Dense(embedding(
+                        extra_cfg.vocab_size_per_layer_input,
+                        total_ple_dim,
+                        vb_m.pp("embed_tokens_per_layer"),
+                    )?),
+                };
 
                 let ple_proj = weight_loader.load_linear(
                     "model.per_layer_model_projection",

@@ -80,6 +80,25 @@ pub trait QuantizedWeightLoader: Send + Sync {
         bias: bool,
     ) -> Result<Box<dyn QuantizedLinear>>;
 
+    /// Load a quantized embedding table that gathers + dequantizes only
+    /// the requested rows per forward, instead of materializing the full
+    /// dense `[num_embeddings, embedding_dim]` table.
+    ///
+    /// Returns `None` (the default) for loaders that do not support it —
+    /// the caller then falls back to a dense [`candle_nn::Embedding`]
+    /// loaded through the VarBuilder. GGUF implements this for Gemma 4's
+    /// Per-Layer Embedding table, which is ~5.6 GB dense and would OOM an
+    /// 8 GB GPU at construction. `out_dtype` / `out_device` are the compute
+    /// dtype/device for the gathered rows.
+    fn load_quantized_embedding(
+        &self,
+        _prefix: &str,
+        _out_dtype: DType,
+        _out_device: &Device,
+    ) -> Result<Option<crate::quantization::QuantizedEmbedding>> {
+        Ok(None)
+    }
+
     /// Get the quantization method this loader handles.
     fn method(&self) -> QuantizationMethod;
 

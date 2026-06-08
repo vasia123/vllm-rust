@@ -45,6 +45,8 @@ pub mod fp8;
 pub mod fp8_cuda;
 pub mod fp_quant;
 pub mod gguf;
+#[cfg(feature = "cuda-kernels")]
+pub mod gguf_cuda;
 pub mod gptq;
 #[cfg(feature = "cuda-kernels")]
 pub mod gptq_cuda;
