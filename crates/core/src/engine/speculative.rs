@@ -827,8 +827,12 @@ impl<M: ModelForward> ExecutionStrategy for SpeculativeExecution<M> {
                 );
             }
 
+            // Recompute preemption (vLLM model): preserve generated tokens;
+            // reset only num_computed_tokens / seqlen_offset so the target
+            // re-prefills the full sequence (prompt + generated) and resumes.
+            // The draft proposer state was freed above and is re-established
+            // on the next proposal step for the resumed sequence.
             req.state.status = RequestStatus::Preempted;
-            req.state.generated_token_ids.clear();
             req.state.num_computed_tokens = 0;
             req.state.seqlen_offset = 0;
         }

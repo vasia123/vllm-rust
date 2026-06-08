@@ -627,8 +627,10 @@ mod tests {
                 for &req_id in &output.preempted_requests {
                     let req = active.get_mut(&req_id).unwrap();
                     let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
+                    // Recompute preemption (vLLM model): preserve generated
+                    // tokens; reset only num_computed_tokens / seqlen_offset
+                    // so the request re-prefills its full sequence and resumes.
                     req.state.status = RequestStatus::Preempted;
-                    req.state.generated_token_ids.clear();
                     req.state.num_computed_tokens = 0;
                     req.state.seqlen_offset = 0;
                 }
@@ -739,6 +741,60 @@ mod tests {
         let result = results[0].as_ref().unwrap();
         assert_eq!(result.generated_token_ids, vec![42, 42, 42, 42, 42]);
         assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    /// Recompute-preemption correctness (vLLM model): under a KV pool too
+    /// small to hold both requests at once, the scheduler preempts one,
+    /// re-prefills its full sequence (prompt + generated), and resumes.
+    /// Each request must produce EXACTLY max_tokens generated tokens — no
+    /// budget regrowth, no lost output — and all blocks must be freed.
+    #[tokio::test]
+    async fn preemption_preserves_output_and_budget() {
+        use crate::kv_cache::{CacheConfig, KVCacheDtype};
+        // Pool: 4 blocks × 16 = 64 tokens. Two requests of prompt 8 +
+        // max_tokens 40 = 48 tokens (3 blocks) each: one fits, both don't →
+        // forces preempt/resume.
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 4,
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 8,
+            dtype: candle_core::DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+        let model = MockModel::new(42, 1000);
+        let config = test_engine_config();
+
+        let results = run_engine_with_pretokenized(
+            model,
+            kv_cache_mgr,
+            config,
+            vec![
+                (vec![1, 2, 3, 4, 5, 6, 7, 8], 40, 999),
+                (vec![1, 2, 3, 4, 5, 6, 7, 8], 40, 999),
+            ],
+        )
+        .await;
+
+        for (i, r) in results.iter().enumerate() {
+            let result = r
+                .as_ref()
+                .unwrap_or_else(|e| panic!("req {i} failed: {e:?}"));
+            assert_eq!(
+                result.generated_token_ids.len(),
+                40,
+                "req {i}: exactly max_tokens generated (no regrowth, no loss)"
+            );
+            assert!(
+                result.generated_token_ids.iter().all(|&t| t == 42),
+                "req {i}: all generated tokens preserved correctly"
+            );
+            assert_eq!(result.finish_reason, FinishReason::Length);
+        }
     }
 
     #[tokio::test]
@@ -1090,8 +1146,10 @@ mod tests {
                 for &req_id in &output.preempted_requests {
                     let req = active.get_mut(&req_id).expect("preempted request missing");
                     let _ = kv_cache_mgr.free_request(&mut req.state.block_table);
+                    // Recompute preemption (vLLM model): preserve generated
+                    // tokens; reset only num_computed_tokens / seqlen_offset
+                    // so the request re-prefills its full sequence and resumes.
                     req.state.status = RequestStatus::Preempted;
-                    req.state.generated_token_ids.clear();
                     req.state.num_computed_tokens = 0;
                     req.state.seqlen_offset = 0;
                 }

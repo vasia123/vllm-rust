@@ -121,6 +121,34 @@ impl SequenceState {
         self.generated_token_ids.len()
     }
 
+    /// Length of the full token sequence the model must hold KV for:
+    /// prompt + everything generated so far. Recompute-preemption keeps
+    /// `prompt_token_ids` and `generated_token_ids` SEPARATE (vLLM model)
+    /// and re-prefills this full length, so scheduling, block sizing, and
+    /// the prefill chunk all reason over `total_len()`, not `prompt` alone.
+    /// For a fresh (not-yet-generated) request this equals the prompt
+    /// length, so the common path is unchanged.
+    pub fn total_len(&self) -> usize {
+        self.prompt_token_ids.len() + self.generated_token_ids.len()
+    }
+
+    /// Tokens of the full sequence (prompt followed by generated) in the
+    /// half-open range `[start, end)`. Used by prefill — including the
+    /// re-prefill of a preempted-and-resumed request, whose chunk may span
+    /// the prompt→generated boundary. Out-of-range indices are skipped.
+    pub fn token_window(&self, start: usize, end: usize) -> Vec<u32> {
+        let plen = self.prompt_token_ids.len();
+        (start..end)
+            .filter_map(|i| {
+                if i < plen {
+                    self.prompt_token_ids.get(i).copied()
+                } else {
+                    self.generated_token_ids.get(i - plen).copied()
+                }
+            })
+            .collect()
+    }
+
     pub fn num_blocks(&self) -> usize {
         self.block_table.block_ids().len()
     }
@@ -131,7 +159,9 @@ impl SequenceState {
     /// need a new block, so the estimate is multiplied by `beam_width`.
     pub fn blocks_needed_for_step(&self) -> usize {
         if self.status == RequestStatus::Waiting || self.status == RequestStatus::Preempted {
-            self.block_table.blocks_needed(self.prompt_token_ids.len())
+            // Full sequence (prompt + already-generated) must be re-prefilled
+            // for a resumed request; equals the prompt for a fresh one.
+            self.block_table.blocks_needed(self.total_len())
         } else {
             let beam_width = self
                 .sampling_params
@@ -183,6 +213,39 @@ mod tests {
     fn blocks_needed_for_prefill() {
         let state = SequenceState::new(0, vec![0; 20], 10, 0, 16, 0);
         // 20 tokens with block_size=16 needs ceil(20/16)=2 blocks
+        assert_eq!(state.blocks_needed_for_step(), 2);
+    }
+
+    #[test]
+    fn total_len_counts_prompt_plus_generated() {
+        let mut state = SequenceState::new(0, vec![1, 2, 3], 10, 0, 16, 0);
+        assert_eq!(state.total_len(), 3, "fresh: prompt only");
+        state.generated_token_ids = vec![7, 8];
+        assert_eq!(state.total_len(), 5, "resumed: prompt + generated");
+    }
+
+    #[test]
+    fn token_window_spans_prompt_and_generated() {
+        let mut state = SequenceState::new(0, vec![10, 11, 12], 10, 0, 16, 0);
+        // Fresh: window is a prompt slice.
+        assert_eq!(state.token_window(0, 3), vec![10, 11, 12]);
+        assert_eq!(state.token_window(1, 3), vec![11, 12]);
+        // Resumed: generated appended logically after the prompt.
+        state.generated_token_ids = vec![20, 21];
+        assert_eq!(state.token_window(0, 5), vec![10, 11, 12, 20, 21]);
+        // A chunk crossing the prompt→generated boundary.
+        assert_eq!(state.token_window(2, 5), vec![12, 20, 21]);
+        // Generated-only tail.
+        assert_eq!(state.token_window(3, 5), vec![20, 21]);
+    }
+
+    #[test]
+    fn blocks_needed_for_resumed_request_uses_total_len() {
+        // Preempted/resumed: prompt 10 + generated 12 = 22 tokens →
+        // ceil(22/16) = 2 blocks (must reserve for the full re-prefill).
+        let mut state = SequenceState::new(0, vec![0; 10], 64, 0, 16, 0);
+        state.generated_token_ids = vec![0; 12];
+        state.status = RequestStatus::Preempted;
         assert_eq!(state.blocks_needed_for_step(), 2);
     }
 

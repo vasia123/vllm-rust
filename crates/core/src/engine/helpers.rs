@@ -637,11 +637,17 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     let req = requests
         .get_mut(&req_id)
         .ok_or_else(|| EngineError::Model(format!("request {req_id} not found")))?;
+    // Prefill operates over the FULL sequence (prompt + already-generated).
+    // For a fresh request `generated` is empty so this is the prompt; for a
+    // request resumed after recompute-preemption it re-prefills prompt +
+    // generated and then continues decoding. See `SequenceState::total_len`.
     let prompt_len = req.state.prompt_token_ids.len();
+    let total_len = req.state.total_len();
+    let is_resumed = !req.state.generated_token_ids.is_empty();
     let offset = req.state.num_computed_tokens;
-    let chunk_end = (offset + chunk_size).min(prompt_len);
+    let chunk_end = (offset + chunk_size).min(total_len);
     let actual_chunk = chunk_end - offset;
-    let is_final_chunk = chunk_end == prompt_len;
+    let is_final_chunk = chunk_end == total_len;
 
     // Use eviction-aware allocation when prefix caching is enabled.
     // This allows evicting unreferenced cached blocks to make room for new requests.
@@ -656,8 +662,10 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     }
     let slot_mapping = req.state.block_table.slot_mapping(offset, actual_chunk);
 
-    let chunk_tokens = &req.state.prompt_token_ids[offset..chunk_end];
-    let input = Tensor::from_vec(chunk_tokens.to_vec(), (1, actual_chunk), model.device())
+    // Tokens for this chunk come from the full sequence (prompt ++ generated),
+    // so a resumed request's chunk can span the prompt→generated boundary.
+    let chunk_tokens = req.state.token_window(offset, chunk_end);
+    let input = Tensor::from_vec(chunk_tokens, (1, actual_chunk), model.device())
         .map_err(|e| EngineError::Model(e.to_string()))?;
 
     // Build LoRA context from request's lora_request if present
@@ -693,8 +701,12 @@ pub(crate) fn execute_prefill<M: ModelForward>(
     req.state.num_computed_tokens = chunk_end;
     req.state.seqlen_offset = chunk_end;
 
-    // Compute prompt logprobs if echo mode is enabled with logprobs
-    let compute_prompt_logprobs = req.state.echo && req.state.num_top_logprobs.is_some();
+    // Compute prompt logprobs if echo mode is enabled with logprobs — but
+    // only on the ORIGINAL prefill. A resumed (recompute) re-prefill must not
+    // re-append prompt logprobs (they were computed the first time); doing so
+    // would duplicate them.
+    let compute_prompt_logprobs =
+        req.state.echo && req.state.num_top_logprobs.is_some() && !is_resumed;
     if compute_prompt_logprobs {
         if offset == 0 {
             req.state.prompt_logprobs.push(None);
@@ -1285,31 +1297,30 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                         failed.push((req_id, format!("kv cache preempt-free failed: {free_err}")));
                         continue;
                     }
-                    // Fold generated tokens back into the prompt so that the
-                    // re-prefill produces the correct seqlen and recovers the
-                    // already-streamed context. The next compute_schedule
-                    // sees a Preempted/Waiting request whose prompt length
-                    // = original_prompt + tokens_generated_so_far, which is
-                    // what scheduler::compute_schedule's prefill admission
-                    // path expects.
+                    // Recompute preemption (vLLM model): keep prompt and
+                    // generated tokens SEPARATE — do NOT fold generated into
+                    // the prompt. Reset only `num_computed_tokens` (and the
+                    // RoPE offset) to 0 so the next schedule re-prefills the
+                    // full sequence (prompt + generated, via `total_len()`)
+                    // and resumes generation. generated_token_ids and its
+                    // logprobs are preserved, so the generation budget
+                    // (`num_generated()` vs max_new_tokens) stays correct and
+                    // the final output keeps every token. The earlier fold
+                    // reset the budget (regrowth past max_model_len) and lost
+                    // tokens for non-streaming requests.
                     let state = &mut req.state;
-                    state
-                        .prompt_token_ids
-                        .append(&mut state.generated_token_ids);
                     state.seqlen_offset = 0;
                     state.num_computed_tokens = 0;
-                    state.token_logprobs.clear();
-                    state.top_logprobs.clear();
-                    // Guard: if the folded context can never fit the pool
-                    // (more blocks than EXIST, not merely more than are
-                    // free), re-admission is impossible — compute_schedule
-                    // would refuse it forever and, under FCFS, head-of-line
-                    // starve every request behind it (live wedge observed
-                    // on an 8 GB GPU: 22-block pool, request crossed
-                    // 352 tokens at a block boundary). Fail it explicitly.
-                    let blocks_for_recompute = state
-                        .block_table
-                        .blocks_needed(state.prompt_token_ids.len());
+                    // Guard: if the full sequence can never fit the pool (more
+                    // blocks than EXIST, not merely more than are free),
+                    // re-admission is impossible — compute_schedule would
+                    // refuse it forever and, under FCFS, head-of-line starve
+                    // every request behind it. Fail it explicitly. With the
+                    // budget no longer reset, this is reachable only when a
+                    // single request's prompt+max_new_tokens genuinely exceeds
+                    // the pool (and should be caught at admission), not via
+                    // preemption regrowth.
+                    let blocks_for_recompute = state.block_table.blocks_needed(state.total_len());
                     let total_blocks = kv_cache_mgr.num_total_blocks();
                     if blocks_for_recompute > total_blocks {
                         failed.push((
@@ -1319,7 +1330,7 @@ pub(crate) fn execute_batched_decode_with_graph<M: ModelForward>(
                                  has only {} in total — recompute after preemption can never \
                                  be scheduled (lower --max-model-len or raise \
                                  --gpu-memory-utilization)",
-                                state.prompt_token_ids.len(),
+                                state.total_len(),
                                 blocks_for_recompute,
                                 total_blocks,
                             ),
@@ -3185,9 +3196,14 @@ mod tests {
         assert_eq!(preempted, vec![req_id]);
         let state = &requests[&req_id].state;
         assert_eq!(state.status, RequestStatus::Preempted);
-        // Generated tokens folded into the prompt for recompute.
-        assert_eq!(state.prompt_token_ids.len(), 32);
-        assert!(state.generated_token_ids.is_empty());
+        // vLLM-model recompute: prompt and generated stay SEPARATE (no fold);
+        // only num_computed_tokens / seqlen_offset reset. The re-prefill will
+        // recompute the full sequence (prompt + generated) via total_len.
+        assert_eq!(state.prompt_token_ids.len(), 30, "prompt unchanged");
+        assert_eq!(state.generated_token_ids, vec![7, 8], "output preserved");
+        assert_eq!(state.total_len(), 32);
+        assert_eq!(state.num_computed_tokens, 0);
+        assert_eq!(state.seqlen_offset, 0);
     }
 
     // ─── reap_disconnected_requests (client-disconnect cancellation) ──────

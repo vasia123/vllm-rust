@@ -509,8 +509,10 @@ impl Scheduler {
             };
 
             if state.status == RequestStatus::Prefilling {
-                // Continued prefill chunk (chunked prefill only)
-                let remaining = state.prompt_token_ids.len() - state.num_computed_tokens;
+                // Continued prefill chunk (chunked prefill only). `total_len`
+                // (prompt + already-generated) so a resumed/recomputed request
+                // re-prefills its full sequence, not just the prompt.
+                let remaining = state.total_len() - state.num_computed_tokens;
                 let chunk_size = if self.config.enable_chunked_prefill {
                     remaining.min(budget)
                 } else {
@@ -591,7 +593,7 @@ impl Scheduler {
                 .filter(|id| {
                     states.get(id).is_some_and(|s| {
                         s.status == RequestStatus::Prefilling
-                            && (s.prompt_token_ids.len() - s.num_computed_tokens) > threshold
+                            && (s.total_len() - s.num_computed_tokens) > threshold
                     })
                 })
                 .count()
@@ -612,7 +614,10 @@ impl Scheduler {
             let Some(state) = states.get(&req_id) else {
                 continue;
             };
-            let remaining = state.prompt_token_ids.len() - state.num_computed_tokens;
+            // `total_len` (prompt + generated) so a Preempted request resumed
+            // for recompute re-prefills its full sequence; for a fresh waiting
+            // request generated is empty and this equals the prompt length.
+            let remaining = state.total_len() - state.num_computed_tokens;
 
             if remaining == 0 {
                 if budget > 0 {
@@ -1259,14 +1264,18 @@ mod tests {
         let config = fcfs_config(4, 512, false);
         let mut scheduler = Scheduler::new(config);
 
-        // Simulate a request where prefix cache covered entire prompt
+        // Simulate a request whose full sequence is already computed
+        // (nothing left to prefill) → must admit for decode. Under the
+        // total_len model "fully computed" is num_computed == total_len
+        // (prompt + generated), so a request with a pending generated
+        // token has num_computed = prompt + generated.len().
         let mut state = SequenceState::new(0, vec![0u32; 32], 64, 0, 16, 0);
-        state.num_computed_tokens = 32; // all prompt tokens cached
-        state.block_table.append_blocks(&[0, 1]); // 2 blocks for 32 tokens
-        state.block_table.advance(32);
-        state.seqlen_offset = 32;
-        // Need at least one generated token for decode to work
+        // One generated token already present; total_len = 32 + 1 = 33.
         state.generated_token_ids.push(42);
+        state.num_computed_tokens = 33; // entire prompt+generated computed
+        state.block_table.append_blocks(&[0, 1, 2]); // 3 blocks for 33 tokens
+        state.block_table.advance(33);
+        state.seqlen_offset = 33;
 
         let mut states = HashMap::new();
         states.insert(0, state);
@@ -1533,6 +1542,38 @@ mod tests {
     }
 
     // ==================== compute_schedule / apply_schedule Tests ====================
+
+    #[test]
+    fn preempted_request_reprefills_full_sequence_not_just_prompt() {
+        // A request preempted for recompute keeps its generated tokens
+        // (vLLM model) with num_computed_tokens reset to 0. The scheduler
+        // must re-prefill the FULL sequence (prompt + generated), so the
+        // prefill chunk size is total_len, not prompt_len.
+        let config = fcfs_config(4, 512, false);
+        let mut scheduler = Scheduler::new(config);
+        scheduler.add_request(0);
+
+        // prompt 10 + generated 12 = total 22; reset for recompute.
+        let mut state = make_state(0, 10, RequestStatus::Preempted, 16, 0);
+        state.generated_token_ids = vec![0u32; 12];
+        state.num_computed_tokens = 0;
+        state.seqlen_offset = 0;
+
+        let mut states = HashMap::new();
+        states.insert(0, state);
+
+        let decision = scheduler.compute_schedule(&refs(&states), 100);
+        let prefill = decision
+            .output
+            .prefill_requests
+            .iter()
+            .find(|p| p.request_id == 0)
+            .expect("preempted request must be scheduled for prefill");
+        assert_eq!(
+            prefill.chunk_size, 22,
+            "must re-prefill prompt + generated (total_len), not just prompt"
+        );
+    }
 
     #[test]
     fn compute_schedule_does_not_mutate_scheduler() {

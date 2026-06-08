@@ -68,22 +68,31 @@ OOM-killing batches, or crashing:
   `DriverError(OUT_OF_MEMORY)` reaching the client, no hang.
 - Sequential and modest concurrency: unchanged, fully working.
 
-## Known Gaps (deliberately deferred — documented, not silently shipped)
+## Recompute-preemption correctness (the former "Known Gap" — now FIXED)
 
-Heavy concurrent bursts on a 22-block pool still **shed some requests** with a
-clean `recompute after preemption can never be scheduled` 500. Root cause is a
-**pre-existing recompute-preemption limitation**, not addressed here:
+The earlier version of this ADR deferred a recompute-preemption bug: KV-exhaustion
+preemption **folded** `generated_token_ids` into `prompt_token_ids` and reset the
+generation budget, so a repeatedly-preempted request regrew past `max_model_len`
+(the "353 tokens needs 23 blocks" guard then failed it) and lost the folded
+tokens from non-streaming output.
 
-- KV-exhaustion preemption folds `generated_token_ids` into `prompt_token_ids`
-  and **resets the generation budget**, so a repeatedly-preempted request
-  regrows past `max_model_len` (the "353 tokens needs 23 blocks" guard then
-  fails it), and for **non-streaming** requests the folded tokens are lost from
-  the final output (would corrupt structured JSON).
-- Proper fix (multi-day): track `original_prompt_len`, decrement
-  `max_new_tokens` by the folded count on preempt, and assemble output from
-  `prompt[original_prompt_len..] ++ generated` — so recompute neither regrows
-  nor loses tokens. Until then, failing cleanly is preferred over returning
-  corrupt output.
+**Fixed** by mirroring vLLM's V1 model (no-fold recompute):
+- Preemption keeps `prompt_token_ids` and `generated_token_ids` SEPARATE and
+  resets only `num_computed_tokens`/`seqlen_offset` to 0 (all four preempt sites:
+  the decode-time KV-exhaustion path in `helpers.rs`, and `handle_preemptions` in
+  `standard.rs`/`speculative.rs`/`mod.rs` — the latter three previously *cleared*
+  generated, losing output even without regrowth).
+- `SequenceState::total_len()` (= prompt + generated) and `token_window()` drive
+  scheduling, block sizing, and the prefill chunk, so a resumed request
+  re-prefills its FULL sequence (prompt + generated) and continues generating.
+- `check_finished` already counts `num_generated()`, which is now never reset →
+  the generation budget is exact (no regrowth), and the final output
+  (`generated_token_ids`) keeps every token. Bonus: `prompt_token_ids` stays the
+  true prompt, so prompt-token counts and prefix-cache registration are correct.
+
+Verified: `preemption_preserves_output_and_budget` integration test (tiny pool
+forces preempt/resume → each request yields exactly `max_tokens`, all preserved);
+the kvpool-OOM repro burst no longer produces "353 tokens" failures.
 
 **Operational guidance for 8 GB + a 12B model:** the hardware is marginal.
 Use `--kv-cache-dtype fp8` (roughly doubles the pool → far less preemption),

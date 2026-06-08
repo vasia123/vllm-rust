@@ -728,8 +728,12 @@ impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
             if let Err(e) = kv_cache_mgr.free_request(&mut req.state.block_table) {
                 warn!(error = %e, request_id = req_id, "Failed to free request cache blocks during preemption");
             }
+            // Recompute preemption (vLLM model): preserve generated tokens;
+            // reset only num_computed_tokens / seqlen_offset so the request
+            // re-prefills its full sequence (prompt + generated) and resumes.
+            // Clearing generated_token_ids here silently dropped already-
+            // produced output and reset the generation budget.
             req.state.status = RequestStatus::Preempted;
-            req.state.generated_token_ids.clear();
             req.state.num_computed_tokens = 0;
             req.state.seqlen_offset = 0;
         }
