@@ -442,6 +442,13 @@ enum Command {
         /// Return token IDs alongside text in completion responses by default.
         #[arg(long)]
         return_tokens_as_token_ids: bool,
+
+        /// Skip vision / audio towers when loading multimodal checkpoints.
+        /// Frees the VRAM their encoder weights would consume; image or
+        /// audio inputs become errors. Useful for serving a VLM checkpoint
+        /// (Gemma 4, etc.) text-only on a tight GPU.
+        #[arg(long, default_value_t = false)]
+        text_only: bool,
     },
     /// Generate text from prompts (CLI mode)
     Generate {
@@ -583,6 +590,7 @@ async fn main() -> anyhow::Result<()> {
             max_seq_len_to_capture,
             enable_auto_tool_choice,
             return_tokens_as_token_ids,
+            text_only,
         } => {
             // Merge CLI args with file config (CLI takes precedence)
             let model = model.or(file_config.model);
@@ -1022,6 +1030,7 @@ async fn main() -> anyhow::Result<()> {
                 return_tokens_as_token_ids,
                 pipeline_parallel_size,
                 tensor_parallel_size,
+                text_only,
             })
             .await
         }
@@ -1136,6 +1145,8 @@ struct ServerLaunchConfig {
     // Parallelism
     pipeline_parallel_size: usize,
     tensor_parallel_size: usize,
+    /// Skip vision / audio towers when loading a multimodal checkpoint.
+    text_only: bool,
 }
 
 async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
@@ -1227,6 +1238,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         return_tokens_as_token_ids,
         pipeline_parallel_size,
         tensor_parallel_size,
+        text_only,
     } = cfg;
 
     // ── Idle mode: no model specified ─────────────────────────────────────
@@ -1440,6 +1452,17 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         if mml < files.config.max_position_embeddings {
             files.config.max_position_embeddings = mml;
         }
+    }
+
+    // Text-only: hint VLM constructors to skip vision / audio towers so their
+    // encoder weights never reach VRAM (honored by Gemma 4 text + quantized).
+    // Image/audio inputs then become errors. Set before model construction.
+    if text_only {
+        eprintln!("Text-only mode: vision / audio towers will be skipped at load time");
+        files.config.extra.insert(
+            "vllm_rust.disable_multimodal".to_string(),
+            serde_json::Value::Bool(true),
+        );
     }
 
     let device = create_cuda_device(0)?;
