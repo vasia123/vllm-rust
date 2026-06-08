@@ -430,11 +430,15 @@ impl GgufWeightLoader {
                 candle_core::Error::Msg("GGUF missing tokenizer.ggml.tokens array".into())
             })?;
 
-        // Prefer an explicit head_dim key (Gemma uses a head_dim that is
-        // NOT hidden/heads); fall back to the even split.
+        // head_dim: derive from the q_proj output width (out / num_heads),
+        // which is robust for models where head_dim != hidden/heads (Gemma
+        // 4 E4B: hidden 2560, 8 heads → 320 by the naive split, but the
+        // real head_dim is 256). The llama.cpp `key_length` key is NOT the
+        // q head_dim on Gemma (it is 512 there), so it is not used.
         let head_dim = self
-            .meta_u64(&format!("{arch_name}.attention.key_length"))
-            .map(|v| v as usize)
+            .qtensor_out_dim("model.layers.0.self_attn.q_proj")
+            .filter(|_| num_attention_heads > 0)
+            .map(|out| out / num_attention_heads)
             .unwrap_or_else(|| {
                 if num_attention_heads > 0 {
                     hidden_size / num_attention_heads
@@ -446,6 +450,15 @@ impl GgufWeightLoader {
         let architectures = self
             .vllm_architecture()
             .unwrap_or_else(|| vec!["LlamaForCausalLM".to_string()]);
+
+        // Gemma 4 needs PLE / sliding / soft-cap / per-attn-type RoPE
+        // settings in `extra` to activate its specialised forward; other
+        // architectures use an empty `extra`.
+        let (sliding_window, extra) = if arch_name == "gemma4" {
+            self.gemma4_config_extras(vocab_size)
+        } else {
+            (None, serde_json::Map::new())
+        };
 
         Ok(crate::config::ModelConfig {
             architectures,
@@ -463,10 +476,113 @@ impl GgufWeightLoader {
             tie_word_embeddings: true,
             bos_token_id: Some(1),
             eos_token_id: Some(2),
-            sliding_window: None,
+            sliding_window,
             attention_bias: Some(false),
-            extra: serde_json::Map::new(),
+            extra,
         })
+    }
+
+    /// First (outermost) dimension of a tensor resolved from a vLLM-style
+    /// prefix — the output feature count for a linear weight. candle's
+    /// `Content` reverses the on-disk dims, so the stored shape is
+    /// `[out, in]` and `dims()[0]` is `out`.
+    fn qtensor_out_dim(&self, prefix: &str) -> Option<usize> {
+        let mut names = vec![format!("{prefix}.weight"), prefix.to_string()];
+        if let Some(m) = to_llama_cpp_prefix(prefix) {
+            names.push(format!("{m}.weight"));
+            names.push(m);
+        }
+        names
+            .iter()
+            .find_map(|n| self.content.tensor_infos.get(n))
+            .and_then(|info| info.shape.dims().first().copied())
+    }
+
+    /// Populate the Gemma-4-specific `ModelConfig.extra` keys from GGUF
+    /// metadata so `Gemma4ExtraConfig::from_model_config` activates the
+    /// PLE path, sliding-window layers, soft-capping and per-attention-type
+    /// RoPE. Returns `(sliding_window, extra)`. Confirmed against the real
+    /// `gemma-4-E4B-it-Q4_K_M.gguf` header.
+    fn gemma4_config_extras(
+        &self,
+        vocab_size: usize,
+    ) -> (Option<usize>, serde_json::Map<String, serde_json::Value>) {
+        use serde_json::{json, Value};
+        let arch = "gemma4";
+        let mut extra: serde_json::Map<String, Value> = serde_json::Map::new();
+
+        // Per-Layer Embeddings.
+        if let Some(ple) = self.meta_u64(&format!("{arch}.embedding_length_per_layer_input")) {
+            extra.insert("hidden_size_per_layer_input".into(), json!(ple));
+        }
+        extra.insert("vocab_size_per_layer_input".into(), json!(vocab_size));
+
+        // KV-cache sharing: the last N layers reuse an earlier layer's KV.
+        if let Some(shared) = self.meta_u64(&format!("{arch}.attention.shared_kv_layers")) {
+            extra.insert("num_kv_shared_layers".into(), json!(shared));
+        }
+
+        // Soft-capping.
+        if let Some(cap) = self.meta_f64(&format!("{arch}.final_logit_softcapping")) {
+            extra.insert("final_logit_softcapping".into(), json!(cap));
+        }
+        if let Some(cap) = self.meta_f64(&format!("{arch}.attn_logit_softcapping")) {
+            extra.insert("attn_logit_softcapping".into(), json!(cap));
+        }
+
+        // Per-layer attention type from the sliding-window bool pattern
+        // (true → sliding_attention, false → full_attention). Mirrors the
+        // HF `layer_types` array the model consumes directly.
+        if let Some(gguf_file::Value::Array(pat)) = self
+            .content
+            .metadata
+            .get(&format!("{arch}.attention.sliding_window_pattern"))
+        {
+            let layer_types: Vec<Value> = pat
+                .iter()
+                .map(|v| {
+                    // candle's `Value::to_bool` is strict (Bool only).
+                    let sliding = v.to_bool().unwrap_or(true);
+                    Value::String(
+                        if sliding {
+                            "sliding_attention"
+                        } else {
+                            "full_attention"
+                        }
+                        .to_string(),
+                    )
+                })
+                .collect();
+            let full = layer_types
+                .iter()
+                .filter(|v| v.as_str() == Some("full_attention"))
+                .count();
+            tracing::info!(
+                "Gemma 4 GGUF: {} layers, {full} full-attention (rest sliding)",
+                layer_types.len()
+            );
+            extra.insert("layer_types".into(), Value::Array(layer_types));
+        }
+
+        // Per-attention-type RoPE bases (full vs sliding/local).
+        let full = self.meta_f64(&format!("{arch}.rope.freq_base"));
+        let swa = self.meta_f64(&format!("{arch}.rope.freq_base_swa"));
+        if full.is_some() || swa.is_some() {
+            let mut rope = serde_json::Map::new();
+            if let Some(f) = full {
+                rope.insert("full_attention".into(), json!({ "rope_theta": f }));
+            }
+            if let Some(s) = swa {
+                rope.insert("sliding_attention".into(), json!({ "rope_theta": s }));
+            }
+            extra.insert("rope_parameters".into(), Value::Object(rope));
+        }
+
+        let sliding_window = self
+            .meta_u64(&format!("{arch}.attention.sliding_window"))
+            .map(|v| v as usize);
+
+        (sliding_window, extra)
     }
 
     /// Create with a specific config.
