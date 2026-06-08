@@ -1712,10 +1712,24 @@ impl QuantizedGemma4ForCausalLM {
                 (None, None, None)
             };
 
-        let cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
-        let cache_num_kv_heads = extra_cfg.max_kv_heads(cfg.num_key_value_heads);
+        // Heterogeneous per-layer KV cache: when the checkpoint declares mixed
+        // geometries (full vs sliding) or KV-sharing, each attention layer
+        // targets its OWN honest `(num_kv_heads, head_dim)` instead of the
+        // padded model-wide max. The server allocates a matching per-layer
+        // cache (`gemma4_kv_cache_layer_specs` + `new_heterogeneous`), so the
+        // pad/slice in write/read collapse to no-ops. Homogeneous checkpoints
+        // (`specs == None`) keep the uniform max path byte-for-byte.
+        // `gemma4_kv_cache_layer_specs` is the single source of truth shared
+        // with the server's cache sizing, so shapes can never drift.
+        let per_layer_specs = super::gemma4::gemma4_kv_cache_layer_specs(cfg);
+        let max_cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
+        let max_cache_num_kv_heads = extra_cfg.max_kv_heads(cfg.num_key_value_heads);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
+            let (cache_head_dim, cache_num_kv_heads) = match &per_layer_specs {
+                Some(specs) => (specs[i].head_dim, specs[i].num_kv_heads),
+                None => (max_cache_head_dim, max_cache_num_kv_heads),
+            };
             layers.push(QuantizedGemma4DecoderLayer::new(
                 cfg,
                 &extra_cfg,
@@ -2217,6 +2231,91 @@ mod tests {
     }
 
     #[test]
+    fn kv_cache_layer_specs_match_model_geometry() {
+        // The server-side spec function MUST agree, per layer, with the
+        // geometry the model's attention actually uses — otherwise the
+        // allocated heterogeneous cache shapes would not match the model's
+        // read/writes. This guards against the two derivations drifting.
+        let cfg = test_config_heterogeneous_heads();
+        let extra = Gemma4ExtraConfig::from_model_config(&cfg);
+
+        let specs = super::super::gemma4::gemma4_kv_cache_layer_specs(&cfg)
+            .expect("heterogeneous head geometry must yield Some(specs)");
+        assert_eq!(specs.len(), cfg.num_hidden_layers);
+        for (i, spec) in specs.iter().enumerate() {
+            assert_eq!(
+                spec.num_kv_heads,
+                extra.kv_heads_for_layer(i, cfg.num_key_value_heads),
+                "layer {i} kv_heads"
+            );
+            assert_eq!(
+                spec.head_dim,
+                extra.head_dim_for_layer(i, cfg.head_dim),
+                "layer {i} head_dim"
+            );
+            assert_eq!(
+                spec.shares_with,
+                extra.kv_sharing_target_layer(i, cfg.num_hidden_layers),
+                "layer {i} shares_with"
+            );
+        }
+        // [sliding(2×16), full(1×32), sliding(2×16), full(1×32)], no sharing.
+        assert_eq!(specs[0], crate::kv_cache::KvLayerSpec::owned(2, 16));
+        assert_eq!(specs[1], crate::kv_cache::KvLayerSpec::owned(1, 32));
+        assert_eq!(specs[2], crate::kv_cache::KvLayerSpec::owned(2, 16));
+        assert_eq!(specs[3], crate::kv_cache::KvLayerSpec::owned(1, 32));
+    }
+
+    #[test]
+    fn kv_cache_layer_specs_none_for_homogeneous() {
+        // Plain config: uniform geometry, no KV-sharing → uniform path (None).
+        let cfg = test_config();
+        assert!(super::super::gemma4::gemma4_kv_cache_layer_specs(&cfg).is_none());
+    }
+
+    #[test]
+    fn kv_cache_layer_specs_encode_kv_sharing() {
+        // Add KV-sharing on the heterogeneous config: last 2 of 4 layers
+        // share. Layer 2 (sliding) → target latest earlier non-shared sliding
+        // (layer 0); layer 3 (full) → latest earlier non-shared full (layer 1).
+        let mut cfg = test_config_heterogeneous_heads();
+        cfg.extra
+            .insert("num_kv_shared_layers".to_string(), serde_json::json!(2u64));
+
+        let specs = super::super::gemma4::gemma4_kv_cache_layer_specs(&cfg)
+            .expect("sharing implies heterogeneous → Some");
+        assert_eq!(specs[0].shares_with, None);
+        assert_eq!(specs[1].shares_with, None);
+        assert_eq!(specs[2].shares_with, Some(0));
+        assert_eq!(specs[3].shares_with, Some(1));
+
+        // And the heterogeneous manager dedups: 2 engines for 4 layers.
+        let device = Device::Cpu;
+        let cache_config = CacheConfig {
+            block_size: 16,
+            num_blocks: 8,
+            num_layers: 4,
+            num_kv_heads: 2,
+            head_dim: 32,
+            dtype: DType::F32,
+            device: device.clone(),
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        };
+        let mgr = KVCacheManager::new_heterogeneous(
+            &cache_config,
+            &specs,
+            crate::kv_cache::KVCacheLayout::NHD,
+            std::sync::Arc::new(crate::kv_cache::KVCacheMetrics::new()),
+        )
+        .expect("heterogeneous mgr");
+        // Layer 2 routes to layer 0's engine (sliding 2×16).
+        assert_eq!(mgr.engine(2).k_cache().dims(), &[8, 16, 2, 16]);
+        // Layer 3 routes to layer 1's engine (full 1×32).
+        assert_eq!(mgr.engine(3).k_cache().dims(), &[8, 16, 1, 32]);
+    }
+
+    #[test]
     fn test_prefill_bucket_len() {
         // Multiples of 32, capped at max_positions, never below real_len.
         assert_eq!(prefill_bucket_len(1, 1024), 1); // decode-sized: untouched
@@ -2376,8 +2475,10 @@ mod tests {
     fn test_kv_head_heterogeneity_forward() {
         // End-to-end prefill + decode through a 4-layer model whose full
         // layers have fewer KV heads and a wider head_dim than sliding
-        // layers. Proves the cache pad-on-write / slice-on-read path
-        // (`pad_kv_heads` + `narrow`) keeps shapes consistent.
+        // layers. The cache is the honest heterogeneous per-layer cache
+        // (matching production via `gemma4_kv_cache_layer_specs` +
+        // `new_heterogeneous`); each layer reads/writes its true geometry
+        // with no padding.
         let cfg = test_config_heterogeneous_heads();
         let device = Device::Cpu;
         let vb = VarBuilder::zeros(DType::F32, &device);
@@ -2396,7 +2497,15 @@ mod tests {
             kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         };
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let specs = super::super::gemma4::gemma4_kv_cache_layer_specs(&cfg)
+            .expect("heterogeneous head config yields per-layer specs");
+        let mut kv_cache_mgr = KVCacheManager::new_heterogeneous(
+            &cache_config,
+            &specs,
+            crate::kv_cache::KVCacheLayout::NHD,
+            std::sync::Arc::new(crate::kv_cache::KVCacheMetrics::new()),
+        )
+        .expect("heterogeneous cache manager");
         let mut block_table = BlockTable::new(cache_config.block_size);
 
         let seq_len = 6;
@@ -2763,24 +2872,33 @@ mod tests {
             "PLE must be enabled"
         );
 
-        // KV cache allocated at the shared `cache_head_dim`
-        // (max head_dim across layers = 512). Each layer's forward pads
-        // K/V to this width and slices back after the read.
+        // Honest heterogeneous per-layer KV cache (production path): full
+        // layers own a 512-head_dim engine, sliding layers a 256-head_dim
+        // engine, and the last `num_kv_shared_layers` reuse an earlier
+        // layer's engine. The model's per-layer geometry matches exactly.
         let cache_head_dim = extra_cfg.max_cache_head_dim(cfg.head_dim);
         assert_eq!(cache_head_dim, 512);
+        let specs = super::super::gemma4::gemma4_kv_cache_layer_specs(&cfg)
+            .expect("E2B is heterogeneous (head_dim 256 vs 512)");
 
         let cache_config = crate::kv_cache::config::CacheConfig {
             block_size: 16,
             num_blocks: 8,
             num_layers: cfg.num_hidden_layers,
-            num_kv_heads: cfg.num_key_value_heads,
+            num_kv_heads: cfg.kv_cache_num_kv_heads(),
             head_dim: cache_head_dim,
             dtype: DType::BF16,
             device: device.clone(),
             kv_cache_dtype: crate::kv_cache::KVCacheDtype::Auto,
             cpu_offload: None,
         };
-        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut kv_cache_mgr = KVCacheManager::new_heterogeneous(
+            &cache_config,
+            &specs,
+            crate::kv_cache::KVCacheLayout::NHD,
+            std::sync::Arc::new(crate::kv_cache::KVCacheMetrics::new()),
+        )
+        .expect("heterogeneous cache manager");
         let mut block_table = BlockTable::new(cache_config.block_size);
 
         let seq_len = 8;

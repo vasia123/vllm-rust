@@ -340,7 +340,7 @@ pub use gemma3_quantized::QuantizedGemma3ForCausalLM;
 pub use gemma3_vlm::Gemma3ForConditionalGeneration;
 pub use gemma3n::Gemma3nForCausalLM;
 pub use gemma3n_vlm::Gemma3nForConditionalGeneration;
-pub use gemma4::Gemma4ForCausalLM;
+pub use gemma4::{gemma4_kv_cache_layer_specs, Gemma4ForCausalLM};
 pub use gemma4_quantized::QuantizedGemma4ForCausalLM;
 pub use gemma4_vlm::Gemma4ForConditionalGeneration;
 pub use gemma4_vlm_quantized::QuantizedGemma4ForConditionalGeneration;

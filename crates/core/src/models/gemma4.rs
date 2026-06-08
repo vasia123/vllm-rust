@@ -529,6 +529,59 @@ impl Gemma4ExtraConfig {
     }
 }
 
+/// Per-layer KV cache geometry for a Gemma 4 checkpoint, or `None` when the
+/// model is homogeneous and shares nothing (in which case the uniform
+/// [`crate::kv_cache::CacheConfig`] path is exact and cheaper).
+///
+/// Returns `Some(specs)` when any layer's `(num_kv_heads, head_dim)` differs
+/// from another's, or when the model declares KV-cache sharing
+/// (`num_kv_shared_layers > 0`). `specs[i].shares_with` points at the earlier
+/// non-sharing layer whose cache layer `i` reuses — matching the routing the
+/// model's forward already performs (`kv_sharing_target.unwrap_or(layer_idx)`).
+///
+/// This is the **single source of truth** for the heterogeneous-cache
+/// decision: both the server's cache sizing/construction and
+/// `QuantizedGemma4ForCausalLM`'s per-layer cache geometry key off it, so the
+/// allocated cache tensor shapes and the model's read/write shapes can never
+/// drift. It derives geometry from [`Gemma4ExtraConfig`] — the same helpers
+/// the forward pass uses.
+///
+/// Single-GPU only: the quantized Gemma 4 path does not support tensor
+/// parallelism, so no `world_size` sharding is applied here.
+pub fn gemma4_kv_cache_layer_specs(cfg: &ModelConfig) -> Option<Vec<crate::kv_cache::KvLayerSpec>> {
+    use crate::kv_cache::KvLayerSpec;
+
+    let extra = Gemma4ExtraConfig::from_model_config(cfg);
+    let n = cfg.num_hidden_layers;
+    if n == 0 {
+        return None;
+    }
+
+    let mut specs = Vec::with_capacity(n);
+    let mut heterogeneous = false;
+    let (base_kv, base_hd) = (cfg.num_key_value_heads, cfg.head_dim);
+
+    for i in 0..n {
+        let num_kv_heads = extra.kv_heads_for_layer(i, base_kv);
+        let head_dim = extra.head_dim_for_layer(i, base_hd);
+        let shares_with = extra.kv_sharing_target_layer(i, n);
+        if num_kv_heads != base_kv || head_dim != base_hd || shares_with.is_some() {
+            heterogeneous = true;
+        }
+        specs.push(KvLayerSpec {
+            num_kv_heads,
+            head_dim,
+            shares_with,
+        });
+    }
+
+    if heterogeneous {
+        Some(specs)
+    } else {
+        None
+    }
+}
+
 // ─── Gemma4 Router ──────────────────────────────────────────────────────────
 //
 // Custom router: UnweightedRmsNorm → root_size scaling → learned scale → gate

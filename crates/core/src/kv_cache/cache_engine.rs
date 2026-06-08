@@ -48,12 +48,27 @@ impl CacheEngine {
     /// - NHD: `[num_blocks, block_size, num_kv_heads, head_dim]`
     /// - HND: `[num_blocks, num_kv_heads, block_size, head_dim]`
     pub fn with_layout(config: &CacheConfig, layout: KVCacheLayout) -> Result<Self, CacheError> {
-        let shape = layout.cache_shape(
-            config.num_blocks,
-            config.block_size,
-            config.num_kv_heads,
-            config.head_dim,
-        );
+        Self::with_geometry(config, layout, config.num_kv_heads, config.head_dim)
+    }
+
+    /// Pre-allocate cache tensors with explicit layout and per-layer
+    /// geometry, overriding the uniform `config.num_kv_heads` /
+    /// `config.head_dim`.
+    ///
+    /// Used by [`super::KVCacheManager::new_heterogeneous`] for models
+    /// (Gemma 4) whose layers do not all share one KV geometry: full-attention
+    /// layers carry a different `(num_kv_heads, head_dim)` than sliding-window
+    /// layers. Block-pool sizing (`block_size`, `num_blocks` in *tokens*) and
+    /// dtype/quantisation stay uniform — only the per-layer tensor shape
+    /// differs. All other fields are taken from `config`.
+    pub fn with_geometry(
+        config: &CacheConfig,
+        layout: KVCacheLayout,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, CacheError> {
+        let shape =
+            layout.cache_shape(config.num_blocks, config.block_size, num_kv_heads, head_dim);
 
         // Use storage dtype based on quantization setting
         let storage_dtype = config.kv_storage_dtype();
@@ -72,8 +87,8 @@ impl CacheEngine {
             v_cache,
             num_blocks: config.num_blocks,
             block_size: config.block_size,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
+            num_kv_heads,
+            head_dim,
             kv_cache_dtype: config.kv_cache_dtype,
             compute_dtype: config.dtype,
             scales,

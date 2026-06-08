@@ -32,6 +32,66 @@ use vllm_server::config::ServerConfig;
 use vllm_server::logging;
 use vllm_server::shutdown::shutdown_signal;
 
+/// Per-layer KV cache geometry when the model warrants a heterogeneous cache
+/// (quantized Gemma 4 with mixed full/sliding geometry or KV-cache sharing),
+/// else `None` (uniform path). Single source of truth shared with the model's
+/// own per-layer geometry via [`vllm_core::models::gemma4_kv_cache_layer_specs`]
+/// — so the allocated cache shapes and the model's read/write shapes match.
+///
+/// Gated to quantized checkpoints: the unquantized Gemma 4 path (`gemma4.rs`)
+/// keeps its uniform padded cache (it is the TP-capable path and is not
+/// migrated). Non-Gemma-4 models always return `None`.
+fn heterogeneous_kv_specs(
+    model_config: &vllm_core::config::ModelConfig,
+    quant_method: vllm_core::quantization::QuantizationMethod,
+) -> Option<Vec<vllm_core::kv_cache::KvLayerSpec>> {
+    if quant_method == vllm_core::quantization::QuantizationMethod::None {
+        return None;
+    }
+    if !model_config
+        .architectures
+        .iter()
+        .any(|a| a.starts_with("Gemma4"))
+    {
+        return None;
+    }
+    vllm_core::models::gemma4_kv_cache_layer_specs(model_config)
+}
+
+/// Build a [`KVCacheManager`], choosing the heterogeneous per-layer path when
+/// `specs` is `Some` (honest per-layer shapes — drops the padded-max waste and
+/// matches the model). CPU offload is unsupported with the heterogeneous cache
+/// (the offload manager assumes uniform geometry); it is dropped with a warning.
+fn build_kv_cache_manager(
+    cache_config: &CacheConfig,
+    specs: Option<&[vllm_core::kv_cache::KvLayerSpec]>,
+) -> anyhow::Result<KVCacheManager> {
+    use vllm_core::kv_cache::{KVCacheLayout, KVCacheMetrics};
+    match specs {
+        Some(specs) => {
+            let cfg = if cache_config.cpu_offload.is_some() {
+                tracing::warn!(
+                    "CPU offload is not supported with the heterogeneous Gemma 4 KV cache; \
+                     disabling offload for this run"
+                );
+                CacheConfig {
+                    cpu_offload: None,
+                    ..cache_config.clone()
+                }
+            } else {
+                cache_config.clone()
+            };
+            Ok(KVCacheManager::new_heterogeneous(
+                &cfg,
+                specs,
+                KVCacheLayout::NHD,
+                std::sync::Arc::new(KVCacheMetrics::new()),
+            )?)
+        }
+        None => Ok(KVCacheManager::new(cache_config)?),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vllm-server", about = "Rust LLM inference engine")]
 struct Cli {
@@ -1795,6 +1855,12 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         ),
     };
 
+    // Per-layer KV geometry for the heterogeneous cache path (quantized
+    // Gemma 4). Drives BOTH the block-budget sizing below and the manager
+    // construction, so they stay consistent with the model's own per-layer
+    // geometry. `None` for every other model → uniform path unchanged.
+    let het_specs = heterogeneous_kv_specs(&files.config, files.quantization.method);
+
     // Compute num_blocks from GPU memory utilization if specified
     if let Some(utilization) = gpu_memory_utilization {
         if !(0.0..=1.0).contains(&utilization) {
@@ -1804,26 +1870,48 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         }
         let kv_budget =
             estimate_kv_cache_budget(utilization, &files.config, &files.quantization, dtype)?;
-        let computed_blocks = CacheConfig::from_memory_budget_with_kv_dtype(
-            kv_budget,
-            files.config.num_hidden_layers,
-            files.config.kv_cache_num_kv_heads(),
-            files.config.kv_cache_head_dim(),
-            block_size,
-            dtype,
-            device.clone(),
-            parsed_kv_cache_dtype,
-        );
+        // Heterogeneous Gemma 4: size against the honest per-layer per-block
+        // cost (sum over owning layers), not `num_layers · padded_max`. The
+        // padded-max term over-counts dramatically (full layers pad 1→8 KV
+        // heads × 256→512 head_dim), so the honest sum yields many more blocks
+        // from the same budget. KV-shared layers cost zero.
+        let computed_num_blocks = match het_specs.as_deref() {
+            Some(specs) => vllm_core::kv_cache::heterogeneous_num_blocks(
+                kv_budget,
+                specs,
+                block_size,
+                dtype,
+                parsed_kv_cache_dtype,
+            ),
+            None => {
+                CacheConfig::from_memory_budget_with_kv_dtype(
+                    kv_budget,
+                    files.config.num_hidden_layers,
+                    files.config.kv_cache_num_kv_heads(),
+                    files.config.kv_cache_head_dim(),
+                    block_size,
+                    dtype,
+                    device.clone(),
+                    parsed_kv_cache_dtype,
+                )
+                .num_blocks
+            }
+        };
         eprintln!(
             "GPU memory utilization {:.0}%: estimated {:.0} MiB for KV cache \
-             (kv_dtype={:?}, {} B/elem) → {} blocks",
+             (kv_dtype={:?}, {} B/elem, {}) → {} blocks",
             utilization * 100.0,
             kv_budget as f64 / (1024.0 * 1024.0),
             parsed_kv_cache_dtype,
             parsed_kv_cache_dtype.element_size(dtype),
-            computed_blocks.num_blocks,
+            if het_specs.is_some() {
+                "heterogeneous per-layer"
+            } else {
+                "uniform"
+            },
+            computed_num_blocks,
         );
-        num_blocks = computed_blocks.num_blocks;
+        num_blocks = computed_num_blocks;
     }
 
     // Bound the CUDA stream-ordered memory pool so async-freed buffers
@@ -1886,7 +1974,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         "Allocating KV cache ({} blocks, {} layers)...",
         cache_config.num_blocks, cache_config.num_layers
     );
-    let mut kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+    let mut kv_cache_mgr = build_kv_cache_manager(&cache_config, het_specs.as_deref())?;
 
     // Phase 8: apply headroom factor to all layers' first-write
     // calibration. Done BEFORE Phase 7 checkpoint apply because
@@ -2858,7 +2946,10 @@ async fn run_generate(
         "Allocating KV cache ({} blocks)...",
         cache_config.num_blocks
     );
-    let kv_cache_mgr = KVCacheManager::new(&cache_config)?;
+    // Mirror the serve path: quantized Gemma 4 uses the honest per-layer
+    // heterogeneous cache so the model's per-layer geometry matches.
+    let rg_het_specs = heterogeneous_kv_specs(&files.config, files.quantization.method);
+    let kv_cache_mgr = build_kv_cache_manager(&cache_config, rg_het_specs.as_deref())?;
 
     // Publish engine limits BEFORE start_engine so pool-backed paged
     // attention V2 + block_tables stride size correctly for capture

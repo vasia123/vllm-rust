@@ -16,6 +16,9 @@ pub enum CacheError {
 
     #[error("candle error: {0}")]
     Candle(#[from] candle_core::Error),
+
+    #[error("invalid cache configuration: {0}")]
+    Config(String),
 }
 
 #[cfg(test)]

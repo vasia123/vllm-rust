@@ -181,6 +181,70 @@ impl fmt::Display for KVCacheLayout {
     }
 }
 
+/// Per-layer KV cache geometry for heterogeneous models.
+///
+/// Most models share one `(num_kv_heads, head_dim)` across every layer and
+/// use the uniform [`CacheConfig`] fields. Gemma 4 does not: full-attention
+/// layers and sliding-window layers carry different KV geometries, and the
+/// last `num_kv_shared_layers` reuse an earlier layer's cache rather than
+/// owning their own. This struct describes one layer.
+///
+/// `shares_with` points at the index of an *earlier* layer whose cache engine
+/// this layer reuses (KV-cache sharing). When `Some`, no separate engine is
+/// allocated and no bytes are counted toward the memory budget for this layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvLayerSpec {
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub shares_with: Option<usize>,
+}
+
+impl KvLayerSpec {
+    /// A layer that owns its own cache engine of the given geometry.
+    pub fn owned(num_kv_heads: usize, head_dim: usize) -> Self {
+        Self {
+            num_kv_heads,
+            head_dim,
+            shares_with: None,
+        }
+    }
+
+    /// Bytes one block of this layer's cache occupies (K+V), or 0 when the
+    /// layer shares an earlier layer's engine (no allocation of its own).
+    pub fn bytes_per_block(&self, block_size: usize, elem_size: usize) -> usize {
+        if self.shares_with.is_some() {
+            0
+        } else {
+            2 * self.num_kv_heads * block_size * self.head_dim * elem_size
+        }
+    }
+}
+
+/// Compute the number of blocks that fit a memory budget for a heterogeneous
+/// per-layer cache. The per-block cost is the sum over layers that *own* an
+/// engine (shared layers cost nothing) of `2·kv_heads·block_size·head_dim·elem`.
+///
+/// Mirrors [`CacheConfig::from_memory_budget_with_kv_dtype`] but replaces the
+/// `num_layers · uniform_bytes` term with the honest per-layer sum.
+pub fn heterogeneous_num_blocks(
+    budget_bytes: usize,
+    specs: &[KvLayerSpec],
+    block_size: usize,
+    compute_dtype: DType,
+    kv_cache_dtype: KVCacheDtype,
+) -> usize {
+    let elem_size = kv_cache_dtype.element_size(compute_dtype);
+    let total_per_block: usize = specs
+        .iter()
+        .map(|s| s.bytes_per_block(block_size, elem_size))
+        .sum();
+    if total_per_block > 0 {
+        budget_bytes / total_per_block
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub block_size: usize,

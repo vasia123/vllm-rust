@@ -18,7 +18,7 @@ pub use block_metrics::{BlockEvictionEvent, BlockMetricsCollector, BlockMetricsS
 pub use block_pool::{BlockId, NULL_BLOCK};
 pub use block_table::BlockTable;
 pub use cache_engine::CacheEngine;
-pub use config::{CacheConfig, KVCacheLayout};
+pub use config::{heterogeneous_num_blocks, CacheConfig, KVCacheLayout, KvLayerSpec};
 pub use error::CacheError;
 pub use free_block_queue::FreeBlockQueue;
 pub use metrics::{KVCacheMetrics, MetricsSnapshot};
@@ -147,6 +147,12 @@ impl CacheVariant {
 pub struct KVCacheManager {
     block_pool: BlockPool,
     engines: Vec<CacheVariant>,
+    /// Maps a logical layer index (`0..num_layers`) to an index into
+    /// `engines`. For homogeneous models this is the identity; for
+    /// heterogeneous models with KV-cache sharing (Gemma 4) several layers
+    /// map to the same engine, so `engines.len() <= num_layers`. See
+    /// [`KVCacheManager::new_heterogeneous`].
+    layer_to_engine: Vec<usize>,
     block_size: usize,
     metrics: Arc<KVCacheMetrics>,
     /// Optional prefix cache for block reuse and eviction coordination
@@ -194,6 +200,82 @@ impl KVCacheManager {
         Ok(Self {
             block_pool: BlockPool::new(config.num_blocks),
             engines,
+            layer_to_engine: (0..config.num_layers).collect(),
+            block_size: config.block_size,
+            metrics,
+            prefix_cache: None,
+            cpu_offload,
+            layout,
+        })
+    }
+
+    /// Create a KVCacheManager with a heterogeneous per-layer KV cache.
+    ///
+    /// `specs[i]` describes layer `i`'s geometry. A layer whose
+    /// `shares_with` is `Some(target)` reuses `target`'s engine instead of
+    /// allocating its own (Gemma 4 KV-cache sharing) — `target` must be an
+    /// *earlier*, non-sharing layer. `config.num_blocks` must already be
+    /// sized for the heterogeneous per-block cost (see
+    /// [`config::heterogeneous_num_blocks`]); `config.num_kv_heads` /
+    /// `config.head_dim` are ignored here (they carry the per-layer max for
+    /// other consumers' metadata only).
+    ///
+    /// The block pool, block size and dtype/quantisation are uniform across
+    /// layers; only the cache tensor shape differs per engine.
+    pub fn new_heterogeneous(
+        config: &CacheConfig,
+        specs: &[KvLayerSpec],
+        layout: KVCacheLayout,
+        metrics: Arc<KVCacheMetrics>,
+    ) -> Result<Self, CacheError> {
+        if specs.len() != config.num_layers {
+            return Err(CacheError::Config(format!(
+                "new_heterogeneous: specs.len()={} != config.num_layers={}",
+                specs.len(),
+                config.num_layers
+            )));
+        }
+
+        let mut engines: Vec<CacheVariant> = Vec::with_capacity(specs.len());
+        let mut layer_to_engine: Vec<usize> = Vec::with_capacity(specs.len());
+
+        for (i, spec) in specs.iter().enumerate() {
+            match spec.shares_with {
+                Some(target) => {
+                    if target >= i {
+                        return Err(CacheError::Config(format!(
+                            "new_heterogeneous: layer {i} shares_with {target} \
+                             which is not an earlier layer"
+                        )));
+                    }
+                    if specs[target].shares_with.is_some() {
+                        return Err(CacheError::Config(format!(
+                            "new_heterogeneous: layer {i} shares_with {target} \
+                             which is itself a sharing layer (chains not allowed)"
+                        )));
+                    }
+                    // Reuse the target's engine — no allocation for this layer.
+                    layer_to_engine.push(layer_to_engine[target]);
+                }
+                None => {
+                    let engine = CacheEngine::with_geometry(
+                        config,
+                        layout,
+                        spec.num_kv_heads,
+                        spec.head_dim,
+                    )?;
+                    layer_to_engine.push(engines.len());
+                    engines.push(CacheVariant::Standard(engine));
+                }
+            }
+        }
+
+        let cpu_offload = Self::init_cpu_offload(config)?;
+
+        Ok(Self {
+            block_pool: BlockPool::new(config.num_blocks),
+            engines,
+            layer_to_engine,
             block_size: config.block_size,
             metrics,
             prefix_cache: None,
@@ -259,6 +341,7 @@ impl KVCacheManager {
         Ok(Self {
             block_pool: BlockPool::new(config.num_blocks),
             engines,
+            layer_to_engine: (0..config.num_layers).collect(),
             block_size: config.block_size,
             metrics,
             prefix_cache: None,
@@ -319,7 +402,7 @@ impl KVCacheManager {
     /// # Panics
     /// Panics if this is an MLA cache manager. Use `mla_engine()` instead.
     pub fn engine(&self, layer_idx: usize) -> &CacheEngine {
-        self.engines[layer_idx].as_standard()
+        self.engines[self.layer_to_engine[layer_idx]].as_standard()
     }
 
     /// Get the CacheEngine for a specific layer (mutable).
@@ -329,7 +412,7 @@ impl KVCacheManager {
     /// # Panics
     /// Panics if this is an MLA cache manager. Use `mla_engine_mut()` instead.
     pub fn engine_mut(&mut self, layer_idx: usize) -> &mut CacheEngine {
-        self.engines[layer_idx].as_standard_mut()
+        self.engines[self.layer_to_engine[layer_idx]].as_standard_mut()
     }
 
     /// Apply a headroom factor to every layer's KV scales. No-op for
@@ -386,9 +469,14 @@ impl KVCacheManager {
 
         let mut pinned = 0usize;
         for (&layer_idx, &(k_opt, v_opt)) in scales.iter() {
-            if layer_idx >= self.engines.len() {
+            // `layer_idx` is a logical layer index; map it to the owning
+            // engine (identity for homogeneous caches; KV-shared layers
+            // resolve to their target's engine — applying the same scale
+            // through several shared layers is idempotent).
+            if layer_idx >= self.layer_to_engine.len() {
                 continue;
             }
+            let engine_idx = self.layer_to_engine[layer_idx];
             // Apply only when both sides are known — `set_kv_scales`
             // pins them together as the calibrated pair. If only one
             // side ships in the checkpoint, log it but keep the
@@ -397,7 +485,7 @@ impl KVCacheManager {
             // other, giving worse output than uncalibrated.
             match (k_opt, v_opt) {
                 (Some(k), Some(v)) => {
-                    self.engines[layer_idx]
+                    self.engines[engine_idx]
                         .as_standard_mut()
                         .set_kv_scales(k, v)?;
                     pinned += 1;
@@ -420,7 +508,7 @@ impl KVCacheManager {
     /// # Panics
     /// Panics if this is a standard cache manager. Use `engine()` instead.
     pub fn mla_engine(&self, layer_idx: usize) -> &MLACacheEngine {
-        self.engines[layer_idx].as_mla()
+        self.engines[self.layer_to_engine[layer_idx]].as_mla()
     }
 
     /// Get the MLACacheEngine for a specific layer (mutable).
@@ -428,7 +516,7 @@ impl KVCacheManager {
     /// # Panics
     /// Panics if this is a standard cache manager. Use `engine_mut()` instead.
     pub fn mla_engine_mut(&mut self, layer_idx: usize) -> &mut MLACacheEngine {
-        self.engines[layer_idx].as_mla_mut()
+        self.engines[self.layer_to_engine[layer_idx]].as_mla_mut()
     }
 
     /// Check if this manager uses MLA compressed cache.
@@ -1444,6 +1532,139 @@ mod tests {
         // HND engine allocates [num_blocks, kv_heads, block_size, head_dim]
         assert_eq!(mgr.engine(0).k_cache().dims(), &[16, 2, 4, 8]);
         assert_eq!(mgr.engine(0).layout(), KVCacheLayout::HND);
+    }
+
+    // ─── Heterogeneous per-layer cache tests ──────────────────────────────────
+
+    fn het_config(num_layers: usize, num_blocks: usize) -> CacheConfig {
+        CacheConfig {
+            block_size: 4,
+            num_blocks,
+            num_layers,
+            // Uniform fields carry the per-layer MAX (metadata only; ignored
+            // by new_heterogeneous which uses the specs).
+            num_kv_heads: 8,
+            head_dim: 512,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            kv_cache_dtype: KVCacheDtype::Auto,
+            cpu_offload: None,
+        }
+    }
+
+    #[test]
+    fn heterogeneous_builds_per_layer_shapes() {
+        // 2 layers, distinct geometry: full(1×512) + sliding(8×256).
+        let config = het_config(2, 16);
+        let specs = vec![KvLayerSpec::owned(1, 512), KvLayerSpec::owned(8, 256)];
+        let mgr = KVCacheManager::new_heterogeneous(
+            &config,
+            &specs,
+            KVCacheLayout::NHD,
+            Arc::new(KVCacheMetrics::new()),
+        )
+        .unwrap();
+
+        // NHD: [num_blocks, block_size, num_kv_heads, head_dim]
+        assert_eq!(mgr.engine(0).k_cache().dims(), &[16, 4, 1, 512]);
+        assert_eq!(mgr.engine(1).k_cache().dims(), &[16, 4, 8, 256]);
+        assert_eq!(mgr.num_free_blocks(), 16);
+        assert_eq!(mgr.num_total_blocks(), 16);
+    }
+
+    #[test]
+    fn heterogeneous_kv_sharing_dedups_engines() {
+        // 4 layers: 0=full, 1=sliding, 2=full shares 0, 3=sliding shares 1.
+        // Only 2 engines should be allocated; engine(2)==engine(0) geometry,
+        // engine(3)==engine(1).
+        let config = het_config(4, 8);
+        let specs = vec![
+            KvLayerSpec::owned(1, 512),
+            KvLayerSpec::owned(8, 256),
+            KvLayerSpec {
+                num_kv_heads: 1,
+                head_dim: 512,
+                shares_with: Some(0),
+            },
+            KvLayerSpec {
+                num_kv_heads: 8,
+                head_dim: 256,
+                shares_with: Some(1),
+            },
+        ];
+        let mut mgr = KVCacheManager::new_heterogeneous(
+            &config,
+            &specs,
+            KVCacheLayout::NHD,
+            Arc::new(KVCacheMetrics::new()),
+        )
+        .unwrap();
+
+        // Shared layers route to the target's engine: write through layer 0,
+        // read through layer 2 (shares 0) sees the same data.
+        let k_data: Vec<f32> = (0..1 * 3 * 512).map(|i| i as f32).collect();
+        let k = Tensor::from_vec(k_data.clone(), (1, 3, 512), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(k_data, (1, 3, 512), &Device::Cpu).unwrap();
+        mgr.engine_mut(0).write(&k, &v, &[0, 1, 2]).unwrap();
+
+        let (k_via_0, _) = mgr.engine(0).read(&[0], 3).unwrap();
+        let (k_via_2, _) = mgr.engine(2).read(&[0], 3).unwrap();
+        let f0: Vec<f32> = k_via_0.flatten_all().unwrap().to_vec1().unwrap();
+        let f2: Vec<f32> = k_via_2.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(f0, f2, "shared layer 2 must read layer 0's cache");
+
+        // Layer 1's engine is independent of layer 0 (still zeros).
+        let (k1, _) = mgr.engine(1).read(&[0], 3).unwrap();
+        let f1: Vec<f32> = k1.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(f1.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn heterogeneous_rejects_forward_share() {
+        let config = het_config(2, 8);
+        // layer 0 shares with layer 1 (not earlier) → error.
+        let specs = vec![
+            KvLayerSpec {
+                num_kv_heads: 1,
+                head_dim: 512,
+                shares_with: Some(1),
+            },
+            KvLayerSpec::owned(8, 256),
+        ];
+        let r = KVCacheManager::new_heterogeneous(
+            &config,
+            &specs,
+            KVCacheLayout::NHD,
+            Arc::new(KVCacheMetrics::new()),
+        );
+        assert!(matches!(r, Err(CacheError::Config(_))));
+    }
+
+    #[test]
+    fn heterogeneous_num_blocks_sums_owned_layers() {
+        use super::config::heterogeneous_num_blocks;
+        // full(1×512) + sliding(8×256) + full-shared(0). block_size=4, F32(4B).
+        // owned per-block bytes:
+        //   L0: 2*1*4*512*4   = 16384
+        //   L1: 2*8*4*256*4   = 65536
+        //   L2 shares → 0
+        // total/block = 81920. budget 819200 → 10 blocks.
+        let specs = vec![
+            KvLayerSpec::owned(1, 512),
+            KvLayerSpec::owned(8, 256),
+            KvLayerSpec {
+                num_kv_heads: 1,
+                head_dim: 512,
+                shares_with: Some(0),
+            },
+        ];
+        let n = heterogeneous_num_blocks(819200, &specs, 4, DType::F32, KVCacheDtype::Auto);
+        assert_eq!(n, 10);
+
+        // fp8 stores 1 B/elem vs F32's 4 B → 4× the per-block capacity here.
+        // (Against the production BF16 baseline of 2 B it is the usual 2×.)
+        let n_fp8 = heterogeneous_num_blocks(819200, &specs, 4, DType::F32, KVCacheDtype::Fp8E4m3);
+        assert_eq!(n_fp8, 40);
     }
 
     #[test]
