@@ -1,30 +1,35 @@
 //! GGUF format support for loading quantized models.
 //!
-//! GGUF (GGML Universal Format) is a file format for storing quantized LLMs.
-//! It is used by llama.cpp and other inference engines.
+//! GGUF (GGML Universal Format) is the llama.cpp checkpoint format. This
+//! module wires GGUF checkpoints into the engine by leaning entirely on
+//! candle's `quantized` subsystem:
 //!
-//! # Supported quantization types
+//! - [`candle_core::quantized::gguf_file::Content`] parses the header
+//!   (metadata + tensor table) and loads each tensor straight onto the
+//!   target device as a [`QTensor`] — **quantized-resident**, no dense
+//!   materialization.
+//! - [`QMatMul`] runs the forward as candle's fused dequant+matmul
+//!   (CUDA MMVQ for M≤8, q8_1 GEMM otherwise; a fused CPU `matmul_t`
+//!   path). The weight never leaves quantized form, so an 8 GB GPU can
+//!   hold models whose dense f16 weights would not fit, AND decode is
+//!   fast — the old path dequantized the WHOLE weight to f32 every
+//!   forward (see `benches/gguf_qmatmul_bench.rs`: ~29-45× slower at
+//!   decode).
 //!
-//! - F32, F16, BF16 - Unquantized
-//! - Q4_0, Q4_1 - 4-bit quantization
-//! - Q5_0, Q5_1 - 5-bit quantization
-//! - Q8_0, Q8_1 - 8-bit quantization
-//! - Q2_K, Q3_K, Q4_K, Q5_K, Q6_K - K-quant formats
+//! Supported quant types are whatever candle's `GgmlDType` covers:
+//! F32/F16/BF16 (unquantized), Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, and the
+//! K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K.
 //!
 //! # References
 //!
 //! - [GGUF Specification](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
 
-mod dequant;
-mod parser;
-
-pub use dequant::{dequantize, GgmlType};
-pub use parser::{GgufFile, GgufMetadata, GgufTensorInfo, GgufValue};
-
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::quantized::{gguf_file, QMatMul, QTensor};
+use candle_core::{DType, Device, Module, Result, Tensor};
 
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
 use super::weight_loader::QuantizedWeightLoader;
@@ -55,7 +60,8 @@ impl QuantizationConfig for GgufConfig {
     }
 
     fn supported_act_dtypes(&self) -> &[DType] {
-        // GGUF dequantization produces F16 internally
+        // GgufLinear casts activations to F32 at the QMatMul boundary, so
+        // it accepts any of the common float activation dtypes.
         &[DType::F16, DType::BF16, DType::F32]
     }
 
@@ -90,28 +96,27 @@ impl QuantizationConfig for GgufConfig {
     }
 }
 
-/// GGUF quantized linear layer.
+/// GGUF quantized linear layer, backed by candle's [`QMatMul`].
 ///
-/// Stores quantized weights and dequantizes them on-the-fly during forward pass.
+/// The quantized weight stays resident on-device as a [`QTensor`]; the
+/// forward delegates to candle's fused dequant+matmul kernel rather than
+/// dequantizing the whole matrix to dense f32 first.
 #[derive(Debug)]
 pub struct GgufLinear {
-    /// Quantized weight data (raw bytes)
-    qweight: Option<Tensor>,
-    /// Weight quantization type
-    qtype: GgmlType,
-    /// Bias tensor (always unquantized)
+    /// Fused quantized matmul over the on-device quantized weight.
+    /// `None` until weights are installed (via the loader's `load_linear`
+    /// or the trait `load_weights`); `forward` errors in that state.
+    qmm: Option<Arc<QMatMul>>,
+    /// Bias tensor, dense f32 (added after the matmul).
     bias: Option<Tensor>,
     /// Input features
     in_features: usize,
     /// Output features
     out_features: usize,
-    /// Device (stored for potential future use in dequantization)
-    #[allow(dead_code)]
-    device: Device,
 }
 
 impl GgufLinear {
-    /// Create a new GGUF linear layer.
+    /// Create a new GGUF linear layer with no weights yet installed.
     pub fn new(
         in_features: usize,
         out_features: usize,
@@ -126,102 +131,108 @@ impl GgufLinear {
         }
 
         let bias = if has_bias {
-            Some(Tensor::zeros(out_features, DType::F16, device)?)
+            Some(Tensor::zeros(out_features, DType::F32, device)?)
         } else {
             None
         };
 
         Ok(Self {
-            qweight: None,
-            qtype: GgmlType::F16,
+            qmm: None,
             bias,
             in_features,
             out_features,
-            device: device.clone(),
         })
     }
 
-    /// Set the quantized weight data.
-    pub fn set_qweight(&mut self, qweight: Tensor, qtype: GgmlType) {
-        self.qweight = Some(qweight);
-        self.qtype = qtype;
+    /// Build a linear directly from a quantized matmul + optional bias.
+    /// This is the path the GGUF loader uses — the weight is already a
+    /// device-resident `QTensor` wrapped in `QMatMul`.
+    pub fn from_qmatmul(
+        qmm: Arc<QMatMul>,
+        bias: Option<Tensor>,
+        in_features: usize,
+        out_features: usize,
+    ) -> Self {
+        Self {
+            qmm: Some(qmm),
+            bias,
+            in_features,
+            out_features,
+        }
     }
 
-    /// Get the quantization type.
-    pub fn qtype(&self) -> GgmlType {
-        self.qtype
+    /// Install the quantized matmul after construction.
+    pub fn set_qmatmul(&mut self, qmm: Arc<QMatMul>) {
+        self.qmm = Some(qmm);
     }
 
     /// Check if weights are loaded.
     pub fn has_weights(&self) -> bool {
-        self.qweight.is_some()
+        self.qmm.is_some()
     }
-}
 
-impl QuantizedLinear for GgufLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let qweight = self.qweight.as_ref().ok_or_else(|| {
+    /// Core forward: cast to f32 at the kernel boundary, run the fused
+    /// quantized matmul, add bias, restore the input dtype.
+    fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
+        let qmm = self.qmm.as_ref().ok_or_else(|| {
             candle_core::Error::Msg(
                 "GGUF layer has no weights loaded - call load_weights() first".to_string(),
             )
         })?;
 
-        // Dequantize once per forward. `weight` lands as F16 with the
-        // llama.cpp row layout `[out_features, in_features]`, which is
-        // what we want for `x @ weight.t() = [*, out]`.
-        let weight_f16 = dequantize(qweight, self.qtype, self.out_features, self.in_features)?;
+        // candle's quantized kernels are f32-in / f32-out. Cast and make
+        // contiguous so the last-dim stride matches the kernel contract;
+        // QMatMul handles arbitrary leading dims (collapses to rows).
         let orig_dtype = x.dtype();
-        let compute_dtype = DType::F32;
-        let weight = weight_f16.t()?.to_dtype(compute_dtype)?; // [in, out]
-        let x_compute = x.to_dtype(compute_dtype)?;
-
-        // Candle does not auto-broadcast a 2D weight over batched 3D
-        // inputs, so collapse leading dims to a single row axis, matmul,
-        // then restore the original shape.
-        let dims = x_compute.dims().to_vec();
-        if dims.is_empty() {
-            candle_core::bail!("GgufLinear forward: scalar input is not supported");
-        }
-        let in_features = *dims.last().unwrap();
-        if in_features != self.in_features {
-            candle_core::bail!(
-                "GgufLinear forward: last dim {in_features} != in_features {}",
-                self.in_features
-            );
-        }
-        let leading: usize = dims[..dims.len() - 1].iter().product();
-        let x2d = x_compute.reshape((leading, in_features))?;
-        let y2d = x2d.matmul(&weight)?;
-
-        let mut out_dims: Vec<usize> = dims[..dims.len() - 1].to_vec();
-        out_dims.push(self.out_features);
-        let y = y2d.reshape(out_dims)?;
+        let x_f32 = x.to_dtype(DType::F32)?.contiguous()?;
+        let y = qmm.forward(&x_f32)?;
 
         let y = match &self.bias {
-            Some(b) => y.broadcast_add(&b.to_dtype(compute_dtype)?)?,
+            Some(b) => y.broadcast_add(b)?,
             None => y,
         };
         y.to_dtype(orig_dtype)
     }
+}
 
-    fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
-        if let Some(qweight) = weights.get("qweight") {
-            self.qweight = Some(qweight.clone());
+impl QuantizedLinear for GgufLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x)
+    }
+
+    fn forward_pooled(
+        &self,
+        x: &crate::engine::output_pool::PooledTensor,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        // candle's `QMatMul` allocates a fresh output buffer (it is not
+        // pool-backed). That is sound only OUTSIDE CUDA Graph capture —
+        // a captured graph would record this transient pointer and
+        // replay stale memory. GGUF models force `enforce_eager` (see the
+        // server GGUF path), so capture never wraps this call; guard
+        // loudly in case that invariant is ever broken.
+        if crate::engine::output_pool::is_capturing() {
+            candle_core::bail!(
+                "GgufLinear::forward_pooled invoked under CUDA Graph capture; \
+                 GGUF must run eager (enforce_eager)"
+            );
         }
-        if let Some(qtype_tensor) = weights.get("qtype") {
-            // qtype is stored as a scalar u8
-            let qtype_val = qtype_tensor.to_vec0::<u8>()?;
-            self.qtype = GgmlType::from_u32(qtype_val as u32);
-        }
-        if let Some(bias) = weights.get("bias") {
-            self.bias = Some(bias.clone());
-        }
+        let out = self.forward_inner(x.as_tensor())?;
+        // SAFETY: not under capture (guarded above), so the fresh-alloc
+        // pointer is never recorded/replayed by a captured graph.
+        Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(out) })
+    }
+
+    fn load_weights(&mut self, _weights: &HashMap<String, Tensor>) -> Result<()> {
+        // GGUF weights are quantized blocks loaded as `QTensor` by the
+        // dedicated loader (`GgufWeightLoader::load_linear`), not dense
+        // tensors in a state dict. This trait entry point is a no-op for
+        // GGUF; the loader installs `qmm` directly.
         Ok(())
     }
 
     fn weight_dtype(&self) -> DType {
-        // GGUF stores quantized weights as raw bytes (U8)
-        DType::U8
+        // Compute dtype at the QMatMul boundary.
+        DType::F32
     }
 
     fn in_features(&self) -> usize {
@@ -237,46 +248,121 @@ impl QuantizedLinear for GgufLinear {
     }
 }
 
+/// Warn once if `CANDLE_DEQUANTIZE_ALL` is set: candle's
+/// `QMatMul::from_arc` then silently dequantizes every weight to dense
+/// f32, which defeats quantized residency and can OOM an 8 GB GPU on a
+/// model that otherwise fits (e.g. Gemma 4 E4B's PLE table).
+fn warn_if_dequantize_all() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if let Ok(v) = std::env::var("CANDLE_DEQUANTIZE_ALL") {
+            if !v.is_empty() && v != "0" {
+                tracing::warn!(
+                    "CANDLE_DEQUANTIZE_ALL={v} is set — GGUF weights will be \
+                     dequantized to dense f32, losing quantized residency. \
+                     This may OOM on memory-constrained GPUs. Unset it for \
+                     the intended quantized-resident GGUF path."
+                );
+            }
+        }
+    });
+}
+
 /// Weight loader for GGUF files.
+///
+/// Holds the parsed candle [`Content`](gguf_file::Content) (metadata +
+/// tensor table) and a one-shot map of every tensor loaded onto the
+/// target device as a [`QTensor`]. Linear layers wrap their `QTensor` in
+/// a [`QMatMul`]; norm/embedding tensors are dequantized on demand by
+/// [`GgufVarBuilderBackend`].
 pub struct GgufWeightLoader {
-    /// Parsed GGUF file
-    gguf: std::sync::Arc<GgufFile>,
+    /// Parsed GGUF header (metadata + tensor infos).
+    content: Arc<gguf_file::Content>,
+    /// Every tensor, loaded once onto `device`, kept quantized-resident.
+    tensors: Arc<HashMap<String, Arc<QTensor>>>,
     /// Device to load tensors to
     device: Device,
     /// Compute dtype for activations
     dtype: DType,
     /// Config
+    #[allow(dead_code)]
     config: GgufConfig,
 }
 
 impl GgufWeightLoader {
-    /// Create a new GGUF weight loader from a file path.
+    /// Open a GGUF file, parse its header, and load every tensor onto
+    /// `device` as a quantized-resident `QTensor`.
     pub fn from_path(path: &Path, device: Device, dtype: DType) -> Result<Self> {
-        let gguf = GgufFile::open(path)
+        warn_if_dequantize_all();
+
+        let mut reader = std::fs::File::open(path)
             .map_err(|e| candle_core::Error::Msg(format!("Failed to open GGUF file: {e}")))?;
+        let content = gguf_file::Content::read(&mut reader)
+            .map_err(|e| candle_core::Error::Msg(format!("Failed to parse GGUF header: {e}")))?;
+
+        // Single pass: load each tensor onto the device, quantized.
+        let names: Vec<String> = content.tensor_infos.keys().cloned().collect();
+        let mut tensors: HashMap<String, Arc<QTensor>> = HashMap::with_capacity(names.len());
+        for name in names {
+            let qt = content.tensor(&mut reader, &name, &device).map_err(|e| {
+                candle_core::Error::Msg(format!("Failed to load tensor {name}: {e}"))
+            })?;
+            tensors.insert(name, Arc::new(qt));
+        }
 
         Ok(Self {
-            gguf: std::sync::Arc::new(gguf),
+            content: Arc::new(content),
+            tensors: Arc::new(tensors),
             device,
             dtype,
             config: GgufConfig::default(),
         })
     }
 
-    /// Shared handle to the parsed GGUF file, so callers can hand the
-    /// same data to both the `QuantizedWeightLoader` (for quantized
-    /// linears) and a custom `VarBuilder` backend (for fp16 norms /
-    /// embeddings).
-    pub fn gguf_handle(&self) -> std::sync::Arc<GgufFile> {
-        std::sync::Arc::clone(&self.gguf)
+    /// Shared handle to the parsed content, so a `VarBuilder` backend can
+    /// resolve non-quantized (dense) tensors against the same file.
+    pub fn content(&self) -> Arc<gguf_file::Content> {
+        Arc::clone(&self.content)
     }
 
-    /// Extract the architecture name exported by the GGUF metadata key
-    /// `general.architecture`. Short-hands like `llama` get mapped to
-    /// the vLLM-style architecture list used by `ModelConfig`.
+    /// Shared handle to the device-resident quantized tensor map.
+    pub fn shared_tensors(&self) -> Arc<HashMap<String, Arc<QTensor>>> {
+        Arc::clone(&self.tensors)
+    }
+
+    /// Look up a metadata string value.
+    fn meta_str(&self, key: &str) -> Option<String> {
+        self.content
+            .metadata
+            .get(key)
+            .and_then(|v| v.to_string().ok())
+            .cloned()
+    }
+
+    /// Look up a metadata integer (upcasts U8/U16/U32 → u64).
+    fn meta_u64(&self, key: &str) -> Option<u64> {
+        self.content.metadata.get(key).and_then(|v| v.to_u64().ok())
+    }
+
+    /// Look up a metadata float (F32 or F64).
+    fn meta_f64(&self, key: &str) -> Option<f64> {
+        self.content
+            .metadata
+            .get(key)
+            .and_then(|v| v.to_f32().ok().map(f64::from).or_else(|| v.to_f64().ok()))
+    }
+
+    /// The GGUF architecture string (`general.architecture`).
+    pub fn architecture(&self) -> Option<String> {
+        self.meta_str("general.architecture")
+    }
+
+    /// Map the GGUF architecture short-hand to the vLLM-style
+    /// architecture list used by `ModelConfig`.
     pub fn vllm_architecture(&self) -> Option<Vec<String>> {
         let arch = self.architecture()?;
-        let mapped = match arch {
+        let mapped = match arch.as_str() {
             "llama" => "LlamaForCausalLM",
             "gemma" => "GemmaForCausalLM",
             "gemma2" => "Gemma2ForCausalLM",
@@ -294,62 +380,68 @@ impl GgufWeightLoader {
         Some(vec![mapped.to_string()])
     }
 
-    /// Build a `ModelConfig` from GGUF metadata. Pulls the standard
-    /// llama.cpp keys (`{arch}.embedding_length`, `{arch}.block_count`,
-    /// etc.) and falls back to conservative defaults for anything not
-    /// present. Used by the GGUF production path so callers do not need
-    /// a separate `config.json`.
+    /// Build a `ModelConfig` from GGUF metadata (no external
+    /// `config.json` needed). Pulls the standard llama.cpp keys
+    /// (`{arch}.embedding_length`, `{arch}.block_count`, …) and falls
+    /// back to conservative defaults for anything absent.
     pub fn build_model_config(&self) -> Result<crate::config::ModelConfig> {
         let arch_name = self
             .architecture()
-            .ok_or_else(|| candle_core::Error::Msg("GGUF missing general.architecture".into()))?
-            .to_string();
-        let metadata = self.gguf.metadata();
-        let get_u64 = |k: &str| metadata.get(k).and_then(|v| v.as_u64());
-        let get_u32 = |k: &str| metadata.get(k).and_then(|v| v.as_u32()).map(|v| v as u64);
-        let get_f32 = |k: &str| metadata.get(k).and_then(|v| v.as_f32()).map(|v| v as f64);
+            .ok_or_else(|| candle_core::Error::Msg("GGUF missing general.architecture".into()))?;
 
-        let hidden_size = get_u32(&format!("{arch_name}.embedding_length"))
-            .or_else(|| get_u64(&format!("{arch_name}.embedding_length")))
+        let hidden_size = self
+            .meta_u64(&format!("{arch_name}.embedding_length"))
             .ok_or_else(|| {
                 candle_core::Error::Msg(format!("GGUF missing {arch_name}.embedding_length"))
             })? as usize;
-        let num_hidden_layers = get_u32(&format!("{arch_name}.block_count"))
-            .or_else(|| get_u64(&format!("{arch_name}.block_count")))
+        let num_hidden_layers = self
+            .meta_u64(&format!("{arch_name}.block_count"))
             .ok_or_else(|| {
                 candle_core::Error::Msg(format!("GGUF missing {arch_name}.block_count"))
             })? as usize;
-        let num_attention_heads = get_u32(&format!("{arch_name}.attention.head_count"))
-            .or_else(|| get_u64(&format!("{arch_name}.attention.head_count")))
+        let num_attention_heads = self
+            .meta_u64(&format!("{arch_name}.attention.head_count"))
             .ok_or_else(|| {
                 candle_core::Error::Msg(format!("GGUF missing {arch_name}.attention.head_count"))
             })? as usize;
-        let num_key_value_heads = get_u32(&format!("{arch_name}.attention.head_count_kv"))
-            .or_else(|| get_u64(&format!("{arch_name}.attention.head_count_kv")))
+        let num_key_value_heads = self
+            .meta_u64(&format!("{arch_name}.attention.head_count_kv"))
             .unwrap_or(num_attention_heads as u64) as usize;
-        let intermediate_size = get_u32(&format!("{arch_name}.feed_forward_length"))
-            .or_else(|| get_u64(&format!("{arch_name}.feed_forward_length")))
+        let intermediate_size = self
+            .meta_u64(&format!("{arch_name}.feed_forward_length"))
             .unwrap_or(4 * hidden_size as u64) as usize;
-        let max_position_embeddings = get_u32(&format!("{arch_name}.context_length"))
-            .or_else(|| get_u64(&format!("{arch_name}.context_length")))
+        let max_position_embeddings = self
+            .meta_u64(&format!("{arch_name}.context_length"))
             .unwrap_or(4096) as usize;
-        let rms_norm_eps =
-            get_f32(&format!("{arch_name}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
-        let rope_theta = get_f32(&format!("{arch_name}.rope.freq_base")).unwrap_or(10000.0);
+        let rms_norm_eps = self
+            .meta_f64(&format!("{arch_name}.attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-6);
+        let rope_theta = self
+            .meta_f64(&format!("{arch_name}.rope.freq_base"))
+            .unwrap_or(10000.0);
 
-        let vocab_size = metadata
+        let vocab_size = self
+            .content
+            .metadata
             .get("tokenizer.ggml.tokens")
-            .and_then(|v| v.as_array())
+            .and_then(|v| v.to_vec().ok())
             .map(|arr| arr.len())
             .ok_or_else(|| {
                 candle_core::Error::Msg("GGUF missing tokenizer.ggml.tokens array".into())
             })?;
 
-        let head_dim = if num_attention_heads > 0 {
-            hidden_size / num_attention_heads
-        } else {
-            hidden_size
-        };
+        // Prefer an explicit head_dim key (Gemma uses a head_dim that is
+        // NOT hidden/heads); fall back to the even split.
+        let head_dim = self
+            .meta_u64(&format!("{arch_name}.attention.key_length"))
+            .map(|v| v as usize)
+            .unwrap_or_else(|| {
+                if num_attention_heads > 0 {
+                    hidden_size / num_attention_heads
+                } else {
+                    hidden_size
+                }
+            });
 
         let architectures = self
             .vllm_architecture()
@@ -383,42 +475,54 @@ impl GgufWeightLoader {
         self
     }
 
-    /// Get the GGUF file metadata.
-    pub fn metadata(&self) -> &GgufMetadata {
-        self.gguf.metadata()
-    }
-
-    /// Get a tensor by name.
-    pub fn get_tensor(&self, name: &str) -> Result<(Tensor, GgmlType)> {
-        self.gguf.load_tensor(name, &self.device)
-    }
-
-    /// Get model architecture from metadata.
-    pub fn architecture(&self) -> Option<&str> {
-        self.gguf
-            .metadata()
-            .get("general.architecture")
-            .and_then(|v| v.as_str())
-    }
-
-    /// Get number of layers from metadata.
+    /// Number of transformer blocks (`{arch}.block_count`).
     pub fn num_layers(&self) -> Option<u32> {
-        // Try common metadata keys
         let arch = self.architecture()?;
-        let key = format!("{arch}.block_count");
-        self.gguf.metadata().get(&key).and_then(|v| v.as_u32())
+        self.meta_u64(&format!("{arch}.block_count"))
+            .map(|v| v as u32)
     }
 
-    /// Get hidden size from metadata.
+    /// Hidden size (`{arch}.embedding_length`).
     pub fn hidden_size(&self) -> Option<u32> {
         let arch = self.architecture()?;
-        let key = format!("{arch}.embedding_length");
-        self.gguf.metadata().get(&key).and_then(|v| v.as_u32())
+        self.meta_u64(&format!("{arch}.embedding_length"))
+            .map(|v| v as u32)
     }
 
-    /// List all tensor names in the file.
+    /// All tensor names in the file.
     pub fn tensor_names(&self) -> Vec<&str> {
-        self.gguf.tensor_names()
+        self.tensors.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Resolve a vLLM-style prefix to a device-resident `QTensor`,
+    /// trying the literal name, the bare prefix, then the llama.cpp
+    /// `blk.N.*` mapping.
+    fn resolve_qtensor(&self, prefix: &str) -> Option<Arc<QTensor>> {
+        let mut candidates: Vec<String> = vec![format!("{prefix}.weight"), prefix.to_string()];
+        if let Some(mapped) = to_llama_cpp_prefix(prefix) {
+            candidates.push(format!("{mapped}.weight"));
+            candidates.push(mapped);
+        }
+        candidates
+            .iter()
+            .find_map(|name| self.tensors.get(name).cloned())
+    }
+
+    /// Resolve an optional bias tensor for a linear layer, dequantized to
+    /// dense f32.
+    fn resolve_bias(&self, prefix: &str) -> Option<Tensor> {
+        let mut candidates: Vec<String> = vec![format!("{prefix}.bias")];
+        if let Some(mapped) = to_llama_cpp_prefix(prefix) {
+            candidates.push(format!("{mapped}.bias"));
+        }
+        for name in &candidates {
+            if let Some(qt) = self.tensors.get(name) {
+                if let Ok(dense) = qt.dequantize(&self.device) {
+                    return dense.to_dtype(DType::F32).ok();
+                }
+            }
+        }
+        None
     }
 }
 
@@ -492,39 +596,48 @@ fn to_llama_cpp_prefixes(prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// `VarBuilder` backend that resolves names against a GGUF file instead
-/// of a safetensors archive. Used to hand the non-quantized tensors
-/// (RMS-norm weights, embeddings) that a model construction pulls
-/// through `vb.pp(...)` over to the same GGUF file that already backs
-/// the quantized linears.
+/// Minimal top-level name mapping for tensors that sit outside a
+/// transformer block (`model.embed_tokens`, `model.norm`, `lm_head`).
+/// `to_llama_cpp_prefix` handles the more general `blk.N.*` cases.
+fn to_llama_cpp_top_level(name: &str) -> Option<&'static str> {
+    match name {
+        "model.embed_tokens" => Some("token_embd"),
+        "model.norm" => Some("output_norm"),
+        "lm_head" => Some("output"),
+        _ => None,
+    }
+}
+
+/// `VarBuilder` backend that resolves names against the GGUF tensor map
+/// instead of a safetensors archive. Hands the non-quantized tensors
+/// (RMS-norm weights, embeddings) a model construction pulls through
+/// `vb.pp(...)` over to the same GGUF file that backs the quantized
+/// linears — dequantizing each `QTensor` to a dense tensor on demand.
 ///
 /// Resolution strategy, in order:
 /// 1. Literal `{name}` — some GGUF exports keep HuggingFace names.
-/// 2. `{to_llama_cpp_prefix(name).unwrap_or(name)}` — standard
-///    llama.cpp shorthand (`blk.N.attn_norm`, `output_norm`, …).
-///
-/// Norm/embedding tensors in llama.cpp GGUF are typically stored as F32
-/// or F16 and loaded directly via `load_tensor` → Candle F32.
+/// 2. `{to_llama_cpp_prefix(name)}` — standard llama.cpp shorthand
+///    (`blk.N.attn_norm`, `output_norm`, …).
 pub struct GgufVarBuilderBackend {
-    gguf: std::sync::Arc<GgufFile>,
+    tensors: Arc<HashMap<String, Arc<QTensor>>>,
     device: Device,
 }
 
 impl GgufVarBuilderBackend {
-    /// Wrap a shared GGUF handle so the same parsed file serves both
-    /// the quantized loader and the VarBuilder backend.
-    pub fn new(gguf: std::sync::Arc<GgufFile>, device: Device) -> Self {
-        Self { gguf, device }
+    /// Wrap the shared device-resident tensor map so the same data serves
+    /// both the quantized loader and the VarBuilder backend.
+    pub fn new(tensors: Arc<HashMap<String, Arc<QTensor>>>, device: Device) -> Self {
+        Self { tensors, device }
     }
 
     /// Resolve `name` using the same fallback chain as
-    /// `GgufWeightLoader::load_linear` — literal path, then
-    /// `blk.N.*`-style mapping, then the bare prefix without `.weight`.
+    /// `GgufWeightLoader::resolve_qtensor` — literal path, then
+    /// `blk.N.*`-style mapping, then the bare top-level name — and
+    /// dequantize the matched `QTensor` to a dense tensor.
     fn try_load(&self, name: &str, target: DType) -> Result<Tensor> {
-        // The name arrives with a trailing qualifier like `...weight`
-        // that VarBuilder appends via `.pp(...).get(shape, "weight")`.
-        // llama.cpp stores e.g. `blk.0.attn_norm.weight` literally, so
-        // the literal path is tried first.
+        // VarBuilder appends a trailing qualifier like `...weight` via
+        // `.pp(...).get(shape, "weight")`. llama.cpp stores e.g.
+        // `blk.0.attn_norm.weight` literally, so the literal path is first.
         let mut candidates: Vec<String> = vec![name.to_string()];
         if let Some((base, leaf)) = name.rsplit_once('.') {
             for mapped_base in to_llama_cpp_prefixes(base) {
@@ -538,67 +651,20 @@ impl GgufVarBuilderBackend {
         }
 
         for candidate in candidates {
-            // Use the tensor-info metadata to get the LOGICAL shape
-            // (vocab_size × hidden_size) rather than the byte-level
-            // shape returned by `load_tensor`, which for quantized
-            // types inflates the second dimension by the block ratio.
-            let info = match self.gguf.tensor_info(&candidate) {
-                Some(info) => info,
+            let qt = match self.tensors.get(&candidate) {
+                Some(qt) => qt,
                 None => continue,
             };
-            let logical_shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
-            let (tensor, qtype) = match self.gguf.load_tensor(&candidate, &self.device) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            // Non-quantized stored tensors (F32/F16/BF16) come back
-            // ready to use; quantized tensors get dequantized on the
-            // fly so the VarBuilder consumer sees a dense weight.
-            let dense = match qtype {
-                GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => {
-                    // Dense tensors just need a reshape to the logical
-                    // shape; `load_tensor` may return them flattened.
-                    if logical_shape.is_empty() {
-                        tensor
-                    } else {
-                        tensor.reshape(logical_shape.clone())?
-                    }
-                }
-                other => {
-                    // llama.cpp stores weight matrices as `[out, in]`
-                    // (rows × cols); the dequant helpers expect
-                    // `(rows, cols)` in that order.
-                    let (rows, cols) = match logical_shape.as_slice() {
-                        [rows] => (*rows, 1usize),
-                        [rows, cols] => (*rows, *cols),
-                        _ => {
-                            return Err(candle_core::Error::Msg(format!(
-                                "GgufVarBuilderBackend: unexpected logical shape {:?} for {candidate}",
-                                logical_shape
-                            )));
-                        }
-                    };
-                    dequantize(&tensor, other, rows, cols)?
-                }
-            };
+            // candle's `Content` reverses the on-disk dims, so a 2-D
+            // weight comes back with candle's logical shape (e.g.
+            // token_embd as `[vocab, hidden]`); `dequantize` yields a
+            // dense tensor in that shape directly — no manual reshape.
+            let dense = qt.dequantize(&self.device)?;
             return dense.to_dtype(target);
         }
         Err(candle_core::Error::Msg(format!(
             "GgufVarBuilderBackend: tensor '{name}' not found (tried literal + llama.cpp mapping)"
         )))
-    }
-}
-
-/// Minimal top-level name mapping for tensors that sit outside a
-/// transformer block (`model.embed_tokens`, `model.norm`, `lm_head`).
-/// `to_llama_cpp_prefix` handles the more general `blk.N.*` cases.
-fn to_llama_cpp_top_level(name: &str) -> Option<&'static str> {
-    match name {
-        "model.embed_tokens" => Some("token_embd"),
-        "model.norm" => Some("output_norm"),
-        "lm_head" => Some("output"),
-        _ => None,
     }
 }
 
@@ -617,14 +683,11 @@ impl candle_nn::var_builder::SimpleBackend for GgufVarBuilderBackend {
             return Ok(tensor);
         }
 
-        // llama.cpp stores 2-D matrices in transposed order relative to
-        // the HuggingFace / PyTorch convention: `token_embd.weight` is
-        // `[n_embd, n_vocab]` on disk but Candle's `Embedding` expects
-        // `[vocab, hidden]`, and linear weights are `[n_out, n_in]` on
-        // disk but `candle_nn::Linear` consumes `[out, in]` already.
-        // When the requested shape is a transpose of what we got, auto-
-        // transpose and retry — this covers embeddings without breaking
-        // already-correctly-shaped linears.
+        // Some exports / consumers disagree on the 2-D matrix orientation
+        // (e.g. an embedding stored `[hidden, vocab]` where the consumer
+        // wants `[vocab, hidden]`). When the requested shape is exactly a
+        // transpose of what we got, auto-transpose and retry — harmless
+        // for already-correctly-shaped tensors (that branch returns above).
         if got.dims().len() == 2 && s.dims().len() == 2 {
             let got_dims = got.dims();
             let want_dims = s.dims();
@@ -660,40 +723,24 @@ impl QuantizedWeightLoader for GgufWeightLoader {
         out_features: usize,
         bias: bool,
     ) -> Result<Box<dyn QuantizedLinear>> {
-        let mut linear = GgufLinear::new(in_features, out_features, bias, &self.device)?;
-
-        // Fallback chain: literal `{prefix}.weight` first (preserves
-        // existing behaviour for checkpoints that already ship vLLM-style
-        // names), then the bare prefix, then a llama.cpp-style mapping.
-        let weight_name = format!("{prefix}.weight");
-
-        if let Ok((qweight, qtype)) = self.get_tensor(&weight_name) {
-            linear.set_qweight(qweight, qtype);
-        } else if let Ok((qweight, qtype)) = self.get_tensor(prefix) {
-            linear.set_qweight(qweight, qtype);
-        } else if let Some(mapped) = to_llama_cpp_prefix(prefix) {
-            let mapped_weight = format!("{mapped}.weight");
-            if let Ok((qweight, qtype)) = self.get_tensor(&mapped_weight) {
-                linear.set_qweight(qweight, qtype);
-            } else if let Ok((qweight, qtype)) = self.get_tensor(&mapped) {
-                linear.set_qweight(qweight, qtype);
-            }
-        }
-
-        if bias {
-            let bias_name = format!("{prefix}.bias");
-            if let Ok((bias_tensor, _)) = self.get_tensor(&bias_name) {
-                let bias_f16 = bias_tensor.to_dtype(DType::F16)?;
-                linear.bias = Some(bias_f16);
-            } else if let Some(mapped) = to_llama_cpp_prefix(prefix) {
-                let mapped_bias = format!("{mapped}.bias");
-                if let Ok((bias_tensor, _)) = self.get_tensor(&mapped_bias) {
-                    linear.bias = Some(bias_tensor.to_dtype(DType::F16)?);
-                }
-            }
-        }
-
-        Ok(Box::new(linear))
+        let qt = self.resolve_qtensor(prefix).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "GGUF: no quantized weight found for '{prefix}' \
+                 (tried literal + llama.cpp mapping)"
+            ))
+        })?;
+        let qmm = Arc::new(QMatMul::from_arc(qt)?);
+        let bias_tensor = if bias {
+            self.resolve_bias(prefix)
+        } else {
+            None
+        };
+        Ok(Box::new(GgufLinear::from_qmatmul(
+            qmm,
+            bias_tensor,
+            in_features,
+            out_features,
+        )))
     }
 
     fn method(&self) -> QuantizationMethod {
@@ -753,7 +800,7 @@ mod tests {
     #[test]
     fn test_gguf_linear_forward_requires_weights() {
         let linear = GgufLinear::new(64, 128, false, &Device::Cpu).unwrap();
-        let x = Tensor::ones(&[2, 64], DType::F16, &Device::Cpu).unwrap();
+        let x = Tensor::ones(&[2, 64], DType::F32, &Device::Cpu).unwrap();
 
         let result = linear.forward(&x);
         assert!(result.is_err());
@@ -764,11 +811,76 @@ mod tests {
     }
 
     #[test]
-    fn test_ggml_type_roundtrip() {
-        assert_eq!(GgmlType::from_u32(0), GgmlType::F32);
-        assert_eq!(GgmlType::from_u32(1), GgmlType::F16);
-        assert_eq!(GgmlType::from_u32(2), GgmlType::Q4_0);
-        assert_eq!(GgmlType::from_u32(8), GgmlType::Q8_0);
+    fn test_gguf_linear_forward_qmatmul_roundtrip() {
+        // Build a real QMatMul over a Q4_K weight and verify the
+        // GgufLinear forward tracks a dense dequant+matmul reference that
+        // uses the SAME quantized weight.
+        //
+        // NOTE: this is a RELATIVE-error check, not bit-equality. ggml's
+        // matmul (candle `k_quants::matmul`) quantizes the ACTIVATION to
+        // the weight's `VecDotType` — Q8_K for Q4_K — before the integer
+        // dot product. So `QMatMul::forward(x)` carries ~1-2% activation
+        // quantization error on top of the (common) weight quantization.
+        // The naive `x @ dequant(W)ᵀ` reference does not, so a tight
+        // absolute tolerance would wrongly flag the correct fused kernel.
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        let device = Device::Cpu;
+        let (out, inn) = (256usize, 256usize); // QK_K=256 divides `in`
+        let w = Tensor::randn(0.0f32, 1.0, (out, inn), &device).unwrap();
+        let qt = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+        let w_dense = qt.dequantize(&device).unwrap();
+        let qmm = Arc::new(QMatMul::from_qtensor(qt).unwrap());
+
+        let linear = GgufLinear::from_qmatmul(qmm, None, inn, out);
+        let x = Tensor::randn(0.0f32, 1.0, (1, 3, inn), &device).unwrap();
+        let y = linear.forward(&x).unwrap();
+
+        // Reference: x @ w_dense.t() (full-precision activation).
+        let x2d = x.reshape((3, inn)).unwrap();
+        let y_ref = x2d.matmul(&w_dense.t().unwrap()).unwrap();
+        let y2d = y.reshape((3, out)).unwrap();
+
+        // Relative RMS error = ‖y − y_ref‖ / ‖y_ref‖.
+        let err = (&y2d - &y_ref).unwrap();
+        let num = err
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let den = y_ref
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let rel_rms = (num / den).sqrt();
+        assert!(
+            rel_rms < 0.03,
+            "QMatMul forward relative-RMS error {rel_rms} exceeds the \
+             Q8_K activation-quantization bound (~1-2%); a real kernel \
+             bug would push this far higher"
+        );
+    }
+
+    #[test]
+    fn test_gguf_linear_forward_preserves_dtype() {
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        let device = Device::Cpu;
+        let w = Tensor::randn(0.0f32, 1.0, (256usize, 256usize), &device).unwrap();
+        let qt = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+        let qmm = Arc::new(QMatMul::from_qtensor(qt).unwrap());
+        let linear = GgufLinear::from_qmatmul(qmm, None, 256, 256);
+
+        // BF16 in → BF16 out (cast happens at the kernel boundary).
+        let x = Tensor::randn(0.0f32, 1.0, (1usize, 2usize, 256usize), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let y = linear.forward(&x).unwrap();
+        assert_eq!(y.dtype(), DType::BF16);
     }
 
     #[test]
@@ -835,11 +947,6 @@ mod tests {
 
     #[test]
     fn test_to_llama_cpp_prefix_layernorms() {
-        // Gemma family has four layernorms per block — verify all land on
-        // the llama.cpp names. `post_attention_layernorm` carries two
-        // candidates because plain Llama/Mistral store it as `ffn_norm`
-        // (pre-FFN position) while Gemma uses a separate
-        // `post_attention_norm` tensor.
         assert_eq!(
             to_llama_cpp_prefix("model.layers.0.input_layernorm").as_deref(),
             Some("blk.0.attn_norm")
@@ -864,8 +971,6 @@ mod tests {
 
     #[test]
     fn test_to_llama_cpp_prefix_unknown_returns_none() {
-        // Unknown Gemma 4 specifics (PLE, MoE experts) stay unmapped so the
-        // caller falls back to the literal path.
         assert!(to_llama_cpp_prefix("model.per_layer_model_projection").is_none());
         assert!(to_llama_cpp_prefix("model.layers.0.per_layer_input_gate").is_none());
         assert!(to_llama_cpp_prefix("model.layers.0.moe.experts.0.gate_proj").is_none());

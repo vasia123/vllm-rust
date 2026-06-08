@@ -121,6 +121,12 @@ harness = false
 name = "quantization_bench"
 harness = false
 
+# GGUF quantized linear: dense-dequant baseline vs candle fused QMatMul
+# (MMVQ). CPU half always builds; CUDA half is `#[cfg(feature="cuda")]`.
+[[bench]]
+name = "gguf_qmatmul_bench"
+harness = false
+
 [[bench]]
 name = "moe_routing_bench"
 harness = false

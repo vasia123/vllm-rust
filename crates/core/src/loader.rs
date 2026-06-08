@@ -270,9 +270,9 @@ pub fn load_gguf_model(
         .build_model_config()
         .map_err(|e| anyhow::anyhow!("GGUF model config extraction failed: {e}"))?;
 
-    let gguf_handle = gguf_loader.gguf_handle();
+    let shared_tensors = gguf_loader.shared_tensors();
     let backend: Box<dyn candle_nn::var_builder::SimpleBackend> =
-        Box::new(GgufVarBuilderBackend::new(gguf_handle, device.clone()));
+        Box::new(GgufVarBuilderBackend::new(shared_tensors, device.clone()));
     let vb = VarBuilder::from_backend(backend, dtype, device);
 
     let quant_config = DetectedQuantConfig {
