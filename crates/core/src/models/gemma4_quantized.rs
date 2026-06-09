@@ -1605,9 +1605,14 @@ impl QuantizedGemma4DecoderLayer {
                 (None, None, None)
             };
 
+        // Gemma 4 per-layer output scale. When absent, fall back to the
+        // identity in the COMPUTE dtype (not a hardcoded F32 — a bf16
+        // hidden × F32 scalar is a dtype-mismatch panic). GGUF ships real,
+        // non-unit values (`blk.N.layer_output_scale`, mapped to this name),
+        // so the fallback should rarely fire for GGUF.
         let layer_scalar = vb_layer
             .get(1, "layer_scalar")
-            .unwrap_or_else(|_| Tensor::ones(1, DType::F32, vb_m.device()).unwrap());
+            .unwrap_or_else(|_| Tensor::ones(1, vb_m.dtype(), vb_m.device()).unwrap());
 
         Ok(Self {
             self_attn,
@@ -1814,10 +1819,28 @@ impl PleEmbedding {
     }
 }
 
+/// Main token-embedding source. Dense (bf16) for most schemes; for GGUF the
+/// Q6_K table stays quantized (a [`QuantizedEmbedding`](crate::quantization::QuantizedEmbedding)
+/// per-row gather) to avoid the ~1.34 GB dense materialization, and the
+/// tied LM head reads the same quantized weight as a `QMatMul`.
+enum EmbedTokens {
+    Dense(Embedding),
+    Quantized(crate::quantization::QuantizedEmbedding),
+}
+
+impl EmbedTokens {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(e) => e.forward(ids),
+            Self::Quantized(q) => q.forward(ids),
+        }
+    }
+}
+
 /// Supports AWQ, BitsAndBytes, GPTQ, FP8, GGUF, and the pass-through
 /// unquantized loader via the `QuantizedWeightLoader` trait.
 pub struct QuantizedGemma4ForCausalLM {
-    embed_tokens: Embedding,
+    embed_tokens: EmbedTokens,
     embed_tokens_per_layer: Option<PleEmbedding>,
     per_layer_model_projection: Option<Box<dyn QuantizedLinear>>,
     per_layer_projection_norm: Option<Gemma4RmsNorm>,
@@ -1873,7 +1896,25 @@ impl QuantizedGemma4ForCausalLM {
     ) -> Result<Self> {
         let extra_cfg = Gemma4ExtraConfig::from_model_config(cfg);
 
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        // Main token embedding. GGUF ships it quantized (Q6_K); dequantized
+        // dense it is ~1.34 GB (plus a ~2.68 GB F32 transient on load) — on
+        // an 8 GB GPU that is the difference between fitting and not. The
+        // loader hook returns a `QuantizedEmbedding` (per-row gather) so the
+        // table stays quantized; the tied LM head then reads the same
+        // quantized weight as a `QMatMul` (see below). Other schemes fall
+        // back to a dense candle Embedding.
+        let embed_tokens = match weight_loader.load_quantized_embedding(
+            "model.embed_tokens",
+            vb_m.dtype(),
+            vb_m.device(),
+        )? {
+            Some(q) => EmbedTokens::Quantized(q),
+            None => EmbedTokens::Dense(embedding(
+                cfg.vocab_size,
+                cfg.hidden_size,
+                vb_m.pp("embed_tokens"),
+            )?),
+        };
 
         // PLE components: per-layer embedding stays as a regular embedding
         // table (embeddings are never quantized by AWQ/BnB/GGUF), only the
@@ -1965,11 +2006,24 @@ impl QuantizedGemma4ForCausalLM {
                 } else {
                     None
                 };
-            separate_head.unwrap_or_else(|| {
-                Box::new(TiedEmbeddingHead {
-                    weight: embed_tokens.embeddings().clone(),
-                })
-            })
+            match separate_head {
+                Some(h) => h,
+                None => match &embed_tokens {
+                    // Dense embedding → tied head reuses the dense weight.
+                    EmbedTokens::Dense(e) => Box::new(TiedEmbeddingHead {
+                        weight: e.embeddings().clone(),
+                    }),
+                    // Quantized (GGUF) → the tied head is a QMatMul over the
+                    // same quantized token_embd weight, so logits never need
+                    // the ~1.34 GB dense embedding.
+                    EmbedTokens::Quantized(_) => weight_loader.load_linear(
+                        "model.embed_tokens",
+                        cfg.hidden_size,
+                        cfg.vocab_size,
+                        false,
+                    )?,
+                },
+            }
         } else {
             weight_loader.load_linear("lm_head", cfg.hidden_size, cfg.vocab_size, false)?
         };

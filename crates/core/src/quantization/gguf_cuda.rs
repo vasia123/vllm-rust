@@ -129,3 +129,67 @@ pub fn gather_dequant_q6k(
         embedding_dim,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{DType, Device, Tensor};
+    use std::sync::Arc;
+
+    /// The GPU Q6_K gather kernel must match the bit-exact CPU QTensor
+    /// gather (which is itself validated against full dequant). This is the
+    /// correctness gate for `kernels/gather_dequant.cu`.
+    #[test]
+    fn gpu_gather_q6k_matches_cpu() {
+        let cuda = match Device::cuda_if_available(0) {
+            Ok(d) if d.is_cuda() => d,
+            _ => {
+                eprintln!("skip gpu_gather_q6k_matches_cpu: no CUDA device");
+                return;
+            }
+        };
+        let cpu = Device::Cpu;
+        let (num, dim) = (512usize, 2560usize); // dim % 256 == 0
+        let table = Tensor::randn(0.0f32, 1.0, (num, dim), &cpu).unwrap();
+        let qt = Arc::new(QTensor::quantize(&table, GgmlDType::Q6K).unwrap());
+
+        // CPU reference (bit-exact block-slice gather + dequant).
+        let cpu_emb =
+            crate::quantization::QuantizedEmbedding::new(Arc::clone(&qt), DType::F32, cpu.clone())
+                .unwrap();
+
+        // GPU: upload the raw Q6_K block bytes and gather via the kernel.
+        let bytes = qt.data().unwrap().to_vec();
+        let nb = bytes.len();
+        let table_gpu = Tensor::from_vec(bytes, (nb,), &cuda).unwrap();
+        let gpu_emb = crate::quantization::QuantizedEmbedding::new_gpu_q6k(
+            table_gpu,
+            num,
+            dim,
+            DType::F32,
+            cuda.clone(),
+        )
+        .unwrap();
+
+        let ids = Tensor::from_vec(vec![0u32, 5, 100, 511, 5, 1], (6,), &cpu).unwrap();
+        let r_cpu = cpu_emb.forward(&ids).unwrap();
+        let r_gpu = gpu_emb
+            .forward(&ids.to_device(&cuda).unwrap())
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+
+        let diff = (r_cpu - r_gpu)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-4,
+            "GPU Q6_K gather diverged from CPU reference: {diff}"
+        );
+    }
+}

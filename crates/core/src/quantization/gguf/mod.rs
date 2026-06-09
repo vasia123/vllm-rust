@@ -938,6 +938,12 @@ fn to_llama_cpp_prefixes(prefix: &str) -> Vec<String> {
         "per_layer_input_gate" => vec!["inp_gate"],
         "per_layer_projection" => vec!["proj"],
         "post_per_layer_input_norm" => vec!["post_norm"],
+        // Gemma 4 per-layer output scale (a layer-level leaf, not a
+        // sub-module; resolved via the full-name path in the VarBuilder
+        // backend). Values are learned (~0.06-0.6), not 1.0, so loading the
+        // real tensor instead of the identity fallback is correctness-
+        // critical.
+        "layer_scalar" => vec!["layer_output_scale"],
         "input_layernorm" => vec!["attn_norm"],
         // Llama/Mistral: post-attention IS the pre-FFN norm → `ffn_norm`.
         // Gemma/Gemma2/Gemma3: separate `post_attention_norm` tensor.
@@ -1008,6 +1014,14 @@ impl GgufVarBuilderBackend {
             }
         } else if let Some(mapped) = to_llama_cpp_top_level(name) {
             candidates.push(mapped.to_string());
+        }
+        // Layer-level leaves that are NOT sub-modules (e.g. Gemma 4's
+        // `model.layers.N.layer_scalar`) don't split into a base+leaf the
+        // block mapper recognises. Try mapping the FULL name as a prefix
+        // too, with and without a `.weight` suffix.
+        for mapped in to_llama_cpp_prefixes(name) {
+            candidates.push(format!("{mapped}.weight"));
+            candidates.push(mapped);
         }
 
         for candidate in candidates {
