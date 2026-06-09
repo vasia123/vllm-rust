@@ -696,8 +696,21 @@ impl GgufWeightLoader {
             rms_norm_eps,
             rope_theta,
             tie_word_embeddings: true,
-            bos_token_id: Some(1),
-            eos_token_id: Some(2),
+            // Read the real special-token ids from GGUF metadata. These are
+            // arch-specific (Llama bos=1/eos=2, but Gemma bos=2/eos=1), so a
+            // hardcoded default silently feeds Gemma `<eos>` as its leading
+            // token — and Gemma is famously degenerate without a correct
+            // `<bos>` (the model loses the thread and re-emits turn markers).
+            // Fall back to the Llama-style defaults only when the keys are
+            // absent.
+            bos_token_id: self
+                .meta_u64("tokenizer.ggml.bos_token_id")
+                .map(|v| v as u32)
+                .or(Some(1)),
+            eos_token_id: self
+                .meta_u64("tokenizer.ggml.eos_token_id")
+                .map(|v| v as u32)
+                .or(Some(2)),
             sliding_window,
             attention_bias: Some(false),
             extra,
