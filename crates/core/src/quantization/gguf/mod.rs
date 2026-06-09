@@ -563,6 +563,55 @@ impl GgufWeightLoader {
         self.content.metadata.get(key).and_then(|v| v.to_u64().ok())
     }
 
+    /// End-of-generation token ids: the metadata `eos_token_id` plus any
+    /// chat end-of-turn markers present in the vocab. GGUF rarely stores an
+    /// explicit EOT id, so — like llama.cpp — we derive it by looking up the
+    /// marker strings in `tokenizer.ggml.tokens` (index == token id). Lets
+    /// the server stop on `<end_of_turn>` (Gemma-instruct) etc. instead of
+    /// leaking it into the output.
+    fn eog_token_ids(&self) -> Vec<u32> {
+        const EOT_MARKERS: &[&str] = &[
+            "<end_of_turn>",
+            "<|im_end|>",
+            "<|eot_id|>",
+            "<|end|>",
+            "<|endoftext|>",
+        ];
+        let mut ids: Vec<u32> = Vec::new();
+        if let Some(eos) = self.meta_u64("tokenizer.ggml.eos_token_id") {
+            ids.push(eos as u32);
+        }
+        let tokens = self
+            .content
+            .metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.to_vec().ok());
+        if let Some(tokens) = &tokens {
+            for (id, tok) in tokens.iter().enumerate() {
+                if let Ok(s) = tok.to_string() {
+                    if EOT_MARKERS.contains(&s.as_str()) && !ids.contains(&(id as u32)) {
+                        ids.push(id as u32);
+                    }
+                }
+            }
+        }
+        // Gemma's end-of-turn is canonically token 106. Some GGUF converters
+        // mangle its string (this E4B checkpoint stores it as "<turn|>", which
+        // the marker search above misses — and llama.cpp flags it too), so add
+        // it by id for any gemma architecture, mirroring llama.cpp treating
+        // 106 as an EOG token for this model.
+        if matches!(self.architecture().as_deref(), Some(a) if a.starts_with("gemma")) {
+            const GEMMA_END_OF_TURN: u32 = 106;
+            let in_vocab = tokens
+                .as_ref()
+                .is_none_or(|t| GEMMA_END_OF_TURN < t.len() as u32);
+            if in_vocab && !ids.contains(&GEMMA_END_OF_TURN) {
+                ids.push(GEMMA_END_OF_TURN);
+            }
+        }
+        ids
+    }
+
     /// Look up a metadata float (F32 or F64).
     fn meta_f64(&self, key: &str) -> Option<f64> {
         self.content
@@ -676,11 +725,24 @@ impl GgufWeightLoader {
         // Gemma 4 needs PLE / sliding / soft-cap / per-attn-type RoPE
         // settings in `extra` to activate its specialised forward; other
         // architectures use an empty `extra`.
-        let (sliding_window, extra) = if arch_name == "gemma4" {
+        let (sliding_window, mut extra) = if arch_name == "gemma4" {
             self.gemma4_config_extras(vocab_size)
         } else {
             (None, serde_json::Map::new())
         };
+
+        // End-of-generation token set: the metadata `eos_token_id` plus any
+        // chat end-of-turn markers in the vocab. Gemma-instruct ends a turn
+        // with `<end_of_turn>` (106), NOT `<eos>` (1), so a single eos lets
+        // `<end_of_turn>` leak into the output. The server reads
+        // `extra["eos_token_ids"]` into its additional-EOS stop set.
+        let eos_token_ids = self.eog_token_ids();
+        if eos_token_ids.len() > 1 {
+            extra.insert(
+                "eos_token_ids".to_string(),
+                serde_json::json!(eos_token_ids),
+            );
+        }
 
         Ok(crate::config::ModelConfig {
             architectures,
