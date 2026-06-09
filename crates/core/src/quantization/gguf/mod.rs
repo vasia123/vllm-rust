@@ -1159,26 +1159,54 @@ impl QuantizedWeightLoader for GgufWeightLoader {
         }
         let ggml_dtype = info.ggml_dtype;
 
-        // Fast GPU path: Q6_K table + CUDA device + the gather kernel.
-        // Keep the quantized bytes resident in VRAM and gather per-row via
-        // the custom kernel — the table never goes dense (would be 5.6 GB
-        // for Gemma PLE).
+        // Fast GPU path: Q6_K table + CUDA device + the gather kernel —
+        // keep the quantized bytes resident in VRAM and gather per-row via
+        // the custom kernel (never goes dense).
+        //
+        // VRAM-aware placement: an embedding table is a GATHER (a few rows
+        // per token), not a matmul — it does not need GPU compute. On a
+        // VRAM-constrained card, parking a multi-GB table (Gemma 4 PLE is
+        // ~2.3 GB Q6_K) in VRAM starves the prefill/decode scratch and the
+        // KV cache, so we keep it on GPU ONLY when there is comfortable
+        // headroom left, otherwise the host (CPU gather). Mirrors
+        // llama.cpp keeping embeddings off the GPU under memory pressure.
         #[cfg(feature = "cuda-kernels")]
         if ggml_dtype == GgmlDType::Q6K && out_device.is_cuda() {
-            let bytes = self.read_tensor_bytes(&gguf_name)?;
-            let n_bytes = bytes.len();
-            let table = Tensor::from_vec(bytes, (n_bytes,), out_device)?;
-            return Ok(Some(crate::quantization::QuantizedEmbedding::new_gpu_q6k(
-                table,
-                dims[0],
-                dims[1],
-                out_dtype,
-                out_device.clone(),
-            )?));
+            let elem_count: usize = dims.iter().product();
+            let table_bytes = elem_count / ggml_dtype.block_size() * ggml_dtype.type_size();
+            // Headroom to leave free AFTER the table for scratch (~1.5 GB)
+            // + a usable KV cache (~0.5 GB).
+            const GPU_PLACE_HEADROOM: usize = 2 * 1024 * 1024 * 1024;
+            let fits_on_gpu = match crate::kv_cache::config::gpu_memory_info() {
+                Ok((free, _total)) => free.saturating_sub(table_bytes) >= GPU_PLACE_HEADROOM,
+                Err(_) => true, // can't measure → assume GPU (prior behaviour)
+            };
+            if fits_on_gpu {
+                tracing::info!(
+                    "GGUF embedding '{gguf_name}' ({:.2} GB Q6_K) → GPU gather kernel",
+                    table_bytes as f64 / 1e9
+                );
+                let bytes = self.read_tensor_bytes(&gguf_name)?;
+                let n_bytes = bytes.len();
+                let table = Tensor::from_vec(bytes, (n_bytes,), out_device)?;
+                return Ok(Some(crate::quantization::QuantizedEmbedding::new_gpu_q6k(
+                    table,
+                    dims[0],
+                    dims[1],
+                    out_dtype,
+                    out_device.clone(),
+                )?));
+            }
+            tracing::info!(
+                "GGUF embedding '{gguf_name}' ({:.2} GB Q6_K) → CPU gather \
+                 (insufficient VRAM headroom; frees it for scratch + KV)",
+                table_bytes as f64 / 1e9
+            );
         }
 
-        // Fallback: CPU-resident QTensor, per-row block-slice gather. Works
-        // for any quant type / non-CUDA devices.
+        // CPU-resident QTensor, per-row block-slice gather. Used for any
+        // quant type, non-CUDA devices, OR (above) when a large table is
+        // better kept off a VRAM-constrained GPU.
         let bytes = self.read_tensor_bytes(&gguf_name)?;
         let storage = QStorage::from_data(Cow::Borrowed(&bytes), &Device::Cpu, ggml_dtype)?;
         let qt = Arc::new(QTensor::new(storage, dims)?);
