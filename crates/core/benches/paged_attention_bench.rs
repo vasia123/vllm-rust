@@ -21,9 +21,10 @@ use candle_core::{DType, Device, Tensor};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use vllm_core::cuda_kernels::{
-    paged_attention_cuda, paged_attention_v2_cuda_pooled,
+    paged_attention_auto_with_kv_dtype, paged_attention_cuda, paged_attention_v2_cuda_pooled,
     paged_attention_v2_cuda_with_partition_size, select_v2_partition_size,
 };
+use vllm_core::kv_cache::KVCacheDtype;
 
 // ─── Shape and grid pinned to Qwen3-4B-AWQ ──────────────────────────────────
 // Single-sequence batch=1 (decode hot path).  Vary only `seq_len` and the V2
@@ -323,10 +324,183 @@ fn bench_v2_pooled_worst_case_sweep(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Sliding-window decode: Gemma 4 E4B sliding-layer shape ─────────────────
+//
+// E4B: 35 of 42 layers are sliding (8 q heads / 2 kv heads, head_dim 256,
+// window 512). Before the windowed kernel, any context beyond the window fell
+// back to a naive bf16 full-history materialisation (read cache → repeat_kv →
+// matmul → softmax → matmul) whose per-token cost grows linearly with context
+// — the "speed cliff" past ~2k tokens. Three arms per seq_len:
+//
+//   naive   — matmul-chain attention over the full history (the old fallback;
+//             conservative: excludes the cache-read/copy the real path pays)
+//   v2_full — paged V2 without window (what full-attention layers pay)
+//   v2_win  — paged V2 with window=512 (the new sliding-layer path; cost must
+//             stay flat across seq_len)
+fn bench_windowed_sliding_decode(c: &mut Criterion) {
+    const Q_HEADS: usize = 8;
+    const KV_HEADS: usize = 2;
+    const HD: usize = 256;
+    const WINDOW: usize = 512;
+    const SEQ_LENS: &[usize] = &[512, 1024, 2048, 4096, 8192];
+
+    let Ok(dev) = Device::new_cuda(0) else { return };
+
+    let mut group = c.benchmark_group("paged_attention_windowed_sliding");
+    for &seq_len in SEQ_LENS {
+        let max_blocks = seq_len.div_ceil(BLOCK_SIZE);
+        let kv_elems = max_blocks * BLOCK_SIZE * KV_HEADS * HD;
+        let q = Tensor::from_vec(
+            (0..Q_HEADS * HD)
+                .map(|i| (i as f32 * 0.0123).sin() * 0.5)
+                .collect::<Vec<f32>>(),
+            (1, Q_HEADS, HD),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let k_cache = Tensor::from_vec(
+            (0..kv_elems)
+                .map(|i| (i as f32 * 0.0271).cos() * 0.5)
+                .collect::<Vec<f32>>(),
+            (max_blocks, BLOCK_SIZE, KV_HEADS, HD),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let v_cache = Tensor::from_vec(
+            (0..kv_elems)
+                .map(|i| (i as f32 * 0.0411).sin() * 0.5)
+                .collect::<Vec<f32>>(),
+            (max_blocks, BLOCK_SIZE, KV_HEADS, HD),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let bt: Vec<u32> = (0..max_blocks as u32).collect();
+        let block_tables = Tensor::from_vec(bt, (1, max_blocks), &dev).unwrap();
+        let seq_lens_t = Tensor::from_vec(vec![seq_len as u32], 1, &dev).unwrap();
+
+        // Naive arm inputs: contiguous [1, kv_heads, seq, hd] K/V (the
+        // materialised history the old fallback attends against).
+        let k_naive = k_cache
+            .reshape((max_blocks * BLOCK_SIZE, KV_HEADS, HD))
+            .unwrap()
+            .narrow(0, 0, seq_len)
+            .unwrap()
+            .transpose(0, 1)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let v_naive = v_cache
+            .reshape((max_blocks * BLOCK_SIZE, KV_HEADS, HD))
+            .unwrap()
+            .narrow(0, 0, seq_len)
+            .unwrap()
+            .transpose(0, 1)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let q_naive = q.unsqueeze(2).unwrap(); // [1, heads, 1, hd]
+
+        let sync = |d: &Device| {
+            if let Device::Cuda(cd) = d {
+                let _ = cd.cuda_stream().synchronize();
+            }
+        };
+
+        let run_paged = |window: Option<usize>| {
+            paged_attention_auto_with_kv_dtype(
+                &q,
+                &k_cache,
+                &v_cache,
+                &block_tables,
+                &seq_lens_t,
+                1.0,
+                Q_HEADS,
+                KV_HEADS,
+                max_blocks,
+                seq_len,
+                HD,
+                BLOCK_SIZE,
+                KVCacheDtype::Auto,
+                None,
+                None,
+                window,
+            )
+            .expect("paged windowed bench")
+        };
+        let run_naive = || {
+            // repeat_kv 2→8 + q·kᵀ + softmax + ·v — the old fallback core.
+            let reps = Q_HEADS / KV_HEADS;
+            let (b, h, s, d) = k_naive.dims4().unwrap();
+            let expand = |t: &Tensor| {
+                t.unsqueeze(2)
+                    .unwrap()
+                    .expand((b, h, reps, s, d))
+                    .unwrap()
+                    .reshape((b, h * reps, s, d))
+                    .unwrap()
+            };
+            let k = expand(&k_naive);
+            let v = expand(&v_naive);
+            let scores = q_naive
+                .matmul(
+                    &k.transpose(candle_core::D::Minus2, candle_core::D::Minus1)
+                        .unwrap(),
+                )
+                .unwrap();
+            let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+            probs.matmul(&v).unwrap()
+        };
+
+        // Warmup
+        let _ = run_paged(None);
+        let _ = run_paged(Some(WINDOW));
+        let _ = run_naive();
+        sync(&dev);
+
+        group.bench_with_input(BenchmarkId::new("naive", seq_len), &seq_len, |bch, _| {
+            bch.iter(|| {
+                let out = run_naive();
+                sync(&dev);
+                out
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("v2_full", seq_len), &seq_len, |bch, _| {
+            bch.iter(|| {
+                let out = run_paged(None);
+                sync(&dev);
+                out
+            })
+        });
+        group.bench_with_input(
+            BenchmarkId::new("v2_win512", seq_len),
+            &seq_len,
+            |bch, _| {
+                bch.iter(|| {
+                    let out = run_paged(Some(WINDOW));
+                    sync(&dev);
+                    out
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_v1,
     bench_v2_partition_sweep,
     bench_v2_pooled_worst_case_sweep,
+    bench_windowed_sliding_decode,
 );
 criterion_main!(benches);

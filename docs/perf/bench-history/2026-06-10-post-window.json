@@ -1,0 +1,1628 @@
+[
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "12",
+    "mean_ns": 1329516.6513914769,
+    "std_dev_ns": 85.12272055125777
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "2048",
+    "mean_ns": 7429502.507804233,
+    "std_dev_ns": 7966.289430277092
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "512",
+    "mean_ns": 2689762.144048501,
+    "std_dev_ns": 331.2755988907166
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "1024",
+    "mean_ns": 4233509.393470695,
+    "std_dev_ns": 552.9383966030874
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "13",
+    "mean_ns": 1469921.1208901205,
+    "std_dev_ns": 458.18727649001977
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "16",
+    "mean_ns": 1479012.9368733712,
+    "std_dev_ns": 2442.2093350397763
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "4",
+    "mean_ns": 456694.31696863676,
+    "std_dev_ns": 309.08978557128046
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "32",
+    "mean_ns": 1467085.558712585,
+    "std_dev_ns": 1083.826708481465
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "14",
+    "mean_ns": 1544498.932002108,
+    "std_dev_ns": 27269.898630047934
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "8",
+    "mean_ns": 885476.311693461,
+    "std_dev_ns": 6077.0912486193765
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "24",
+    "mean_ns": 1464653.4981503526,
+    "std_dev_ns": 254.50896454625018
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "10",
+    "mean_ns": 1530322.4244402987,
+    "std_dev_ns": 29327.698676261407
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "256",
+    "mean_ns": 1868481.148201286,
+    "std_dev_ns": 531.3258306109116
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "64",
+    "mean_ns": 1475651.5126317001,
+    "std_dev_ns": 155.43281446185375
+  },
+  {
+    "group": "awq_marlin_dispatch",
+    "name": "1",
+    "mean_ns": 142165.69616554902,
+    "std_dev_ns": 122.90456629156799
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "mlp_up_old_K4096_N11008_M8",
+    "mean_ns": 887098.148316855,
+    "std_dev_ns": 16784.34893286705
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "q_o_K2560_N2560_M1",
+    "mean_ns": 24201.606092981638,
+    "std_dev_ns": 1485.7113831193308
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "down_K11008_N2560_M8",
+    "mean_ns": 558400.4365200798,
+    "std_dev_ns": 14883.272843525936
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "gate_up_K2560_N11008_M4",
+    "mean_ns": 273587.2114359328,
+    "std_dev_ns": 7442.048789444079
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "mlp_up_old_K4096_N11008_M1",
+    "mean_ns": 141837.22651305882,
+    "std_dev_ns": 5380.7988156029705
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "q_o_K2560_N2560_M4",
+    "mean_ns": 78578.59053651955,
+    "std_dev_ns": 1742.3530856725135
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "gate_up_K2560_N11008_M1",
+    "mean_ns": 81301.09917776307,
+    "std_dev_ns": 2128.819122974001
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "q_o_K2560_N2560_M8",
+    "mean_ns": 151175.8882531069,
+    "std_dev_ns": 3894.466308597353
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "gate_up_K2560_N11008_M8",
+    "mean_ns": 541733.4559415773,
+    "std_dev_ns": 17272.939729562728
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "down_K11008_N2560_M4",
+    "mean_ns": 322140.9347486325,
+    "std_dev_ns": 10394.098757517566
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "mlp_up_old_K4096_N11008_M4",
+    "mean_ns": 453135.95770953706,
+    "std_dev_ns": 12336.468645624802
+  },
+  {
+    "group": "awq_marlin_dispatch_qwen3",
+    "name": "down_K11008_N2560_M1",
+    "mean_ns": 74180.5307200906,
+    "std_dev_ns": 2459.3428929244237
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c8_down",
+    "mean_ns": 158819.19601936534,
+    "std_dev_ns": 90.21969216107199
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c4_down",
+    "mean_ns": 158002.2765990821,
+    "std_dev_ns": 107.13216675796076
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c1_qkv_like",
+    "mean_ns": 59470.9620078019,
+    "std_dev_ns": 336.8478219278322
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c1_gate_or_up",
+    "mean_ns": 158806.99755715617,
+    "std_dev_ns": 99.07420245838549
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c4_qkv_like",
+    "mean_ns": 60250.55059484799,
+    "std_dev_ns": 356.604378376076
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c8_gate_or_up",
+    "mean_ns": 159657.42460072823,
+    "std_dev_ns": 128.96042442110576
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c4_gate_or_up",
+    "mean_ns": 159110.23513300277,
+    "std_dev_ns": 87.9463613252764
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c8_qkv_like",
+    "mean_ns": 60088.384375272006,
+    "std_dev_ns": 55.13912963130852
+  },
+  {
+    "group": "exl3_gemm_decode",
+    "name": "c1_down",
+    "mean_ns": 157585.90129951562,
+    "std_dev_ns": 296.9201434392312
+  },
+  {
+    "group": "flashinfer_decode_full",
+    "name": "512",
+    "mean_ns": 106222.6376953125,
+    "std_dev_ns": 3842.1461785850943
+  },
+  {
+    "group": "flashinfer_decode_full",
+    "name": "384",
+    "mean_ns": 94150.1162109375,
+    "std_dev_ns": 1831.0240074559927
+  },
+  {
+    "group": "flashinfer_decode_full",
+    "name": "1024",
+    "mean_ns": 151749.2802734375,
+    "std_dev_ns": 426.5939303132209
+  },
+  {
+    "group": "flashinfer_decode_full",
+    "name": "256",
+    "mean_ns": 80200.91015625,
+    "std_dev_ns": 526.1634039390516
+  },
+  {
+    "group": "flashinfer_decode_full",
+    "name": "64",
+    "mean_ns": 69916.38525390625,
+    "std_dev_ns": 805.3110691615914
+  },
+  {
+    "group": "flashinfer_decode_replay",
+    "name": "512",
+    "mean_ns": 71390.7529296875,
+    "std_dev_ns": 1397.9901573758325
+  },
+  {
+    "group": "flashinfer_decode_replay",
+    "name": "384",
+    "mean_ns": 61418.33837890625,
+    "std_dev_ns": 860.8327621640553
+  },
+  {
+    "group": "flashinfer_decode_replay",
+    "name": "1024",
+    "mean_ns": 117809.8994140625,
+    "std_dev_ns": 2057.0716822948393
+  },
+  {
+    "group": "flashinfer_decode_replay",
+    "name": "256",
+    "mean_ns": 50845.9189453125,
+    "std_dev_ns": 1079.3667369188288
+  },
+  {
+    "group": "flashinfer_decode_replay",
+    "name": "64",
+    "mean_ns": 33641.092529296875,
+    "std_dev_ns": 463.6248500410533
+  },
+  {
+    "group": "fused_embedding",
+    "name": "c1_f16",
+    "mean_ns": 10190.255950927734,
+    "std_dev_ns": 92.90672717973709
+  },
+  {
+    "group": "fused_embedding",
+    "name": "c1_bf16",
+    "mean_ns": 10371.211654663086,
+    "std_dev_ns": 142.21678662858506
+  },
+  {
+    "group": "fused_embedding",
+    "name": "c4_f16",
+    "mean_ns": 10435.822631835938,
+    "std_dev_ns": 59.32739832259524
+  },
+  {
+    "group": "fused_embedding",
+    "name": "c4_bf16",
+    "mean_ns": 9983.177612304688,
+    "std_dev_ns": 292.48515614238624
+  },
+  {
+    "group": "fused_embedding",
+    "name": "c8_f16",
+    "mean_ns": 10101.09033203125,
+    "std_dev_ns": 157.30018478553671
+  },
+  {
+    "group": "fused_embedding",
+    "name": "c8_bf16",
+    "mean_ns": 10263.3173828125,
+    "std_dev_ns": 250.8409516211827
+  },
+  {
+    "group": "fused_half_add",
+    "name": "c1_f16",
+    "mean_ns": 10292.079986572266,
+    "std_dev_ns": 261.7670547733757
+  },
+  {
+    "group": "fused_half_add",
+    "name": "c1_bf16",
+    "mean_ns": 10570.415100097656,
+    "std_dev_ns": 72.25462574989056
+  },
+  {
+    "group": "fused_half_add",
+    "name": "c4_f16",
+    "mean_ns": 10226.687866210938,
+    "std_dev_ns": 88.05879031304376
+  },
+  {
+    "group": "fused_half_add",
+    "name": "c4_bf16",
+    "mean_ns": 10407.108154296875,
+    "std_dev_ns": 25.444795579259672
+  },
+  {
+    "group": "fused_half_add",
+    "name": "c8_f16",
+    "mean_ns": 10284.5498046875,
+    "std_dev_ns": 224.28128895381204
+  },
+  {
+    "group": "fused_half_add",
+    "name": "c8_bf16",
+    "mean_ns": 10658.05209350586,
+    "std_dev_ns": 311.9823395140936
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c4_gate_or_up_f16",
+    "mean_ns": 402641.65625,
+    "std_dev_ns": 10371.08544121754
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c8_down_f16",
+    "mean_ns": 435321.67919921875,
+    "std_dev_ns": 10121.55615886478
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c4_qkv_like_f16",
+    "mean_ns": 49244.78125,
+    "std_dev_ns": 24.262601429463412
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c4_gate_or_up_bf16",
+    "mean_ns": 403813.1142578125,
+    "std_dev_ns": 9832.279741428914
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c1_qkv_like_bf16",
+    "mean_ns": 139568.52905273438,
+    "std_dev_ns": 18.920975935451168
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c8_down_bf16",
+    "mean_ns": 443246.53271484375,
+    "std_dev_ns": 10221.404608212875
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c1_gate_or_up_bf16",
+    "mean_ns": 400618.9541015625,
+    "std_dev_ns": 9263.655403920371
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c1_gate_or_up_f16",
+    "mean_ns": 400700.1787109375,
+    "std_dev_ns": 9291.213233435597
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c8_qkv_like_bf16",
+    "mean_ns": 57381.631103515625,
+    "std_dev_ns": 4.120070908153844
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c4_down_bf16",
+    "mean_ns": 408445.9208984375,
+    "std_dev_ns": 10857.761350844707
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c1_qkv_like_f16",
+    "mean_ns": 139515.48583984375,
+    "std_dev_ns": 41.423061018591234
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c4_down_f16",
+    "mean_ns": 407048.556640625,
+    "std_dev_ns": 11546.857625129976
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c8_gate_or_up_bf16",
+    "mean_ns": 404808.267578125,
+    "std_dev_ns": 10027.898346521895
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c4_qkv_like_bf16",
+    "mean_ns": 56261.95849609375,
+    "std_dev_ns": 112.04535078959768
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c1_down_bf16",
+    "mean_ns": 399882.85400390625,
+    "std_dev_ns": 10454.972197941488
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c1_down_f16",
+    "mean_ns": 400282.99658203125,
+    "std_dev_ns": 9900.940224202508
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c8_gate_or_up_f16",
+    "mean_ns": 403921.7216796875,
+    "std_dev_ns": 10176.187753585065
+  },
+  {
+    "group": "fused_half_matmul_decode",
+    "name": "c8_qkv_like_f16",
+    "mean_ns": 52337.48095703125,
+    "std_dev_ns": 75.46224233871787
+  },
+  {
+    "group": "fused_silu_and_mul",
+    "name": "c1_f16",
+    "mean_ns": 11032.219177246094,
+    "std_dev_ns": 245.31831991133208
+  },
+  {
+    "group": "fused_silu_and_mul",
+    "name": "c1_bf16",
+    "mean_ns": 11367.371704101562,
+    "std_dev_ns": 105.55312307473378
+  },
+  {
+    "group": "fused_silu_and_mul",
+    "name": "c4_f16",
+    "mean_ns": 11193.045043945312,
+    "std_dev_ns": 244.99057522771813
+  },
+  {
+    "group": "fused_silu_and_mul",
+    "name": "c4_bf16",
+    "mean_ns": 11108.645874023438,
+    "std_dev_ns": 132.60927966366026
+  },
+  {
+    "group": "fused_silu_and_mul",
+    "name": "c8_f16",
+    "mean_ns": 11267.137268066406,
+    "std_dev_ns": 129.6673460182524
+  },
+  {
+    "group": "fused_silu_and_mul",
+    "name": "c8_bf16",
+    "mean_ns": 11263.281005859375,
+    "std_dev_ns": 42.745433563486
+  },
+  {
+    "group": "gemma4_hetero_kv",
+    "name": "F32",
+    "mean_ns": 68.9724927040026,
+    "std_dev_ns": 1.6280824517759125
+  },
+  {
+    "group": "gemma4_hetero_kv",
+    "name": "BF16",
+    "mean_ns": 71.51168472201603,
+    "std_dev_ns": 1.7991758918384686
+  },
+  {
+    "group": "gemma4_hetero_kv",
+    "name": "F32",
+    "mean_ns": 410.54486096578665,
+    "std_dev_ns": 12.020621254447528
+  },
+  {
+    "group": "gemma4_hetero_kv",
+    "name": "BF16",
+    "mean_ns": 386.3162144139938,
+    "std_dev_ns": 30.87683895601248
+  },
+  {
+    "group": "gemma4_hetero_kv",
+    "name": "F32",
+    "mean_ns": 21.94207096971654,
+    "std_dev_ns": 0.6497375556148902
+  },
+  {
+    "group": "gemma4_hetero_kv",
+    "name": "BF16",
+    "mean_ns": 22.35286499215413,
+    "std_dev_ns": 0.4541257235663571
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "4096x4096_prefill_m32",
+    "mean_ns": 34141187.9,
+    "std_dev_ns": 1327935.527537783
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "4096x4096_decode_m1",
+    "mean_ns": 28651353.26,
+    "std_dev_ns": 551192.7830675282
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "14336x4096_decode_m1",
+    "mean_ns": 99541361.26666667,
+    "std_dev_ns": 3111628.161183757
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "14336x4096_prefill_m32",
+    "mean_ns": 107238561.56666666,
+    "std_dev_ns": 2334975.6194258244
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "4096x4096_prefill_m32",
+    "mean_ns": 37556395.825,
+    "std_dev_ns": 1348442.3968148434
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "4096x4096_decode_m1",
+    "mean_ns": 1071247.9248255703,
+    "std_dev_ns": 89377.67955086818
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "14336x4096_decode_m1",
+    "mean_ns": 2322732.658342219,
+    "std_dev_ns": 123107.81089449282
+  },
+  {
+    "group": "gguf_linear_forward_cpu",
+    "name": "14336x4096_prefill_m32",
+    "mean_ns": 76454302.53333333,
+    "std_dev_ns": 4248669.636399152
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "4096x4096_prefill_m32",
+    "mean_ns": 1901700.5941465262,
+    "std_dev_ns": 27514.139224662922
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "4096x4096_decode_m1",
+    "mean_ns": 1825218.0887061611,
+    "std_dev_ns": 35909.998704747166
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "14336x4096_decode_m1",
+    "mean_ns": 8895730.294214863,
+    "std_dev_ns": 406799.82793306635
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "14336x4096_prefill_m32",
+    "mean_ns": 8963703.841603948,
+    "std_dev_ns": 190012.99339052473
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "4096x4096_prefill_m32",
+    "mean_ns": 248735.30631067062,
+    "std_dev_ns": 8145.72989015195
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "4096x4096_decode_m1",
+    "mean_ns": 52093.29276355785,
+    "std_dev_ns": 1945.203634500332
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "14336x4096_decode_m1",
+    "mean_ns": 102448.643964392,
+    "std_dev_ns": 2567.774935219258
+  },
+  {
+    "group": "gguf_linear_forward_cuda",
+    "name": "14336x4096_prefill_m32",
+    "mean_ns": 558019.9696026654,
+    "std_dev_ns": 15798.148616631152
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "4",
+    "mean_ns": 3154669.474430081,
+    "std_dev_ns": 1046.8035334955985
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "8",
+    "mean_ns": 3178351.3321299097,
+    "std_dev_ns": 1408.228029623122
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "1",
+    "mean_ns": 3104960.023922266,
+    "std_dev_ns": 2470.638263714242
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "4",
+    "mean_ns": 3140970.9758332893,
+    "std_dev_ns": 1700.3471802935867
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "8",
+    "mean_ns": 3160171.0099244337,
+    "std_dev_ns": 2020.3768312293398
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "1",
+    "mean_ns": 3122464.908489476,
+    "std_dev_ns": 2014.435922584615
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "4",
+    "mean_ns": 3154808.80980698,
+    "std_dev_ns": 1258.4940523182738
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "8",
+    "mean_ns": 3178605.782877191,
+    "std_dev_ns": 623.560507752399
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "1",
+    "mean_ns": 3104907.22183909,
+    "std_dev_ns": 505.74535443650785
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "4",
+    "mean_ns": 3275884.3712804704,
+    "std_dev_ns": 22824.77583335009
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "8",
+    "mean_ns": 3303918.284335281,
+    "std_dev_ns": 33676.73130001024
+  },
+  {
+    "group": "lm_head_matmul",
+    "name": "1",
+    "mean_ns": 3227266.109462851,
+    "std_dev_ns": 11698.634495046748
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "512",
+    "mean_ns": 46567240.07204364,
+    "std_dev_ns": 35521.74482252432
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "16",
+    "mean_ns": 1484580.7716135704,
+    "std_dev_ns": 2347.800028734315
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "4",
+    "mean_ns": 414887.8220640008,
+    "std_dev_ns": 180.13342411000164
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "32",
+    "mean_ns": 2938191.3766950113,
+    "std_dev_ns": 8025.324078015395
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "8",
+    "mean_ns": 760994.1153869049,
+    "std_dev_ns": 140.2787835810493
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "256",
+    "mean_ns": 23187258.009062503,
+    "std_dev_ns": 16311.251850532435
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "64",
+    "mean_ns": 5805537.647226001,
+    "std_dev_ns": 9400.373166160558
+  },
+  {
+    "group": "marlin_tile_mma_dispatch",
+    "name": "1",
+    "mean_ns": 115325.02474450627,
+    "std_dev_ns": 54.00789147475795
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "mlp_up_old_K4096_N11008_M8",
+    "mean_ns": 176478.73417782265,
+    "std_dev_ns": 794.062651676665
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "q_o_K2560_N2560_M1",
+    "mean_ns": 47661.670325668376,
+    "std_dev_ns": 127.02620863644853
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "down_K11008_N2560_M8",
+    "mean_ns": 209273.51279217663,
+    "std_dev_ns": 101.76031055028788
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "gate_up_K2560_N11008_M4",
+    "mean_ns": 82789.62106296582,
+    "std_dev_ns": 68.41292434352528
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "mlp_up_old_K4096_N11008_M1",
+    "mean_ns": 129701.43407723126,
+    "std_dev_ns": 23.024244996847724
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "q_o_K2560_N2560_M4",
+    "mean_ns": 48468.66953016958,
+    "std_dev_ns": 55.85066398824082
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "gate_up_K2560_N11008_M1",
+    "mean_ns": 80042.94874649253,
+    "std_dev_ns": 11.000505163086071
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "q_o_K2560_N2560_M8",
+    "mean_ns": 51080.929636331275,
+    "std_dev_ns": 5.970539302121872
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "gate_up_K2560_N11008_M8",
+    "mean_ns": 115901.5375356653,
+    "std_dev_ns": 83.3892010423038
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "down_K11008_N2560_M4",
+    "mean_ns": 200078.04270951726,
+    "std_dev_ns": 395.69184217421207
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "mlp_up_old_K4096_N11008_M4",
+    "mean_ns": 132055.99020166355,
+    "std_dev_ns": 27.447075128813967
+  },
+  {
+    "group": "marlin_tile_mma_dispatch_qwen3",
+    "name": "down_K11008_N2560_M1",
+    "mean_ns": 196097.3062934103,
+    "std_dev_ns": 138.7060361887509
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "128",
+    "mean_ns": 83882.35668121962,
+    "std_dev_ns": 8558.719725243434
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "2048",
+    "mean_ns": 927820.3008356702,
+    "std_dev_ns": 46466.44505816006
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "512",
+    "mean_ns": 255994.3851950927,
+    "std_dev_ns": 13325.793285614824
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "1024",
+    "mean_ns": 492437.68634438067,
+    "std_dev_ns": 38803.583905035535
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "8192",
+    "mean_ns": 3399104.3513333322,
+    "std_dev_ns": 58978.67800002665
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "256",
+    "mean_ns": 146635.93432178625,
+    "std_dev_ns": 8509.014299161103
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "4096",
+    "mean_ns": 1744961.9696164634,
+    "std_dev_ns": 45050.334705507354
+  },
+  {
+    "group": "paged_attention_v1",
+    "name": "64",
+    "mean_ns": 52044.81569100029,
+    "std_dev_ns": 3520.3211208720045
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s128",
+    "mean_ns": 64740.01487001026,
+    "std_dev_ns": 5697.767439327215
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s256",
+    "mean_ns": 60917.32953324281,
+    "std_dev_ns": 4739.641847492668
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s512",
+    "mean_ns": 75312.62852819952,
+    "std_dev_ns": 4487.873956612389
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s1024",
+    "mean_ns": 89242.42515595934,
+    "std_dev_ns": 6891.985420197444
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s64",
+    "mean_ns": 55852.13363259518,
+    "std_dev_ns": 5758.308040671095
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s512",
+    "mean_ns": 109924.06842343276,
+    "std_dev_ns": 7920.645284698572
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s4096",
+    "mean_ns": 184281.65356085973,
+    "std_dev_ns": 11519.79175063089
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s8192",
+    "mean_ns": 357710.51312849956,
+    "std_dev_ns": 9954.26287109739
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s1024",
+    "mean_ns": 78160.9445092128,
+    "std_dev_ns": 3511.063528010496
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s16384",
+    "mean_ns": 657285.0263905595,
+    "std_dev_ns": 19014.545114570137
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s1024",
+    "mean_ns": 80098.88219376683,
+    "std_dev_ns": 5274.8410523928205
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s4096",
+    "mean_ns": 180166.914162495,
+    "std_dev_ns": 9226.712917157669
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s2048",
+    "mean_ns": 111688.76536203707,
+    "std_dev_ns": 7113.428606934366
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s64",
+    "mean_ns": 53390.167353870485,
+    "std_dev_ns": 6148.355326609213
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s16384",
+    "mean_ns": 691360.2732958492,
+    "std_dev_ns": 23952.217345875706
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s16384",
+    "mean_ns": 658028.4035239583,
+    "std_dev_ns": 16484.17163801678
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s8192",
+    "mean_ns": 333973.2850945924,
+    "std_dev_ns": 15171.227060483192
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s8192",
+    "mean_ns": 322159.82007520023,
+    "std_dev_ns": 10779.380721722882
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s512",
+    "mean_ns": 66652.58508207492,
+    "std_dev_ns": 6253.854347681155
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s2048",
+    "mean_ns": 143708.2870432009,
+    "std_dev_ns": 9278.462142706316
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s256",
+    "mean_ns": 74638.69310454544,
+    "std_dev_ns": 5943.477481582808
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s4096",
+    "mean_ns": 172067.24852222373,
+    "std_dev_ns": 6753.169570297068
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s16384",
+    "mean_ns": 653829.4152431561,
+    "std_dev_ns": 15787.07761254149
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s256",
+    "mean_ns": 78614.41945026495,
+    "std_dev_ns": 7037.017377877357
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s512",
+    "mean_ns": 60665.45330284372,
+    "std_dev_ns": 3308.169645099784
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s128",
+    "mean_ns": 61399.29894220596,
+    "std_dev_ns": 5455.797444191592
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s2048",
+    "mean_ns": 113540.30642181914,
+    "std_dev_ns": 11820.592494281316
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s256",
+    "mean_ns": 52262.463346334545,
+    "std_dev_ns": 2568.270520029284
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s2048",
+    "mean_ns": 124440.36238457155,
+    "std_dev_ns": 14009.10911343587
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s64",
+    "mean_ns": 58779.352583059066,
+    "std_dev_ns": 6615.422275986129
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s8192",
+    "mean_ns": 331306.57510109065,
+    "std_dev_ns": 8921.65498852589
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s1024",
+    "mean_ns": 111840.88011345755,
+    "std_dev_ns": 7831.048218527026
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p512_s4096",
+    "mean_ns": 198503.7134246587,
+    "std_dev_ns": 7572.545871077832
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p64_s128",
+    "mean_ns": 53250.15322387743,
+    "std_dev_ns": 7378.645977848366
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p128_s128",
+    "mean_ns": 60682.28033120906,
+    "std_dev_ns": 4379.17813247458
+  },
+  {
+    "group": "paged_attention_v2",
+    "name": "p256_s64",
+    "mean_ns": 57474.362377515354,
+    "std_dev_ns": 5192.918228127714
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act1024_worst32768",
+    "mean_ns": 107935.0590528186,
+    "std_dev_ns": 5518.536554891773
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act32_worst1024",
+    "mean_ns": 81148.10945559587,
+    "std_dev_ns": 5570.06094120691
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act256_worst1024",
+    "mean_ns": 80821.25562643951,
+    "std_dev_ns": 4577.591699375017
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act32_worst131072",
+    "mean_ns": 99475.05214486246,
+    "std_dev_ns": 5736.407948502795
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act256_worst8192",
+    "mean_ns": 89977.1400904485,
+    "std_dev_ns": 4525.516687977941
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act32_worst32768",
+    "mean_ns": 79881.4143530753,
+    "std_dev_ns": 4246.353224765494
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act256_worst131072",
+    "mean_ns": 105805.68996235222,
+    "std_dev_ns": 5442.647556365932
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act32_worst8192",
+    "mean_ns": 84196.6655410606,
+    "std_dev_ns": 6667.562324141196
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act1024_worst8192",
+    "mean_ns": 102721.28548008966,
+    "std_dev_ns": 6486.293015401744
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act256_worst32768",
+    "mean_ns": 95259.22455957957,
+    "std_dev_ns": 4825.295306845576
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act1024_worst1024",
+    "mean_ns": 93470.92547780092,
+    "std_dev_ns": 9419.761559070505
+  },
+  {
+    "group": "paged_attention_v2_pooled_worst_case",
+    "name": "act1024_worst131072",
+    "mean_ns": 120872.03973188634,
+    "std_dev_ns": 5733.257211351661
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "2048",
+    "mean_ns": 2235529.893043478,
+    "std_dev_ns": 55868.53108652965
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "512",
+    "mean_ns": 221714.4505792622,
+    "std_dev_ns": 4796.542265592246
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "1024",
+    "mean_ns": 413169.9604333677,
+    "std_dev_ns": 13408.301155888515
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "8192",
+    "mean_ns": 4898735.226363637,
+    "std_dev_ns": 103688.21847813262
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "4096",
+    "mean_ns": 2439749.0023809527,
+    "std_dev_ns": 56490.68201705589
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "2048",
+    "mean_ns": 93878.24088022896,
+    "std_dev_ns": 12571.42723806164
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "512",
+    "mean_ns": 61137.636193808234,
+    "std_dev_ns": 6156.873559761091
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "1024",
+    "mean_ns": 71320.05017279297,
+    "std_dev_ns": 6747.128825486257
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "8192",
+    "mean_ns": 230654.21966679583,
+    "std_dev_ns": 6611.838069934333
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "4096",
+    "mean_ns": 138082.92327868807,
+    "std_dev_ns": 8374.08402959629
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "2048",
+    "mean_ns": 62360.58628987553,
+    "std_dev_ns": 8103.462931551264
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "512",
+    "mean_ns": 61103.06712311077,
+    "std_dev_ns": 4080.2954480518824
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "1024",
+    "mean_ns": 63602.02352471878,
+    "std_dev_ns": 10427.19664493142
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "8192",
+    "mean_ns": 64928.67482966289,
+    "std_dev_ns": 6793.680251994133
+  },
+  {
+    "group": "paged_attention_windowed_sliding",
+    "name": "4096",
+    "mean_ns": 61457.51203997527,
+    "std_dev_ns": 4970.601704572188
+  },
+  {
+    "group": "paged_attn_v2",
+    "name": "512",
+    "mean_ns": 188375.96728515625,
+    "std_dev_ns": 6636.119111097591
+  },
+  {
+    "group": "paged_attn_v2",
+    "name": "384",
+    "mean_ns": 145000.23828125,
+    "std_dev_ns": 734.0265573171885
+  },
+  {
+    "group": "paged_attn_v2",
+    "name": "1024",
+    "mean_ns": 334911.384765625,
+    "std_dev_ns": 651.5740396406275
+  },
+  {
+    "group": "paged_attn_v2",
+    "name": "256",
+    "mean_ns": 121971.349609375,
+    "std_dev_ns": 3579.9877205281136
+  },
+  {
+    "group": "paged_attn_v2",
+    "name": "64",
+    "mean_ns": 65551.31005859375,
+    "std_dev_ns": 715.1425249489184
+  },
+  {
+    "group": "quantized_qwen3_layer",
+    "name": "4",
+    "mean_ns": 826081.2080554188,
+    "std_dev_ns": 13086.378447469715
+  },
+  {
+    "group": "quantized_qwen3_layer",
+    "name": "8",
+    "mean_ns": 885387.8791879602,
+    "std_dev_ns": 71772.30142102206
+  },
+  {
+    "group": "quantized_qwen3_layer",
+    "name": "1",
+    "mean_ns": 826022.9833200631,
+    "std_dev_ns": 18119.02383603243
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h1536_f16",
+    "mean_ns": 5426.218322753906,
+    "std_dev_ns": 10.221024814531575
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h5120_f16",
+    "mean_ns": 6271.789733886719,
+    "std_dev_ns": 173.28803138364657
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h5120_f16",
+    "mean_ns": 6260.131103515625,
+    "std_dev_ns": 118.41690769390263
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h4096_bf16",
+    "mean_ns": 6203.148956298828,
+    "std_dev_ns": 125.36821102103954
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h1536_bf16",
+    "mean_ns": 5989.699249267578,
+    "std_dev_ns": 70.04487390030972
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h1536_f16",
+    "mean_ns": 5580.548675537109,
+    "std_dev_ns": 64.1238904088214
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h5120_bf16",
+    "mean_ns": 6268.547302246094,
+    "std_dev_ns": 243.18353415543538
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h5120_bf16",
+    "mean_ns": 6417.097991943359,
+    "std_dev_ns": 227.54738513788516
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h2560_f16",
+    "mean_ns": 5944.2156982421875,
+    "std_dev_ns": 203.43389588670541
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h2560_bf16",
+    "mean_ns": 5899.128448486328,
+    "std_dev_ns": 137.87283166114133
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h4096_f16",
+    "mean_ns": 6241.5535888671875,
+    "std_dev_ns": 114.7203067403998
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h1536_bf16",
+    "mean_ns": 5520.131927490234,
+    "std_dev_ns": 50.250545131356915
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h2560_bf16",
+    "mean_ns": 6086.7196044921875,
+    "std_dev_ns": 146.05984552043972
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h2560_f16",
+    "mean_ns": 5908.467224121094,
+    "std_dev_ns": 52.3610327233249
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h2560_bf16",
+    "mean_ns": 5976.1221923828125,
+    "std_dev_ns": 102.0595391072357
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h4096_f16",
+    "mean_ns": 6293.965576171875,
+    "std_dev_ns": 233.15775781979102
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c4_h4096_bf16",
+    "mean_ns": 6306.713653564453,
+    "std_dev_ns": 172.54946214863403
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h1536_bf16",
+    "mean_ns": 8814.446960449219,
+    "std_dev_ns": 237.10648998763048
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h5120_f16",
+    "mean_ns": 6308.719345092773,
+    "std_dev_ns": 82.13256307925109
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h1536_f16",
+    "mean_ns": 5093.299407958984,
+    "std_dev_ns": 143.1844189276325
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h4096_f16",
+    "mean_ns": 6207.170959472656,
+    "std_dev_ns": 10.468063340868964
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h4096_bf16",
+    "mean_ns": 6340.886474609375,
+    "std_dev_ns": 159.94648357674976
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c1_h2560_f16",
+    "mean_ns": 5889.955215454102,
+    "std_dev_ns": 139.89067980573282
+  },
+  {
+    "group": "rms_norm_candle_nn",
+    "name": "c8_h5120_bf16",
+    "mean_ns": 6314.683898925781,
+    "std_dev_ns": 112.87925687029143
+  },
+  {
+    "group": "rms_norm_chain_x4",
+    "name": "candle_4x",
+    "mean_ns": 25155.64610065861,
+    "std_dev_ns": 315.5690761155997
+  },
+  {
+    "group": "rms_norm_chain_x4",
+    "name": "custom_4x",
+    "mean_ns": 42911.93725999791,
+    "std_dev_ns": 1505.4370970596046
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h1536_f16",
+    "mean_ns": 10431.752868652344,
+    "std_dev_ns": 123.72944444459702
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h5120_f16",
+    "mean_ns": 10822.880889892578,
+    "std_dev_ns": 167.02303250197036
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h5120_f16",
+    "mean_ns": 10451.3466796875,
+    "std_dev_ns": 60.108219604652554
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h4096_bf16",
+    "mean_ns": 10637.283599853516,
+    "std_dev_ns": 239.55628870714293
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h1536_bf16",
+    "mean_ns": 11058.897186279297,
+    "std_dev_ns": 129.87696623530704
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h1536_f16",
+    "mean_ns": 10618.330108642578,
+    "std_dev_ns": 140.59612498956366
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h5120_bf16",
+    "mean_ns": 11145.961791992188,
+    "std_dev_ns": 373.58871571636143
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h5120_bf16",
+    "mean_ns": 11315.613189697266,
+    "std_dev_ns": 200.85401783134725
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h2560_f16",
+    "mean_ns": 10263.287719726562,
+    "std_dev_ns": 320.0094947602624
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h2560_bf16",
+    "mean_ns": 10174.96728515625,
+    "std_dev_ns": 133.54547108806813
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h4096_f16",
+    "mean_ns": 10854.530151367188,
+    "std_dev_ns": 242.52985743986827
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h1536_bf16",
+    "mean_ns": 9964.53173828125,
+    "std_dev_ns": 279.2940584233322
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h2560_bf16",
+    "mean_ns": 10116.045288085938,
+    "std_dev_ns": 132.62637037931881
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h2560_f16",
+    "mean_ns": 10427.551025390625,
+    "std_dev_ns": 49.96703777994002
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h2560_bf16",
+    "mean_ns": 10361.364013671875,
+    "std_dev_ns": 151.26768005853899
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h4096_f16",
+    "mean_ns": 10436.898681640625,
+    "std_dev_ns": 362.6974413710787
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c4_h4096_bf16",
+    "mean_ns": 10381.256042480469,
+    "std_dev_ns": 387.0600839088667
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h1536_bf16",
+    "mean_ns": 11031.400512695312,
+    "std_dev_ns": 357.30488899707376
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h5120_f16",
+    "mean_ns": 10628.987365722656,
+    "std_dev_ns": 220.38037626311822
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h1536_f16",
+    "mean_ns": 9771.887756347656,
+    "std_dev_ns": 268.40476936320175
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h4096_f16",
+    "mean_ns": 12895.515014648438,
+    "std_dev_ns": 29.882339478283157
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h4096_bf16",
+    "mean_ns": 10648.1708984375,
+    "std_dev_ns": 8.132159567374048
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c1_h2560_f16",
+    "mean_ns": 10244.819213867188,
+    "std_dev_ns": 173.59506004828043
+  },
+  {
+    "group": "rms_norm_pooled",
+    "name": "c8_h5120_bf16",
+    "mean_ns": 10540.818542480469,
+    "std_dev_ns": 194.32791079377637
+  },
+  {
+    "group": "rotary_embedding_pooled",
+    "name": "c1_f16",
+    "mean_ns": 32347.99853515625,
+    "std_dev_ns": 1147.6087561090246
+  },
+  {
+    "group": "rotary_embedding_pooled",
+    "name": "c1_bf16",
+    "mean_ns": 32236.111328125,
+    "std_dev_ns": 189.69658580054343
+  },
+  {
+    "group": "rotary_embedding_pooled",
+    "name": "c4_f16",
+    "mean_ns": 32961.5654296875,
+    "std_dev_ns": 1236.577152288785
+  },
+  {
+    "group": "rotary_embedding_pooled",
+    "name": "c4_bf16",
+    "mean_ns": 33230.81945800781,
+    "std_dev_ns": 732.7803161420455
+  },
+  {
+    "group": "rotary_embedding_pooled",
+    "name": "c8_f16",
+    "mean_ns": 32025.3759765625,
+    "std_dev_ns": 1022.5330293809599
+  },
+  {
+    "group": "rotary_embedding_pooled",
+    "name": "c8_bf16",
+    "mean_ns": 31926.755859375,
+    "std_dev_ns": 157.89335346233284
+  }
+]

@@ -645,6 +645,7 @@ pub fn gpu_top_k_top_p_sample(
 pub fn gpu_multinomial_sample_no_filter(probs: &Tensor, rand_vals: &Tensor) -> Result<Tensor> {
     use std::sync::atomic::Ordering;
     MULTINOMIAL_NO_FILTER_COUNT.fetch_add(1, Ordering::Relaxed);
+    MULTINOMIAL_NO_FILTER_COUNT_LOCAL.with(|c| c.set(c.get() + 1));
     let probs = probs.contiguous()?;
     let rand_vals = rand_vals.contiguous()?;
     probs.apply_op2_no_bwd(&rand_vals, &cuda_ops::MultinomialSampleNoFilterOp)
@@ -657,6 +658,16 @@ pub fn gpu_multinomial_sample_no_filter(probs: &Tensor, rand_vals: &Tensor) -> R
 #[cfg(feature = "cuda-kernels")]
 pub static MULTINOMIAL_NO_FILTER_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "cuda-kernels")]
+thread_local! {
+    /// Thread-local twin of [`MULTINOMIAL_NO_FILTER_COUNT`]: a test asserting
+    /// "THIS call routed to the fast path" reads the twin, so concurrent test
+    /// threads bumping the global counter can't race the delta. The global
+    /// stays the process-wide observability source.
+    pub static MULTINOMIAL_NO_FILTER_COUNT_LOCAL: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 fn gpu_top_k_top_p_sample_cpu(
     probs: &Tensor,
@@ -1898,7 +1909,6 @@ mod tests {
     #[cfg(feature = "cuda-kernels")]
     #[test]
     fn test_dispatch_routes_to_no_filter_fast_path() {
-        use std::sync::atomic::Ordering;
         let Ok(device) = Device::new_cuda(0) else {
             return;
         };
@@ -1910,9 +1920,9 @@ mod tests {
             top_p: 1.0,
             rand_val: 0.42,
         }];
-        let before = MULTINOMIAL_NO_FILTER_COUNT.load(Ordering::Relaxed);
+        let before = MULTINOMIAL_NO_FILTER_COUNT_LOCAL.with(|c| c.get());
         let _ = gpu_sample_batch_with_diffs_to_tensor(&logits, &configs, &[]).unwrap();
-        let after = MULTINOMIAL_NO_FILTER_COUNT.load(Ordering::Relaxed);
+        let after = MULTINOMIAL_NO_FILTER_COUNT_LOCAL.with(|c| c.get());
         assert_eq!(
             after - before,
             1,

@@ -210,6 +210,12 @@ struct PagedAttnOp {
     k_scale: Option<Tensor>,
     /// Per-tensor scalar F32 scale for V cache. See [`Self::k_scale`].
     v_scale: Option<Tensor>,
+    /// Sliding-window size in tokens; `0` disables windowing (full causal
+    /// attention over `[0, seq_len)`). When non-zero the kernel attends
+    /// only to the last `min(seq_len, window)` cached positions —
+    /// matching the decode row of the model-side `sliding_window_mask`
+    /// (allowed keys: `(query_pos - window, query_pos]`).
+    window: usize,
 }
 
 impl CustomOp1 for PagedAttnOp {
@@ -457,9 +463,16 @@ impl PagedAttnOp {
         let kernel_sym = self.kernel_symbol_v1::<T>();
         let func = dev.get_or_load_custom_func(kernel_sym, "paged_attention", PTX)?;
 
-        // Shared memory: q_smem[head_dim] + reduce_smem[NUM_WARPS] + logits[max_seq_len]
+        // Shared memory: q_smem[head_dim] + reduce_smem[NUM_WARPS] + logits[eff_len].
+        // With a sliding window the kernel indexes logits relative to the
+        // window start, so the buffer is bounded by the window size.
+        let logits_len = if self.window > 0 {
+            self.max_seq_len.min(self.window)
+        } else {
+            self.max_seq_len
+        };
         let shared_mem_bytes =
-            ((head_dim + NUM_WARPS + self.max_seq_len) * std::mem::size_of::<f32>()) as u32;
+            ((head_dim + NUM_WARPS + logits_len) * std::mem::size_of::<f32>()) as u32;
 
         let cfg = LaunchConfig {
             grid_dim: (self.num_heads as u32, num_seqs as u32, 1),
@@ -472,6 +485,7 @@ impl PagedAttnOp {
         let max_blocks_i32 = self.max_blocks_per_seq as i32;
         let head_dim_i32 = head_dim as i32;
         let block_size_i32 = self.block_size as i32;
+        let window_i32 = self.window as i32;
 
         // The K/V slice element type differs between Auto (Q dtype) and
         // quantized (raw u8 byte storage). Each branch holds its own
@@ -497,6 +511,7 @@ impl PagedAttnOp {
                 builder.arg(&max_blocks_i32);
                 builder.arg(&head_dim_i32);
                 builder.arg(&block_size_i32);
+                builder.arg(&window_i32);
                 push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
 
                 unsafe { builder.launch(cfg) }
@@ -524,6 +539,7 @@ impl PagedAttnOp {
                 builder.arg(&max_blocks_i32);
                 builder.arg(&head_dim_i32);
                 builder.arg(&block_size_i32);
+                builder.arg(&window_i32);
                 push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
 
                 unsafe { builder.launch(cfg) }
@@ -605,6 +621,7 @@ pub fn paged_attention_cuda(
         kv_cache_dtype: KVCacheDtype::Auto,
         k_scale: None,
         v_scale: None,
+        window: 0,
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -615,6 +632,11 @@ pub fn paged_attention_cuda(
 /// KV cache is FP8/INT8 packed; pass per-tensor `k_scale` / `v_scale`
 /// length-1 F32 device tensors (Auto mode ignores them and may pass
 /// `None`).
+///
+/// `window`: sliding-window size in tokens. `Some(w)` restricts attention
+/// to the last `min(seq_len, w)` cached positions — the decode row of a
+/// sliding-window mask (allowed keys `(query_pos - w, query_pos]`).
+/// `None` (or `Some(0)`) keeps full causal attention.
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_cuda_with_kv_dtype(
     q: &Tensor,
@@ -632,6 +654,7 @@ pub fn paged_attention_cuda_with_kv_dtype(
     kv_cache_dtype: KVCacheDtype,
     k_scale: Option<&Tensor>,
     v_scale: Option<&Tensor>,
+    window: Option<usize>,
 ) -> Result<Tensor> {
     let q = q.contiguous()?;
     let num_seqs = q.dim(0)?;
@@ -651,6 +674,7 @@ pub fn paged_attention_cuda_with_kv_dtype(
         kv_cache_dtype,
         k_scale: k_scale.cloned(),
         v_scale: v_scale.cloned(),
+        window: window.unwrap_or(0),
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -738,6 +762,10 @@ struct PagedAttnV2Op {
     kv_cache_dtype: KVCacheDtype,
     k_scale: Option<Tensor>,
     v_scale: Option<Tensor>,
+    /// See [`PagedAttnOp::window`]. Stage-1 partitions are re-based at the
+    /// per-sequence window start; the reduce kernel derives the matching
+    /// partition count from `(seq_len, window)`.
+    window: usize,
 }
 
 impl CustomOp1 for PagedAttnV2Op {
@@ -860,6 +888,7 @@ impl PagedAttnV2Op {
         let block_size_i32 = self.block_size as i32;
         let partition_size_i32 = self.partition_size as i32;
         let max_partitions_i32 = max_num_partitions as i32;
+        let window_i32 = self.window as i32;
 
         match self.kv_cache_dtype {
             KVCacheDtype::Auto => {
@@ -885,6 +914,7 @@ impl PagedAttnV2Op {
                 builder.arg(&block_size_i32);
                 builder.arg(&partition_size_i32);
                 builder.arg(&max_partitions_i32);
+                builder.arg(&window_i32);
                 push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
 
                 unsafe { builder.launch(v2_cfg) }.map_err(|e| {
@@ -916,6 +946,7 @@ impl PagedAttnV2Op {
                 builder.arg(&block_size_i32);
                 builder.arg(&partition_size_i32);
                 builder.arg(&max_partitions_i32);
+                builder.arg(&window_i32);
                 push_scale_args(&mut builder, k_scale_slice, v_scale_slice);
 
                 unsafe { builder.launch(v2_cfg) }.map_err(|e| {
@@ -951,6 +982,7 @@ impl PagedAttnV2Op {
             builder.arg(&head_dim_i32);
             builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
+            builder.arg(&window_i32);
 
             // SAFETY: reduce kernel launch with validated partition outputs
             unsafe { builder.launch(reduce_cfg) }
@@ -1072,6 +1104,7 @@ pub fn paged_attention_v2_cuda_with_partition_size(
         kv_cache_dtype: KVCacheDtype::Auto,
         k_scale: None,
         v_scale: None,
+        window: 0,
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -1082,6 +1115,11 @@ pub fn paged_attention_v2_cuda_with_partition_size(
 /// `kv_cache_dtype = Auto` reproduces the legacy behaviour; quantized
 /// variants require length-1 F32 `k_scale` / `v_scale` device tensors
 /// matching the write-side calibration.
+///
+/// `window`: sliding-window size in tokens (see
+/// [`paged_attention_cuda_with_kv_dtype`]). With a window the per-sequence
+/// token range is the last `min(seq_len, window)` positions, so the
+/// partition grid is sized from `min(max_seq_len, window)`.
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_v2_cuda_with_kv_dtype(
     q: &Tensor,
@@ -1100,13 +1138,20 @@ pub fn paged_attention_v2_cuda_with_kv_dtype(
     kv_cache_dtype: KVCacheDtype,
     k_scale: Option<&Tensor>,
     v_scale: Option<&Tensor>,
+    window: Option<usize>,
 ) -> Result<Tensor> {
     if partition_size == 0 {
         candle_core::bail!("paged_attention_v2: partition_size must be > 0");
     }
     let q = q.contiguous()?;
     let num_seqs = q.dim(0)?;
-    let max_num_partitions = max_seq_len.div_ceil(partition_size);
+    let window = window.unwrap_or(0);
+    let effective_max_seq_len = if window > 0 {
+        max_seq_len.min(window)
+    } else {
+        max_seq_len
+    };
+    let max_num_partitions = effective_max_seq_len.div_ceil(partition_size);
 
     let seq_lens_c = seq_lens.contiguous()?;
     debug_assert_seq_lens_within_bound(&seq_lens_c, max_seq_len)?;
@@ -1128,6 +1173,7 @@ pub fn paged_attention_v2_cuda_with_kv_dtype(
         kv_cache_dtype,
         k_scale: k_scale.cloned(),
         v_scale: v_scale.cloned(),
+        window,
     };
 
     let output = q.apply_op1_no_bwd(&op)?;
@@ -1358,6 +1404,11 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
         let block_size_i32 = self.block_size as i32;
         let partition_size_i32 = self.partition_size as i32;
         let max_partitions_i32 = max_num_partitions as i32;
+        // The pooled/captured path serves full-causal models only; the
+        // sliding-window kernel arg stays disabled (0). Windowed callers
+        // (quantized Gemma 4) run eager via
+        // `paged_attention_auto_with_kv_dtype`.
+        let window_i32: i32 = 0;
 
         {
             let mut builder = v2_func.builder();
@@ -1377,6 +1428,7 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
             builder.arg(&block_size_i32);
             builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
+            builder.arg(&window_i32);
             // Pooled-V2 currently routes Auto KV cache only — push two
             // device nullptrs for `(k_scale_ptr, v_scale_ptr)` so the
             // kernel side falls back to scale=1.0. The kernel signature
@@ -1410,6 +1462,7 @@ impl<'a> PagedAttnV2InplaceOp<'a> {
             builder.arg(&head_dim_i32);
             builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
+            builder.arg(&window_i32);
             unsafe { builder.launch(reduce_cfg) }.map_err(|e| {
                 candle_core::Error::Msg(format!("paged_attention_v2_inplace reduce: {e}"))
             })?;
@@ -1605,6 +1658,7 @@ pub fn paged_attention_v2_cuda_pooled_with_kv_dtype(
             kv_cache_dtype,
             k_scale,
             v_scale,
+            None,
         );
     }
     let _ = (k_scale, v_scale); // Auto path ignores scales by definition.
@@ -1742,6 +1796,7 @@ pub fn paged_attention_auto(
         KVCacheDtype::Auto,
         None,
         None,
+        None,
     )
 }
 
@@ -1750,6 +1805,13 @@ pub fn paged_attention_auto(
 /// when `kv_cache_dtype != Auto`. Per-tensor `k_scale` / `v_scale`
 /// (F32 length-1 device tensors) must be supplied for quantized cache;
 /// pass `None` for `Auto`.
+///
+/// `window`: sliding-window size in tokens — attention is restricted to
+/// the last `min(seq_len, window)` cached positions (the decode row of a
+/// sliding-window mask). `None` keeps full causal attention. The V1/V2
+/// dispatch and the V2 partition size are derived from the *effective*
+/// sequence length `min(max_seq_len, window)` — windowed decode cost is
+/// O(window) regardless of context length.
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_auto_with_kv_dtype(
     q: &Tensor,
@@ -1767,8 +1829,13 @@ pub fn paged_attention_auto_with_kv_dtype(
     kv_cache_dtype: KVCacheDtype,
     k_scale: Option<&Tensor>,
     v_scale: Option<&Tensor>,
+    window: Option<usize>,
 ) -> Result<Tensor> {
-    if max_seq_len > V2_SEQ_LEN_THRESHOLD {
+    let effective_max_seq_len = match window {
+        Some(w) if w > 0 => max_seq_len.min(w),
+        _ => max_seq_len,
+    };
+    if effective_max_seq_len > V2_SEQ_LEN_THRESHOLD {
         paged_attention_v2_cuda_with_kv_dtype(
             q,
             k_cache,
@@ -1782,10 +1849,11 @@ pub fn paged_attention_auto_with_kv_dtype(
             max_seq_len,
             head_dim,
             block_size,
-            select_v2_partition_size(max_seq_len),
+            select_v2_partition_size(effective_max_seq_len),
             kv_cache_dtype,
             k_scale,
             v_scale,
+            window,
         )
     } else {
         paged_attention_cuda_with_kv_dtype(
@@ -1804,6 +1872,7 @@ pub fn paged_attention_auto_with_kv_dtype(
             kv_cache_dtype,
             k_scale,
             v_scale,
+            window,
         )
     }
 }
@@ -2306,6 +2375,8 @@ impl PagedAttnV2AlibiOp {
         };
 
         {
+            // ALiBi models are full-causal — sliding-window stays disabled.
+            let window_i32: i32 = 0;
             let mut builder = reduce_func.builder();
             builder.arg(&output_slice);
             builder.arg(&tmp_out_slice);
@@ -2316,6 +2387,7 @@ impl PagedAttnV2AlibiOp {
             builder.arg(&head_dim_i32);
             builder.arg(&partition_size_i32);
             builder.arg(&max_partitions_i32);
+            builder.arg(&window_i32);
 
             // SAFETY: reduce kernel launch
             unsafe { builder.launch(reduce_cfg) }.map_err(|e| {
@@ -5271,6 +5343,326 @@ mod tests {
         );
     }
 
+    /// Sliding-window decode parity: windowed attention over the FULL cache
+    /// must be bit-identical to full attention over a cache holding ONLY the
+    /// last `window` tokens. Both kernels visit the same key set in the same
+    /// order — the window start only relocates the data, so even the
+    /// floating-point operation sequence matches.
+    ///
+    /// Geometry pinned to Gemma 4 E4B sliding layers (8 q / 2 kv heads,
+    /// head_dim 256, window 512). seq_lens chosen so the window start falls
+    /// mid-block (600 → start 88, offset 8 into block 5) and the V2 grid
+    /// crosses partition boundaries (1100, 4099).
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attention_windowed_matches_truncated_cache() {
+        use crate::kv_cache::quantization::{quantize_fp8, KVCacheDtype};
+
+        let Ok(dev) = Device::new_cuda(0) else { return };
+
+        let num_seqs = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 256usize;
+        let block_size = 16usize;
+        let window = 512usize;
+        let scale = 1.0f32; // Gemma 4: q/k norms carry magnitude
+
+        for &seq_len in &[600usize, 1100, 4099] {
+            assert!(seq_len > window, "test must exercise the windowed path");
+            let start = seq_len - window;
+            let max_blocks = seq_len.div_ceil(block_size);
+            let kv_elems = max_blocks * block_size * num_kv_heads * head_dim;
+
+            let q_f32: Vec<f32> = (0..num_seqs * num_heads * head_dim)
+                .map(|i| (i as f32 * 0.0123).sin() * 0.5)
+                .collect();
+            let k_f32: Vec<f32> = (0..kv_elems)
+                .map(|i| (i as f32 * 0.0271).cos() * 0.5)
+                .collect();
+            let v_f32: Vec<f32> = (0..kv_elems)
+                .map(|i| (i as f32 * 0.0411).sin() * 0.5)
+                .collect();
+
+            // Truncated copies: token rows [start, seq_len) re-laid into
+            // fresh contiguous blocks (cache layout [blk, blk_sz, kv_h, hd]).
+            let row = num_kv_heads * head_dim;
+            let trunc_blocks = window.div_ceil(block_size);
+            let mut k_trunc = vec![0f32; trunc_blocks * block_size * row];
+            let mut v_trunc = vec![0f32; trunc_blocks * block_size * row];
+            for t in 0..window {
+                let src = (start + t) * row;
+                let dst = t * row;
+                k_trunc[dst..dst + row].copy_from_slice(&k_f32[src..src + row]);
+                v_trunc[dst..dst + row].copy_from_slice(&v_f32[src..src + row]);
+            }
+
+            let to_bf16 = |data: Vec<f32>, blocks: usize| {
+                Tensor::from_vec(data, (blocks, block_size, num_kv_heads, head_dim), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+            };
+            let q = Tensor::from_vec(q_f32, (num_seqs, num_heads, head_dim), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let k_full = to_bf16(k_f32, max_blocks);
+            let v_full = to_bf16(v_f32, max_blocks);
+            let k_tr = to_bf16(k_trunc, trunc_blocks);
+            let v_tr = to_bf16(v_trunc, trunc_blocks);
+
+            let bt_full: Vec<u32> = (0..max_blocks as u32).collect();
+            let bt_full = Tensor::from_vec(bt_full, (num_seqs, max_blocks), &dev).unwrap();
+            let sl_full = Tensor::from_vec(vec![seq_len as u32], num_seqs, &dev).unwrap();
+            let bt_tr: Vec<u32> = (0..trunc_blocks as u32).collect();
+            let bt_tr = Tensor::from_vec(bt_tr, (num_seqs, trunc_blocks), &dev).unwrap();
+            let sl_tr = Tensor::from_vec(vec![window as u32], num_seqs, &dev).unwrap();
+
+            let collect = |t: Tensor| -> Vec<f32> {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+
+            // ── V2 (auto routes to V2; partition sizing from the window) ──
+            let windowed = collect(
+                paged_attention_auto_with_kv_dtype(
+                    &q,
+                    &k_full,
+                    &v_full,
+                    &bt_full,
+                    &sl_full,
+                    scale,
+                    num_heads,
+                    num_kv_heads,
+                    max_blocks,
+                    seq_len,
+                    head_dim,
+                    block_size,
+                    KVCacheDtype::Auto,
+                    None,
+                    None,
+                    Some(window),
+                )
+                .unwrap(),
+            );
+            let truncated = collect(
+                paged_attention_auto_with_kv_dtype(
+                    &q,
+                    &k_tr,
+                    &v_tr,
+                    &bt_tr,
+                    &sl_tr,
+                    scale,
+                    num_heads,
+                    num_kv_heads,
+                    trunc_blocks,
+                    window,
+                    head_dim,
+                    block_size,
+                    KVCacheDtype::Auto,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                windowed, truncated,
+                "V2 windowed != truncated at seq_len={seq_len}"
+            );
+
+            // ── V1 (direct call; smem bounded by the window) ──
+            let windowed_v1 = collect(
+                paged_attention_cuda_with_kv_dtype(
+                    &q,
+                    &k_full,
+                    &v_full,
+                    &bt_full,
+                    &sl_full,
+                    scale,
+                    num_heads,
+                    num_kv_heads,
+                    max_blocks,
+                    seq_len,
+                    head_dim,
+                    block_size,
+                    KVCacheDtype::Auto,
+                    None,
+                    None,
+                    Some(window),
+                )
+                .unwrap(),
+            );
+            let truncated_v1 = collect(
+                paged_attention_cuda_with_kv_dtype(
+                    &q,
+                    &k_tr,
+                    &v_tr,
+                    &bt_tr,
+                    &sl_tr,
+                    scale,
+                    num_heads,
+                    num_kv_heads,
+                    trunc_blocks,
+                    window,
+                    head_dim,
+                    block_size,
+                    KVCacheDtype::Auto,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                windowed_v1, truncated_v1,
+                "V1 windowed != truncated at seq_len={seq_len}"
+            );
+
+            // ── fp8 KV (inline dequant; same per-token bytes both ways) ──
+            let one = Tensor::from_vec(vec![1.0f32], 1, &dev).unwrap();
+            let k_q = quantize_fp8(&k_full, &one).unwrap();
+            let v_q = quantize_fp8(&v_full, &one).unwrap();
+            let k_tr_q = quantize_fp8(&k_tr, &one).unwrap();
+            let v_tr_q = quantize_fp8(&v_tr, &one).unwrap();
+            let windowed_fp8 = collect(
+                paged_attention_auto_with_kv_dtype(
+                    &q,
+                    &k_q,
+                    &v_q,
+                    &bt_full,
+                    &sl_full,
+                    scale,
+                    num_heads,
+                    num_kv_heads,
+                    max_blocks,
+                    seq_len,
+                    head_dim,
+                    block_size,
+                    KVCacheDtype::Fp8E4m3,
+                    Some(&one),
+                    Some(&one),
+                    Some(window),
+                )
+                .unwrap(),
+            );
+            let truncated_fp8 = collect(
+                paged_attention_auto_with_kv_dtype(
+                    &q,
+                    &k_tr_q,
+                    &v_tr_q,
+                    &bt_tr,
+                    &sl_tr,
+                    scale,
+                    num_heads,
+                    num_kv_heads,
+                    trunc_blocks,
+                    window,
+                    head_dim,
+                    block_size,
+                    KVCacheDtype::Fp8E4m3,
+                    Some(&one),
+                    Some(&one),
+                    None,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                windowed_fp8, truncated_fp8,
+                "fp8 windowed != truncated at seq_len={seq_len}"
+            );
+        }
+    }
+
+    /// `window >= seq_len` (including window == seq_len exactly) must be a
+    /// no-op: identical to the unwindowed kernel on the same cache.
+    #[cfg(feature = "cuda-kernels")]
+    #[test]
+    fn test_paged_attention_window_geq_seq_len_is_noop() {
+        let Ok(dev) = Device::new_cuda(0) else { return };
+
+        let num_seqs = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 256usize;
+        let block_size = 16usize;
+        let seq_len = 300usize;
+        let max_blocks = seq_len.div_ceil(block_size);
+        let kv_elems = max_blocks * block_size * num_kv_heads * head_dim;
+
+        let q = Tensor::from_vec(
+            (0..num_seqs * num_heads * head_dim)
+                .map(|i| (i as f32 * 0.0123).sin() * 0.5)
+                .collect::<Vec<f32>>(),
+            (num_seqs, num_heads, head_dim),
+            &dev,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let mk = |f: fn(f32) -> f32, m: f32| {
+            Tensor::from_vec(
+                (0..kv_elems)
+                    .map(|i| f(i as f32 * m) * 0.5)
+                    .collect::<Vec<f32>>(),
+                (max_blocks, block_size, num_kv_heads, head_dim),
+                &dev,
+            )
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+        };
+        let k_cache = mk(f32::cos, 0.0271);
+        let v_cache = mk(f32::sin, 0.0411);
+        let bt: Vec<u32> = (0..max_blocks as u32).collect();
+        let bt = Tensor::from_vec(bt, (num_seqs, max_blocks), &dev).unwrap();
+        let sl = Tensor::from_vec(vec![seq_len as u32], num_seqs, &dev).unwrap();
+
+        let run = |window: Option<usize>| -> Vec<f32> {
+            paged_attention_auto_with_kv_dtype(
+                &q,
+                &k_cache,
+                &v_cache,
+                &bt,
+                &sl,
+                1.0,
+                num_heads,
+                num_kv_heads,
+                max_blocks,
+                seq_len,
+                head_dim,
+                block_size,
+                KVCacheDtype::Auto,
+                None,
+                None,
+                window,
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+        };
+
+        assert_eq!(
+            run(Some(seq_len)),
+            run(None),
+            "window == seq_len must be a no-op"
+        );
+        assert_eq!(
+            run(Some(4096)),
+            run(None),
+            "window > seq_len must be a no-op"
+        );
+    }
+
     // ─── Boundary parity matrix for V1 ↔ V2 (Step 2 of Phase 2 hardening) ───
     //
     // These tests exercise paths that the existing parity tests do not cover:
@@ -5744,6 +6136,7 @@ mod tests {
             kv_cache_dtype,
             Some(&k_scale_t),
             Some(&v_scale_t),
+            None,
         )
         .unwrap()
         .to_dtype(DType::F32)

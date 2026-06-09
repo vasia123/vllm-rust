@@ -195,6 +195,7 @@ __device__ void paged_attention_v1_impl(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int window,                          // sliding window; 0 = full causal
     const float* __restrict__ alibi_slopes,    // [num_heads] or nullptr
     const float* __restrict__ k_scale_ptr,     // [1] or nullptr (1.0 default)
     const float* __restrict__ v_scale_ptr      // [1] or nullptr (1.0 default)
@@ -209,6 +210,15 @@ __device__ void paged_attention_v1_impl(
 
     const int seq_len = seq_lens[seq_idx];
     if (seq_len == 0) return;
+
+    // Sliding window: the query (position seq_len-1) attends only to the
+    // last `window` keys — positions (query_pos - window, query_pos], i.e.
+    // [seq_len - window, seq_len). Matches the Rust-side decode
+    // `sliding_window_mask` exactly. All cached positions are causal at
+    // decode, so a start offset replaces masking. Logits are indexed
+    // relative to `start_token`, bounding shared memory by the window.
+    const int start_token = (window > 0 && seq_len > window) ? (seq_len - window) : 0;
+    const int eff_len = seq_len - start_token;
 
     // ALiBi slope for this head (0 if not using ALiBi)
     const float alibi_slope = (alibi_slopes != nullptr) ? alibi_slopes[head_idx] : 0.0f;
@@ -240,16 +250,20 @@ __device__ void paged_attention_v1_impl(
 
     // ---- Phase 1: Compute QK dot products ----
     const int num_blocks_used = (seq_len + block_size - 1) / block_size;
+    const int start_block_idx = start_token / block_size;
     float qk_max = -FLT_MAX;
 
     // The query position is the last position: seq_len - 1 (decode produces 1 token).
     const int query_pos = seq_len - 1;
 
-    for (int block_idx = 0; block_idx < num_blocks_used; block_idx++) {
+    for (int block_idx = start_block_idx; block_idx < num_blocks_used; block_idx++) {
         const int physical_block = block_tables[seq_idx * max_blocks_per_seq + block_idx];
-        const int tokens_in_block = min(block_size, seq_len - block_idx * block_size);
+        const int block_start_token = block_idx * block_size;
+        const int token_lo = max(block_start_token, start_token);
+        const int token_hi = min(block_start_token + block_size, seq_len);
 
-        for (int token = 0; token < tokens_in_block; token++) {
+        for (int abs_token = token_lo; abs_token < token_hi; abs_token++) {
+            const int token = abs_token - block_start_token;
             // Partial dot product across head dimensions
             float qk = 0.0f;
             for (int d = tid; d < head_dim; d += NUM_THREADS) {
@@ -266,11 +280,10 @@ __device__ void paged_attention_v1_impl(
 
             // Thread 0 stores the scaled logit (with optional ALiBi bias)
             if (tid == 0) {
-                const int token_pos = block_idx * block_size + token;
                 float scaled_qk = qk * scale;
                 // ALiBi bias: slope * (key_position - query_position)
-                scaled_qk += alibi_slope * (float)(token_pos - query_pos);
-                logits[token_pos] = scaled_qk;
+                scaled_qk += alibi_slope * (float)(abs_token - query_pos);
+                logits[abs_token - start_token] = scaled_qk;
                 qk_max = fmaxf(qk_max, scaled_qk);
             }
             __syncthreads();
@@ -286,7 +299,7 @@ __device__ void paged_attention_v1_impl(
 
     // ---- Phase 2: Softmax ----
     float exp_sum = 0.0f;
-    for (int i = tid; i < seq_len; i += NUM_THREADS) {
+    for (int i = tid; i < eff_len; i += NUM_THREADS) {
         const float val = __expf(logits[i] - qk_max);
         logits[i] = val;
         exp_sum += val;
@@ -296,7 +309,7 @@ __device__ void paged_attention_v1_impl(
     exp_sum = block_reduce_sum(exp_sum, reduce_smem);
 
     const float inv_sum = __fdividef(1.0f, exp_sum + 1e-6f);
-    for (int i = tid; i < seq_len; i += NUM_THREADS) {
+    for (int i = tid; i < eff_len; i += NUM_THREADS) {
         logits[i] *= inv_sum;
     }
     __syncthreads();
@@ -306,17 +319,20 @@ __device__ void paged_attention_v1_impl(
     for (int d = tid; d < head_dim; d += NUM_THREADS) {
         float acc = 0.0f;
 
-        for (int block_idx = 0; block_idx < num_blocks_used; block_idx++) {
+        for (int block_idx = start_block_idx; block_idx < num_blocks_used; block_idx++) {
             const int physical_block = block_tables[seq_idx * max_blocks_per_seq + block_idx];
-            const int tokens_in_block = min(block_size, seq_len - block_idx * block_size);
+            const int block_start_token = block_idx * block_size;
+            const int token_lo = max(block_start_token, start_token);
+            const int token_hi = min(block_start_token + block_size, seq_len);
 
-            for (int token = 0; token < tokens_in_block; token++) {
+            for (int abs_token = token_lo; abs_token < token_hi; abs_token++) {
+                const int token = abs_token - block_start_token;
                 const int v_offset = physical_block * cache_stride_block
                                    + token * cache_stride_token
                                    + kv_head_idx * head_dim
                                    + d;
                 const float v_val = load_kv_to_f32<Cache_t>(v_cache[v_offset], v_scale);
-                const float weight = logits[block_idx * block_size + token];
+                const float weight = logits[abs_token - start_token];
                 acc += weight * v_val;
             }
         }
@@ -351,13 +367,14 @@ extern "C" __global__ void paged_attention_v1_bf16(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int window,
     const float* __restrict__ k_scale_ptr,
     const float* __restrict__ v_scale_ptr
 ) {
     paged_attention_v1_impl<__nv_bfloat16, __nv_bfloat16>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size,
+        head_dim, block_size, window,
         /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
@@ -382,7 +399,7 @@ extern "C" __global__ void paged_attention_v1_bf16_alibi(
     paged_attention_v1_impl<__nv_bfloat16, __nv_bfloat16>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size,
+        head_dim, block_size, /*window*/ 0,
         alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
@@ -400,13 +417,14 @@ extern "C" __global__ void paged_attention_v1_f16(
     const int max_blocks_per_seq,
     const int head_dim,
     const int block_size,
+    const int window,
     const float* __restrict__ k_scale_ptr,
     const float* __restrict__ v_scale_ptr
 ) {
     paged_attention_v1_impl<__half, __half>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size,
+        head_dim, block_size, window,
         /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
@@ -431,7 +449,7 @@ extern "C" __global__ void paged_attention_v1_f16_alibi(
     paged_attention_v1_impl<__half, __half>(
         out, q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size,
+        head_dim, block_size, /*window*/ 0,
         alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
@@ -458,13 +476,14 @@ extern "C" __global__ void paged_attention_v1_##QSUFFIX##_##KVSUFFIX( \
     const int max_blocks_per_seq, \
     const int head_dim, \
     const int block_size, \
+    const int window, \
     const float* __restrict__ k_scale_ptr, \
     const float* __restrict__ v_scale_ptr \
 ) { \
     paged_attention_v1_impl<QTYPE, KVMARKER>( \
         out, q, k_cache, v_cache, block_tables, seq_lens, \
         scale, num_heads, num_kv_heads, max_blocks_per_seq, \
-        head_dim, block_size, \
+        head_dim, block_size, window, \
         /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr \
     ); \
 }
@@ -490,7 +509,7 @@ extern "C" __global__ void paged_attention_v1_##QSUFFIX##_##KVSUFFIX##_alibi( \
     paged_attention_v1_impl<QTYPE, KVMARKER>( \
         out, q, k_cache, v_cache, block_tables, seq_lens, \
         scale, num_heads, num_kv_heads, max_blocks_per_seq, \
-        head_dim, block_size, \
+        head_dim, block_size, /*window*/ 0, \
         alibi_slopes, k_scale_ptr, v_scale_ptr \
     ); \
 }
@@ -554,6 +573,7 @@ __device__ void paged_attention_v2_impl(
     const int block_size,
     const int partition_size,
     const int max_num_partitions,
+    const int window,                          // sliding window; 0 = full causal
     const float* __restrict__ alibi_slopes,    // [num_heads] or nullptr
     const float* __restrict__ k_scale_ptr,     // [1] or nullptr (1.0 default)
     const float* __restrict__ v_scale_ptr      // [1] or nullptr (1.0 default)
@@ -566,8 +586,15 @@ __device__ void paged_attention_v2_impl(
     const int seq_len = seq_lens[seq_idx];
     if (seq_len == 0) return;
 
-    // Partition boundaries in token space
-    const int partition_start_token = partition_idx * partition_size;
+    // Sliding window: attend only to the last `window` keys — positions
+    // [seq_len - window, seq_len). Partitions are re-based at the window
+    // start so per-sequence partition count is ⌈min(seq_len, window) /
+    // partition_size⌉; the reduce kernel derives the same count from
+    // (seq_len, window). See `paged_attention_v1_impl` for semantics.
+    const int start_token = (window > 0 && seq_len > window) ? (seq_len - window) : 0;
+
+    // Partition boundaries in token space (re-based at start_token)
+    const int partition_start_token = start_token + partition_idx * partition_size;
     if (partition_start_token >= seq_len) return;  // No work for this partition
     const int partition_end_token = min(partition_start_token + partition_size, seq_len);
     const int partition_num_tokens = partition_end_token - partition_start_token;
@@ -794,7 +821,8 @@ __device__ void paged_attention_v2_reduce_impl(
     const int num_heads,
     const int head_dim,
     const int partition_size,
-    const int max_num_partitions
+    const int max_num_partitions,
+    const int window                        // sliding window; 0 = full causal
 ) {
     const int head_idx = blockIdx.x;
     const int seq_idx = blockIdx.y;
@@ -803,7 +831,10 @@ __device__ void paged_attention_v2_reduce_impl(
     const int seq_len = seq_lens[seq_idx];
     if (seq_len == 0) return;
 
-    const int num_partitions = (seq_len + partition_size - 1) / partition_size;
+    // Must mirror the Stage-1 re-based partitioning: with a window the
+    // per-sequence token range is the last min(seq_len, window) tokens.
+    const int eff_len = (window > 0 && seq_len > window) ? window : seq_len;
+    const int num_partitions = (eff_len + partition_size - 1) / partition_size;
 
     // Fast path: single partition → just copy (convert f32 → output dtype)
     if (num_partitions == 1) {
@@ -932,11 +963,12 @@ extern "C" __global__ void paged_attention_v2_reduce_bf16(
     const int num_heads,
     const int head_dim,
     const int partition_size,
-    const int max_num_partitions
+    const int max_num_partitions,
+    const int window
 ) {
     paged_attention_v2_reduce_impl<__nv_bfloat16>(
         out, tmp_out, exp_sums, max_logits, seq_lens,
-        num_heads, head_dim, partition_size, max_num_partitions
+        num_heads, head_dim, partition_size, max_num_partitions, window
     );
 }
 
@@ -950,11 +982,12 @@ extern "C" __global__ void paged_attention_v2_reduce_f16(
     const int num_heads,
     const int head_dim,
     const int partition_size,
-    const int max_num_partitions
+    const int max_num_partitions,
+    const int window
 ) {
     paged_attention_v2_reduce_impl<__half>(
         out, tmp_out, exp_sums, max_logits, seq_lens,
-        num_heads, head_dim, partition_size, max_num_partitions
+        num_heads, head_dim, partition_size, max_num_partitions, window
     );
 }
 
@@ -981,6 +1014,7 @@ extern "C" __global__ void paged_attention_v2_bf16(
     const int block_size,
     const int partition_size,
     const int max_num_partitions,
+    const int window,
     const float* __restrict__ k_scale_ptr,
     const float* __restrict__ v_scale_ptr
 ) {
@@ -988,7 +1022,7 @@ extern "C" __global__ void paged_attention_v2_bf16(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, partition_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions, window,
         /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
@@ -1018,7 +1052,7 @@ extern "C" __global__ void paged_attention_v2_bf16_alibi(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, partition_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions, /*window*/ 0,
         alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
@@ -1040,6 +1074,7 @@ extern "C" __global__ void paged_attention_v2_f16(
     const int block_size,
     const int partition_size,
     const int max_num_partitions,
+    const int window,
     const float* __restrict__ k_scale_ptr,
     const float* __restrict__ v_scale_ptr
 ) {
@@ -1047,7 +1082,7 @@ extern "C" __global__ void paged_attention_v2_f16(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, partition_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions, window,
         /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr
     );
 }
@@ -1077,7 +1112,7 @@ extern "C" __global__ void paged_attention_v2_f16_alibi(
         tmp_out, exp_sums, max_logits,
         q, k_cache, v_cache, block_tables, seq_lens,
         scale, num_heads, num_kv_heads, max_blocks_per_seq,
-        head_dim, block_size, partition_size, max_num_partitions,
+        head_dim, block_size, partition_size, max_num_partitions, /*window*/ 0,
         alibi_slopes, k_scale_ptr, v_scale_ptr
     );
 }
@@ -1101,6 +1136,7 @@ extern "C" __global__ void paged_attention_v2_##QSUFFIX##_##KVSUFFIX( \
     const int block_size, \
     const int partition_size, \
     const int max_num_partitions, \
+    const int window, \
     const float* __restrict__ k_scale_ptr, \
     const float* __restrict__ v_scale_ptr \
 ) { \
@@ -1108,7 +1144,7 @@ extern "C" __global__ void paged_attention_v2_##QSUFFIX##_##KVSUFFIX( \
         tmp_out, exp_sums, max_logits, \
         q, k_cache, v_cache, block_tables, seq_lens, \
         scale, num_heads, num_kv_heads, max_blocks_per_seq, \
-        head_dim, block_size, partition_size, max_num_partitions, \
+        head_dim, block_size, partition_size, max_num_partitions, window, \
         /*alibi*/ nullptr, k_scale_ptr, v_scale_ptr \
     ); \
 }
@@ -1139,7 +1175,7 @@ extern "C" __global__ void paged_attention_v2_##QSUFFIX##_##KVSUFFIX##_alibi( \
         tmp_out, exp_sums, max_logits, \
         q, k_cache, v_cache, block_tables, seq_lens, \
         scale, num_heads, num_kv_heads, max_blocks_per_seq, \
-        head_dim, block_size, partition_size, max_num_partitions, \
+        head_dim, block_size, partition_size, max_num_partitions, /*window*/ 0, \
         alibi_slopes, k_scale_ptr, v_scale_ptr \
     ); \
 }

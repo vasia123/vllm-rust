@@ -1246,12 +1246,12 @@ impl QuantizedGemma4Attention {
     ///
     /// - non-CUDA → no (kernel is CUDA-only).
     /// - attn soft-cap present → no (the kernel has no soft-cap hook).
-    /// - sliding-window layer → only while every sequence stays within the
-    ///   window: paged V2 has no window masking, but when no token is beyond
-    ///   the window the masked and unmasked results are bit-identical. Full
-    ///   layers (no window) always qualify.
+    /// - sliding-window layers always qualify: the kernel takes the window
+    ///   as a parameter and attends only to the last `window` cached
+    ///   positions — same key set as the naive `sliding_window_mask` decode
+    ///   row, at O(window) cost regardless of context length.
     #[cfg(feature = "cuda-kernels")]
-    fn can_use_paged_decode(&self, xs: &Tensor, sequences: &[DecodeSequenceMetadata]) -> bool {
+    fn can_use_paged_decode(&self, xs: &Tensor, _sequences: &[DecodeSequenceMetadata]) -> bool {
         if !xs.device().is_cuda() {
             return false;
         }
@@ -1266,16 +1266,6 @@ impl QuantizedGemma4Attention {
         }
         if self.attn_logit_softcap.is_some() {
             return false;
-        }
-        if let Some(window) = self.sliding_window {
-            let max_kv_len = sequences
-                .iter()
-                .map(|s| s.seqlen_offset + 1)
-                .max()
-                .unwrap_or(0);
-            if max_kv_len > window {
-                return false;
-            }
         }
         true
     }
@@ -1380,6 +1370,9 @@ impl QuantizedGemma4Attention {
         let kv_cache_dtype = cache_engine.kv_cache_dtype();
         let k_scale = cache_engine.k_scale();
         let v_scale = cache_engine.v_scale();
+        // Sliding layers pass their window: the kernel attends only to the
+        // last `window` cached positions, keeping decode O(window) at any
+        // context length. Full layers pass None (full causal).
         let attn_output = crate::cuda_kernels::paged_attention_auto_with_kv_dtype(
             &q,
             cache_engine.k_cache(),
@@ -1396,6 +1389,7 @@ impl QuantizedGemma4Attention {
             kv_cache_dtype,
             k_scale,
             v_scale,
+            self.sliding_window,
         )?;
         // [batch, num_heads*head_dim] → o_proj → [batch, hidden] → [batch, 1, hidden]
         self.o_proj.forward(&attn_output)?.unsqueeze(1)

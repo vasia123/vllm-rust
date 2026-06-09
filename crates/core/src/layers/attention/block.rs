@@ -1341,6 +1341,7 @@ impl AttentionBlock {
                 kv_cache_dtype,
                 k_scale,
                 v_scale,
+                None,
             )?
         };
 
