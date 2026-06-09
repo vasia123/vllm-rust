@@ -796,19 +796,34 @@ impl GgufWeightLoader {
             extra.insert("layer_types".into(), Value::Array(layer_types));
         }
 
-        // Per-attention-type RoPE bases (full vs sliding/local).
-        let full = self.meta_f64(&format!("{arch}.rope.freq_base"));
-        let swa = self.meta_f64(&format!("{arch}.rope.freq_base_swa"));
-        if full.is_some() || swa.is_some() {
-            let mut rope = serde_json::Map::new();
-            if let Some(f) = full {
-                rope.insert("full_attention".into(), json!({ "rope_theta": f }));
-            }
-            if let Some(s) = swa {
-                rope.insert("sliding_attention".into(), json!({ "rope_theta": s }));
-            }
-            extra.insert("rope_parameters".into(), Value::Object(rope));
-        }
+        // Per-attention-type RoPE. Full-attention layers use a PARTIAL,
+        // "proportional" rotary (Gemma 4 architectural constants:
+        // partial_rotary_factor 0.25, rope_type "proportional"); sliding
+        // layers use the default full rotary. The GGUF header carries only
+        // the freq bases (freq_base / freq_base_swa), NOT the partial
+        // factor or rope type, so those are supplied from the known Gemma 4
+        // spec — without them the full layers rotate the wrong number of
+        // dims and decode is incoherent.
+        let full = self
+            .meta_f64(&format!("{arch}.rope.freq_base"))
+            .unwrap_or(1_000_000.0);
+        let swa = self
+            .meta_f64(&format!("{arch}.rope.freq_base_swa"))
+            .unwrap_or(10_000.0);
+        let mut rope = serde_json::Map::new();
+        rope.insert(
+            "full_attention".into(),
+            json!({
+                "rope_theta": full,
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+            }),
+        );
+        rope.insert(
+            "sliding_attention".into(),
+            json!({ "rope_theta": swa, "rope_type": "default" }),
+        );
+        extra.insert("rope_parameters".into(), Value::Object(rope));
 
         let sliding_window = self
             .meta_u64(&format!("{arch}.attention.sliding_window"))

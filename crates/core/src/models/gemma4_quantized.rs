@@ -2054,6 +2054,11 @@ impl QuantizedGemma4ForCausalLM {
         input_ids: &Tensor,
         hidden_states: &Tensor,
     ) -> Result<Option<Tensor>> {
+        // Diagnostic bisect: VLLM_GEMMA_DISABLE_PLE=1 skips the entire PLE
+        // contribution so the base transformer can be validated in isolation.
+        if std::env::var("VLLM_GEMMA_DISABLE_PLE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            return Ok(None);
+        }
         let (embed_pl, proj, norm) = match (
             &self.embed_tokens_per_layer,
             &self.per_layer_model_projection,
