@@ -744,6 +744,34 @@ impl GgufWeightLoader {
             );
         }
 
+        // Embedded chat template + the bos/eos token STRINGS, so the server
+        // can render `/v1/chat/completions` without an external
+        // `tokenizer_config.json`. The server uses this only as the
+        // last-resort source (it prefers `--chat-template` / sibling files);
+        // the strings feed `{{ bos_token }}` / `{{ eos_token }}` in the
+        // template.
+        if let Some(tmpl) = self.meta_str("tokenizer.chat_template") {
+            extra.insert("chat_template".to_string(), serde_json::json!(tmpl));
+        }
+        if let Some(tokens) = self
+            .content
+            .metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.to_vec().ok())
+        {
+            let tok_str = |id: Option<u64>| -> Option<String> {
+                id.and_then(|i| tokens.get(i as usize))
+                    .and_then(|v| v.to_string().ok())
+                    .cloned()
+            };
+            if let Some(s) = tok_str(self.meta_u64("tokenizer.ggml.bos_token_id")) {
+                extra.insert("bos_token".to_string(), serde_json::json!(s));
+            }
+            if let Some(s) = tok_str(self.meta_u64("tokenizer.ggml.eos_token_id")) {
+                extra.insert("eos_token".to_string(), serde_json::json!(s));
+            }
+        }
+
         Ok(crate::config::ModelConfig {
             architectures,
             hidden_size,

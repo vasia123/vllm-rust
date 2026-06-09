@@ -1549,11 +1549,22 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         }
         gguf_vb = Some(vb);
         gguf_loader = Some(gloader);
+        // A sibling `tokenizer_config.json` (next to the .gguf or the
+        // resolved tokenizer.json) carries the chat template + special-token
+        // strings for `/v1/chat/completions`. GGUF can also embed the
+        // template (used as a last-resort fallback in the resolver below);
+        // this lets a dropped-in file work too.
+        let tokenizer_config = [
+            path.with_file_name("tokenizer_config.json"),
+            tokenizer.with_file_name("tokenizer_config.json"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file());
         loader::ModelFiles {
             config: cfg,
             weights: vec![path.clone()],
             tokenizer,
-            tokenizer_config: None,
+            tokenizer_config,
             quantization: quant,
         }
     } else {
@@ -1925,18 +1936,43 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     let tokenizer = TokenizerWrapper::from_file(&tokenizer_path)?;
     let tokenizer = Arc::new(tokenizer);
 
-    // Resolve chat template: CLI override > tokenizer_config auto-detect
+    // Special-token strings for `{{ bos_token }}` / `{{ eos_token }}` in a
+    // raw or embedded template. GGUF surfaces them via `ModelConfig.extra`
+    // (see `build_model_config`); fall back to the Gemma-style defaults.
+    let cfg_token = |key: &str, default: &str| -> String {
+        files
+            .config
+            .extra
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    // Resolve chat template, in priority order:
+    //   1. `--chat-template <file>`  (raw Jinja OR tokenizer_config.json)
+    //   2. sibling tokenizer_config.json (`files.tokenizer_config`)
+    //   3. sibling chat_template.jinja
+    //   4. template embedded in GGUF metadata (best-effort last resort)
     let chat_template = if let Some(ref template_path) = chat_template_override {
         let path = std::path::Path::new(template_path);
-        Some(Arc::new(
-            ChatTemplateEngine::from_tokenizer_config(path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to load chat template from '{}': {}",
-                    template_path,
-                    e
+        // The flag's help promises a "Jinja template file path", so accept a
+        // raw `.jinja` as well as a `tokenizer_config.json`: try the JSON
+        // form first, then fall back to reading the file as a raw template.
+        let engine = match ChatTemplateEngine::from_tokenizer_config(path) {
+            Ok(engine) => engine,
+            Err(_) => {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read chat template '{}': {}", template_path, e)
+                })?;
+                ChatTemplateEngine::new(
+                    raw,
+                    cfg_token("bos_token", "<bos>"),
+                    cfg_token("eos_token", "<eos>"),
                 )
-            })?,
-        ))
+            }
+        };
+        Some(Arc::new(engine))
     } else {
         files
             .tokenizer_config
@@ -1969,6 +2005,24 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                     template,
                     token_str("bos_token"),
                     token_str("eos_token"),
+                ))
+            })
+            .or_else(|| {
+                // Last resort: the template embedded in the GGUF metadata
+                // (surfaced via `ModelConfig.extra["chat_template"]`). Some
+                // GGUF templates are non-standard, so this is best-effort —
+                // a broken render surfaces at the chat endpoint, and the user
+                // can override with `--chat-template`.
+                let tmpl = files
+                    .config
+                    .extra
+                    .get("chat_template")?
+                    .as_str()?
+                    .to_string();
+                Some(ChatTemplateEngine::new(
+                    tmpl,
+                    cfg_token("bos_token", "<bos>"),
+                    cfg_token("eos_token", "<eos>"),
                 ))
             })
             .map(Arc::new)
