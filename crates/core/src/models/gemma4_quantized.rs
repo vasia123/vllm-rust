@@ -1098,7 +1098,35 @@ impl QuantizedGemma4Attention {
             attn_output
                 .transpose(1, 2)?
                 .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&attn_output)
+        let out = self.o_proj.forward(&attn_output)?;
+        if self.head_dim == 512
+            && std::env::var("VLLM_GEMMA_DEBUG_NORMS").is_ok_and(|v| v != "0" && !v.is_empty())
+        {
+            let rms = |t: &Tensor| -> f32 {
+                t.to_dtype(DType::F32)
+                    .and_then(|x| x.sqr())
+                    .and_then(|x| x.mean_all())
+                    .and_then(|x| x.sqrt())
+                    .and_then(|x| x.to_scalar::<f32>())
+                    .unwrap_or(f32::NAN)
+            };
+            let amax = |t: &Tensor| -> f32 {
+                t.to_dtype(DType::F32)
+                    .and_then(|x| x.abs())
+                    .and_then(|x| x.max_all())
+                    .and_then(|x| x.to_scalar::<f32>())
+                    .unwrap_or(f32::NAN)
+            };
+            eprintln!(
+                "[GATTN full] q_rms={:.3} k_rms={:.3} attnW_absmax={:.3} attn_out_rms={:.3} o_proj_rms={:.3}",
+                rms(q),
+                rms(&k_full),
+                amax(&attn_weights),
+                rms(&attn_output),
+                rms(&out)
+            );
+        }
+        Ok(out)
     }
 
     fn forward_decode_batch(
