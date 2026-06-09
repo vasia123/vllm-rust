@@ -1098,35 +1098,7 @@ impl QuantizedGemma4Attention {
             attn_output
                 .transpose(1, 2)?
                 .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-        let out = self.o_proj.forward(&attn_output)?;
-        if self.head_dim == 512
-            && std::env::var("VLLM_GEMMA_DEBUG_NORMS").is_ok_and(|v| v != "0" && !v.is_empty())
-        {
-            let rms = |t: &Tensor| -> f32 {
-                t.to_dtype(DType::F32)
-                    .and_then(|x| x.sqr())
-                    .and_then(|x| x.mean_all())
-                    .and_then(|x| x.sqrt())
-                    .and_then(|x| x.to_scalar::<f32>())
-                    .unwrap_or(f32::NAN)
-            };
-            let amax = |t: &Tensor| -> f32 {
-                t.to_dtype(DType::F32)
-                    .and_then(|x| x.abs())
-                    .and_then(|x| x.max_all())
-                    .and_then(|x| x.to_scalar::<f32>())
-                    .unwrap_or(f32::NAN)
-            };
-            eprintln!(
-                "[GATTN full] q_rms={:.3} k_rms={:.3} attnW_absmax={:.3} attn_out_rms={:.3} o_proj_rms={:.3}",
-                rms(q),
-                rms(&k_full),
-                amax(&attn_weights),
-                rms(&attn_output),
-                rms(&out)
-            );
-        }
-        Ok(out)
+        self.o_proj.forward(&attn_output)
     }
 
     fn forward_decode_batch(
@@ -1661,15 +1633,8 @@ impl QuantizedGemma4DecoderLayer {
         })
     }
 
-    /// Apply the per-layer output scale. Diagnostic gate
-    /// VLLM_GEMMA_DISABLE_LAYER_SCALAR=1 skips it (identity) to bisect
-    /// whether scaling the cumulative residual by `layer_scalar` each layer
-    /// is the E4B garbage cause.
+    /// Apply the learned per-layer output scale (`layer_scalar`).
     fn apply_layer_scalar(&self, hidden_states: Tensor) -> Result<Tensor> {
-        if std::env::var("VLLM_GEMMA_DISABLE_LAYER_SCALAR").is_ok_and(|v| v != "0" && !v.is_empty())
-        {
-            return Ok(hidden_states);
-        }
         hidden_states.broadcast_mul(&self.layer_scalar)
     }
 
@@ -2094,11 +2059,6 @@ impl QuantizedGemma4ForCausalLM {
         input_ids: &Tensor,
         hidden_states: &Tensor,
     ) -> Result<Option<Tensor>> {
-        // Diagnostic bisect: VLLM_GEMMA_DISABLE_PLE=1 skips the entire PLE
-        // contribution so the base transformer can be validated in isolation.
-        if std::env::var("VLLM_GEMMA_DISABLE_PLE").is_ok_and(|v| v != "0" && !v.is_empty()) {
-            return Ok(None);
-        }
         let (embed_pl, proj, norm) = match (
             &self.embed_tokens_per_layer,
             &self.per_layer_model_projection,
@@ -2171,25 +2131,7 @@ impl QuantizedGemma4ForCausalLM {
         let normalizer = (self.hidden_size as f64).sqrt();
         let xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
 
-        let dbg = std::env::var("VLLM_GEMMA_DEBUG_NORMS").is_ok_and(|v| v != "0" && !v.is_empty());
-        let rms = |t: &Tensor| -> f32 {
-            t.to_dtype(DType::F32)
-                .and_then(|x| x.sqr())
-                .and_then(|x| x.mean_all())
-                .and_then(|x| x.sqrt())
-                .and_then(|x| x.to_scalar::<f32>())
-                .unwrap_or(f32::NAN)
-        };
-        if dbg {
-            eprintln!("[GNORM] after embed*norm: rms={:.4}", rms(&xs));
-        }
-
         let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
-        if dbg {
-            if let Some(p) = per_layer_inputs.as_ref() {
-                eprintln!("[GNORM] per_layer_inputs: rms={:.4}", rms(p));
-            }
-        }
 
         // Bucket the prefill length so candle's per-shape CUDA buffer cache
         // sees a bounded set of activation shapes (see PREFILL_LEN_BUCKET).
@@ -2228,9 +2170,6 @@ impl QuantizedGemma4ForCausalLM {
                 block_table,
                 slot_mapping,
             )?;
-            if dbg && (layer_idx == 0 || layer_idx == 5 || layer_idx + 1 == self.layers.len()) {
-                eprintln!("[GNORM] after layer {layer_idx}: rms={:.4}", rms(&xs));
-            }
         }
 
         // Only the final position's logits are consumed downstream (the
@@ -2247,20 +2186,7 @@ impl QuantizedGemma4ForCausalLM {
             xs
         };
         let xs = self.norm.forward(&xs)?;
-        if dbg {
-            eprintln!("[GNORM] after final norm: rms={:.4}", rms(&xs));
-        }
         let mut logits = self.lm_head.forward(&xs)?;
-        if dbg {
-            let amax = logits
-                .to_dtype(DType::F32)
-                .and_then(|l| l.argmax(candle_core::D::Minus1))
-                .and_then(|l| l.flatten_all())
-                .and_then(|l| l.to_vec1::<u32>())
-                .map(|v| v.first().copied().unwrap_or(0))
-                .unwrap_or(0);
-            eprintln!("[GNORM] logits argmax_token={amax}");
-        }
 
         if let Some(cap) = self.final_logit_softcap {
             logits = soft_cap(&logits, cap)?;

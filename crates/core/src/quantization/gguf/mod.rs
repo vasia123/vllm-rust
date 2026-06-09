@@ -960,9 +960,15 @@ fn to_llama_cpp_prefixes(prefix: &str) -> Vec<String> {
         // critical.
         "layer_scalar" => vec!["layer_output_scale"],
         "input_layernorm" => vec!["attn_norm"],
-        // Llama/Mistral: post-attention IS the pre-FFN norm → `ffn_norm`.
-        // Gemma/Gemma2/Gemma3: separate `post_attention_norm` tensor.
-        "post_attention_layernorm" => vec!["ffn_norm", "post_attention_norm"],
+        // Gemma/Gemma2/Gemma3/Gemma4 ship a SEPARATE `post_attention_norm`
+        // (the pre-FFN norm is `ffn_norm`). Llama/Mistral have no
+        // `post_attention_norm` — their post-attention IS the pre-FFN
+        // `ffn_norm`. Try `post_attention_norm` FIRST: present → Gemma uses
+        // it; absent → Llama falls back to `ffn_norm`. (Trying `ffn_norm`
+        // first was a bug: on Gemma both tensors exist, so
+        // `post_attention_layernorm` wrongly loaded `ffn_norm` — the
+        // pre-FFN weights — blowing up the residual stream.)
+        "post_attention_layernorm" => vec!["post_attention_norm", "ffn_norm"],
         // Gemma family has both pre/post FFN norms; plain Llama doesn't.
         "pre_feedforward_layernorm" => vec!["ffn_norm"],
         "post_feedforward_layernorm" => vec!["post_ffw_norm"],
@@ -1391,12 +1397,14 @@ mod tests {
             to_llama_cpp_prefix("model.layers.0.input_layernorm").as_deref(),
             Some("blk.0.attn_norm")
         );
+        // Gemma's separate post-attention norm must be tried FIRST so it
+        // wins over `ffn_norm` (the pre-FFN norm) when both exist.
         let post_attn = to_llama_cpp_prefixes("model.layers.0.post_attention_layernorm");
         assert_eq!(
             post_attn,
             vec![
-                "blk.0.ffn_norm".to_string(),
                 "blk.0.post_attention_norm".to_string(),
+                "blk.0.ffn_norm".to_string(),
             ]
         );
         assert_eq!(
