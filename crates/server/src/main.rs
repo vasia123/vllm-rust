@@ -206,9 +206,16 @@ enum Command {
         #[arg(long)]
         enable_prefix_caching: bool,
 
-        /// Enable chunked prefill for long prompts
-        #[arg(long)]
+        /// Enable chunked prefill for long prompts (default: enabled).
+        /// Kept for backward compatibility — chunked prefill is on by default.
+        #[arg(long, hide = true)]
         enable_chunked_prefill: bool,
+
+        /// Disable chunked prefill. WARNING: prompts longer than
+        /// --max-num-batched-tokens are then rejected at admission (they
+        /// could never be scheduled in a single step).
+        #[arg(long, conflicts_with = "enable_chunked_prefill")]
+        disable_chunked_prefill: bool,
 
         /// Graceful shutdown timeout in seconds (force shutdown after this duration)
         #[arg(long, default_value_t = 30)]
@@ -587,6 +594,7 @@ async fn main() -> anyhow::Result<()> {
             lora_adapters,
             enable_prefix_caching,
             enable_chunked_prefill,
+            disable_chunked_prefill,
             shutdown_timeout,
             allowed_origins,
             allowed_methods,
@@ -700,8 +708,17 @@ async fn main() -> anyhow::Result<()> {
             // Bool flags: CLI flag (true) takes precedence, otherwise fall back to file config
             let enable_prefix_caching =
                 enable_prefix_caching || file_config.enable_prefix_caching.unwrap_or(false);
-            let enable_chunked_prefill =
-                enable_chunked_prefill || file_config.enable_chunked_prefill.unwrap_or(false);
+            // Chunked prefill is ON by default (prompts longer than the
+            // per-step token budget are otherwise unschedulable). Priority:
+            // explicit CLI (--disable-chunked-prefill / legacy
+            // --enable-chunked-prefill) > config file > default(true).
+            let enable_chunked_prefill = if disable_chunked_prefill {
+                false
+            } else if enable_chunked_prefill {
+                true
+            } else {
+                file_config.enable_chunked_prefill.unwrap_or(true)
+            };
 
             // CORS: CLI defaults are the wildcard values; fall back to file config
             // only when CLI has the default.

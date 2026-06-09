@@ -494,6 +494,48 @@ pub(crate) fn handle_prefill_error(
     ))
 }
 
+/// Why a prompt can NEVER be scheduled by this engine configuration, or
+/// `None` if it is schedulable. Pure so admission policy is unit-testable.
+///
+/// Two permanent-starvation cases (`compute_schedule` re-evaluates every
+/// step, but neither condition can ever change for the request):
+/// 1. The prompt (+1 headroom token for the first generated token) needs
+///    more KV blocks than the pool has IN TOTAL — `blocks_needed <=
+///    free_blocks <= total` can never hold. Mirrors the decode-time
+///    recompute guard and the startup max_model_len clamp.
+/// 2. Chunked prefill is disabled (explicit opt-out) and the prompt exceeds
+///    `max_tokens_per_step`: the scheduler then requires the WHOLE remaining
+///    prompt to fit one step's budget.
+pub(crate) fn prompt_unschedulable_reason(
+    prompt_tokens: usize,
+    block_size: usize,
+    total_blocks: usize,
+    sched_cfg: &crate::scheduler::SchedulerConfig,
+) -> Option<String> {
+    let blocks_for_prompt = prompt_tokens.saturating_add(1).div_ceil(block_size);
+    if blocks_for_prompt > total_blocks {
+        return Some(format!(
+            "prompt of {} tokens needs {} KV cache blocks but the pool has only {} \
+             in total ({} tokens) — it can never be scheduled. Shorten the prompt, \
+             raise --gpu-memory-utilization / --num-blocks, or use --kv-cache-dtype fp8.",
+            prompt_tokens,
+            blocks_for_prompt,
+            total_blocks,
+            total_blocks * block_size,
+        ));
+    }
+    if !sched_cfg.enable_chunked_prefill && prompt_tokens > sched_cfg.max_tokens_per_step {
+        return Some(format!(
+            "prompt of {} tokens exceeds the per-step token budget of {} \
+             (--max-num-batched-tokens) and chunked prefill is disabled — it can \
+             never be scheduled. Remove --disable-chunked-prefill, raise \
+             --max-num-batched-tokens, or shorten the prompt.",
+            prompt_tokens, sched_cfg.max_tokens_per_step,
+        ));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_request(
     request: GenerationRequest,
@@ -513,28 +555,16 @@ fn admit_request(
         }
     };
 
-    // Admission guard: a prompt that needs more KV blocks than the pool
-    // HAS can never be scheduled (`compute_schedule` requires
-    // blocks_needed <= free_blocks <= total). Left in the waiting queue
-    // it would hang until the client times out (HTTP 000 / empty), so
-    // fail it immediately with an actionable error. Mirrors the
-    // decode-time recompute guard and the startup max_model_len clamp.
-    // +1 token of headroom so the first generated token has a slot.
-    let blocks_for_prompt = prompt_ids.len().saturating_add(1).div_ceil(block_size);
-    let total_blocks = kv_cache_mgr.num_total_blocks();
-    if blocks_for_prompt > total_blocks {
-        send_error(
-            response,
-            EngineError::Cache(format!(
-                "prompt of {} tokens needs {} KV cache blocks but the pool has only {} \
-                 in total ({} tokens) — it can never be scheduled. Shorten the prompt, \
-                 raise --gpu-memory-utilization / --num-blocks, or use --kv-cache-dtype fp8.",
-                prompt_ids.len(),
-                blocks_for_prompt,
-                total_blocks,
-                total_blocks * block_size,
-            )),
-        );
+    // Admission guards: fail immediately (with an actionable error) any
+    // prompt this engine configuration could NEVER schedule — otherwise it
+    // sits in the waiting queue until the client times out.
+    if let Some(reason) = prompt_unschedulable_reason(
+        prompt_ids.len(),
+        block_size,
+        kv_cache_mgr.num_total_blocks(),
+        scheduler.config(),
+    ) {
+        send_error(response, EngineError::Cache(reason));
         return;
     }
 
@@ -4225,5 +4255,40 @@ mod tests {
         assert!(context_capacity_reached(1024, Some(1024)));
         // Past the limit also trips.
         assert!(context_capacity_reached(1025, Some(1024)));
+    }
+
+    #[test]
+    fn prompt_unschedulable_admission_guards() {
+        use crate::scheduler::SchedulerConfig;
+        let chunked = SchedulerConfig {
+            max_tokens_per_step: 2048,
+            enable_chunked_prefill: true,
+            ..SchedulerConfig::default()
+        };
+        let unchunked = SchedulerConfig {
+            enable_chunked_prefill: false,
+            ..chunked
+        };
+        // Pool: 64 blocks × 16 = 1024 tokens.
+        let (bs, total) = (16usize, 64usize);
+
+        // Fits pool, chunked: schedulable even when prompt > per-step budget
+        // (1000 < 1024 pool; budget irrelevant with chunking).
+        assert!(prompt_unschedulable_reason(1000, bs, total, &chunked).is_none());
+
+        // Pool overflow trips regardless of chunking (+1 headroom: 1024
+        // prompt tokens need 1025 slots → 65 blocks > 64).
+        let r = prompt_unschedulable_reason(1024, bs, total, &chunked);
+        assert!(r.is_some_and(|m| m.contains("KV cache blocks")));
+
+        // Chunking disabled: prompt > max_tokens_per_step can never be
+        // scheduled (the 2026-06-10 E4B starvation) → explicit rejection.
+        let big_pool = 1024usize; // 16k tokens — pool is not the limiter
+        let r = prompt_unschedulable_reason(2900, bs, big_pool, &unchunked);
+        assert!(r.is_some_and(|m| m.contains("chunked prefill is disabled")));
+        // Same prompt with chunking: fine.
+        assert!(prompt_unschedulable_reason(2900, bs, big_pool, &chunked).is_none());
+        // Exactly at the budget: schedulable even unchunked.
+        assert!(prompt_unschedulable_reason(2048, bs, big_pool, &unchunked).is_none());
     }
 }

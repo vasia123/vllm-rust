@@ -364,7 +364,12 @@ impl Default for SchedulerConfig {
         Self {
             max_running_requests: 256,
             max_tokens_per_step: 8192,
-            enable_chunked_prefill: false,
+            // ON by default (matching Python vLLM v1): with chunking disabled
+            // any prompt longer than `max_tokens_per_step` can NEVER be
+            // scheduled — it sits in the waiting queue forever (silent
+            // starvation). Disabling is an explicit opt-out, guarded by an
+            // admission-time rejection in `engine::helpers::admit_request`.
+            enable_chunked_prefill: true,
             scheduling_policy: SchedulingPolicy::Fcfs,
             max_loras_per_batch: 0,
             preemption_mode: PreemptionMode::Recompute,
@@ -417,7 +422,18 @@ pub struct Scheduler {
     request_metadata: HashMap<RequestId, RequestMetadata>,
     /// Monotonic counter for arrival time ordering.
     arrival_counter: u64,
+    /// Starvation tripwire: consecutive `compute_schedule` calls in which the
+    /// engine is fully idle (nothing running, nothing admitted) yet the head
+    /// of the waiting queue could not be scheduled. Admission guards should
+    /// make this unreachable — a throttled warn fires if it happens anyway
+    /// (e.g. a future budget/blocks accounting bug). Atomic because
+    /// `compute_schedule` is deliberately `&self`.
+    starved_steps: std::sync::atomic::AtomicU32,
 }
+
+/// Warn about head-of-queue starvation every this many consecutive stalled
+/// scheduling rounds (~seconds at decode cadence; keeps logs quiet).
+const STARVATION_WARN_EVERY: u32 = 100;
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig) -> Self {
@@ -427,6 +443,7 @@ impl Scheduler {
             running_set: HashSet::new(),
             request_metadata: HashMap::new(),
             arrival_counter: 0,
+            starved_steps: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -476,6 +493,12 @@ impl Scheduler {
     /// Get the scheduling policy in use.
     pub fn scheduling_policy(&self) -> SchedulingPolicy {
         self.config.scheduling_policy
+    }
+
+    /// The scheduler's configuration (read-only). Used by engine admission
+    /// to reject requests that this configuration could never schedule.
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
     }
 
     /// Compute a scheduling decision without mutating scheduler state.
@@ -604,6 +627,11 @@ impl Scheduler {
 
         let candidates: Vec<RequestId> = self.waiting_queue.iter_in_order();
 
+        // Starvation tripwire bookkeeping: (request_id, remaining_tokens,
+        // blocks_needed) of the head-of-queue candidate if it failed to
+        // schedule. Evaluated after the loop.
+        let mut head_stall: Option<(RequestId, usize, usize)> = None;
+
         for req_id in candidates {
             if running_count + newly_admitted.len() >= self.config.max_running_requests {
                 break;
@@ -628,6 +656,9 @@ impl Scheduler {
                         budget -= 1;
                         output.decode_requests.push(req_id);
                     } else {
+                        if newly_admitted.is_empty() {
+                            head_stall = Some((req_id, remaining, blocks_needed));
+                        }
                         break;
                     }
                 } else {
@@ -666,7 +697,42 @@ impl Scheduler {
                     chunk_size,
                 });
             } else {
+                if newly_admitted.is_empty() {
+                    head_stall = Some((req_id, remaining, blocks_needed));
+                }
                 break;
+            }
+        }
+
+        // Starvation tripwire: the engine is fully idle (nothing running,
+        // nothing admitted this round) yet the head of the waiting queue
+        // could not be scheduled — no future step can change anything, so
+        // this is a permanent stall. The admission guards
+        // (`engine::helpers::admit_request`) are supposed to make this
+        // unreachable; warn (throttled) instead of staying silent if a
+        // budget/blocks accounting bug ever reintroduces it.
+        {
+            use std::sync::atomic::Ordering;
+            if let Some((req_id, remaining, blocks_needed)) =
+                head_stall.filter(|_| running_count == 0 && newly_admitted.is_empty())
+            {
+                let stalled = self.starved_steps.fetch_add(1, Ordering::Relaxed) + 1;
+                if stalled.is_multiple_of(STARVATION_WARN_EVERY) {
+                    tracing::warn!(
+                        request_id = req_id,
+                        stalled_rounds = stalled,
+                        remaining_tokens = remaining,
+                        blocks_needed,
+                        free_blocks,
+                        budget_left = budget,
+                        max_tokens_per_step = self.config.max_tokens_per_step,
+                        chunked_prefill = self.config.enable_chunked_prefill,
+                        "head-of-queue request cannot be scheduled while the engine is \
+                         idle — permanent starvation (budget/blocks configuration bug?)"
+                    );
+                }
+            } else {
+                self.starved_steps.store(0, Ordering::Relaxed);
             }
         }
 
@@ -1257,6 +1323,30 @@ mod tests {
         // Can't fit 25 tokens in budget of 10 without chunking
         assert!(output.prefill_requests.is_empty());
         assert_eq!(scheduler.num_waiting(), 1);
+    }
+
+    /// The DEFAULT config must chunk long prompts: with chunking disabled a
+    /// prompt longer than `max_tokens_per_step` is permanently unschedulable
+    /// (silent starvation — the 2026-06-10 E4B bug). Guards the default.
+    #[test]
+    fn default_config_chunks_long_prompt() {
+        let config = SchedulerConfig {
+            max_tokens_per_step: 10,
+            ..SchedulerConfig::default()
+        };
+        assert!(
+            config.enable_chunked_prefill,
+            "chunked prefill must be ON by default"
+        );
+        let mut scheduler = Scheduler::new(config);
+
+        let mut states = HashMap::new();
+        states.insert(0, make_state(0, 25, RequestStatus::Waiting, 16, 0));
+        scheduler.add_request(0);
+
+        let output = scheduler.schedule(&refs(&states), 64);
+        assert_eq!(output.prefill_requests.len(), 1);
+        assert_eq!(output.prefill_requests[0].chunk_size, 10);
     }
 
     #[test]

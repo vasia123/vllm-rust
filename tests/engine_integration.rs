@@ -55,6 +55,10 @@ impl ModelForward for MockModel {
 }
 
 /// Mock model that emits EOS after a fixed number of decode steps.
+///
+/// Counting starts at the first prefill call (seq_len > 1): the engine runs
+/// warmup forwards (dummy decode batches) at startup which must not consume
+/// the `eos_after` budget.
 struct CountingMockModel {
     output_token: u32,
     eos_token: u32,
@@ -62,6 +66,7 @@ struct CountingMockModel {
     device: Device,
     eos_after: usize,
     call_count: std::sync::atomic::AtomicUsize,
+    armed: std::sync::atomic::AtomicBool,
 }
 
 impl CountingMockModel {
@@ -73,6 +78,7 @@ impl CountingMockModel {
             device: Device::Cpu,
             eos_after,
             call_count: std::sync::atomic::AtomicUsize::new(0),
+            armed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -86,10 +92,17 @@ impl ModelForward for CountingMockModel {
         _block_table: &BlockTable,
         _slot_mapping: &[usize],
     ) -> candle_core::Result<Tensor> {
+        use std::sync::atomic::Ordering;
         let seq_len = input_ids.dims()[1];
-        let count = self
-            .call_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if seq_len > 1 {
+            self.armed.store(true, Ordering::Relaxed);
+        }
+        let count = if self.armed.load(Ordering::Relaxed) {
+            self.call_count.fetch_add(1, Ordering::Relaxed)
+        } else {
+            // Warmup decode forwards before the first real prefill.
+            0
+        };
         let token = if count >= self.eos_after {
             self.eos_token
         } else {
@@ -463,6 +476,255 @@ async fn test_engine_cancel_request_via_drop() {
     let request2 = make_request("t1 t2", 2, 999);
     let result = handle.generate(request2).await.unwrap();
     assert_eq!(result.generated_token_ids.len(), 2);
+
+    handle.shutdown().await.unwrap();
+}
+
+// ─── Chunked prefill (default-on) ───────────────────────────────────────────
+
+/// Mock model that records every forward call's `(seqlen_offset, seq_len)` —
+/// lets tests assert that chunked prefill feeds the prompt in contiguous,
+/// budget-bounded chunks with correct offsets.
+struct ChunkRecordingModel {
+    output_token: u32,
+    vocab_size: usize,
+    device: Device,
+    calls: std::sync::Mutex<Vec<(usize, usize)>>,
+}
+
+impl ChunkRecordingModel {
+    fn new(output_token: u32, vocab_size: usize) -> Self {
+        Self {
+            output_token,
+            vocab_size,
+            device: Device::Cpu,
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ModelForward for ChunkRecordingModel {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        _kv_cache_mgr: &mut KVCacheManager,
+        _block_table: &BlockTable,
+        _slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        let seq_len = input_ids.dims()[1];
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push((seqlen_offset, seq_len));
+        let mut logits = vec![-100.0f32; seq_len * self.vocab_size];
+        for pos in 0..seq_len {
+            logits[pos * self.vocab_size + self.output_token as usize] = 100.0;
+        }
+        Tensor::from_vec(logits, (1, seq_len, self.vocab_size), &self.device)
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+fn long_prompt(n_tokens: usize) -> String {
+    (0..n_tokens)
+        .map(|i| format!("t{}", i % 900))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A prompt longer than `max_tokens_per_step` must complete via chunked
+/// prefill (the default): chunks are contiguous, budget-bounded, cover the
+/// whole prompt, and the generated output matches a single-chunk run.
+/// Regression test for the 2026-06-10 starvation bug (request waited
+/// forever because the whole prompt was required to fit one step).
+#[tokio::test]
+async fn test_chunked_prefill_long_prompt_completes_and_matches_unchunked() {
+    const PROMPT_TOKENS: usize = 250;
+    const BUDGET: usize = 100;
+    const MAX_NEW: usize = 4;
+
+    let cache_config = CacheConfig {
+        num_blocks: 64, // 1024-token pool — not the limiter
+        ..test_cache_config()
+    };
+
+    let run = |budget: usize| {
+        let cache_config = cache_config.clone();
+        async move {
+            let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+            let model = ChunkRecordingModel::new(42, 1000);
+            let tokenizer = TokenizerWrapper::for_testing(1000);
+            let config = EngineConfig::builder(
+                SchedulerConfig {
+                    max_running_requests: 4,
+                    max_tokens_per_step: budget,
+                    // enable_chunked_prefill comes from Default — must be true
+                    ..SchedulerConfig::default()
+                },
+                None,
+            )
+            .build();
+            let handle = start_engine(
+                model,
+                tokenizer,
+                kv_cache_mgr,
+                config,
+                vllm_core::engine::EngineLimits::for_testing(),
+            );
+            let request = make_request(&long_prompt(PROMPT_TOKENS), MAX_NEW, 999);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.generate(request))
+                    .await
+                    .expect("request must not starve in the waiting queue")
+                    .unwrap();
+            handle.shutdown().await.unwrap();
+            result
+        }
+    };
+
+    let chunked = run(BUDGET).await;
+    let single = run(PROMPT_TOKENS + 64).await;
+
+    assert_eq!(chunked.generated_token_ids.len(), MAX_NEW);
+    assert_eq!(
+        chunked.generated_token_ids, single.generated_token_ids,
+        "chunked output must match single-chunk output"
+    );
+    assert_eq!(
+        chunked.finish_reason,
+        vllm_core::request::FinishReason::Length
+    );
+}
+
+/// Chunk coverage: prefill forward calls must be contiguous from offset 0,
+/// each within the per-step budget, jointly covering the entire prompt.
+#[tokio::test]
+async fn test_chunked_prefill_chunks_are_contiguous_and_bounded() {
+    const PROMPT_TOKENS: usize = 250;
+    const BUDGET: usize = 100;
+
+    let cache_config = CacheConfig {
+        num_blocks: 64,
+        ..test_cache_config()
+    };
+    let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+    let model = std::sync::Arc::new(ChunkRecordingModel::new(42, 1000));
+
+    // ModelForward is consumed by start_engine; keep a handle to the call
+    // log via Arc.
+    struct Shared(std::sync::Arc<ChunkRecordingModel>);
+    impl ModelForward for Shared {
+        fn forward(
+            &self,
+            input_ids: &Tensor,
+            seqlen_offset: usize,
+            kv_cache_mgr: &mut KVCacheManager,
+            block_table: &BlockTable,
+            slot_mapping: &[usize],
+        ) -> candle_core::Result<Tensor> {
+            self.0.forward(
+                input_ids,
+                seqlen_offset,
+                kv_cache_mgr,
+                block_table,
+                slot_mapping,
+            )
+        }
+        fn device(&self) -> &Device {
+            self.0.device()
+        }
+    }
+
+    let tokenizer = TokenizerWrapper::for_testing(1000);
+    let config = EngineConfig::builder(
+        SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: BUDGET,
+            ..SchedulerConfig::default()
+        },
+        None,
+    )
+    .build();
+    let handle = start_engine(
+        Shared(model.clone()),
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
+    let request = make_request(&long_prompt(PROMPT_TOKENS), 2, 999);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), handle.generate(request))
+        .await
+        .expect("must not starve")
+        .unwrap();
+    assert_eq!(result.generated_token_ids.len(), 2);
+    handle.shutdown().await.unwrap();
+
+    let calls = model.calls.lock().expect("calls lock").clone();
+    // Prefill calls = seq_len > 1 (decode steps are single-token).
+    let prefill: Vec<(usize, usize)> = calls.iter().copied().filter(|&(_, l)| l > 1).collect();
+    assert!(
+        prefill.len() >= 3,
+        "250-token prompt at budget 100 must take ≥3 chunks, got {prefill:?}"
+    );
+    let mut expected_offset = 0usize;
+    for &(offset, len) in &prefill {
+        assert_eq!(
+            offset, expected_offset,
+            "chunks must be contiguous: {prefill:?}"
+        );
+        assert!(len <= BUDGET, "chunk exceeds budget: {prefill:?}");
+        expected_offset += len;
+    }
+    assert_eq!(
+        expected_offset, PROMPT_TOKENS,
+        "chunks must cover the whole prompt: {prefill:?}"
+    );
+}
+
+/// With chunked prefill explicitly disabled, an over-budget prompt must be
+/// rejected at admission with an actionable error — NOT left starving in
+/// the waiting queue.
+#[tokio::test]
+async fn test_unchunked_long_prompt_rejected_at_admission() {
+    let cache_config = CacheConfig {
+        num_blocks: 64,
+        ..test_cache_config()
+    };
+    let kv_cache_mgr = KVCacheManager::new(&cache_config).unwrap();
+    let model = MockModel::new(42, 1000);
+    let tokenizer = TokenizerWrapper::for_testing(1000);
+    let config = EngineConfig::builder(
+        SchedulerConfig {
+            max_running_requests: 4,
+            max_tokens_per_step: 100,
+            enable_chunked_prefill: false,
+            ..SchedulerConfig::default()
+        },
+        None,
+    )
+    .build();
+    let handle = start_engine(
+        model,
+        tokenizer,
+        kv_cache_mgr,
+        config,
+        vllm_core::engine::EngineLimits::for_testing(),
+    );
+    let request = make_request(&long_prompt(250), 2, 999);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), handle.generate(request))
+        .await
+        .expect("rejection must be immediate, not a starve-then-timeout")
+        .expect_err("over-budget prompt with chunking disabled must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("chunked prefill is disabled"),
+        "error must explain the rejection, got: {msg}"
+    );
 
     handle.shutdown().await.unwrap();
 }
