@@ -2463,11 +2463,44 @@ fn run_serial_fallback_decode<M: ModelForward>(
     failed
 }
 
+/// Whether a sequence has reached the effective context limit. Total context
+/// (prompt + generated) `>=` the engine's `max_model_len` (clamped to the KV
+/// pool capacity at startup) means the next decode step cannot allocate a slot
+/// — the sequence must finish with `Length` here rather than overrun the pool
+/// and wedge the FCFS engine in a preempt-for-recompute loop it can never exit.
+/// `>=` (not `>`) is load-bearing: a sequence that *exactly* fills the pool
+/// still cannot generate the next token. `None` (limit unpublished, e.g. unit
+/// tests that never call `set_max_model_len`) disables the check.
+pub(crate) fn context_capacity_reached(total_len: usize, max_model_len: Option<usize>) -> bool {
+    matches!(max_model_len, Some(limit) if total_len >= limit)
+}
+
 pub(crate) fn check_finished(
     state: &SequenceState,
     tokenizer: &TokenizerWrapper,
 ) -> Option<FinishCheck> {
     let last_token = *state.generated_token_ids.last()?;
+
+    // Context-capacity stop (hard limit, overrides min_tokens). Total context
+    // = prompt + generated cannot exceed the engine's effective `max_model_len`,
+    // which is clamped to the KV-pool capacity at startup
+    // (`clamp_max_model_len_to_capacity`). Without this the sequence keeps
+    // generating until `max_new_tokens`, then exhausts the pool mid-decode →
+    // the decode-step preempt-for-recompute can never make progress (the full
+    // context no longer fits) → the request wedges the FCFS engine and stalls
+    // every request behind it. Stopping here at the boundary returns the
+    // generated tokens with `Length` instead. Inactive (None) in unit tests
+    // that never call `set_max_model_len`.
+    if context_capacity_reached(
+        state.total_len(),
+        crate::engine::engine_limits::max_model_len(),
+    ) {
+        return Some(FinishCheck {
+            reason: FinishReason::Length,
+            trim_bytes: 0,
+            stop_reason: None,
+        });
+    }
 
     // min_tokens guard: don't stop before minimum generated tokens.
     // Length limit still overrides min_tokens.
@@ -4179,5 +4212,18 @@ mod tests {
     fn generation_request_default_skip_prefix_cache_false() {
         let req = GenerationRequest::default();
         assert!(!req.skip_prefix_cache);
+    }
+
+    #[test]
+    fn context_capacity_reached_boundary() {
+        // Unpublished limit (unit-test default) never trips.
+        assert!(!context_capacity_reached(100_000, None));
+        // Below the limit: keep generating.
+        assert!(!context_capacity_reached(1023, Some(1024)));
+        // Exactly at capacity MUST trip (off-by-one guard): a sequence that
+        // fills the pool can't allocate the next token. Was the wedge bug.
+        assert!(context_capacity_reached(1024, Some(1024)));
+        // Past the limit also trips.
+        assert!(context_capacity_reached(1025, Some(1024)));
     }
 }
