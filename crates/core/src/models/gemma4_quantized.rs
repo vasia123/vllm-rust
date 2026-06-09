@@ -1633,6 +1633,18 @@ impl QuantizedGemma4DecoderLayer {
         })
     }
 
+    /// Apply the per-layer output scale. Diagnostic gate
+    /// VLLM_GEMMA_DISABLE_LAYER_SCALAR=1 skips it (identity) to bisect
+    /// whether scaling the cumulative residual by `layer_scalar` each layer
+    /// is the E4B garbage cause.
+    fn apply_layer_scalar(&self, hidden_states: Tensor) -> Result<Tensor> {
+        if std::env::var("VLLM_GEMMA_DISABLE_LAYER_SCALAR").is_ok_and(|v| v != "0" && !v.is_empty())
+        {
+            return Ok(hidden_states);
+        }
+        hidden_states.broadcast_mul(&self.layer_scalar)
+    }
+
     fn apply_ple(
         &self,
         hidden_states: &Tensor,
@@ -1710,7 +1722,7 @@ impl QuantizedGemma4DecoderLayer {
         let hidden_states = (hidden_states + residual)?;
 
         let hidden_states = self.apply_ple(&hidden_states, per_layer_input)?;
-        hidden_states.broadcast_mul(&self.layer_scalar)
+        self.apply_layer_scalar(hidden_states)
     }
 
     fn forward_decode_batch(
@@ -1743,7 +1755,7 @@ impl QuantizedGemma4DecoderLayer {
         let hidden_states = (hidden_states + residual)?;
 
         let hidden_states = self.apply_ple(&hidden_states, per_layer_input)?;
-        hidden_states.broadcast_mul(&self.layer_scalar)
+        self.apply_layer_scalar(hidden_states)
     }
 }
 
