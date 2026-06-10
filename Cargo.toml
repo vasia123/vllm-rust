@@ -8,6 +8,16 @@ publish = false
 members = ["crates/*"]
 resolver = "2"
 
+# The FFI sibling crates (xgrammar-rs, flashinfer-rs) are pulled from
+# GitHub so the project builds standalone. To develop against a local
+# checkout, uncomment the matching [patch] block (do not commit it):
+#
+# [patch."https://github.com/vasia123/xgrammar-rs"]
+# xgrammar-rs = { path = "../xgrammar-rs" }
+#
+# [patch."https://github.com/vasia123/flashinfer-rs"]
+# flashinfer-rs = { path = "../flashinfer-rs" }
+
 # Top-level convenience feature so `cargo clippy --all-targets --features cuda`
 # (the pre-commit hook) keeps working with the patched candle. Activates the
 # CUDA feature on each workspace member; candle's `cuda` feature comes
