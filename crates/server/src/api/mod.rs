@@ -157,6 +157,9 @@ pub struct AppState {
     /// requests removes that per-request TTFT tax. `Arc<OnceLock<…>>` so
     /// every cloned `AppState` (axum clones per request) shares one cell.
     grammar_compiler: Arc<std::sync::OnceLock<Arc<GrammarCompiler>>>,
+    /// Per-spec structured-output compile budget (cooperative xgrammar
+    /// deadline + queue wait). CLI: `--grammar-compile-timeout-secs`.
+    grammar_compile_timeout: std::time::Duration,
     pub max_model_len: usize,
     /// Tool call parser for extracting function calls from model output.
     pub tool_call_parser: Arc<dyn ToolCallParser>,
@@ -232,6 +235,8 @@ impl AppState {
             eos_token_id,
             additional_eos_token_ids: Vec::new(),
             grammar_compiler: Arc::new(std::sync::OnceLock::new()),
+            grammar_compile_timeout:
+                vllm_core::sampling::grammar::compiler::DEFAULT_COMPILE_TIMEOUT,
             max_model_len,
             tool_call_parser,
             reasoning_parser,
@@ -250,6 +255,15 @@ impl AppState {
             enable_lora,
             disable_mm_preprocessor_cache,
         }
+    }
+
+    /// Override the structured-output compile budget (default
+    /// [`vllm_core::sampling::grammar::compiler::DEFAULT_COMPILE_TIMEOUT`]).
+    /// Must be called before the first [`Self::grammar_compiler`] use —
+    /// the compiler is built once and cached.
+    pub fn with_grammar_compile_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.grammar_compile_timeout = timeout;
+        self
     }
 
     /// Attach extra EOS token ids (beyond `eos_token_id`) that should also
@@ -286,9 +300,20 @@ impl AppState {
                 let vocab_index = Arc::new(VocabularyIndex::from_tokenizer_arc(&self.tokenizer));
                 let mut stop = vec![self.eos_token_id];
                 stop.extend(self.additional_eos_token_ids.iter().copied());
-                Arc::new(GrammarCompiler::with_stop_tokens(vocab_index, stop))
+                Arc::new(
+                    GrammarCompiler::with_stop_tokens(vocab_index, stop)
+                        .with_compile_timeout(self.grammar_compile_timeout),
+                )
             })
             .clone()
+    }
+
+    /// Build the grammar compiler's vocabulary index off the request
+    /// path. The first `grammar_compiler()` call decodes the whole vocab
+    /// (~1-3s CPU at 262k tokens); calling this from a blocking thread at
+    /// server startup means no request ever pays that on a tokio worker.
+    pub fn warmup_grammar_compiler(&self) {
+        let _ = self.grammar_compiler();
     }
 
     pub fn accepting_requests(&self) -> bool {

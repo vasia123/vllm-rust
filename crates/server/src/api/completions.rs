@@ -85,13 +85,15 @@ pub async fn create_completion(
                 req.structured_outputs.as_ref(),
                 &state.tokenizer,
                 &state.grammar_compiler(),
-            )?
+            )
+            .await?
         } else {
             super::chat::create_constraint_from_response_format(
                 req.response_format.as_ref(),
                 &state.tokenizer,
                 &state.grammar_compiler(),
             )
+            .await
         };
 
         let beam_search = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
@@ -201,26 +203,37 @@ pub async fn create_completion(
             // Generate `best_of` candidates for this prompt.
             // First request runs serially to populate the prefix cache. Remaining
             // requests run concurrently for KV cache reuse on shared prompts.
-            let build_gen_req = || -> GenerationRequest {
-                let constraint = if has_constraint {
-                    if req.structured_outputs.is_some() {
-                        create_constraint_from_structured_outputs(
-                            req.structured_outputs.as_ref(),
-                            &state.tokenizer,
-                            &state.grammar_compiler(),
-                        )
-                        .ok()
-                        .flatten()
-                    } else {
-                        super::chat::create_constraint_from_response_format(
-                            req.response_format.as_ref(),
-                            &state.tokenizer,
-                            &state.grammar_compiler(),
-                        )
-                    }
+            //
+            // Constraints are compiled OUTSIDE the closure (grammar
+            // compilation is async — single-flight + deadline in
+            // GrammarCompiler); each candidate gets its own matcher
+            // instance, instant template-cache hits after the first.
+            let make_constraint = || async {
+                if !has_constraint {
+                    return None;
+                }
+                if req.structured_outputs.is_some() {
+                    create_constraint_from_structured_outputs(
+                        req.structured_outputs.as_ref(),
+                        &state.tokenizer,
+                        &state.grammar_compiler(),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
                 } else {
-                    None
-                };
+                    super::chat::create_constraint_from_response_format(
+                        req.response_format.as_ref(),
+                        &state.tokenizer,
+                        &state.grammar_compiler(),
+                    )
+                    .await
+                }
+            };
+            let build_gen_req = |constraint: Option<
+                Box<dyn vllm_core::sampling::SamplingConstraint>,
+            >|
+             -> GenerationRequest {
                 let beam =
                     build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
                 GenerationRequest {
@@ -265,10 +278,11 @@ pub async fn create_completion(
                 Vec::with_capacity(best_of);
 
             // First candidate — serial to populate prefix cache
+            let first_constraint = make_constraint().await;
             let first_result = state
                 .engine
                 .get()
-                .generate(build_gen_req())
+                .generate(build_gen_req(first_constraint))
                 .await
                 .map_err(|e| {
                     prometheus::inc_requests_error();
@@ -297,9 +311,14 @@ pub async fn create_completion(
 
             if best_of > 1 {
                 // Remaining candidates — concurrent (prefix cache provides KV reuse)
+                let mut extra_constraints = Vec::with_capacity(best_of - 1);
+                for _ in 1..best_of {
+                    extra_constraints.push(make_constraint().await);
+                }
                 let engine = state.engine.get();
-                let futs: Vec<_> = (1..best_of)
-                    .map(|_| engine.generate(build_gen_req()))
+                let futs: Vec<_> = extra_constraints
+                    .into_iter()
+                    .map(|c| engine.generate(build_gen_req(c)))
                     .collect();
                 let results = futures::future::join_all(futs).await;
                 for result in results {

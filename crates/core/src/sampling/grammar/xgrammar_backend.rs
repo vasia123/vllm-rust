@@ -236,8 +236,21 @@ pub(crate) fn make_xgrammar_compiler(
     stop_token_ids: &[u32],
 ) -> anyhow::Result<Arc<xgrammar_rs::GrammarCompiler>> {
     let tok = tokenizer_info_from_vocab(vocab, stop_token_ids)?;
-    let compiler =
-        xgrammar_rs::GrammarCompiler::new(tok).context("xgrammar GrammarCompiler::new")?;
+    // max_threads 4 (upstream default 8): halves the CPU burst of a
+    // pathological compile without measurably slowing legitimate schema
+    // compiles (sub-second). max_memory_bytes bounds the upstream
+    // grammar+rule caches — one pathological grammar's token masks
+    // reach tens of MB at a 262k vocab, so "unlimited" (-1) is an OOM
+    // vector on an 8-10GB host.
+    let compiler = xgrammar_rs::GrammarCompiler::new_with_options(
+        tok,
+        xgrammar_rs::CompilerOptions {
+            max_threads: 4,
+            cache_enabled: true,
+            max_memory_bytes: 256 * 1024 * 1024,
+        },
+    )
+    .context("xgrammar GrammarCompiler::new_with_options")?;
     Ok(Arc::new(compiler))
 }
 

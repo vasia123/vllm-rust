@@ -4,14 +4,51 @@
 //! GBNF grammar) into `StructuredOutputGrammar` instances. DFA compilation
 //! is offloaded to blocking threads via `tokio::task::spawn_blocking`.
 //! Compiled templates are cached by content hash.
+//!
+//! ## Isolation guarantees (2026-06-10 incident)
+//!
+//! A pathological grammar (e.g. a chain of 40 optional rules) explodes
+//! xgrammar's token-mask precompute to tens of seconds at a 262k vocab,
+//! and upstream has no cancellation — historically one such request
+//! pinned a tokio worker plus 8 C++ threads until process restart. The
+//! async [`GrammarCompiler::compile`] path now enforces:
+//!
+//! - **never on a tokio worker** — marshal + compile run inside
+//!   `spawn_blocking`;
+//! - **single-flight** — concurrent identical specs share one compile;
+//! - **bounded concurrency** — at most [`MAX_CONCURRENT_COMPILES`]
+//!   compiles run at once; the queue is bounded by the timeout;
+//! - **cooperative deadline** — the xgrammar C++ compile itself aborts
+//!   at `compile_timeout` (the `0001-compile-deadline` xgrammar-rs
+//!   patch), so the blocking thread and its C++ thread-pool are
+//!   reclaimed instead of burning CPU forever; a hard-cap watchdog of
+//!   `compile_timeout + 5s` covers the path failing to return.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
 use super::vocabulary::VocabularyIndex;
 use super::StructuredOutputGrammar;
+
+/// Default wall-clock budget for compiling one structured-output spec.
+/// Covers the one-off vocabulary marshal (~3s at 262k tokens) plus any
+/// legitimate schema compile (sub-second to ~2s) with a wide margin.
+pub const DEFAULT_COMPILE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum structured-output compiles running concurrently. Bounds the
+/// damage of pathological grammars to `2 × xgrammar max_threads` C++
+/// threads for at most one timeout window.
+#[cfg(feature = "xgrammar")]
+const MAX_CONCURRENT_COMPILES: usize = 2;
+
+/// Extra slack on top of the cooperative C++ deadline before the async
+/// caller gives up waiting on the blocking task (watchdog for "the
+/// deadline patch failed to fire").
+#[cfg(feature = "xgrammar")]
+const HARD_CAP_GRACE: Duration = Duration::from_secs(5);
 
 /// What kind of structured output to compile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,9 +81,33 @@ struct CompiledTemplate {
 /// feature is off — it has a smaller dependency footprint at the
 /// cost of partial JSON-Schema enforcement.
 pub struct GrammarCompiler {
-    // Both fields are consumed only by the `xgrammar`-gated compile paths
-    // (`xgrammar_compiler_handle`, `compile`, `compile_sync`). Without the
-    // feature there is no backend, so they are intentionally unread.
+    /// Vocabulary + lazy upstream handle, `Arc`-shared so blocking
+    /// compile tasks can own a `'static` reference. Only the
+    /// `xgrammar`-gated compile paths consume it.
+    #[cfg_attr(not(feature = "xgrammar"), allow(dead_code))]
+    state: Arc<CompilerState>,
+    cache: Arc<Mutex<HashMap<u64, Arc<CompiledTemplate>>>>,
+    /// Single-flight registry: spec hash → cell that the first caller
+    /// fills by compiling; concurrent identical specs await the same
+    /// cell instead of spawning duplicate blocking compiles.
+    #[cfg(feature = "xgrammar")]
+    in_flight: Arc<Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<CompileOutcome>>>>>,
+    /// Bounds concurrent compiles to [`MAX_CONCURRENT_COMPILES`].
+    #[cfg(feature = "xgrammar")]
+    compile_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Wall-clock budget per compile; also armed as the cooperative
+    /// deadline inside the xgrammar C++ compile.
+    #[cfg_attr(not(feature = "xgrammar"), allow(dead_code))]
+    compile_timeout: Duration,
+}
+
+/// The compile inputs a blocking task needs to own (`spawn_blocking`
+/// requires `'static`): vocabulary, stop tokens, and the lazily-built
+/// upstream compiler handle.
+struct CompilerState {
+    // Both fields are consumed only by the `xgrammar`-gated compile paths.
+    // Without the feature there is no backend, so they are intentionally
+    // unread.
     #[cfg_attr(not(feature = "xgrammar"), allow(dead_code))]
     vocab_index: Arc<VocabularyIndex>,
     /// Token ids that terminate the grammar at an accepting state. The
@@ -60,7 +121,6 @@ pub struct GrammarCompiler {
     /// garbage (see the `diag_eos_termination_needs_stop_token_ids` test).
     #[cfg_attr(not(feature = "xgrammar"), allow(dead_code))]
     stop_token_ids: Vec<u32>,
-    cache: Arc<Mutex<HashMap<u64, Arc<CompiledTemplate>>>>,
     /// Lazily-built upstream xgrammar compiler, shared across all
     /// `compile_*` calls on this `GrammarCompiler`. `None` while the
     /// `xgrammar` feature is off OR while no xgrammar-routed compile
@@ -69,30 +129,17 @@ pub struct GrammarCompiler {
     xgrammar_compiler: std::sync::OnceLock<Arc<xgrammar_rs::GrammarCompiler>>,
 }
 
-impl GrammarCompiler {
-    /// Create a new compiler with the given vocabulary index and no
-    /// configured stop tokens. Prefer [`Self::with_stop_tokens`] in the
-    /// server so the grammar terminates on the model's real EOS.
-    pub fn new(vocab_index: Arc<VocabularyIndex>) -> Self {
-        Self::with_stop_tokens(vocab_index, Vec::new())
-    }
+/// Clone-able single-flight result: the winning compiler thread stores
+/// it once; every awaiting request clones it. Errors are stringly so
+/// the type is `Clone` (`anyhow::Error` is not).
+#[cfg(feature = "xgrammar")]
+type CompileOutcome = Result<Arc<CompiledTemplate>, String>;
 
-    /// Create a compiler whose grammars terminate on `stop_token_ids`
-    /// (typically the model EOS) once they reach an accepting state.
-    pub fn with_stop_tokens(vocab_index: Arc<VocabularyIndex>, stop_token_ids: Vec<u32>) -> Self {
-        Self {
-            vocab_index,
-            stop_token_ids,
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "xgrammar")]
-            xgrammar_compiler: std::sync::OnceLock::new(),
-        }
-    }
-
+impl CompilerState {
     /// Lazily build (or fetch) the underlying xgrammar compiler bound
-    /// to this `GrammarCompiler`'s vocabulary. The vocabulary marshal
-    /// (token-bytes → xgrammar `TokenizerInfo`) happens on first
-    /// call; subsequent calls just clone the `Arc`.
+    /// to this vocabulary. The vocabulary marshal (token-bytes →
+    /// xgrammar `TokenizerInfo`, ~3s at 262k tokens) happens on first
+    /// call — call this from a blocking context only.
     #[cfg(feature = "xgrammar")]
     fn xgrammar_compiler_handle(&self) -> anyhow::Result<Arc<xgrammar_rs::GrammarCompiler>> {
         if let Some(c) = self.xgrammar_compiler.get() {
@@ -112,11 +159,49 @@ impl GrammarCompiler {
                 .clone()),
         }
     }
+}
+
+impl GrammarCompiler {
+    /// Create a new compiler with the given vocabulary index and no
+    /// configured stop tokens. Prefer [`Self::with_stop_tokens`] in the
+    /// server so the grammar terminates on the model's real EOS.
+    pub fn new(vocab_index: Arc<VocabularyIndex>) -> Self {
+        Self::with_stop_tokens(vocab_index, Vec::new())
+    }
+
+    /// Create a compiler whose grammars terminate on `stop_token_ids`
+    /// (typically the model EOS) once they reach an accepting state.
+    pub fn with_stop_tokens(vocab_index: Arc<VocabularyIndex>, stop_token_ids: Vec<u32>) -> Self {
+        Self {
+            state: Arc::new(CompilerState {
+                vocab_index,
+                stop_token_ids,
+                #[cfg(feature = "xgrammar")]
+                xgrammar_compiler: std::sync::OnceLock::new(),
+            }),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "xgrammar")]
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "xgrammar")]
+            compile_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_COMPILES)),
+            compile_timeout: DEFAULT_COMPILE_TIMEOUT,
+        }
+    }
+
+    /// Override the per-spec compile budget (default
+    /// [`DEFAULT_COMPILE_TIMEOUT`]).
+    pub fn with_compile_timeout(mut self, timeout: Duration) -> Self {
+        self.compile_timeout = timeout;
+        self
+    }
 
     /// Compile a structured output specification into a grammar.
     ///
-    /// Uses `spawn_blocking` for CPU-heavy DFA / NPDA compilation.
-    /// Results are cached by content hash.
+    /// This is the ONLY production compile path. Guarantees (see module
+    /// docs): cache hit → instant; otherwise single-flight + bounded
+    /// concurrency + cooperative C++ deadline, all inside
+    /// `spawn_blocking` — a pathological grammar costs one timeout
+    /// window of bounded CPU, never a wedged server.
     ///
     /// With the `xgrammar` feature enabled, JSON-Schema / regex / EBNF
     /// route through upstream xgrammar — the compile cost (NPDA build,
@@ -139,40 +224,50 @@ impl GrammarCompiler {
             }
         }
 
-        // ── xgrammar fast path ─────────────────────────────────────
-        // Compile once into an Arc<CompiledGrammar>, then the factory
-        // is a cheap `new_matcher` call per request.
+        // ── xgrammar path: single-flight + bounded + deadlined ─────
         #[cfg(feature = "xgrammar")]
         {
-            let xgr_compiler = self.xgrammar_compiler_handle()?;
-            let spec_owned = spec.to_string();
-            let option_for_compile = option.clone();
-            let compiled = tokio::task::spawn_blocking(move || {
-                xgrammar_compile_to_arc(&xgr_compiler, &option_for_compile, &spec_owned)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("xgrammar compile task panicked: {e}"))??;
+            let cell = {
+                let mut in_flight = self.in_flight.lock().await;
+                in_flight
+                    .entry(spec_hash)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                    .clone()
+            };
 
-            let vocab_size = self.vocab_index.vocab_size();
-            let compiled_for_factory = compiled.clone();
-            let factory: Arc<dyn Fn() -> Box<dyn StructuredOutputGrammar> + Send + Sync> =
-                Arc::new(move || {
-                    Box::new(
-                        super::xgrammar_backend::XGrammarGrammar::from_compiled(
-                            compiled_for_factory.clone(),
-                            vocab_size,
-                            /* max_rollback_tokens = */ 64,
-                        )
-                        .expect("cached xgrammar matcher creation must not fail"),
-                    )
-                });
+            // The cooperative C++ deadline returns the blocking thread
+            // within ~compile_timeout on its own; the hard cap is a
+            // watchdog for that mechanism failing. On hard-cap expiry
+            // the cell is left in place: its empty state hands
+            // leadership to the next caller (tokio OnceCell semantics),
+            // who will hit the upstream cached exception instantly.
+            let hard_cap = self.compile_timeout + HARD_CAP_GRACE;
+            let outcome = tokio::time::timeout(
+                hard_cap,
+                cell.get_or_init(|| self.compile_template(option.clone(), spec.to_string())),
+            )
+            .await;
+            let outcome = match outcome {
+                Ok(o) => o.clone(),
+                Err(_elapsed) => anyhow::bail!(
+                    "grammar compilation did not return within the {hard_cap:?} hard cap; \
+                     the grammar is too complex for this vocabulary"
+                ),
+            };
 
-            let template = Arc::new(CompiledTemplate { factory });
-            {
-                let mut cache = self.cache.lock().await;
-                cache.insert(spec_hash, template.clone());
+            // The entry has served its single-flight purpose: successes
+            // move to the template cache; failures must NOT pin the
+            // error forever — a retry recompiles, which the upstream
+            // cached exception turns into an instant error anyway.
+            self.in_flight.lock().await.remove(&spec_hash);
+
+            match outcome {
+                Ok(template) => {
+                    self.cache.lock().await.insert(spec_hash, template.clone());
+                    Ok((template.factory)())
+                }
+                Err(msg) => Err(anyhow::anyhow!(msg)),
             }
-            Ok((template.factory)())
         }
 
         // ── No backend without xgrammar ────────────────────────────
@@ -190,11 +285,70 @@ impl GrammarCompiler {
         }
     }
 
-    /// Synchronous compilation (for use in non-async contexts).
+    /// The single-flight leader's work: take a compile slot (bounded
+    /// queue), then marshal + compile on a blocking thread with the
+    /// cooperative deadline armed.
+    #[cfg(feature = "xgrammar")]
+    async fn compile_template(
+        &self,
+        option: StructuredOutputOption,
+        spec: String,
+    ) -> CompileOutcome {
+        let permit = match tokio::time::timeout(
+            self.compile_timeout,
+            Arc::clone(&self.compile_semaphore).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => return Err("grammar compile semaphore closed".to_string()),
+            Err(_elapsed) => {
+                return Err(format!(
+                    "grammar compiler is busy: no compile slot freed within {:?} \
+                     (other grammars are still compiling); try again later",
+                    self.compile_timeout
+                ));
+            }
+        };
+
+        let state = Arc::clone(&self.state);
+        let timeout = self.compile_timeout;
+        let joined = tokio::task::spawn_blocking(move || {
+            let _slot = permit; // hold the compile slot for the full compile
+            let xgr_compiler = state.xgrammar_compiler_handle()?;
+            let compiled = xgrammar_compile_to_arc(&xgr_compiler, &option, &spec, Some(timeout))?;
+
+            let vocab_size = state.vocab_index.vocab_size();
+            let factory: Arc<dyn Fn() -> Box<dyn StructuredOutputGrammar> + Send + Sync> =
+                Arc::new(move || {
+                    Box::new(
+                        super::xgrammar_backend::XGrammarGrammar::from_compiled(
+                            compiled.clone(),
+                            vocab_size,
+                            /* max_rollback_tokens = */ 64,
+                        )
+                        .expect("cached xgrammar matcher creation must not fail"),
+                    )
+                });
+            Ok::<_, anyhow::Error>(Arc::new(CompiledTemplate { factory }))
+        })
+        .await;
+
+        match joined {
+            Ok(Ok(template)) => Ok(template),
+            // `{:#}` keeps the full anyhow context chain in the flat string.
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(join_err) => Err(format!("grammar compile task panicked: {join_err}")),
+        }
+    }
+
+    /// Synchronous compilation — TEST/DIAGNOSTIC ONLY.
     ///
-    /// With `xgrammar` enabled this re-compiles from spec on every
-    /// call (no factory caching) — acceptable for the test-only call
-    /// sites; production goes through [`Self::compile`].
+    /// Runs the full compile on the calling thread with no deadline, no
+    /// caching, no concurrency bound. Production must go through
+    /// [`Self::compile`]; calling this from an async context blocks a
+    /// tokio worker for the whole compile (the exact 2026-06-10
+    /// incident).
     pub fn compile_sync(
         &self,
         option: &StructuredOutputOption,
@@ -202,12 +356,12 @@ impl GrammarCompiler {
     ) -> anyhow::Result<Box<dyn StructuredOutputGrammar>> {
         #[cfg(feature = "xgrammar")]
         {
-            let xgr_compiler = self.xgrammar_compiler_handle()?;
-            let arc = xgrammar_compile_to_arc(&xgr_compiler, option, spec)?;
+            let xgr_compiler = self.state.xgrammar_compiler_handle()?;
+            let arc = xgrammar_compile_to_arc(&xgr_compiler, option, spec, None)?;
             Ok(Box::new(
                 super::xgrammar_backend::XGrammarGrammar::from_compiled(
                     arc,
-                    self.vocab_index.vocab_size(),
+                    self.state.vocab_index.vocab_size(),
                     64,
                 )?,
             ))
@@ -223,13 +377,32 @@ impl GrammarCompiler {
 /// Compile a structured-output spec to an `Arc<xgrammar_rs::CompiledGrammar>`.
 /// Shared helper for both the async and sync compile paths under
 /// `feature = "xgrammar"`.
+///
+/// `deadline`: cooperative C++-side compile budget (the
+/// `0001-compile-deadline` xgrammar-rs patch). `None` runs unbounded —
+/// test/diagnostic use only.
 #[cfg(feature = "xgrammar")]
 fn xgrammar_compile_to_arc(
     compiler: &xgrammar_rs::GrammarCompiler,
     option: &StructuredOutputOption,
     spec: &str,
+    deadline: Option<std::time::Duration>,
 ) -> anyhow::Result<Arc<xgrammar_rs::CompiledGrammar>> {
     use anyhow::Context;
+
+    let compile_ebnf = |ebnf: &str| match deadline {
+        Some(d) => compiler.compile_ebnf_with_timeout(ebnf, "root", d),
+        None => compiler.compile_ebnf(ebnf, "root"),
+    };
+    let compile_json_schema = |schema: &str| match deadline {
+        Some(d) => compiler.compile_json_schema_with_timeout(schema, true, true, d),
+        None => compiler.compile_json_schema(schema, true, true),
+    };
+    let compile_regex = |regex: &str| match deadline {
+        Some(d) => compiler.compile_regex_with_timeout(regex, d),
+        None => compiler.compile_regex(regex),
+    };
+
     let compiled = match option {
         StructuredOutputOption::JsonSchema => {
             // Route through our schema→EBNF translator when the
@@ -252,7 +425,7 @@ fn xgrammar_compile_to_arc(
                         target: "vllm_core::xgrammar",
                         "generated EBNF:\n{ebnf}"
                     );
-                    compiler.compile_ebnf(&ebnf, "root").with_context(|| {
+                    compile_ebnf(&ebnf).with_context(|| {
                         format!(
                             "xgrammar compile_ebnf on translated schema; \
                                  generated EBNF: {ebnf}"
@@ -263,8 +436,7 @@ fn xgrammar_compile_to_arc(
                         target: "vllm_core::xgrammar",
                         "JSON schema → translator declined → falling back to CompileJSONSchema"
                     );
-                    compiler
-                        .compile_json_schema(spec, true, true)
+                    compile_json_schema(spec)
                         .with_context(|| format!("xgrammar compile_json_schema for {spec}"))?
                 }
             } else {
@@ -272,17 +444,16 @@ fn xgrammar_compile_to_arc(
                     target: "vllm_core::xgrammar",
                     "JSON schema → CompileJSONSchema direct (no EBNF triggers)"
                 );
-                compiler
-                    .compile_json_schema(spec, /* any_ws = */ true, /* strict = */ true)
+                compile_json_schema(spec)
                     .with_context(|| format!("xgrammar compile_json_schema for {spec}"))?
             }
         }
-        StructuredOutputOption::Regex => compiler
-            .compile_regex(spec)
-            .with_context(|| format!("xgrammar compile_regex for {spec}"))?,
-        StructuredOutputOption::Grammar => compiler
-            .compile_ebnf(spec, "root")
-            .with_context(|| format!("xgrammar compile_ebnf for {spec}"))?,
+        StructuredOutputOption::Regex => {
+            compile_regex(spec).with_context(|| format!("xgrammar compile_regex for {spec}"))?
+        }
+        StructuredOutputOption::Grammar => {
+            compile_ebnf(spec).with_context(|| format!("xgrammar compile_ebnf for {spec}"))?
+        }
     };
     Ok(Arc::new(compiled))
 }
@@ -364,6 +535,93 @@ mod tests {
             .compile(StructuredOutputOption::Regex, "[a-z]+")
             .await;
         assert!(result.is_ok());
+    }
+
+    /// The dnd-llm 2026-06-10 pathological shape: a chain of optional
+    /// rules whose token-mask state count grows ~O(n²). On the 256-token
+    /// synthetic vocab n=1000 compiles in ~40ms — enough to trip a
+    /// millisecond deadline deterministically.
+    #[cfg(feature = "xgrammar")]
+    fn pathological_optseq_grammar(n: usize) -> String {
+        let opts = "strchar? ".repeat(n);
+        format!(
+            "root ::= \"{{\" \"\\\"r\\\"\" \":\" sv \"}}\"\n\
+             sv ::= \"\\\"\" {opts} \"\\\"\"\n\
+             strchar ::= [-a-zA-Z0-9 .,!?:;'()/+*#@%&=<>~_]\n"
+        )
+    }
+
+    #[cfg(feature = "xgrammar")]
+    #[tokio::test]
+    async fn async_compile_times_out_on_pathological_grammar() {
+        let vocab: Vec<Vec<u8>> = (0u32..256).map(|b| vec![b as u8]).collect();
+        let vi = Arc::new(VocabularyIndex::from_token_bytes(vocab));
+        let compiler =
+            GrammarCompiler::new(vi).with_compile_timeout(std::time::Duration::from_millis(5));
+
+        let t0 = std::time::Instant::now();
+        let result = compiler
+            .compile(
+                StructuredOutputOption::Grammar,
+                &pathological_optseq_grammar(1000),
+            )
+            .await;
+        let dt = t0.elapsed();
+
+        // `Box<dyn StructuredOutputGrammar>` is not Debug → no expect_err.
+        let err = match result {
+            Ok(_) => panic!("5ms budget must abort a ~40ms compile"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("deadline"),
+            "error must surface the deadline abort: {err:#}"
+        );
+        assert!(
+            dt < std::time::Duration::from_secs(2),
+            "abort must be prompt, took {dt:?}"
+        );
+
+        // Identical spec afterwards: instant failure from the upstream
+        // cached exception, never a recompile.
+        let t1 = std::time::Instant::now();
+        let retry = compiler
+            .compile(
+                StructuredOutputOption::Grammar,
+                &pathological_optseq_grammar(1000),
+            )
+            .await;
+        assert!(retry.is_err(), "retry of an aborted spec must fail");
+        assert!(
+            t1.elapsed() < std::time::Duration::from_millis(100),
+            "cached failure must be immediate"
+        );
+
+        // The compiler is not poisoned for OTHER specs.
+        compiler
+            .compile(StructuredOutputOption::Regex, "[a-z]+")
+            .await
+            .expect("simple spec must still compile after an aborted one");
+    }
+
+    #[cfg(feature = "xgrammar")]
+    #[tokio::test]
+    async fn async_compile_single_flight_concurrent_identical_specs() {
+        let compiler = Arc::new(make_compiler());
+        let a = {
+            let c = compiler.clone();
+            tokio::spawn(async move { c.compile(StructuredOutputOption::Regex, "[0-9]+").await })
+        };
+        let b = {
+            let c = compiler.clone();
+            tokio::spawn(async move { c.compile(StructuredOutputOption::Regex, "[0-9]+").await })
+        };
+        let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+        assert!(ra.is_ok() && rb.is_ok(), "both concurrent compiles succeed");
+
+        // One template in the cache, no in-flight leak.
+        assert_eq!(compiler.cache.lock().await.len(), 1);
+        assert!(compiler.in_flight.lock().await.is_empty());
     }
 
     #[cfg(feature = "xgrammar")]
@@ -1180,6 +1438,80 @@ mod tests {
 
         eprintln!("native compile_json_schema string-fill : {native:?}/step");
         eprintln!("our EBNF translator     string-fill     : {ours:?}/step");
+    }
+
+    // Diagnostic for the dnd-llm repro (2026-06-10): grammar shapes whose
+    // compile time explodes on a REAL vocab (262k Gemma) while staying
+    // instant on a 256-byte synthetic vocab. One shape per invocation so
+    // an external `timeout` can bound a hung compile:
+    //   XGR_TOKENIZER=<tokenizer.json> XGR_SHAPE=optseq|repalt|baseline \
+    //   XGR_N=40 timeout 60 cargo test -p vllm-core --lib \
+    //     --features xgrammar diag_compile_explosion -- --ignored --nocapture
+
+    #[cfg(feature = "xgrammar")]
+    #[test]
+    #[ignore = "manual diagnostic, drive via XGR_* env + external timeout"]
+    fn diag_compile_explosion_real_vocab() {
+        let Ok(tok_path) = std::env::var("XGR_TOKENIZER") else {
+            eprintln!("SKIP: set XGR_TOKENIZER to a local tokenizer.json");
+            return;
+        };
+        let shape = std::env::var("XGR_SHAPE").unwrap_or_else(|_| "baseline".into());
+        let n: usize = std::env::var("XGR_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+
+        const CLASS: &str = r#"[-a-zA-Z0-9 .,!?:;'()/+*#@%&=<>~_]"#;
+        let grammar = match shape.as_str() {
+            "baseline" => format!(
+                "root ::= \"{{\" \"\\\"r\\\"\" \":\" sv \"}}\"\nsv ::= \"\\\"\" strplain{{0,{n}}} \"\\\"\"\nstrplain ::= {CLASS}\n"
+            ),
+            "optseq" => {
+                let opts = "strchar? ".repeat(n);
+                format!(
+                    "root ::= \"{{\" \"\\\"r\\\"\" \":\" sv \"}}\"\nsv ::= \"\\\"\" {opts} \"\\\"\"\nstrchar ::= {CLASS}\n"
+                )
+            }
+            "repalt" => format!(
+                "root ::= \"{{\" \"\\\"r\\\"\" \":\" sv \"}}\"\nsv ::= \"\\\"\" strchar{{0,{n}}} \"\\\"\"\nstrchar ::= {CLASS} | \"\\\\n\" | \"\\\\\" [\"\\\\/bfnrtu]\n"
+            ),
+            other => panic!("unknown XGR_SHAPE {other}"),
+        };
+
+        let t_load = std::time::Instant::now();
+        let tok =
+            TokenizerWrapper::from_file(std::path::Path::new(&tok_path)).expect("load tokenizer");
+        let vi = Arc::new(VocabularyIndex::from_tokenizer(&tok));
+        let vocab_size = vi.vocab_size();
+        let compiler = GrammarCompiler::new(vi);
+        eprintln!(
+            "vocab={vocab_size} loaded in {:?}; compiling shape={shape} n={n}",
+            t_load.elapsed()
+        );
+
+        // XGR_DEADLINE_MS set → exercise the cooperative C++ deadline at
+        // this real vocab (the production path); unset → unbounded.
+        let deadline = std::env::var("XGR_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis);
+        let t0 = std::time::Instant::now();
+        let handle = compiler
+            .state
+            .xgrammar_compiler_handle()
+            .expect("xgrammar handle");
+        let result = xgrammar_compile_to_arc(
+            &handle,
+            &StructuredOutputOption::Grammar,
+            &grammar,
+            deadline,
+        );
+        let dt = t0.elapsed();
+        match result {
+            Ok(_) => eprintln!("{shape} n={n} deadline={deadline:?}: compiled in {dt:?}"),
+            Err(e) => eprintln!("{shape} n={n} deadline={deadline:?}: ERROR after {dt:?}: {e:#}"),
+        }
     }
 
     // Find a string-rule EBNF formulation xgrammar fills fast. Hypothesis:

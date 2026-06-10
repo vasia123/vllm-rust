@@ -75,7 +75,8 @@ pub async fn create_response(
         req.response_format.as_ref(),
         &state.tokenizer,
         &state.grammar_compiler(),
-    );
+    )
+    .await;
 
     let response_id = generate_response_id();
     let model = state.model_id.clone();

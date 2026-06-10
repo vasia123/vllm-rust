@@ -131,13 +131,15 @@ pub async fn create_chat_completion(
             req.structured_outputs.as_ref(),
             &state.tokenizer,
             &state.grammar_compiler(),
-        )?
+        )
+        .await?
     } else {
         create_constraint_from_response_format(
             req.response_format.as_ref(),
             &state.tokenizer,
             &state.grammar_compiler(),
         )
+        .await
     };
 
     // Convert logit_bias once, before branching on stream vs non-stream
@@ -279,22 +281,14 @@ pub async fn create_chat_completion(
         // First request runs serially to populate the prefix cache. Remaining
         // requests run concurrently — they get prefix cache hits and skip most
         // of the prefill, saving significant GPU time for long prompts.
-        let build_gen_req = |req: &ChatCompletionRequest| -> GenerationRequest {
-            let constraint = if req.structured_outputs.is_some() {
-                create_constraint_from_structured_outputs(
-                    req.structured_outputs.as_ref(),
-                    &state.tokenizer,
-                    &state.grammar_compiler(),
-                )
-                .ok()
-                .flatten()
-            } else {
-                create_constraint_from_response_format(
-                    req.response_format.as_ref(),
-                    &state.tokenizer,
-                    &state.grammar_compiler(),
-                )
-            };
+        //
+        // Constraints are compiled OUTSIDE the closure (grammar compilation
+        // is async — single-flight + deadline in GrammarCompiler); each
+        // candidate needs its own stateful matcher instance, but after the
+        // first compile the rest are instant template-cache hits.
+        let build_gen_req = |req: &ChatCompletionRequest,
+                             constraint: Option<Box<dyn SamplingConstraint>>|
+         -> GenerationRequest {
             let beam = build_beam_config(req.beam_width, req.length_penalty, req.early_stopping);
             GenerationRequest {
                 prompt: prompt.clone(),
@@ -336,11 +330,12 @@ pub async fn create_chat_completion(
 
         let mut candidates: Vec<GenerationResult> = Vec::with_capacity(best_of);
 
-        // First candidate — serial to populate prefix cache
+        // First candidate — serial to populate prefix cache. Reuses the
+        // constraint compiled before the stream/non-stream branch.
         let first_result = state
             .engine
             .get()
-            .generate(build_gen_req(&req))
+            .generate(build_gen_req(&req, constraint))
             .await
             .map_err(|e| {
                 prometheus::inc_requests_error();
@@ -355,10 +350,35 @@ pub async fn create_chat_completion(
         candidates.push(first_result);
 
         if best_of > 1 {
-            // Remaining candidates — concurrent (prefix cache provides KV reuse)
+            // Remaining candidates — concurrent (prefix cache provides KV
+            // reuse). Per-candidate constraints are template-cache hits
+            // (compile errors were already surfaced by the first compile;
+            // mirror the historical .ok().flatten() tolerance here).
+            let mut extra_constraints = Vec::with_capacity(best_of - 1);
+            for _ in 1..best_of {
+                let c = if req.structured_outputs.is_some() {
+                    create_constraint_from_structured_outputs(
+                        req.structured_outputs.as_ref(),
+                        &state.tokenizer,
+                        &state.grammar_compiler(),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    create_constraint_from_response_format(
+                        req.response_format.as_ref(),
+                        &state.tokenizer,
+                        &state.grammar_compiler(),
+                    )
+                    .await
+                };
+                extra_constraints.push(c);
+            }
             let engine = state.engine.get();
-            let futs: Vec<_> = (1..best_of)
-                .map(|_| engine.generate(build_gen_req(&req)))
+            let futs: Vec<_> = extra_constraints
+                .into_iter()
+                .map(|c| engine.generate(build_gen_req(&req, c)))
                 .collect();
             let results = futures::future::join_all(futs).await;
             for result in results {
@@ -653,7 +673,7 @@ fn build_chat_logprobs(
 /// Grammar-based constraints (regex, grammar, json schema via structured_outputs)
 /// use DFA-compiled bitmasks for O(vocab_size/32) masking. Falls back to the
 /// legacy text-based constraints for response_format-only requests.
-pub(crate) fn create_constraint_from_response_format(
+pub(crate) async fn create_constraint_from_response_format(
     response_format: Option<&ResponseFormat>,
     tokenizer: &Arc<TokenizerWrapper>,
     compiler: &GrammarCompiler,
@@ -671,7 +691,10 @@ pub(crate) fn create_constraint_from_response_format(
             // constraining generation — visible as hard 400s on Gemma 4 @
             // 2.0bpw, whose free-running JSON is slightly malformed.
             let schema = serde_json::json!({"type": "object"});
-            match compiler.compile_sync(&StructuredOutputOption::JsonSchema, &schema.to_string()) {
+            match compiler
+                .compile(StructuredOutputOption::JsonSchema, &schema.to_string())
+                .await
+            {
                 Ok(grammar) => Some(Box::new(GrammarConstraintAdapter::new(
                     grammar,
                     tokenizer.vocab_size(),
@@ -716,7 +739,10 @@ pub(crate) fn create_constraint_from_response_format(
                     )));
                 }
             };
-            match compiler.compile_sync(&StructuredOutputOption::JsonSchema, &spec) {
+            match compiler
+                .compile(StructuredOutputOption::JsonSchema, &spec)
+                .await
+            {
                 Ok(grammar) => Some(Box::new(GrammarConstraintAdapter::new(
                     grammar,
                     tokenizer.vocab_size(),
@@ -742,7 +768,7 @@ pub(crate) fn create_constraint_from_response_format(
 ///
 /// Returns `Ok(None)` if no constraint is specified. Returns `Err` if
 /// compilation fails (e.g., invalid regex or grammar syntax).
-pub(crate) fn create_constraint_from_structured_outputs(
+pub(crate) async fn create_constraint_from_structured_outputs(
     structured_outputs: Option<&super::types::StructuredOutputs>,
     tokenizer: &Arc<TokenizerWrapper>,
     compiler: &GrammarCompiler,
@@ -757,9 +783,10 @@ pub(crate) fn create_constraint_from_structured_outputs(
 
     if let Some(ref regex_pattern) = so.regex {
         let grammar = compiler
-            .compile_sync(&StructuredOutputOption::Regex, regex_pattern)
+            .compile(StructuredOutputOption::Regex, regex_pattern)
+            .await
             .map_err(|e| {
-                super::error::ApiError::InvalidRequest(format!("invalid regex pattern: {e}"))
+                super::error::ApiError::InvalidRequest(format!("invalid regex pattern: {e:#}"))
             })?;
         let vocab_size = tokenizer.vocab_size();
         return Ok(Some(Box::new(GrammarConstraintAdapter::new(
@@ -769,8 +796,11 @@ pub(crate) fn create_constraint_from_structured_outputs(
 
     if let Some(ref grammar_str) = so.grammar {
         let grammar = compiler
-            .compile_sync(&StructuredOutputOption::Grammar, grammar_str)
-            .map_err(|e| super::error::ApiError::InvalidRequest(format!("invalid grammar: {e}")))?;
+            .compile(StructuredOutputOption::Grammar, grammar_str)
+            .await
+            .map_err(|e| {
+                super::error::ApiError::InvalidRequest(format!("invalid grammar: {e:#}"))
+            })?;
         let vocab_size = tokenizer.vocab_size();
         return Ok(Some(Box::new(GrammarConstraintAdapter::new(
             grammar, vocab_size,
@@ -782,10 +812,11 @@ pub(crate) fn create_constraint_from_structured_outputs(
             super::error::ApiError::InvalidRequest(format!("invalid JSON schema: {e}"))
         })?;
         let grammar = compiler
-            .compile_sync(&StructuredOutputOption::JsonSchema, &spec)
+            .compile(StructuredOutputOption::JsonSchema, &spec)
+            .await
             .map_err(|e| {
                 super::error::ApiError::InvalidRequest(format!(
-                    "JSON schema compilation failed: {e}"
+                    "JSON schema compilation failed: {e:#}"
                 ))
             })?;
         let vocab_size = tokenizer.vocab_size();

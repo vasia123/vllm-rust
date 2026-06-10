@@ -425,6 +425,13 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         stream_interval: usize,
 
+        /// Wall-clock budget (seconds) for compiling one structured-output
+        /// grammar/schema/regex. Pathologically complex grammars are
+        /// rejected with HTTP 400 once the budget elapses instead of
+        /// burning CPU until restart.
+        #[arg(long, default_value_t = 15)]
+        grammar_compile_timeout_secs: u64,
+
         // ─── LoRA Configuration ─────────────────────────────────────────
         /// Enable LoRA adapter support globally.
         #[arg(long)]
@@ -595,6 +602,7 @@ async fn main() -> anyhow::Result<()> {
             enable_prefix_caching,
             enable_chunked_prefill,
             disable_chunked_prefill,
+            grammar_compile_timeout_secs,
             shutdown_timeout,
             allowed_origins,
             allowed_methods,
@@ -1098,6 +1106,7 @@ async fn main() -> anyhow::Result<()> {
                 long_prefill_token_threshold,
                 acceptance_method: parsed_acceptance_method,
                 stream_interval,
+                grammar_compile_timeout_secs,
                 enable_lora,
                 max_loras,
                 lora_extra_vocab_size,
@@ -1208,6 +1217,8 @@ struct ServerLaunchConfig {
     // Spec-decode acceptance
     acceptance_method: AcceptanceMethod,
     stream_interval: usize,
+    /// Structured-output grammar compile budget (seconds).
+    grammar_compile_timeout_secs: u64,
     // LoRA
     enable_lora: bool,
     max_loras: usize,
@@ -1309,6 +1320,7 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         long_prefill_token_threshold,
         acceptance_method,
         stream_interval,
+        grammar_compile_timeout_secs,
         enable_lora,
         max_loras,
         lora_extra_vocab_size,
@@ -2571,7 +2583,18 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         max_cpu_loras,
         disable_mm_preprocessor_cache,
     )
-    .with_additional_eos_token_ids(files.config.eos_token_ids());
+    .with_additional_eos_token_ids(files.config.eos_token_ids())
+    .with_grammar_compile_timeout(std::time::Duration::from_secs(
+        grammar_compile_timeout_secs.max(1),
+    ));
+
+    // Build the grammar compiler's vocabulary index off the request path:
+    // the first structured-output request would otherwise pay ~1-3s of
+    // vocab decode on a tokio worker.
+    {
+        let warmup_state = state.clone();
+        tokio::task::spawn_blocking(move || warmup_state.warmup_grammar_compiler());
+    }
 
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
