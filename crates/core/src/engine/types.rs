@@ -473,6 +473,20 @@ pub(crate) enum EngineCommand {
     ResetPrefixCache {
         response_tx: oneshot::Sender<Result<usize, EngineError>>,
     },
+    /// Compute pooled embeddings for pre-tokenized inputs on the loaded model.
+    ///
+    /// Runs a one-shot prefill-style forward (no generation), pools the
+    /// per-token hidden states, and optionally L2-normalizes. One output
+    /// vector per input. Errors if the loaded model does not support
+    /// embeddings (see [`ModelForward::supports_embeddings`]).
+    Embed {
+        inputs: Vec<Vec<u32>>,
+        /// `None` → use the model's native pooling (mean for an encoder
+        /// embedder, last-token for a causal LM).
+        pooling: Option<crate::engine::PoolingStrategy>,
+        normalize: bool,
+        response_tx: oneshot::Sender<Result<Vec<Vec<f32>>, EngineError>>,
+    },
     Shutdown,
 }
 

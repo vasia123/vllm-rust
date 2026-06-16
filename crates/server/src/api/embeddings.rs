@@ -106,6 +106,15 @@ pub struct EmbeddingRequest {
     /// A unique identifier for the end-user (for monitoring/abuse detection).
     #[serde(default)]
     pub user: Option<String>,
+    /// Pooling strategy override (extension, not part of the OpenAI spec):
+    /// `mean` | `cls` | `last`/`last_token` | `eos`. Defaults to `last_token`,
+    /// the correct choice for causal-LM hidden states (only the last token has
+    /// attended to the full input). Lets one compare strategies empirically.
+    #[serde(default)]
+    pub pooling: Option<String>,
+    /// Whether to L2-normalize the output embeddings (extension). Default true.
+    #[serde(default)]
+    pub normalize: Option<bool>,
 }
 
 fn default_encoding_format() -> EncodingFormat {
@@ -265,25 +274,69 @@ pub async fn create_embedding(
                 .map_err(|e| ApiError::InvalidRequest(format!("Tokenization failed: {}", e)))?,
             InputItem::TokenIds(ids) => ids,
         };
+        if token_ids.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "Embedding input must contain at least one token".to_string(),
+            ));
+        }
+        // Wrap with model-required special tokens (EmbeddingGemma: [bos] … [eos]).
+        let mut token_ids = token_ids;
+        if let Some(bos) = state.embed_prefix_token {
+            token_ids.insert(0, bos);
+        }
+        if let Some(eos) = state.embed_suffix_token {
+            token_ids.push(eos);
+        }
         token_counts.push(token_ids.len());
         all_token_ids.push(token_ids);
     }
 
-    // For now, return a placeholder response since we don't have an embedding model loaded.
-    // In a full implementation, this would:
-    // 1. Get the embedding model from state
-    // 2. Create input tensors
-    // 3. Run forward pass through the embedding model
-    // 4. Apply pooling and normalization
-    // 5. Return the embeddings
+    // Pooling strategy. When unset, the engine uses the model's native pooling
+    // (mean for an encoder embedder like EmbeddingGemma, last-token for a
+    // causal LM). An explicit value overrides it (handy for experiments).
+    let pooling = match request.pooling.as_deref() {
+        Some(s) => Some(
+            s.parse::<vllm_core::engine::PoolingStrategy>()
+                .map_err(|e| ApiError::InvalidRequest(format!("invalid pooling strategy: {e}")))?,
+        ),
+        None => None,
+    };
+    let normalize = request.normalize.unwrap_or(true);
 
-    // Placeholder: return zero embeddings with correct dimensions
-    // Real implementation would use ModelForEmbedding::encode()
-    let embedding_dim = 1536; // Common dimension for embedding models
-    let embeddings: Vec<Vec<f32>> = all_token_ids
-        .iter()
-        .map(|_| vec![0.0f32; embedding_dim])
-        .collect();
+    // Run the embedding forward on the loaded model via the engine. This reuses
+    // the same weights the engine uses for generation — no second model load.
+    let engine = state.engine.get();
+    let mut embeddings = engine
+        .embed(all_token_ids, pooling, normalize)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("does not support embeddings") {
+                ApiError::InvalidRequest(format!(
+                    "the loaded model cannot produce embeddings: {msg}"
+                ))
+            } else {
+                ApiError::EngineError(msg)
+            }
+        })?;
+
+    // Optional dimensionality reduction (OpenAI `dimensions`): truncate, then
+    // re-normalize so a unit-norm vector stays unit-norm after truncation.
+    if let Some(dim) = request.dimensions {
+        for embedding in &mut embeddings {
+            if dim < embedding.len() {
+                embedding.truncate(dim);
+                if normalize {
+                    let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for x in embedding.iter_mut() {
+                            *x /= norm;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let response = EmbeddingResponse::new(
         embeddings,

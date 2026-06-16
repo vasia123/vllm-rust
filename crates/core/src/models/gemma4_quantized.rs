@@ -2189,6 +2189,47 @@ impl QuantizedGemma4ForCausalLM {
         Ok(logits)
     }
 
+    /// Per-token hidden states for embeddings: full sequence, post-final-norm,
+    /// pre-`lm_head`. Returns `[seq, hidden]`.
+    ///
+    /// Differs from [`forward`] in two ways: (1) no prefill bucketing/padding —
+    /// pooling reads every real position, so padded rows would poison the
+    /// pooled vector, and an embed request is never in the per-shape graph
+    /// cache hot path; (2) no narrow to the last token and no `lm_head` —
+    /// the caller pools over all positions. `lm_head`'s 262k-vocab buffer is
+    /// never allocated, so peak memory is lower than a generation prefill.
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let normalizer = (self.hidden_size as f64).sqrt();
+        let xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
+        let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
+        let real_len = xs.dim(1)?;
+
+        let mut xs = xs;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
+            xs = layer.forward(
+                &xs,
+                pli.as_ref(),
+                real_len,
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+            )?;
+        }
+
+        let xs = self.norm.forward(&xs)?;
+        xs.squeeze(0)
+    }
+
     /// Embed text tokens (for VLM use — embed only, no layers).
     /// Applies Gemma 4's sqrt(hidden_size) normalisation.
     pub(crate) fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -2305,6 +2346,28 @@ impl crate::engine::ModelForward for QuantizedGemma4ForCausalLM {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         QuantizedGemma4ForCausalLM::forward(
+            self,
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn supports_embeddings(&self) -> bool {
+        true
+    }
+
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        QuantizedGemma4ForCausalLM::forward_hidden(
             self,
             input_ids,
             seqlen_offset,
@@ -2624,8 +2687,8 @@ mod tests {
                     );
                 }
                 // Padded KV columns must be masked for real rows.
-                for j in real_kv..kv_len {
-                    assert_eq!(bucketed[i][j], f32::NEG_INFINITY, "pad col ({i},{j})");
+                for (j, &cell) in bucketed[i].iter().enumerate().take(kv_len).skip(real_kv) {
+                    assert_eq!(cell, f32::NEG_INFINITY, "pad col ({i},{j})");
                 }
             }
             // Padding rows: only column 0 open (NaN guard), rest -inf.
@@ -2877,6 +2940,54 @@ mod tests {
             logits.dims(),
             &[batch_size, 1, cfg.vocab_size],
             "prefill logits shape should be [batch, 1, vocab_size]"
+        );
+    }
+
+    #[test]
+    fn test_quantized_gemma4_forward_hidden_shape() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model =
+            QuantizedGemma4ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build model");
+
+        assert!(
+            <QuantizedGemma4ForCausalLM as crate::engine::ModelForward>::supports_embeddings(
+                &model
+            ),
+            "gemma4 quantized must advertise embedding support"
+        );
+
+        let cache_config = create_cache_config(&cfg, &device);
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let seq_len = 5;
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).expect("input");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let hidden = model
+            .forward_hidden(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("forward_hidden");
+
+        // Full sequence preserved (NOT narrowed to last token), hidden_size
+        // (NOT vocab_size — lm_head skipped), batch dim squeezed.
+        assert_eq!(
+            hidden.dims(),
+            &[seq_len, cfg.hidden_size],
+            "forward_hidden shape should be [seq_len, hidden_size]"
         );
     }
 

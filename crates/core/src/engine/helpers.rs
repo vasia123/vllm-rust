@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use candle_core::{IndexOp, Tensor};
 
-use crate::kv_cache::KVCacheManager;
+use crate::kv_cache::{BlockTable, KVCacheManager};
 use crate::request::{FinishReason, RequestId, RequestStatus, SequenceState};
 use crate::sampling::{self, SamplerState};
 use crate::scheduler::Scheduler;
@@ -355,6 +355,16 @@ pub(crate) fn handle_command(
             let _ = response_tx.send(Ok(num_evicted));
             false
         }
+        EngineCommand::Embed { response_tx, .. } => {
+            // Embeddings are peeled off by the engine loop's `process_command!`
+            // macro before reaching here (they need direct strategy/KV access).
+            // Reaching this arm means the macro was bypassed — fail cleanly
+            // rather than silently dropping the request.
+            let _ = response_tx.send(Err(EngineError::Model(
+                "embed command must be handled by the engine loop".into(),
+            )));
+            false
+        }
         EngineCommand::Shutdown => true,
     }
 }
@@ -646,6 +656,118 @@ pub(crate) fn send_error(response: ResponseChannel, error: EngineError) {
             });
         }
     }
+}
+
+/// Compute pooled embeddings for pre-tokenized inputs on the loaded model.
+///
+/// Stateless one-shot: each input gets a temporary block table, a single
+/// `forward_hidden` prefill, pooling over all positions + optional L2
+/// normalization, then the blocks are freed **unconditionally** (even when the
+/// forward errors). No scheduler entry, no generation. Bypasses the output
+/// pool via `ModeGuard::prefill` (transients drop on scope exit; `forward_hidden`
+/// never allocates the `lm_head` buffer, so peak memory is below a generation
+/// prefill). Inputs are processed sequentially.
+pub(crate) fn execute_embed<M: ModelForward>(
+    model: &M,
+    inputs: &[Vec<u32>],
+    pooling: Option<super::embedding_forward::PoolingStrategy>,
+    normalize: bool,
+    kv_cache_mgr: &mut KVCacheManager,
+) -> Result<Vec<Vec<f32>>, EngineError> {
+    use super::embedding_forward::PoolingStrategy;
+    let _mode_guard = crate::engine::output_pool::ModeGuard::prefill();
+
+    if !model.supports_embeddings() {
+        return Err(EngineError::Model(
+            "loaded model does not support embeddings".into(),
+        ));
+    }
+
+    // Resolve pooling: explicit request override → model's native pooling
+    // (e.g. mean for an encoder embedder) → last-token default (causal LMs).
+    let pooling = pooling
+        .or_else(|| model.embedding_pooling())
+        .unwrap_or(PoolingStrategy::LastToken);
+
+    let device = model.device();
+    let block_size = kv_cache_mgr.block_size();
+    let mut out = Vec::with_capacity(inputs.len());
+
+    for tokens in inputs {
+        let len = tokens.len();
+        if len == 0 {
+            return Err(EngineError::Model("empty embedding input".into()));
+        }
+
+        // Temporary block table — not tied to any ActiveRequest. Allocate,
+        // run, then free regardless of outcome so a forward error cannot leak
+        // blocks out of the shared pool.
+        let mut block_table = BlockTable::new(block_size);
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, len)
+            .map_err(|e| EngineError::Cache(e.to_string()))?;
+        let slot_mapping = block_table.slot_mapping(0, len);
+
+        let input = match Tensor::from_vec(tokens.clone(), (1, len), device) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = kv_cache_mgr.free_request(&mut block_table);
+                return Err(EngineError::Model(e.to_string()));
+            }
+        };
+
+        // seqlen_offset is always 0: each embed input is a fresh sequence with
+        // a fresh block table (a non-zero offset would silently corrupt RoPE).
+        let hidden = model.forward_hidden(&input, 0, kv_cache_mgr, &block_table, &slot_mapping);
+        let _ = kv_cache_mgr.free_request(&mut block_table);
+        let hidden = hidden.map_err(|e| EngineError::Model(e.to_string()))?;
+
+        // forward_hidden must return one row per real token; a mismatch means
+        // bucketing/padding leaked in and would poison the pooled vector.
+        let hidden_positions = hidden
+            .dim(0)
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+        if hidden_positions != len {
+            return Err(EngineError::Model(format!(
+                "forward_hidden returned {hidden_positions} positions for {len} tokens"
+            )));
+        }
+
+        // Pool over all positions: [1, seq, hidden] with an all-ones mask.
+        let token_embeddings = hidden
+            .unsqueeze(0)
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+        let mask = Tensor::ones((1, len), candle_core::DType::F32, device)
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+        let pooled = super::embedding_forward::pool_embeddings(&token_embeddings, &mask, pooling)
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+
+        // Model-specific projection between pooling and normalization
+        // (EmbeddingGemma's sentence-transformers Dense head); identity otherwise.
+        let mut pooled = model
+            .project_embedding(&pooled)
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+
+        if normalize {
+            let norm = pooled
+                .sqr()
+                .and_then(|t| t.sum_keepdim(candle_core::D::Minus1))
+                .and_then(|t| t.sqrt())
+                .map_err(|e| EngineError::Model(e.to_string()))?;
+            pooled = pooled
+                .broadcast_div(&norm)
+                .map_err(|e| EngineError::Model(e.to_string()))?;
+        }
+
+        let vector = pooled
+            .squeeze(0)
+            .and_then(|t| t.to_dtype(candle_core::DType::F32))
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| EngineError::Model(e.to_string()))?;
+        out.push(vector);
+    }
+
+    Ok(out)
 }
 
 pub(crate) fn execute_prefill<M: ModelForward>(
@@ -3214,9 +3336,9 @@ mod tests {
         // request holds 2 full blocks and allocation of a 3rd fails.
         // Folded prompt = 32 tokens ⇒ 2 blocks ≤ 3 total ⇒ recompute is
         // possible once the other block frees: must preempt, not fail.
-        let (mut kv, mut requests, req_id) = boundary_exhausted_request(30, 2);
-        // Rebuild with a 3-block pool: take the same geometry but hold
-        // one block externally.
+        // The cache from this helper is discarded — we rebuild with a
+        // 3-block pool below (same geometry, but hold one block externally).
+        let (_, mut requests, req_id) = boundary_exhausted_request(30, 2);
         use crate::kv_cache::{CacheConfig, KVCacheDtype};
         let cache_config = CacheConfig {
             block_size: 16,
@@ -3229,7 +3351,7 @@ mod tests {
             kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         };
-        kv = KVCacheManager::new(&cache_config).unwrap();
+        let mut kv = KVCacheManager::new(&cache_config).unwrap();
         let mut other_table = BlockTable::new(16);
         kv.allocate_for_request(&mut other_table, 16).unwrap();
         {

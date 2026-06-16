@@ -541,6 +541,66 @@ mod tests {
         }
     }
 
+    /// Mock that supports embeddings: `forward_hidden` returns a deterministic
+    /// `[seq, hidden]` tensor where every element of row `pos` equals `pos`.
+    /// This makes pooling outcomes exactly predictable:
+    /// - LastToken → row `seq-1` → all `(seq-1)`
+    /// - Mean → all `(0+1+…+(seq-1))/seq`
+    struct EmbeddingMockModel {
+        hidden: usize,
+        device: Device,
+    }
+
+    impl EmbeddingMockModel {
+        fn new(hidden: usize) -> Self {
+            Self {
+                hidden,
+                device: Device::Cpu,
+            }
+        }
+    }
+
+    impl ModelForward for EmbeddingMockModel {
+        fn forward(
+            &self,
+            input_ids: &candle_core::Tensor,
+            _seqlen_offset: usize,
+            _kv_cache_mgr: &mut KVCacheManager,
+            _block_table: &BlockTable,
+            _slot_mapping: &[usize],
+        ) -> candle_core::Result<candle_core::Tensor> {
+            let seq_len = input_ids.dims()[1];
+            candle_core::Tensor::zeros((1, seq_len, self.hidden), DType::F32, &self.device)
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn supports_embeddings(&self) -> bool {
+            true
+        }
+
+        fn forward_hidden(
+            &self,
+            input_ids: &candle_core::Tensor,
+            _seqlen_offset: usize,
+            _kv_cache_mgr: &mut KVCacheManager,
+            _block_table: &BlockTable,
+            _slot_mapping: &[usize],
+        ) -> candle_core::Result<candle_core::Tensor> {
+            let seq_len = input_ids.dims()[1];
+            let mut data = vec![0.0f32; seq_len * self.hidden];
+            for pos in 0..seq_len {
+                for h in 0..self.hidden {
+                    data[pos * self.hidden + h] = pos as f32;
+                }
+            }
+            // [seq, hidden] — note: NOT narrowed, NOT [1, seq, hidden].
+            candle_core::Tensor::from_vec(data, (seq_len, self.hidden), &self.device)
+        }
+    }
+
     fn test_cache_config() -> CacheConfig {
         use crate::kv_cache::KVCacheDtype;
         CacheConfig {
@@ -554,6 +614,104 @@ mod tests {
             kv_cache_dtype: KVCacheDtype::Auto,
             cpu_offload: None,
         }
+    }
+
+    #[test]
+    fn execute_embed_last_token_pooling() {
+        let model = EmbeddingMockModel::new(4);
+        let mut kv = KVCacheManager::new(&test_cache_config()).expect("cache");
+        // Two inputs of length 3 and 2 → last-token rows are 2.0 and 1.0.
+        let inputs = vec![vec![0u32, 1, 2], vec![0u32, 1]];
+        let out = crate::engine::helpers::execute_embed(
+            &model,
+            &inputs,
+            Some(crate::engine::PoolingStrategy::LastToken),
+            false,
+            &mut kv,
+        )
+        .expect("embed");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], vec![2.0f32; 4]);
+        assert_eq!(out[1], vec![1.0f32; 4]);
+    }
+
+    #[test]
+    fn execute_embed_mean_pooling() {
+        let model = EmbeddingMockModel::new(4);
+        let mut kv = KVCacheManager::new(&test_cache_config()).expect("cache");
+        let inputs = vec![vec![0u32, 1, 2]]; // mean of {0,1,2} = 1.0
+        let out = crate::engine::helpers::execute_embed(
+            &model,
+            &inputs,
+            Some(crate::engine::PoolingStrategy::Mean),
+            false,
+            &mut kv,
+        )
+        .expect("embed");
+        assert_eq!(out[0], vec![1.0f32; 4]);
+    }
+
+    #[test]
+    fn execute_embed_normalizes_to_unit_norm() {
+        let model = EmbeddingMockModel::new(4);
+        let mut kv = KVCacheManager::new(&test_cache_config()).expect("cache");
+        // LastToken on len-3 → [2,2,2,2]; ‖·‖ = sqrt(16) = 4 → [0.5;4].
+        let inputs = vec![vec![0u32, 1, 2]];
+        let out = crate::engine::helpers::execute_embed(
+            &model,
+            &inputs,
+            Some(crate::engine::PoolingStrategy::LastToken),
+            true,
+            &mut kv,
+        )
+        .expect("embed");
+        for x in &out[0] {
+            assert!((x - 0.5).abs() < 1e-6, "expected 0.5, got {x}");
+        }
+        let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "expected unit norm, got {norm}");
+    }
+
+    #[test]
+    fn execute_embed_blocks_are_freed_each_input() {
+        let model = EmbeddingMockModel::new(4);
+        let mut kv = KVCacheManager::new(&test_cache_config()).expect("cache");
+        let free_before = kv.num_free_blocks();
+        // Many inputs: if blocks leaked, the pool would drain and later allocs fail.
+        let inputs: Vec<Vec<u32>> = (0..200).map(|_| vec![0u32, 1, 2, 3, 4]).collect();
+        let out = crate::engine::helpers::execute_embed(
+            &model,
+            &inputs,
+            Some(crate::engine::PoolingStrategy::LastToken),
+            false,
+            &mut kv,
+        )
+        .expect("embed");
+        assert_eq!(out.len(), 200);
+        assert_eq!(
+            kv.num_free_blocks(),
+            free_before,
+            "embedding must free every transiently-allocated block"
+        );
+    }
+
+    #[test]
+    fn execute_embed_unsupported_model_errors() {
+        let model = MockModel::new(42, 1000); // supports_embeddings() == false
+        let mut kv = KVCacheManager::new(&test_cache_config()).expect("cache");
+        let inputs = vec![vec![0u32, 1, 2]];
+        let err = crate::engine::helpers::execute_embed(
+            &model,
+            &inputs,
+            Some(crate::engine::PoolingStrategy::LastToken),
+            true,
+            &mut kv,
+        )
+        .expect_err("must error for non-embedding model");
+        assert!(
+            err.to_string().contains("does not support embeddings"),
+            "unexpected error: {err}"
+        );
     }
 
     fn test_engine_config() -> EngineConfig {
@@ -741,6 +899,70 @@ mod tests {
         let result = results[0].as_ref().unwrap();
         assert_eq!(result.generated_token_ids, vec![42, 42, 42, 42, 42]);
         assert_eq!(result.finish_reason, FinishReason::Length);
+    }
+
+    /// End-to-end embedding through the real engine loop: an `Embed` command
+    /// arrives while the engine is idle, is peeled off by `process_command!`,
+    /// run on the blocking pool, and the pooled vectors come back over the
+    /// oneshot channel. Exercises the full command → loop → execute_embed path.
+    #[tokio::test]
+    async fn engine_embed_roundtrip() {
+        let kv_cache_mgr = KVCacheManager::new(&test_cache_config()).unwrap();
+        let model = EmbeddingMockModel::new(4);
+        let config = test_engine_config();
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
+
+        let out = handle
+            .embed(
+                vec![vec![0u32, 1, 2], vec![0u32, 1, 2, 3]],
+                Some(crate::engine::PoolingStrategy::LastToken),
+                false,
+            )
+            .await
+            .expect("embed");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], vec![2.0f32; 4]); // last token of len-3
+        assert_eq!(out[1], vec![3.0f32; 4]); // last token of len-4
+
+        handle.shutdown().await.ok();
+    }
+
+    /// A non-embedding model surfaces a clean error through the engine path.
+    #[tokio::test]
+    async fn engine_embed_unsupported_model_errors() {
+        let kv_cache_mgr = KVCacheManager::new(&test_cache_config()).unwrap();
+        let model = MockModel::new(42, 1000); // supports_embeddings() == false
+        let config = test_engine_config();
+        let tokenizer = TokenizerWrapper::for_testing(1000);
+        let handle = start_engine(
+            model,
+            tokenizer,
+            kv_cache_mgr,
+            config,
+            crate::engine::EngineLimits::for_testing(),
+        );
+
+        let err = handle
+            .embed(
+                vec![vec![0u32, 1, 2]],
+                Some(crate::engine::PoolingStrategy::LastToken),
+                true,
+            )
+            .await
+            .expect_err("non-embedding model must error");
+        assert!(
+            err.to_string().contains("does not support embeddings"),
+            "unexpected error: {err}"
+        );
+
+        handle.shutdown().await.ok();
     }
 
     /// Recompute-preemption correctness (vLLM model): under a KV pool too

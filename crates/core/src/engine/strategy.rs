@@ -76,6 +76,25 @@ pub(crate) trait ExecutionStrategy: Send {
         None
     }
 
+    /// Compute pooled embeddings for pre-tokenized inputs on the loaded model.
+    ///
+    /// One-shot prefill-style forward (no generation, no scheduler entry) per
+    /// input, pooling the per-token hidden states and optionally L2-normalizing.
+    /// Returns one vector per input. The default errors; strategies whose model
+    /// supports embeddings override this.
+    fn embed(
+        &self,
+        inputs: &[Vec<u32>],
+        pooling: Option<crate::engine::PoolingStrategy>,
+        normalize: bool,
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Vec<Vec<f32>>, super::types::EngineError> {
+        let _ = (inputs, pooling, normalize, kv_cache_mgr);
+        Err(super::types::EngineError::Model(
+            "embeddings not supported by this execution strategy".into(),
+        ))
+    }
+
     /// Perform warmup for this execution strategy.
     ///
     /// Warmup is called before the engine starts accepting requests to:
@@ -364,6 +383,33 @@ fn compute_blocks_allocated(
     total
 }
 
+// ─── Embedding Execution ─────────────────────────────────────────────────
+
+/// Run an embedding request on the blocking thread pool, then return the
+/// moved-out `strategy` and `kv_cache_mgr` so the async loop can reclaim them.
+///
+/// Embeddings need exclusive access to the model and KV pool (same as a
+/// generation step), so they cannot run concurrently with a step — they are
+/// serialized at step granularity. GPU work must run on the blocking pool,
+/// not the async-loop thread, hence the dedicated `spawn_blocking`.
+async fn run_embed_blocking<S: ExecutionStrategy + 'static>(
+    strategy: S,
+    mut kv_cache_mgr: KVCacheManager,
+    inputs: Vec<Vec<u32>>,
+    pooling: Option<crate::engine::PoolingStrategy>,
+    normalize: bool,
+    response_tx: tokio::sync::oneshot::Sender<Result<Vec<Vec<f32>>, super::types::EngineError>>,
+) -> (S, KVCacheManager) {
+    let (strategy, kv_cache_mgr, result) = tokio::task::spawn_blocking(move || {
+        let result = strategy.embed(&inputs, pooling, normalize, &mut kv_cache_mgr);
+        (strategy, kv_cache_mgr, result)
+    })
+    .await
+    .expect("engine embedding task panicked");
+    let _ = response_tx.send(result);
+    (strategy, kv_cache_mgr)
+}
+
 // ─── Engine Loop ─────────────────────────────────────────────────────────
 
 /// Pipelined engine loop that works with any ExecutionStrategy.
@@ -408,13 +454,34 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
     // invalidated by completions or new commands.
     let mut pending_decision: Option<ScheduleDecision> = None;
 
-    loop {
-        // Phase 1: Drain incoming commands (non-blocking)
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    // Any command invalidates the pre-schedule
-                    pending_decision = None;
+    // Process one command. `Embed` is peeled off and run on the blocking pool
+    // (it needs exclusive ownership of `strategy`/`kv_cache_mgr`, which
+    // `handle_command` cannot reach); everything else goes through
+    // `handle_command`. A `return` propagates the shutdown signal out of the
+    // loop. Defined as a macro so it can move and reassign the loop-local
+    // `strategy`/`kv_cache_mgr` bindings at every command-drain site.
+    macro_rules! process_command {
+        ($cmd:expr) => {{
+            match $cmd {
+                EngineCommand::Embed {
+                    inputs,
+                    pooling,
+                    normalize,
+                    response_tx,
+                } => {
+                    let (s, kv) = run_embed_blocking(
+                        strategy,
+                        kv_cache_mgr,
+                        inputs,
+                        pooling,
+                        normalize,
+                        response_tx,
+                    )
+                    .await;
+                    strategy = s;
+                    kv_cache_mgr = kv;
+                }
+                cmd => {
                     if handle_command(
                         cmd,
                         &mut state.next_id,
@@ -429,6 +496,19 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
                     ) {
                         return; // shutdown
                     }
+                }
+            }
+        }};
+    }
+
+    loop {
+        // Phase 1: Drain incoming commands (non-blocking)
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    // Any command invalidates the pre-schedule
+                    pending_decision = None;
+                    process_command!(cmd);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
@@ -464,20 +544,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
             pending_decision = None;
             match cmd_rx.recv().await {
                 Some(cmd) => {
-                    if handle_command(
-                        cmd,
-                        &mut state.next_id,
-                        &tokenizer,
-                        &mut scheduler,
-                        &mut state.requests,
-                        block_size,
-                        &mut kv_cache_mgr,
-                        &mut paused,
-                        &mut frozen,
-                        strategy.spec_decode_stats(),
-                    ) {
-                        return;
-                    }
+                    process_command!(cmd);
                     continue;
                 }
                 None => return,
@@ -489,20 +556,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
             pending_decision = None;
             match cmd_rx.recv().await {
                 Some(cmd) => {
-                    if handle_command(
-                        cmd,
-                        &mut state.next_id,
-                        &tokenizer,
-                        &mut scheduler,
-                        &mut state.requests,
-                        block_size,
-                        &mut kv_cache_mgr,
-                        &mut paused,
-                        &mut frozen,
-                        strategy.spec_decode_stats(),
-                    ) {
-                        return;
-                    }
+                    process_command!(cmd);
                     continue;
                 }
                 None => return,
@@ -640,20 +694,7 @@ pub async fn run_engine_loop<S: ExecutionStrategy + 'static>(
         // Any processed command invalidates the pre-schedule (already handled
         // by the validation above — pending_cmds.len() > 0 → invalid).
         for cmd in pending_cmds {
-            if handle_command(
-                cmd,
-                &mut state.next_id,
-                &tokenizer,
-                &mut scheduler,
-                &mut state.requests,
-                block_size,
-                &mut kv_cache_mgr,
-                &mut paused,
-                &mut frozen,
-                strategy.spec_decode_stats(),
-            ) {
-                return; // shutdown
-            }
+            process_command!(cmd);
         }
     }
 }

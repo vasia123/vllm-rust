@@ -181,6 +181,52 @@ pub trait ModelForward: Send + 'static {
             slot_mapping,
         )
     }
+
+    /// Whether this model can produce per-token hidden states for embeddings.
+    ///
+    /// Returns `true` if the model overrides [`forward_hidden`] to return the
+    /// post-final-norm, pre-`lm_head` representation. Causal-LM models that
+    /// implement this can serve `/v1/embeddings` (with pooling) on the same
+    /// loaded weights they use for generation.
+    fn supports_embeddings(&self) -> bool {
+        false
+    }
+
+    /// Prefill-style forward returning per-token hidden states.
+    ///
+    /// Shape `[tokens, hidden_size]`, taken **after** the final norm and
+    /// **before** `lm_head`, with **no** narrowing to the last token — so the
+    /// caller can pool over all positions. Writes KV to the supplied
+    /// (temporary) block table exactly like [`forward`]; the caller frees it.
+    ///
+    /// Default returns an error; only embedding-capable models override it.
+    #[allow(unused_variables)]
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "forward_hidden not supported by this model".into(),
+        ))
+    }
+
+    /// Native pooling strategy for this model's embeddings, if it has a fixed
+    /// one (e.g. mean for a bidirectional encoder embedder). `None` lets the
+    /// caller pick (causal LMs default to last-token).
+    fn embedding_pooling(&self) -> Option<crate::engine::PoolingStrategy> {
+        None
+    }
+
+    /// Apply a model-specific projection to a pooled embedding
+    /// `[batch, hidden]` — e.g. EmbeddingGemma's sentence-transformers Dense
+    /// head, applied between pooling and L2 normalization. Default identity.
+    fn project_embedding(&self, pooled: &Tensor) -> candle_core::Result<Tensor> {
+        Ok(pooled.clone())
+    }
 }
 
 impl ModelForward for Box<dyn ModelForward> {
@@ -282,5 +328,34 @@ impl ModelForward for Box<dyn ModelForward> {
             block_table,
             slot_mapping,
         )
+    }
+
+    fn supports_embeddings(&self) -> bool {
+        (**self).supports_embeddings()
+    }
+
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        (**self).forward_hidden(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn embedding_pooling(&self) -> Option<crate::engine::PoolingStrategy> {
+        (**self).embedding_pooling()
+    }
+
+    fn project_embedding(&self, pooled: &Tensor) -> candle_core::Result<Tensor> {
+        (**self).project_embedding(pooled)
     }
 }

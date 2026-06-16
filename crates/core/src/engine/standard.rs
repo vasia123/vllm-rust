@@ -500,6 +500,16 @@ impl<M: ModelForward> StandardExecution<M> {
 }
 
 impl<M: ModelForward> ExecutionStrategy for StandardExecution<M> {
+    fn embed(
+        &self,
+        inputs: &[Vec<u32>],
+        pooling: Option<crate::engine::PoolingStrategy>,
+        normalize: bool,
+        kv_cache_mgr: &mut KVCacheManager,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        super::helpers::execute_embed(&self.model, inputs, pooling, normalize, kv_cache_mgr)
+    }
+
     fn execute_prefills(
         &mut self,
         output: &SchedulerOutput,

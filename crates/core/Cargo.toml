@@ -117,6 +117,12 @@ harness = false
 name = "gemma4_hetero_kv_bench"
 harness = false
 
+# Embedding forward path (forward_hidden) vs generation prefill (forward),
+# for the quantized Gemma 4 + Qwen3 models that back /v1/embeddings.
+[[bench]]
+name = "embed_forward_bench"
+harness = false
+
 [[bench]]
 name = "quantization_bench"
 harness = false

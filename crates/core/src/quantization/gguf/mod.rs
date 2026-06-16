@@ -727,6 +727,8 @@ impl GgufWeightLoader {
         // architectures use an empty `extra`.
         let (sliding_window, mut extra) = if arch_name == "gemma4" {
             self.gemma4_config_extras(vocab_size)
+        } else if arch_name == "gemma3" {
+            self.gemma3_config_extras()
         } else {
             (None, serde_json::Map::new())
         };
@@ -742,6 +744,27 @@ impl GgufWeightLoader {
                 "eos_token_ids".to_string(),
                 serde_json::json!(eos_token_ids),
             );
+        }
+
+        // Whether the tokenizer prepends BOS / appends EOS. EmbeddingGemma
+        // needs both (`[bos] … [eos]`) to match the reference; our HTTP
+        // tokenizer doesn't add them, so the embedding path applies them from
+        // these flags. Mirrors `tokenizer.ggml.add_{bos,eos}_token`.
+        if let Some(add_bos) = self
+            .content
+            .metadata
+            .get("tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.to_bool().ok())
+        {
+            extra.insert("add_bos_token".to_string(), serde_json::json!(add_bos));
+        }
+        if let Some(add_eos) = self
+            .content
+            .metadata
+            .get("tokenizer.ggml.add_eos_token")
+            .and_then(|v| v.to_bool().ok())
+        {
+            extra.insert("add_eos_token".to_string(), serde_json::json!(add_eos));
         }
 
         // Embedded chat template + the bos/eos token STRINGS, so the server
@@ -927,6 +950,117 @@ impl GgufWeightLoader {
             json!({ "rope_theta": swa, "rope_type": "default" }),
         );
         extra.insert("rope_parameters".into(), Value::Object(rope));
+
+        let sliding_window = self
+            .meta_u64(&format!("{arch}.attention.sliding_window"))
+            .map(|v| v as usize);
+
+        (sliding_window, extra)
+    }
+
+    /// Populate the Gemma-3-specific `ModelConfig.extra`. Besides the usual
+    /// chat-model settings (soft-caps, local RoPE), this detects the
+    /// **EmbeddingGemma** variant: a bidirectional Gemma3 encoder
+    /// (`gemma3.attention.causal == false`) with mean pooling
+    /// (`gemma3.pooling_type`) and a sentence-transformers projector
+    /// (`dense.0`/`dense.1` weights). Those three keys flip the quantized
+    /// model into embedding mode. Returns `(sliding_window, extra)`.
+    fn gemma3_config_extras(&self) -> (Option<usize>, serde_json::Map<String, serde_json::Value>) {
+        use serde_json::{json, Value};
+        let arch = "gemma3";
+        let mut extra: serde_json::Map<String, Value> = serde_json::Map::new();
+
+        // llama.cpp's GGUF conversion adds 1 to every `*norm.weight`, so the
+        // Gemma `(1 + weight)` scaling is already baked in — apply norms plainly.
+        extra.insert("gemma_norm_prefolded".into(), json!(true));
+
+        // Soft-capping (Gemma 3 chat models set these; embedding models don't).
+        if let Some(cap) = self.meta_f64(&format!("{arch}.final_logit_softcapping")) {
+            extra.insert("final_logit_softcapping".into(), json!(cap));
+        }
+        if let Some(cap) = self.meta_f64(&format!("{arch}.attn_logit_softcapping")) {
+            extra.insert("attn_logit_softcapping".into(), json!(cap));
+        }
+
+        // Separate local (sliding-layer) RoPE base.
+        if let Some(swa) = self.meta_f64(&format!("{arch}.rope.freq_base_swa")) {
+            extra.insert("rope_local_base_freq".into(), json!(swa));
+        }
+
+        // Per-layer sliding/global pattern. Gemma 3 interleaves sliding-window
+        // and full-attention layers (5:1), each with its own RoPE base. The
+        // GGUF stores a per-layer bool array (true = sliding); index it
+        // directly rather than guessing a stride.
+        if let Some(gguf_file::Value::Array(pat)) = self
+            .content
+            .metadata
+            .get(&format!("{arch}.attention.sliding_window_pattern"))
+        {
+            let flags: Vec<Value> = pat
+                .iter()
+                .map(|v| Value::Bool(v.to_bool().unwrap_or(true)))
+                .collect();
+            if !flags.is_empty() {
+                let sliding = flags.iter().filter(|v| v.as_bool() == Some(true)).count();
+                tracing::info!(
+                    "Gemma 3 GGUF: {} layers, {sliding} sliding / {} full",
+                    flags.len(),
+                    flags.len() - sliding
+                );
+                extra.insert("layer_is_sliding".into(), Value::Array(flags));
+            }
+        }
+
+        // Query pre-attention scalar = head_dim (key_length) → scaling
+        // 1/sqrt(head_dim). The struct default (sqrt(head_dim)) is not the
+        // Gemma 3 value; set it explicitly from the GGUF geometry.
+        if let Some(kl) = self.meta_u64(&format!("{arch}.attention.key_length")) {
+            extra.insert("query_pre_attn_scalar".into(), json!(kl));
+        }
+
+        // ── EmbeddingGemma detection ──────────────────────────────────────
+        // Bidirectional encoder: `causal == false`.
+        let causal = self
+            .content
+            .metadata
+            .get(&format!("{arch}.attention.causal"))
+            .and_then(|v| v.to_bool().ok())
+            .unwrap_or(true);
+        if !causal {
+            extra.insert("is_encoder_only".into(), json!(true));
+        }
+
+        // Pooling: llama.cpp pooling_type 0=none,1=mean,2=cls,3=last.
+        if let Some(pt) = self.meta_u64(&format!("{arch}.pooling_type")) {
+            let name = match pt {
+                1 => Some("mean"),
+                2 => Some("cls"),
+                3 => Some("last"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                extra.insert("embedding_pooling".into(), json!(name));
+            }
+        }
+
+        // Sentence-transformers projector: presence of `dense.0`/`dense.1`
+        // (BF16, no bias) signals the Matryoshka head applied after pooling.
+        if let (Some(d0), Some(d1)) = (
+            self.content.tensor_infos.get("dense.0.weight"),
+            self.content.tensor_infos.get("dense.1.weight"),
+        ) {
+            // candle reverses on-disk dims → stored `[out, in]`; dims()[0] is out.
+            let mid = d0.shape.dims().first().copied();
+            let out = d1.shape.dims().first().copied();
+            if let (Some(mid), Some(out)) = (mid, out) {
+                extra.insert("has_st_projector".into(), json!(true));
+                extra.insert("st_projector_mid".into(), json!(mid));
+                extra.insert("st_projector_out".into(), json!(out));
+                tracing::info!(
+                    "Gemma 3 GGUF: EmbeddingGemma ST projector detected (dense {mid}→{out})"
+                );
+            }
+        }
 
         let sliding_window = self
             .meta_u64(&format!("{arch}.attention.sliding_window"))

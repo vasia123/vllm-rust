@@ -1206,6 +1206,49 @@ impl QuantizedQwen3ForCausalLM {
         Ok(logits)
     }
 
+    /// Per-token hidden states for embeddings: full sequence, post-final-norm,
+    /// pre-`lm_head`. Returns `[seq, hidden]`.
+    ///
+    /// Identical to [`forward`] up to the final norm, then stops — no `lm_head`
+    /// and no narrowing (the caller pools over all positions). Qwen3 prefill
+    /// never narrows to the last token, so this is simply `forward` minus the
+    /// `lm_head` matmul.
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        let (_b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            Some(crate::layers::causal_mask(
+                seq_len,
+                seqlen_offset,
+                self.dtype,
+                &self.device,
+            )?)
+        };
+
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+            )?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        xs.squeeze(0)
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -1289,6 +1332,27 @@ impl crate::engine::ModelForward for QuantizedQwen3ForCausalLM {
         slot_mapping: &[usize],
     ) -> Result<Tensor> {
         self.forward(
+            input_ids,
+            seqlen_offset,
+            kv_cache_mgr,
+            block_table,
+            slot_mapping,
+        )
+    }
+
+    fn supports_embeddings(&self) -> bool {
+        true
+    }
+
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<Tensor> {
+        self.forward_hidden(
             input_ids,
             seqlen_offset,
             kv_cache_mgr,
@@ -1484,6 +1548,50 @@ mod tests {
             logits.dims(),
             &[batch_size, seq_len, cfg.vocab_size],
             "logits shape should be [batch, seq_len, vocab_size]"
+        );
+    }
+
+    #[test]
+    fn test_quantized_qwen3_forward_hidden_shape() {
+        let cfg = test_config();
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(DType::F32, &device);
+
+        let detected = DetectedQuantConfig::default();
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model = QuantizedQwen3ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("build model");
+
+        assert!(
+            <QuantizedQwen3ForCausalLM as crate::engine::ModelForward>::supports_embeddings(&model),
+            "qwen3 quantized must advertise embedding support"
+        );
+
+        let cache_config = create_cache_config(&cfg, &device);
+        let mut kv_cache_mgr = KVCacheManager::new(&cache_config).expect("cache manager");
+        let mut block_table = BlockTable::new(cache_config.block_size);
+
+        let seq_len = 5;
+        let input_ids = Tensor::zeros((1, seq_len), DType::U32, &device).expect("input");
+        kv_cache_mgr
+            .allocate_for_request(&mut block_table, seq_len)
+            .expect("allocate");
+        let slot_mapping = block_table.slot_mapping(0, seq_len);
+
+        let hidden = model
+            .forward_hidden(
+                &input_ids,
+                0,
+                &mut kv_cache_mgr,
+                &block_table,
+                &slot_mapping,
+            )
+            .expect("forward_hidden");
+
+        // Full sequence, hidden_size (lm_head skipped), batch dim squeezed.
+        assert_eq!(
+            hidden.dims(),
+            &[seq_len, cfg.hidden_size],
+            "forward_hidden shape should be [seq_len, hidden_size]"
         );
     }
 }

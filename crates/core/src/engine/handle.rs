@@ -53,6 +53,32 @@ impl EngineHandle {
         Ok((request_id, stream_rx))
     }
 
+    /// Compute pooled embeddings for pre-tokenized inputs on the loaded model.
+    ///
+    /// Runs a one-shot prefill-style forward (no generation) on the same model
+    /// the engine uses for generation, pools the per-token hidden states with
+    /// the given strategy, and optionally L2-normalizes. Returns one vector per
+    /// input. Errors with [`EngineError::Model`] if the loaded model does not
+    /// support embeddings.
+    pub async fn embed(
+        &self,
+        inputs: Vec<Vec<u32>>,
+        pooling: Option<crate::engine::PoolingStrategy>,
+        normalize: bool,
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(EngineCommand::Embed {
+                inputs,
+                pooling,
+                normalize,
+                response_tx: resp_tx,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+        resp_rx.await.map_err(|_| EngineError::Shutdown)?
+    }
+
     /// Abort a running request, freeing its GPU resources.
     ///
     /// This is used when a client disconnects before generation completes.

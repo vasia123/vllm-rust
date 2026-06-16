@@ -2584,6 +2584,24 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         disable_mm_preprocessor_cache,
     )
     .with_additional_eos_token_ids(files.config.eos_token_ids())
+    .with_embed_special_tokens(
+        // EmbeddingGemma wraps inputs as `[bos] … [eos]`; driven by the GGUF
+        // `add_{bos,eos}_token` flags (absent → no wrapping, e.g. Qwen3-Embedding).
+        files
+            .config
+            .extra
+            .get("add_bos_token")
+            .and_then(|v| v.as_bool())
+            .filter(|&b| b)
+            .and(files.config.bos_token_id),
+        files
+            .config
+            .extra
+            .get("add_eos_token")
+            .and_then(|v| v.as_bool())
+            .filter(|&b| b)
+            .and(files.config.eos_token_id),
+    )
     .with_grammar_compile_timeout(std::time::Duration::from_secs(
         grammar_compile_timeout_secs.max(1),
     ));

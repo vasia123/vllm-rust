@@ -150,6 +150,11 @@ pub struct AppState {
     /// request's stop-token set so instruct models terminate cleanly instead
     /// of running past the answer. Empty for single-EOS models.
     pub additional_eos_token_ids: Vec<u32>,
+    /// Token prepended/appended to embedding inputs (e.g. EmbeddingGemma needs
+    /// `[bos] … [eos]`). `None` = don't add. Driven by the GGUF
+    /// `add_{bos,eos}_token` flags; our HTTP tokenizer doesn't add them.
+    pub embed_prefix_token: Option<u32>,
+    pub embed_suffix_token: Option<u32>,
     /// Lazily-built, process-shared grammar compiler for structured
     /// output. Building it decodes the whole vocab into a
     /// `VocabularyIndex` (~0.5 s for a 151k-token tokenizer) and marshals
@@ -234,6 +239,8 @@ impl AppState {
             chat_template,
             eos_token_id,
             additional_eos_token_ids: Vec::new(),
+            embed_prefix_token: None,
+            embed_suffix_token: None,
             grammar_compiler: Arc::new(std::sync::OnceLock::new()),
             grammar_compile_timeout:
                 vllm_core::sampling::grammar::compiler::DEFAULT_COMPILE_TIMEOUT,
@@ -273,6 +280,14 @@ impl AppState {
             .into_iter()
             .filter(|&t| t != self.eos_token_id)
             .collect();
+        self
+    }
+
+    /// Set the BOS/EOS tokens wrapped around embedding inputs (`[bos] … [eos]`),
+    /// as required by EmbeddingGemma. `None` leaves the tokenized input as-is.
+    pub fn with_embed_special_tokens(mut self, prefix: Option<u32>, suffix: Option<u32>) -> Self {
+        self.embed_prefix_token = prefix;
+        self.embed_suffix_token = suffix;
         self
     }
 
@@ -1133,6 +1148,7 @@ mod tests {
     struct MockModel {
         output_token: u32,
         vocab_size: usize,
+        hidden: usize,
         device: Device,
     }
 
@@ -1156,6 +1172,30 @@ mod tests {
         fn device(&self) -> &Device {
             &self.device
         }
+
+        fn supports_embeddings(&self) -> bool {
+            true
+        }
+
+        fn forward_hidden(
+            &self,
+            input_ids: &Tensor,
+            _seqlen_offset: usize,
+            _kv_cache_mgr: &mut KVCacheManager,
+            _block_table: &BlockTable,
+            _slot_mapping: &[usize],
+        ) -> candle_core::Result<Tensor> {
+            // Deterministic per-token hidden: row `pos` is all `(pos + 1)` so the
+            // pooled vector is always non-zero (distinguishes from the old stub).
+            let seq_len = input_ids.dims()[1];
+            let mut data = vec![0.0f32; seq_len * self.hidden];
+            for pos in 0..seq_len {
+                for h in 0..self.hidden {
+                    data[pos * self.hidden + h] = (pos + 1) as f32;
+                }
+            }
+            Tensor::from_vec(data, (seq_len, self.hidden), &self.device)
+        }
     }
 
     fn test_app_state() -> AppState {
@@ -1174,6 +1214,7 @@ mod tests {
         let model = MockModel {
             output_token: 42,
             vocab_size: 1000,
+            hidden: 4,
             device: Device::Cpu,
         };
         let tokenizer = TokenizerWrapper::for_testing(1000);
@@ -1232,6 +1273,124 @@ mod tests {
             None,  // max_cpu_loras: unlimited in tests
             false, // disable_mm_preprocessor_cache: cache enabled in tests
         )
+    }
+
+    async fn post_embeddings(
+        state: AppState,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = create_router(state);
+        let req = Request::post("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn embeddings_endpoint_returns_real_normalized_vectors() {
+        let (status, json) = post_embeddings(
+            test_app_state(),
+            serde_json::json!({ "model": "test-model", "input": "hello world" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let data = json["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1);
+        let embedding: Vec<f32> = data[0]["embedding"]
+            .as_array()
+            .expect("embedding array")
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+
+        // Real dim from the model (hidden=4), NOT the old hard-coded 1536.
+        assert_eq!(embedding.len(), 4);
+        // Not the old zero stub.
+        assert!(embedding.iter().any(|&x| x != 0.0));
+        // Default normalize=true → unit norm.
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
+    }
+
+    #[tokio::test]
+    async fn embeddings_endpoint_dimensions_truncates_and_renormalizes() {
+        let (status, json) = post_embeddings(
+            test_app_state(),
+            serde_json::json!({ "model": "test-model", "input": "hello", "dimensions": 2 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let embedding: Vec<f32> = json["data"][0]["embedding"]
+            .as_array()
+            .expect("embedding array")
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        assert_eq!(embedding.len(), 2, "must truncate to `dimensions`");
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "truncated vector must re-normalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_endpoint_base64_format() {
+        let (status, json) = post_embeddings(
+            test_app_state(),
+            serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "encoding_format": "base64"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            json["data"][0]["embedding"].is_string(),
+            "base64 format must return a string"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_endpoint_wraps_bos_eos() {
+        // EmbeddingGemma needs `[bos] … [eos]`; the wrapping adds 2 tokens.
+        let plain = test_app_state();
+        let (_s0, j0) = post_embeddings(
+            plain,
+            serde_json::json!({ "model": "test-model", "input": "hello world" }),
+        )
+        .await;
+        let n_plain = j0["usage"]["prompt_tokens"].as_u64().unwrap();
+
+        let wrapped = test_app_state().with_embed_special_tokens(Some(2), Some(1));
+        let (status, j1) = post_embeddings(
+            wrapped,
+            serde_json::json!({ "model": "test-model", "input": "hello world" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let n_wrapped = j1["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert_eq!(n_wrapped, n_plain + 2, "bos+eos must add exactly 2 tokens");
+    }
+
+    #[tokio::test]
+    async fn embeddings_endpoint_rejects_empty_input() {
+        let (status, _json) = post_embeddings(
+            test_app_state(),
+            serde_json::json!({ "model": "test-model", "input": "" }),
+        )
+        .await;
+        // Empty string → no tokens → 400 rather than a 500 from the engine.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3057,7 +3216,7 @@ mod tests {
     #[tokio::test]
     async fn load_lora_adapter_evicts_via_api() {
         // Create state with max_cpu_loras = 1 via a small capacity registry.
-        let mut state = test_app_state();
+        let state = test_app_state();
         *state.lora_adapters.write().await = LoraAdapterRegistry::new(Some(1));
 
         let router = create_router(state);
