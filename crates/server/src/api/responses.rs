@@ -540,6 +540,15 @@ fn sse_event(event_type: &str, payload: &serde_json::Value) -> Event {
 mod tests {
     use super::*;
 
+    // Helper to extract text from content parts in tests.
+    impl ResponseContentPart {
+        fn text(&self) -> &str {
+            match self {
+                ResponseContentPart::OutputText(t) => &t.text,
+            }
+        }
+    }
+
     #[test]
     fn input_to_messages_text_input() {
         let messages = input_to_messages(ResponseInput::Text("Hello!".to_string()), None);
@@ -635,16 +644,6 @@ mod tests {
                 assert!(msg.content[0].text().contains("<tool_call>"));
             }
             _ => panic!("expected Message"),
-        }
-    }
-}
-
-// Helper trait to extract text from content parts in tests
-#[cfg(test)]
-impl ResponseContentPart {
-    fn text(&self) -> &str {
-        match self {
-            ResponseContentPart::OutputText(t) => &t.text,
         }
     }
 }

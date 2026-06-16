@@ -899,7 +899,8 @@ mod tests {
         for t in 0..tokens {
             for d in 0..real_head_dim {
                 // head 0, token t, dim d  → index in [8, tokens, 16]
-                padded[(0 * tokens + t) * 16 + d] = real[t * real_head_dim + d];
+                // (head-0 base offset is 0, so the flat index is t*16 + d)
+                padded[t * 16 + d] = real[t * real_head_dim + d];
             }
         }
         let k = Tensor::from_vec(padded.clone(), (8, tokens, 16), &Device::Cpu).unwrap();

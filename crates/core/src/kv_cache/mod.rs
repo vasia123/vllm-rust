@@ -1602,7 +1602,7 @@ mod tests {
 
         // Shared layers route to the target's engine: write through layer 0,
         // read through layer 2 (shares 0) sees the same data.
-        let k_data: Vec<f32> = (0..1 * 3 * 512).map(|i| i as f32).collect();
+        let k_data: Vec<f32> = (0..3 * 512).map(|i| i as f32).collect();
         let k = Tensor::from_vec(k_data.clone(), (1, 3, 512), &Device::Cpu).unwrap();
         let v = Tensor::from_vec(k_data, (1, 3, 512), &Device::Cpu).unwrap();
         mgr.engine_mut(0).write(&k, &v, &[0, 1, 2]).unwrap();

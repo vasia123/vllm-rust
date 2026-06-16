@@ -710,7 +710,7 @@ mod tests {
             json_type_name(&serde_json::Value::Number(42.into())),
             "integer"
         );
-        assert_eq!(json_type_name(&serde_json::json!(3.14)), "number");
+        assert_eq!(json_type_name(&serde_json::json!(1.5)), "number");
         assert_eq!(
             json_type_name(&serde_json::Value::String("hi".into())),
             "string"
