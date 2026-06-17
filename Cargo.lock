@@ -4557,6 +4557,7 @@ dependencies = [
  "axum-server",
  "base64 0.22.1",
  "candle-core",
+ "candle-nn",
  "clap",
  "dirs 5.0.1",
  "futures",

@@ -2112,6 +2112,20 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     // geometry. `None` for every other model → uniform path unchanged.
     let het_specs = heterogeneous_kv_specs(&files.config, files.quantization.method);
 
+    // Bound the CUDA stream-ordered memory pool so async-freed buffers
+    // are returned to the OS instead of being hoarded indefinitely (the
+    // pool would otherwise creep to the device limit under a burst of
+    // varied-shape allocations and OOM a tight GPU). The engine also
+    // trims under pressure per step; this just caps the steady-state
+    // cache. No-op on non-CUDA builds.
+    //
+    // Initialized HERE (before the budget profiling below) rather than
+    // just before cache allocation: `estimate_kv_cache_budget`'s profiling
+    // run calls `cuda_mem::trim`, which is a no-op until `init` sets the
+    // pool ordinal. `init` only sets the release threshold + ordinal, so
+    // moving it earlier is side-effect-free for everything downstream.
+    vllm_core::engine::cuda_mem::init(0, vllm_core::engine::cuda_mem::keep_bytes() as u64);
+
     // Compute num_blocks from GPU memory utilization if specified
     if let Some(utilization) = gpu_memory_utilization {
         if !(0.0..=1.0).contains(&utilization) {
@@ -2119,8 +2133,31 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
                 "--gpu-memory-utilization must be between 0.0 and 1.0, got {utilization}"
             );
         }
-        let kv_budget =
-            estimate_kv_cache_budget(utilization, &files.config, &files.quantization, dtype)?;
+        // Profile-context cap for the memory-profiling run: the model's
+        // effective max context. `files.config.max_position_embeddings` is
+        // already clamped to any `--max-model-len` override above (~line
+        // 1620). Resolved here, BEFORE the budget is known, to break the
+        // cycle — the *effective* `max_model_len` (computed later, ~line
+        // 2330) depends on `num_blocks`, which depends on this budget.
+        let profile_ctx_cap = files.config.max_position_embeddings;
+        // PP stages each hold only a layer subset; the profiler builds a
+        // full-model temp cache, so profiling is skipped under pipeline
+        // parallelism and falls back to the legacy reserve (untested
+        // combination — see ADR 0024).
+        let allow_profiling = pp_stage.is_none();
+        let kv_budget = estimate_kv_cache_budget(
+            utilization,
+            &*model,
+            &device,
+            dtype,
+            het_specs.as_deref(),
+            block_size,
+            parsed_kv_cache_dtype,
+            max_num_batched_tokens,
+            profile_ctx_cap,
+            allow_profiling,
+            &files.config,
+        )?;
         // Heterogeneous Gemma 4: size against the honest per-layer per-block
         // cost (sum over owning layers), not `num_layers · padded_max`. The
         // padded-max term over-counts dramatically (full layers pad 1→8 KV
@@ -2164,14 +2201,6 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
         );
         num_blocks = computed_num_blocks;
     }
-
-    // Bound the CUDA stream-ordered memory pool so async-freed buffers
-    // are returned to the OS instead of being hoarded indefinitely (the
-    // pool would otherwise creep to the device limit under a burst of
-    // varied-shape allocations and OOM a tight GPU). The engine also
-    // trims under pressure per step; this just caps the steady-state
-    // cache. No-op on non-CUDA builds.
-    vllm_core::engine::cuda_mem::init(0, vllm_core::engine::cuda_mem::keep_bytes() as u64);
 
     // Compute CPU offload config from swap_space or cpu_offload_gb
     let cpu_offload_config = {
@@ -2799,58 +2828,269 @@ fn create_cuda_device(ordinal: usize) -> candle_core::Result<Device> {
     Ok(device)
 }
 
+/// Fallback non-KV reserve when profiling is unavailable or fails.
+///
+/// Historically this was the *only* path: a fixed 1.5 GiB withheld from
+/// the KV budget. It was calibrated for the worst case — a 4 B AWQ-Marlin
+/// model whose long-context decode (crossing the 4096 adaptive-attention
+/// boundary in `test_qwen3_awq_correctness.sh` case 6) OOM'd at 1 GiB.
+/// It is grossly oversized for small models (an embedder needs a few
+/// hundred MiB), which is why we now *measure* instead — see
+/// [`profile_non_kv_memory`] and ADR 0024. This constant remains the
+/// safe fallback.
+#[cfg(feature = "cuda")]
+const LEGACY_SCRATCH_RESERVE: usize = 1536 * 1024 * 1024;
+
+/// Profile the model's peak **non-KV-cache** GPU memory: the transient
+/// activation + cuBLAS/dequant workspace high-water a forward touches
+/// (weights are already resident). Mirrors vLLM's
+/// `determine_available_memory` profiling run (`reference/vllm/vllm/v1/
+/// worker/gpu_worker.py:332`): build a *temporary* KV cache, run a dummy
+/// prefill at `max_num_batched_tokens` and a dummy long-context decode
+/// (crossing the 4096 adaptive-attention boundary — the reason the legacy
+/// reserve had to be 1.5 GiB, not 1.0), measure the free-VRAM dip, free
+/// everything, and return the reserve to withhold from the KV budget.
+///
+/// **Measurement.** candle's CUDA pool retains freed buffers (see
+/// [`cuda_mem`](vllm_core::engine::cuda_mem)), so a free-VRAM snapshot
+/// taken *after* a forward (before any trim) already reflects the pool's
+/// high-water. The temp cache's block-pool tensor is allocated up front
+/// at `build_kv_cache_manager` time, so it is already accounted for in
+/// `free_with_temp`; the dip below it is pure transient scratch. We take
+/// the *minimum* free across both probes (whichever reserved more) as the
+/// peak. This net-of-temp measurement can slightly under-count the true
+/// instantaneous peak (the pool reuses buffers *within* a forward), which
+/// the multiplicative margin + fixed headroom in [`cuda_mem`] cover.
+///
+/// Returns `Err` on any failure (OOM, forward error, query failure, or an
+/// implausible measurement); the caller falls back to
+/// [`LEGACY_SCRATCH_RESERVE`]. The temporary `KVCacheManager` owns the
+/// whole block-pool tensor and frees it on drop, so even an early `?`
+/// return leaks no device memory; the caller trims the pool afterwards.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn profile_non_kv_memory(
+    model: &dyn vllm_core::engine::ModelForward,
+    config: &vllm_core::config::ModelConfig,
+    device: &Device,
+    dtype: DType,
+    kv_cache_dtype: KVCacheDtype,
+    het_specs: Option<&[vllm_core::kv_cache::KvLayerSpec]>,
+    block_size: usize,
+    max_num_batched_tokens: usize,
+    profile_ctx_cap: usize,
+) -> anyhow::Result<usize> {
+    use vllm_core::engine::{cuda_mem, DecodeSequenceMetadata, ForwardContext};
+    use vllm_core::kv_cache::BlockTable;
+
+    let free_now =
+        || cuda_mem::free_vram().ok_or_else(|| anyhow::anyhow!("cuMemGetInfo unavailable"));
+
+    // Drain pending async frees so the baseline reflects reality.
+    cuda_mem::trim(0);
+    cuda_mem::synchronize();
+    let free_baseline = free_now()?;
+
+    // Profile context: cross the 4096 adaptive-attention boundary when the
+    // model's capacity allows, but cap so we don't materialize a
+    // pathologically long context (and its temp KV). A model whose context
+    // is below 4096 (e.g. an embedder) legitimately needs less — that is
+    // the whole point of measuring.
+    const PROFILE_CTX_UPPER: usize = 8192;
+    const ADAPTIVE_BOUNDARY: usize = 4096;
+    let cross_boundary = profile_ctx_cap.min(ADAPTIVE_BOUNDARY + block_size);
+    let profile_ctx = profile_ctx_cap
+        .min(PROFILE_CTX_UPPER)
+        .max(cross_boundary)
+        .max(1);
+    let prefill_n = max_num_batched_tokens.min(profile_ctx).max(1);
+
+    // Temp KV cache: enough blocks for one prefill chunk plus one
+    // long-context sequence. Same geometry + kv_dtype as the real cache so
+    // per-block cost and kernel shapes match. `num_layers` is the full
+    // model count — profiling is skipped under pipeline parallelism, so
+    // this equals the served layer count and matches `het_specs.len()`.
+    let profile_blocks = profile_ctx.div_ceil(block_size) + prefill_n.div_ceil(block_size) + 1;
+    let temp_cfg = CacheConfig {
+        block_size,
+        num_blocks: profile_blocks,
+        num_layers: config.num_hidden_layers,
+        num_kv_heads: config.kv_cache_num_kv_heads(),
+        head_dim: config.kv_cache_head_dim(),
+        dtype,
+        device: device.clone(),
+        kv_cache_dtype,
+        cpu_offload: None,
+    };
+    let mut mgr = build_kv_cache_manager(&temp_cfg, het_specs)?;
+    cuda_mem::synchronize();
+    let free_with_temp = free_now()?;
+
+    // ── Prefill probe ────────────────────────────────────────────────
+    let free_after_prefill = {
+        let mut bt = BlockTable::new(block_size);
+        mgr.allocate_for_request(&mut bt, prefill_n)?;
+        let slot = bt.slot_mapping(0, prefill_n);
+        let input = candle_core::Tensor::zeros((1, prefill_n), candle_core::DType::U32, device)?;
+        let fwd = model.forward(&input, 0, &mut mgr, &bt, &slot);
+        // Free unconditionally so a forward error doesn't leak blocks.
+        let ids = bt.release();
+        if !ids.is_empty() {
+            let _ = mgr.free_blocks(&ids);
+        }
+        fwd?;
+        cuda_mem::synchronize();
+        free_now()?
+    };
+
+    // ── Decode probe (single token at a long context offset) ─────────
+    // Uses the model's real batched-decode path so a model with a distinct
+    // long-context decode kernel (the 4096-boundary switch) actually
+    // exercises it; falls back to `forward` for models without one.
+    let free_after_decode = {
+        let mut bt = BlockTable::new(block_size);
+        mgr.allocate_for_request(&mut bt, profile_ctx)?;
+        bt.advance(profile_ctx - 1);
+        mgr.allocate_for_request(&mut bt, 1)?;
+        let slot = bt.slot_mapping(profile_ctx - 1, 1);
+        let input = candle_core::Tensor::zeros((1, 1), candle_core::DType::U32, device)?;
+        let seq = DecodeSequenceMetadata {
+            request_id: 0,
+            seqlen_offset: profile_ctx - 1,
+            block_ids: bt.block_ids().to_vec(),
+            slot_mapping: slot,
+        };
+        let ctx = ForwardContext::eager();
+        let fwd =
+            model.forward_decode_batch_with_ctx(&input, std::slice::from_ref(&seq), &mut mgr, &ctx);
+        let ids = bt.release();
+        if !ids.is_empty() {
+            let _ = mgr.free_blocks(&ids);
+        }
+        fwd?;
+        cuda_mem::synchronize();
+        free_now()?
+    };
+
+    drop(mgr); // RAII frees the temp block-pool tensor back to the pool.
+    cuda_mem::trim(0);
+
+    // Net transient peak (temp cache excluded — allocated before
+    // `free_with_temp`). Lower free reading ⇒ higher pool reservation.
+    //
+    // A measured peak of 0 is legitimate, not an error: it means the pool
+    // already held everything the forwards needed (e.g. a warm pool, or a
+    // model whose persistent cuBLAS workspace — allocated outside candle's
+    // pool and not reclaimed by `trim` — was paid on a prior forward). The
+    // `floor` below is the safe answer in that case, so we do NOT bail.
+    // Only `peak >= free_baseline` is genuinely impossible (a forward
+    // cannot use more transient memory than was free) and signals a
+    // corrupt reading — e.g. another process freed VRAM mid-profile.
+    let peak = free_with_temp.saturating_sub(free_after_prefill.min(free_after_decode));
+    if peak >= free_baseline {
+        anyhow::bail!(
+            "implausible profiled non-KV peak {} MiB (baseline free {} MiB)",
+            peak / (1 << 20),
+            free_baseline / (1 << 20),
+        );
+    }
+
+    let margin = cuda_mem::profile_margin();
+    let headroom = cuda_mem::profile_headroom_bytes();
+    let floor = cuda_mem::profile_floor_bytes();
+    let reserve = ((peak as f64 * margin) as usize)
+        .saturating_add(headroom)
+        .max(floor);
+
+    eprintln!(
+        "Memory profiling: prefill {} tok + decode @ctx {} → peak non-KV {} MiB \
+         × {:.2} + {} MiB headroom → reserve {} MiB (floor {} MiB)",
+        prefill_n,
+        profile_ctx,
+        peak / (1 << 20),
+        margin,
+        headroom / (1 << 20),
+        reserve / (1 << 20),
+        floor / (1 << 20),
+    );
+
+    Ok(reserve)
+}
+
+/// Size the KV-cache byte budget from `--gpu-memory-utilization`.
+///
+/// The model is already loaded when this is called (after
+/// `report_gpu_mem("after model build")`), so measured free VRAM is the
+/// honest starting point. The non-KV reserve withheld from it is
+/// *profiled* per model+workload via [`profile_non_kv_memory`], falling
+/// back to [`LEGACY_SCRATCH_RESERVE`] when profiling is disabled
+/// (`allow_profiling == false`, e.g. pipeline parallelism) or fails.
+#[allow(clippy::too_many_arguments)]
 fn estimate_kv_cache_budget(
     utilization: f32,
-    config: &vllm_core::config::ModelConfig,
-    quantization: &vllm_core::quantization::DetectedQuantConfig,
+    model: &dyn vllm_core::engine::ModelForward,
+    device: &Device,
     dtype: DType,
+    het_specs: Option<&[vllm_core::kv_cache::KvLayerSpec]>,
+    block_size: usize,
+    kv_cache_dtype: KVCacheDtype,
+    max_num_batched_tokens: usize,
+    profile_ctx_cap: usize,
+    allow_profiling: bool,
+    config: &vllm_core::config::ModelConfig,
 ) -> anyhow::Result<usize> {
     #[cfg(feature = "cuda")]
     {
-        // The model is already loaded by the time we get here (called
-        // after `report_gpu_mem("after model build")` in the
-        // `serve`/`run_server` path), so the *measured* free VRAM is
-        // strictly more accurate than any param-count estimate. The
-        // legacy estimate based on `vocab*hidden + layers*(4h² + 3hi)`
-        // routinely missed ~2 GiB of overhead (embedding tables held
-        // BF16, CUDA workspace, weight scales, kernel scratch already
-        // allocated during build), which on small GPUs translated into
-        // either over-allocating KV (and starving prefill scratch — see
-        // Stage 13-G TTFT cliff) or under-allocating KV (and capping
-        // concurrency unnecessarily). Use real free VRAM and reserve a
-        // 1 GiB minimum overhead for the per-prefill scratch the
-        // AWQ-Marlin dequant+matmul path needs.
-        let (free_vram, total_vram) = vllm_core::kv_cache::config::gpu_memory_info()?;
-        let _ = config;
-        let _ = quantization;
-        let _ = dtype;
+        let non_kv = if allow_profiling {
+            match profile_non_kv_memory(
+                model,
+                config,
+                device,
+                dtype,
+                kv_cache_dtype,
+                het_specs,
+                block_size,
+                max_num_batched_tokens,
+                profile_ctx_cap,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // Hand any partially-reserved pool memory back before
+                    // the real cache is sized.
+                    vllm_core::engine::cuda_mem::trim(0);
+                    eprintln!(
+                        "WARNING: GPU memory profiling failed ({e}); falling back \
+                         to legacy {} MiB scratch reserve",
+                        LEGACY_SCRATCH_RESERVE / (1024 * 1024)
+                    );
+                    LEGACY_SCRATCH_RESERVE
+                }
+            }
+        } else {
+            eprintln!(
+                "Memory profiling skipped (pipeline parallelism); using legacy \
+                 {} MiB scratch reserve",
+                LEGACY_SCRATCH_RESERVE / (1024 * 1024)
+            );
+            LEGACY_SCRATCH_RESERVE
+        };
 
-        // 1.5 GiB scratch floor: empirically the long-context decode
-        // path (e.g. 4500-token generation crossing the 4096 boundary
-        // in `test_qwen3_awq_correctness.sh` case 6) needs more
-        // headroom than the 1 GiB the prefill-only profile suggested.
-        // With 1 GiB the c=1 long-context test hit
-        // CUDA_ERROR_OUT_OF_MEMORY mid-decode; 1.5 GiB clears it
-        // without measurably reducing concurrent capacity.
-        let scratch_reserve: usize = 1536 * 1024 * 1024;
+        let (free_vram, total_vram) = vllm_core::kv_cache::config::gpu_memory_info()?;
         let allowed = (total_vram as f64 * utilization as f64) as usize;
-        // Cap at `free_vram - reserve` so we don't bid for memory that
-        // isn't there even when `utilization * total_vram` would
-        // theoretically allow it.
-        let kv_budget = free_vram
-            .saturating_sub(scratch_reserve)
-            .min(allowed.saturating_sub(scratch_reserve));
+        // Withhold the non-KV reserve from whichever is smaller: the
+        // utilization target, or what is actually free post-model.
+        let kv_budget = free_vram.min(allowed).saturating_sub(non_kv);
 
         if kv_budget == 0 {
             anyhow::bail!(
                 "Insufficient GPU memory: free {:.0} MiB after model load, \
-                 utilization {:.0}% of {:.0} MiB total, scratch reserve \
+                 utilization {:.0}% of {:.0} MiB total, non-KV reserve \
                  {:.0} MiB. Lower --gpu-memory-utilization or use a smaller \
                  model.",
                 free_vram as f64 / (1024.0 * 1024.0),
                 utilization * 100.0,
                 total_vram as f64 / (1024.0 * 1024.0),
-                scratch_reserve as f64 / (1024.0 * 1024.0),
+                non_kv as f64 / (1024.0 * 1024.0),
             );
         }
 
@@ -2859,7 +3099,19 @@ fn estimate_kv_cache_budget(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (utilization, config, quantization, dtype);
+        let _ = (
+            utilization,
+            model,
+            device,
+            dtype,
+            het_specs,
+            block_size,
+            kv_cache_dtype,
+            max_num_batched_tokens,
+            profile_ctx_cap,
+            allow_profiling,
+            config,
+        );
         anyhow::bail!("--gpu-memory-utilization requires the 'cuda' feature")
     }
 }
@@ -3412,4 +3664,101 @@ async fn run_generate(
 
     handle.shutdown().await?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod profiling_tests {
+    use candle_core::{DType, Device};
+    use candle_nn::VarBuilder;
+    use vllm_core::config::ModelConfig;
+    use vllm_core::kv_cache::KVCacheDtype;
+    use vllm_core::models::qwen3_quantized::QuantizedQwen3ForCausalLM;
+    use vllm_core::quantization::{create_weight_loader_with_params, DetectedQuantConfig};
+
+    /// A toy Qwen3 config: 2 layers, hidden 64, vocab 256. Zero weights
+    /// (unquantized loader) — we exercise the profiling *mechanism* and
+    /// memory accounting, not kernel numerics. Absolute calibration of the
+    /// reserve against a real model is the job of
+    /// `scripts/test_qwen3_awq_correctness.sh` case 6.
+    fn toy_qwen3_config() -> ModelConfig {
+        ModelConfig {
+            architectures: vec!["Qwen3ForCausalLM".to_string()],
+            hidden_size: 64,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            num_hidden_layers: 2,
+            intermediate_size: 128,
+            vocab_size: 256,
+            max_position_embeddings: 512,
+            head_dim: 16,
+            hidden_act: "silu".to_string(),
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            tie_word_embeddings: true,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
+            sliding_window: None,
+            attention_bias: Some(false),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// GPU-gated: build a tiny model and run [`super::profile_non_kv_memory`]
+    /// twice. Asserts the reserve is positive, fits in free VRAM, beats the
+    /// legacy 1.5 GiB constant (the whole point for small models), and is
+    /// stable across runs. Ignored by default — needs a CUDA device. Run
+    /// with `cargo test -p vllm-server --features cuda -- --ignored profile`.
+    #[test]
+    #[ignore]
+    fn profile_non_kv_memory_is_positive_bounded_and_stable() {
+        let device = Device::new_cuda(0).expect("cuda device");
+        vllm_core::engine::cuda_mem::init(0, vllm_core::engine::cuda_mem::keep_bytes() as u64);
+
+        let cfg = toy_qwen3_config();
+        let detected = DetectedQuantConfig::default();
+        let vb = VarBuilder::zeros(DType::BF16, &device);
+        let loader = create_weight_loader_with_params(vb.clone(), &detected);
+        let model = QuantizedQwen3ForCausalLM::new(&cfg, vb, loader.as_ref()).expect("qwen3");
+
+        let free_before =
+            vllm_core::engine::cuda_mem::free_vram().expect("free_vram before profiling");
+
+        let run = || {
+            super::profile_non_kv_memory(
+                &model,
+                &cfg,
+                &device,
+                DType::BF16,
+                KVCacheDtype::Auto,
+                None, // uniform cache (no heterogeneous specs)
+                16,   // block_size
+                256,  // max_num_batched_tokens
+                cfg.max_position_embeddings,
+            )
+            .expect("profiling run")
+        };
+
+        let r1 = run();
+        assert!(r1 > 0, "reserve must be positive");
+        assert!(
+            r1 < free_before,
+            "reserve {r1} must be below free VRAM {free_before}"
+        );
+        assert!(
+            r1 < super::LEGACY_SCRATCH_RESERVE,
+            "reserve {} MiB must beat the legacy {} MiB constant for a tiny model",
+            r1 / (1 << 20),
+            super::LEGACY_SCRATCH_RESERVE / (1 << 20),
+        );
+
+        // Stability: a second run must land within 32 MiB of the first.
+        // (For a toy model the measured peak is below the floor, so both
+        // resolve to the sanity floor and match exactly; the tolerance
+        // covers any pool jitter on larger models.)
+        let r2 = run();
+        assert!(
+            r1.abs_diff(r2) <= 32 * 1024 * 1024,
+            "two profiling runs must agree within 32 MiB: {r1} vs {r2}"
+        );
+    }
 }

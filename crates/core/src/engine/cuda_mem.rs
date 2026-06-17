@@ -81,6 +81,15 @@ mod imp {
         result::mem_get_info().ok().map(|(free, _total)| free)
     }
 
+    /// Block until all previously enqueued CUDA work on the current
+    /// context completes. Required before reading [`free_vram`] /
+    /// `mem_get_info` so pending stream-ordered frees (`cuMemFreeAsync`)
+    /// are reflected in the pool's accounting. Best-effort; ignores
+    /// driver errors.
+    pub fn synchronize() {
+        let _ = result::ctx::synchronize();
+    }
+
     /// Synchronize and release pool memory beyond `keep_bytes` back to
     /// the OS. Best-effort; logs and ignores driver errors.
     pub fn trim(keep_bytes: usize) {
@@ -133,13 +142,14 @@ mod imp {
     pub fn free_vram() -> Option<usize> {
         None
     }
+    pub fn synchronize() {}
     pub fn trim(_keep_bytes: usize) {}
     pub fn trim_under_pressure(_watermark_bytes: usize, _keep_bytes: usize) -> bool {
         false
     }
 }
 
-pub use imp::{free_vram, init, trim, trim_under_pressure};
+pub use imp::{free_vram, init, synchronize, trim, trim_under_pressure};
 
 #[cfg(all(test, feature = "cuda"))]
 mod gpu_tests {
@@ -205,5 +215,45 @@ pub fn watermark_bytes() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_WATERMARK_MB);
+    mb * 1024 * 1024
+}
+
+/// Multiplicative safety margin applied to the profiled non-KV memory
+/// peak when sizing the KV cache budget. Covers scaling error between the
+/// measured peak and the true instantaneous peak (candle's retaining pool
+/// can reuse buffers within a forward, so the net-delta measurement
+/// slightly under-counts). Overridable via `VLLM_PROFILE_MARGIN` (e.g.
+/// `1.10`); values `< 1.0` or non-finite are rejected.
+pub fn profile_margin() -> f64 {
+    const DEFAULT_MARGIN: f64 = 1.10;
+    std::env::var("VLLM_PROFILE_MARGIN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|m| m.is_finite() && *m >= 1.0)
+        .unwrap_or(DEFAULT_MARGIN)
+}
+
+/// Fixed additive headroom added on top of the margined non-KV peak.
+/// Absorbs fixed-size cuBLAS/kernel workspace that the proportional
+/// margin cannot cover on small models. Overridable via
+/// `VLLM_PROFILE_HEADROOM_MB`.
+pub fn profile_headroom_bytes() -> usize {
+    const DEFAULT_HEADROOM_MB: usize = 128;
+    let mb = std::env::var("VLLM_PROFILE_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HEADROOM_MB);
+    mb * 1024 * 1024
+}
+
+/// Sanity floor for the profiled non-KV reserve, guarding against a
+/// near-zero measurement from a profiling bug from over-committing the KV
+/// pool. Overridable via `VLLM_PROFILE_FLOOR_MB`.
+pub fn profile_floor_bytes() -> usize {
+    const DEFAULT_FLOOR_MB: usize = 256;
+    let mb = std::env::var("VLLM_PROFILE_FLOOR_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FLOOR_MB);
     mb * 1024 * 1024
 }

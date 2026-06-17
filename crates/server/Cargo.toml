@@ -51,3 +51,5 @@ vllm-core = { path = "../core", features = ["test-utils"] }
 tower.workspace = true
 tempfile = "3"
 hound = "3"
+# Zero-weight model construction for the GPU memory-profiling unit test.
+candle-nn.workspace = true
