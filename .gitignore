@@ -20,3 +20,6 @@ model_cache/
 .plans/sessions/
 # <<< visual-plan
 .claude/worktrees/
+
+# Local release artifacts (scripts/publish-binary.sh)
+/dist/

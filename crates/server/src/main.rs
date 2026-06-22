@@ -153,7 +153,11 @@ fn resolve_gguf_tokenizer(
 }
 
 #[derive(Parser)]
-#[command(name = "vllm-server", about = "Rust LLM inference engine")]
+#[command(
+    name = "vllm-server",
+    about = "Rust LLM inference engine",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

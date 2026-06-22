@@ -1,6 +1,6 @@
 [package]
 name = "vllm-rust-tests"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 publish = false
 
@@ -37,7 +37,11 @@ serde = { workspace = true }
 serde_json = "1"
 tempfile = "3"
 
+# Single source of truth for the release version — every workspace member
+# inherits this via `version.workspace = true`. Bump it through
+# `scripts/release.sh` (see docs/RELEASING.md), never by hand.
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
