@@ -1,4 +1,4 @@
-//! Tier 1 — native I-quant (IQ) matmul: dequant-then-matmul vs the fused GEMV.
+//! Tier 1 — native I-quant (IQ) matmul: dequant-then-matmul vs the q8_1 MMVQ.
 //!
 //! candle has no I-quant path, so the Unsloth "UD" GGUFs (IQ2_XS / IQ2_S /
 //! IQ3_XXS / IQ3_S / IQ4_XS) run through our own `IqLinear`. This bench is the
@@ -6,8 +6,9 @@
 //!
 //! - `decode_dequant_matmul` (BEFORE): dequantize the whole weight to dense f32
 //!   each forward, then matmul — O(out·in) work per token (the old path).
-//! - `decode_fused_gemv` (AFTER): `iq_matmul` — one pass over the I-quant bytes,
-//!   dotting blocks against the activation, no dense weight materialized.
+//! - `decode_fused_mmvq` (AFTER): `iq_matmul` — quantize the activation to q8_1
+//!   once, then integer `__dp4a` dots over the I-quant bytes, no dense weight
+//!   materialized (the path llama.cpp itself runs for I-quant decode).
 //! - `prefill_dequant_matmul` (M=32): the dequant + GEMM path both decode and
 //!   prefill share for large M (amortized over the prompt).
 //!
@@ -87,7 +88,7 @@ fn run_suite(c: &mut Criterion, device: &Device, tag: &str) {
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("decode_fused_gemv", shape_name),
+            BenchmarkId::new("decode_fused_mmvq", shape_name),
             &out,
             |bn, _| {
                 bn.iter(|| {

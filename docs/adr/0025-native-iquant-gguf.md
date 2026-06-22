@@ -67,9 +67,11 @@ Add **native I-quant support in our own crate**, leaving candle vanilla.
   one-to-one port of ggml's `dequantize_row_iq*`. Plus `dequantize_iq`, a
   `CustomOp1` whose `cuda_fwd` launches the kernel and whose `cpu_fwd` runs
   the scalar port.
-- `kernels/iq_dequant.cu` — one CUDA thread per 256-element super-block,
-  dequantizing an I-quant weight to a dense f32 matrix. (Simple, correct
-  dequant-then-matmul; see "Consequences".)
+- `kernels/iq_dequant.cu` — two paths sharing the same device decoders: (1)
+  `dequantize_iq*` (one thread per 256-element super-block) materializes a
+  dense f32 weight for the prefill GEMM; (2) `quantize_q8_1_rows` + `mmvq_iq*`
+  implement q8_1 MMVQ for decode (integer `__dp4a` dots, no dense weight). See
+  "Consequences".
 - `header.rs` — a minimal GGUF header parser that classifies each tensor's
   dtype as candle-native **or** I-quant. Replaces `Content::read` (which
   cannot get past the IQ tensors) while reusing candle's public
@@ -77,8 +79,8 @@ Add **native I-quant support in our own crate**, leaving candle vanilla.
   unchanged.
 - `GgufTensor` / `IqLinear` — the loader keeps candle-native weights as
   `QTensor` (fast `QMatMul` path, untouched) and I-quant weights as raw block
-  bytes resident on the GPU; `IqLinear::forward` dequantizes to dense f32 and
-  matmuls.
+  bytes resident on the GPU; `IqLinear::forward` runs q8_1 MMVQ for decode and
+  dequant + GEMM for prefill (see "Consequences").
 
 ### Correctness pinning
 
@@ -98,17 +100,27 @@ Every layer is pinned against an independent reference:
   re-quantization, weights stay I-quant-resident (4.6 GB).
 - `IqLinear` is two-path, mirroring candle's `QMatMul` (vec-kernel for small M,
   GEMM otherwise):
-  - **Decode (M ≤ `IQ_GEMV_MAX_M` = 16): fused GEMV** (`gemv_*` in
-    `kernels/iq_dequant.cu`). One CUDA block per output row dequantizes the
-    row's blocks on the fly and dots them against the activation — a **single
-    pass over the I-quant bytes, no dense weight materialized**. This is the
-    hot path (one launch per decode step) and runs at memory bandwidth.
+  - **Decode (M ≤ `IQ_GEMV_MAX_M` = 16): q8_1 MMVQ** (`quantize_q8_1_rows` +
+    `mmvq_*` in `kernels/iq_dequant.cu`). The activation row is quantized to
+    q8_1 (int8 quants + a per-32 f32 scale) once, then each output row is the
+    sum of integer `__dp4a` dots of the I-quant codebook values (sign-flipped
+    on the fly) against the q8_1 quants, scaled by the per-block I-quant scale
+    and the weight/activation deltas. **No dense weight is materialized and the
+    inner loop has no float multiplies** — this is a one-to-one port of ggml's
+    `vec_dot_iq*_q8_1`, the path llama.cpp itself runs for I-quant decode. One
+    warp per output row, 32-element-sub-block striding so every lane stays busy
+    on narrow rows. (This replaced an earlier float GEMV that dequantized each
+    block to a 256-float local array per lane — a register/local-memory hog.)
   - **Prefill (M > 16) / CPU: dequant-then-matmul** — dequantize the whole
     weight to dense f32 once, then a single cuBLAS/candle GEMM amortizes it
     over all rows. One-shot, so the materialization cost is paid once per
     prompt, not per token.
-  Both paths are pinned to the same reference (`iq_matmul_matches_dequant_then_matmul`).
-  `benches/iq_dequant_bench.rs` covers both.
+  Correctness is doubly pinned: the CUDA `mmvq_*` kernels match a CPU port of
+  the identical integer algorithm (`q8_1_mmvq_cpu`) bit-for-bit modulo f32
+  reduction order (`*_mmvq_gpu_matches_cpu`), and that algorithm approximates a
+  full-precision f32 matmul within int8-activation tolerance
+  (`iq_matmul_matches_dequant_then_matmul`). `benches/iq_dequant_bench.rs`
+  covers the before/after.
 - candle stays at vanilla 0.10.2; no `[patch.crates-io]`.
 - Regenerating the tables requires `reference/llama.cpp` present; the script
   is the single source of truth for both the Rust and CUDA tables.

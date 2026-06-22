@@ -393,7 +393,7 @@ impl CustomOp1 for DequantIqOp {
             _ => candle_core::bail!("dequantize_iq: weight bytes must be U8"),
         };
 
-        if self.n_elements % QK_K != 0 {
+        if !self.n_elements.is_multiple_of(QK_K) {
             candle_core::bail!(
                 "dequantize_iq: n_elements {} not a multiple of {QK_K}",
                 self.n_elements
@@ -453,23 +453,282 @@ pub const IQ_GEMV_MAX_M: usize = 16;
 
 #[cfg(feature = "cuda-kernels")]
 impl IqType {
-    /// The `kernels/iq_dequant.cu` fused GEMV entry point for this type.
-    fn gemv_kernel(self) -> &'static str {
+    /// The `kernels/iq_dequant.cu` MMVQ (q8_1 × I-quant) entry point.
+    fn mmvq_kernel(self) -> &'static str {
         match self {
-            IqType::Iq2Xs => "gemv_iq2_xs_f32",
-            IqType::Iq2S => "gemv_iq2_s_f32",
-            IqType::Iq3Xxs => "gemv_iq3_xxs_f32",
-            IqType::Iq3S => "gemv_iq3_s_f32",
-            IqType::Iq4Xs => "gemv_iq4_xs_f32",
+            IqType::Iq2Xs => "mmvq_iq2_xs_f32",
+            IqType::Iq2S => "mmvq_iq2_s_f32",
+            IqType::Iq3Xxs => "mmvq_iq3_xxs_f32",
+            IqType::Iq3S => "mmvq_iq3_s_f32",
+            IqType::Iq4Xs => "mmvq_iq4_xs_f32",
         }
     }
 }
 
-/// Fused `Y = X @ Wᵀ` over an I-quant weight, GEMV-style — for small M
-/// (decode). The weight stays I-quant-resident; the kernel dequantizes each
-/// block on the fly and dots it against the activation, never materializing
-/// the dense weight (one pass over the I-quant bytes vs the
-/// dequant-to-f32-then-matmul round-trip). `m` must be `<= IQ_GEMV_MAX_M`.
+// ===========================================================================
+// CPU q8_1 MMVQ reference — the exact integer algorithm the CUDA `mmvq_*`
+// kernels run, used as `IqMatmulOp::cpu_fwd` and as the bit-level pin for the
+// GPU kernels. A one-to-one port of ggml's `vec_dot_iq*_q8_1`
+// (reference/llama.cpp/ggml/src/ggml-cuda/vecdotq.cuh). The SIMD primitives
+// (`__dp4a`, `__vsub4`, `__vcmpne4`, `__byte_perm`) are reproduced with
+// portable byte arithmetic so the integer results are identical to the kernel.
+// ===========================================================================
+
+/// SIMD int8x4 dot-product with accumulate: `c + Σ a_i·b_i` over the four
+/// signed bytes of `a` and `b`.
+#[inline]
+fn dp4a(a: i32, b: i32, c: i32) -> i32 {
+    let mut acc = c;
+    for i in 0..4 {
+        let av = ((a >> (8 * i)) & 0xff) as u8 as i8 as i32;
+        let bv = ((b >> (8 * i)) & 0xff) as u8 as i8 as i32;
+        acc += av * bv;
+    }
+    acc
+}
+
+/// Per-byte "set if not equal to zero" → 0xFF / 0x00 (mirrors `__vcmpne4(x,0)`).
+#[inline]
+fn vcmpne4(x: u32) -> i32 {
+    let mut r = 0u32;
+    for i in 0..4 {
+        if (x >> (8 * i)) & 0xff != 0 {
+            r |= 0xffu32 << (8 * i);
+        }
+    }
+    r as i32
+}
+
+/// Per-byte wrapping subtract (mirrors `__vsub4`).
+#[inline]
+fn vsub4(a: i32, b: i32) -> i32 {
+    let (a, b) = (a as u32, b as u32);
+    let mut r = 0u32;
+    for i in 0..4 {
+        let av = ((a >> (8 * i)) & 0xff) as u8;
+        let bv = ((b >> (8 * i)) & 0xff) as u8;
+        r |= (av.wrapping_sub(bv) as u32) << (8 * i);
+    }
+    r as i32
+}
+
+/// Negate the four signed bytes of `g` where the matching byte of `signs`
+/// (a `vcmpne4` mask) is set. Two's-complement: `(g ^ 0xFF) - 0xFF == -g`.
+#[inline]
+fn apply_signs(g: i32, signs: i32) -> i32 {
+    vsub4(g ^ signs, signs)
+}
+
+/// Expand a 7-bit ggml sign index to a per-byte selector. The 8th sign is the
+/// parity of the 7 bits; the xor cancels any stray high bit the caller leaves
+/// in, so callers need not mask (mirrors `unpack_ksigns`).
+#[inline]
+fn unpack_ksigns(v: u8) -> u32 {
+    let p = v.count_ones() & 1;
+    let s = (v as u32) ^ (p << 7);
+    s.wrapping_mul(0x0101_0101)
+}
+
+/// Look up eight 4-bit indices packed in `q4` against a 16-entry int8 table.
+/// `.0` = even-nibble (low) lookups, `.1` = odd-nibble (high), each int8x4
+/// (mirrors `get_int_from_table_16`).
+#[inline]
+fn table16(q4: i32, table: &[i8; 16]) -> (i32, i32) {
+    let q4 = q4 as u32;
+    let mut v0 = 0u32;
+    let mut v1 = 0u32;
+    for i in 0..4 {
+        let lo = ((q4 >> (8 * i)) & 0xf) as usize;
+        let hi = ((q4 >> (8 * i + 4)) & 0xf) as usize;
+        v0 |= (table[lo] as u8 as u32) << (8 * i);
+        v1 |= (table[hi] as u8 as u32) << (8 * i);
+    }
+    (v0 as i32, v1 as i32)
+}
+
+/// Low/high 32 bits of a u64 grid entry as the two int8x4 lanes (matches the
+/// CUDA `(const uint2*)`/`(const int*)` reinterpret of the codebook).
+#[inline]
+fn grid_u64_halves(entry: u64) -> (i32, i32) {
+    (entry as u32 as i32, (entry >> 32) as u32 as i32)
+}
+
+fn cpu_dot_iq2_xs(b: &[u8], ib: usize, u: &[i32; 8]) -> i32 {
+    let qs = |i: usize| u16::from_le_bytes([b[2 + 2 * i], b[2 + 2 * i + 1]]);
+    let scales = b[66 + ib];
+    let (mut s0, mut s1) = (0i32, 0i32);
+    for k in 0..4 {
+        let q = qs(4 * ib + k);
+        let (gx, gy) = grid_u64_halves(IQ2XS_GRID[(q & 0x1ff) as usize]);
+        let signs = unpack_ksigns((q >> 9) as u8);
+        let gl = apply_signs(gx, vcmpne4(signs & 0x0804_0201));
+        let gh = apply_signs(gy, vcmpne4(signs & 0x8040_2010));
+        if k < 2 {
+            s0 = dp4a(gl, u[2 * k], s0);
+            s0 = dp4a(gh, u[2 * k + 1], s0);
+        } else {
+            s1 = dp4a(gl, u[2 * k], s1);
+            s1 = dp4a(gh, u[2 * k + 1], s1);
+        }
+    }
+    let (ls0, ls1) = ((scales & 0xf) as i32, (scales >> 4) as i32);
+    (s0 * ls0 + s1 * ls1 + (s0 + s1) / 2) / 4
+}
+
+fn cpu_dot_iq2_s(b: &[u8], ib: usize, u: &[i32; 8]) -> i32 {
+    let idx = |k: usize| b[2 + 4 * ib + k];
+    let sgn = |k: usize| b[2 + QK_K / 8 + 4 * ib + k];
+    let qh = b[66 + ib] as i32;
+    let scales = b[74 + ib];
+    let (mut s0, mut s1) = (0i32, 0i32);
+    for k in 0..4 {
+        let l0 = 2 * k;
+        let gi = (idx(k) as i32 | ((qh << (8 - l0)) & 0x300)) as usize;
+        let (g0, g1) = grid_u64_halves(IQ2S_GRID[gi]);
+        let sb = sgn(k);
+        let sg0 = vcmpne4((((sb & 0x03) as u32) << 7) | (((sb & 0x0C) as u32) << 21));
+        let sg1 = vcmpne4((((sb & 0x30) as u32) << 3) | (((sb & 0xC0) as u32) << 17));
+        let gl = apply_signs(g0, sg0);
+        let gh = apply_signs(g1, sg1);
+        if k < 2 {
+            s0 = dp4a(gl, u[2 * k], s0);
+            s0 = dp4a(gh, u[2 * k + 1], s0);
+        } else {
+            s1 = dp4a(gl, u[2 * k], s1);
+            s1 = dp4a(gh, u[2 * k + 1], s1);
+        }
+    }
+    let (ls0, ls1) = ((scales & 0xf) as i32, (scales >> 4) as i32);
+    (s0 * ls0 + s1 * ls1 + (s0 + s1) / 2) / 4
+}
+
+fn cpu_dot_iq3_xxs(b: &[u8], ib: usize, u: &[i32; 8]) -> i32 {
+    let qs = |i: usize| b[2 + 8 * ib + i] as usize;
+    let o = 2 + QK_K / 4 + 4 * ib;
+    let aux32 = u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let mut sumi = 0i32;
+    for k in 0..4 {
+        let g0 = IQ3XXS_GRID[qs(2 * k)] as i32;
+        let g1 = IQ3XXS_GRID[qs(2 * k + 1)] as i32;
+        let signs = unpack_ksigns((aux32 >> (7 * k)) as u8);
+        let gl = apply_signs(g0, vcmpne4(signs & 0x0804_0201));
+        let gh = apply_signs(g1, vcmpne4(signs & 0x8040_2010));
+        sumi = dp4a(gl, u[2 * k], sumi);
+        sumi = dp4a(gh, u[2 * k + 1], sumi);
+    }
+    let ls = (aux32 >> 28) as i32;
+    (ls * sumi + sumi / 2) / 2
+}
+
+fn cpu_dot_iq3_s(b: &[u8], ib: usize, u: &[i32; 8]) -> i32 {
+    let qs = |i: usize| b[2 + 8 * ib + i] as i32;
+    let qh = b[66 + ib] as i32;
+    let sgn = |k: usize| b[74 + 4 * ib + k];
+    let scales = |i: usize| b[106 + i];
+    let mut sumi = 0i32;
+    for k in 0..4 {
+        let l0 = 2 * k;
+        let g0 = IQ3S_GRID[(qs(2 * k) | ((qh << (8 - l0)) & 0x100)) as usize] as i32;
+        let g1 = IQ3S_GRID[(qs(2 * k + 1) | ((qh << (7 - l0)) & 0x100)) as usize] as i32;
+        let sb = sgn(k);
+        let sg0 = vcmpne4((((sb & 0x03) as u32) << 7) | (((sb & 0x0C) as u32) << 21));
+        let sg1 = vcmpne4((((sb & 0x30) as u32) << 3) | (((sb & 0xC0) as u32) << 17));
+        sumi = dp4a(apply_signs(g0, sg0), u[2 * k], sumi);
+        sumi = dp4a(apply_signs(g1, sg1), u[2 * k + 1], sumi);
+    }
+    let nib = ((scales(ib / 2) >> (4 * (ib & 1))) & 0x0f) as i32;
+    sumi * (1 + 2 * nib)
+}
+
+fn cpu_dot_iq4_xs(b: &[u8], ib: usize, u: &[i32; 8]) -> i32 {
+    let scales_h = u16::from_le_bytes([b[2], b[3]]);
+    let scales_l = |i: usize| b[4 + i];
+    let mut sumi = 0i32;
+    for j in 0..4 {
+        let o = 8 + 16 * ib + 4 * j;
+        let aux = i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let (vx, vy) = table16(aux, &KVALUES_IQ4NL);
+        sumi = dp4a(vx, u[j], sumi);
+        sumi = dp4a(vy, u[j + 4], sumi);
+    }
+    let iqs = 4 * ib;
+    let ls = (((scales_l(ib / 2) >> (iqs & 0x04)) & 0x0f) as i32)
+        | ((((scales_h >> (iqs / 2)) & 0x03) as i32) << 4);
+    sumi * (ls - 32)
+}
+
+/// Quantize a row-major `[m, n_in]` activation to q8_1: per 32-element block,
+/// `d = amax/127` and `q = round(x/d)`. Returns `(qs i8 [m·n_in], d f32
+/// [m·n_in/32])`. Identical to the `quantize_q8_1_rows` kernel.
+fn quantize_q8_1_cpu(x: &[f32], n_in: usize, m: usize) -> (Vec<i8>, Vec<f32>) {
+    let n_blocks = m * (n_in / 32);
+    let mut aq = vec![0i8; m * n_in];
+    let mut ad = vec![0f32; n_blocks];
+    for (blk, ad_blk) in ad.iter_mut().enumerate() {
+        let base = blk * 32;
+        let mut amax = 0f32;
+        for i in 0..32 {
+            amax = amax.max(x[base + i].abs());
+        }
+        let d = amax / 127.0;
+        *ad_blk = d;
+        if amax != 0.0 {
+            for i in 0..32 {
+                aq[base + i] = (x[base + i] / d).round() as i8;
+            }
+        }
+    }
+    (aq, ad)
+}
+
+/// CPU q8_1 MMVQ: `Y[m, n_out] = X[m, n_in] @ Wᵀ` over the I-quant weight
+/// `w` (`n_out · n_in/QK_K` blocks). Quantizes X to q8_1, then for each output
+/// row sums the per-sub-block integer dots scaled by the weight/activation
+/// deltas. Bit-for-bit the algorithm the `mmvq_*` kernels run (modulo f32
+/// reduction order).
+fn q8_1_mmvq_cpu(w: &[u8], x: &[f32], iq: IqType, n_out: usize, n_in: usize, m: usize) -> Vec<f32> {
+    let ts = iq.type_size();
+    let nb256 = n_in / QK_K;
+    let nblk32 = n_in / 32;
+    let (aq, ad) = quantize_q8_1_cpu(x, n_in, m);
+    let dot: fn(&[u8], usize, &[i32; 8]) -> i32 = match iq {
+        IqType::Iq2Xs => cpu_dot_iq2_xs,
+        IqType::Iq2S => cpu_dot_iq2_s,
+        IqType::Iq3Xxs => cpu_dot_iq3_xxs,
+        IqType::Iq3S => cpu_dot_iq3_s,
+        IqType::Iq4Xs => cpu_dot_iq4_xs,
+    };
+    let mut y = vec![0f32; m * n_out];
+    for o in 0..n_out {
+        for mi in 0..m {
+            let mut acc = 0f32;
+            for g in 0..nblk32 {
+                let (sb, ib) = (g >> 3, g & 7);
+                let off = (o * nb256 + sb) * ts;
+                let wb = &w[off..off + ts];
+                let w_d = block_scale(wb);
+                let u: [i32; 8] = core::array::from_fn(|j| {
+                    let p = mi * n_in + g * 32 + 4 * j;
+                    i32::from_le_bytes([
+                        aq[p] as u8,
+                        aq[p + 1] as u8,
+                        aq[p + 2] as u8,
+                        aq[p + 3] as u8,
+                    ])
+                });
+                acc += w_d * ad[mi * nblk32 + g] * (dot(wb, ib, &u) as f32);
+            }
+            y[mi * n_out + o] = acc;
+        }
+    }
+    y
+}
+
+/// Fused `Y = X @ Wᵀ` over an I-quant weight via q8_1 MMVQ — for small M
+/// (decode). The activation row is quantized to q8_1 (int8 + per-32 scale)
+/// once, then the I-quant weight is dotted against it with integer `__dp4a`;
+/// the dense weight is never materialized and the inner loop has no float
+/// multiplies. `m` must be `<= IQ_GEMV_MAX_M`.
 struct IqMatmulOp {
     /// Activation `[m, n_in]`, f32, contiguous, same device as the weight.
     x: Tensor,
@@ -485,27 +744,14 @@ impl CustomOp1 for IqMatmulOp {
     }
 
     fn cpu_fwd(&self, storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        // Reference path (CPU device / tests): dequantize the weight and do a
-        // plain matmul. Mirrors the fused kernel's math exactly.
+        // Reference path (CPU device / tests): the exact q8_1 MMVQ algorithm
+        // the CUDA kernel runs (integer dots over q8_1-quantized activations).
         let bytes = match storage {
             CpuStorage::U8(b) => b,
             _ => candle_core::bail!("iq_matmul: weight bytes must be U8"),
         };
-        let mut w = vec![0f32; self.n_out * self.n_in];
-        dequantize(self.iq, bytes, &mut w)?;
         let x = self.x.flatten_all()?.to_vec1::<f32>()?;
-        let mut y = vec![0f32; self.m * self.n_out];
-        for mi in 0..self.m {
-            let xr = &x[mi * self.n_in..(mi + 1) * self.n_in];
-            for o in 0..self.n_out {
-                let wr = &w[o * self.n_in..(o + 1) * self.n_in];
-                let mut s = 0f32;
-                for k in 0..self.n_in {
-                    s += xr[k] * wr[k];
-                }
-                y[mi * self.n_out + o] = s;
-            }
-        }
+        let y = q8_1_mmvq_cpu(bytes, &x, self.iq, self.n_out, self.n_in, self.m);
         Ok((CpuStorage::F32(y), Shape::from_dims(&[self.m, self.n_out])))
     }
 
@@ -544,13 +790,37 @@ impl CustomOp1 for IqMatmulOp {
             Some((o1, o2)) => x.slice(o1..o2),
             None => candle_core::bail!("iq_matmul: activation must be contiguous"),
         };
+        if !self.n_in.is_multiple_of(32) {
+            candle_core::bail!("iq_matmul: n_in {} not a multiple of 32", self.n_in);
+        }
 
+        // Step 1: quantize the activation rows to q8_1 (int8 quants in `aq`,
+        // per-32-block f32 deltas in `ad`). Done once, reused for every row.
+        let total_blocks = self.m * (self.n_in / 32);
+        let aq = dev.alloc_zeros::<u8>(self.m * self.n_in)?;
+        let ad = dev.alloc_zeros::<f32>(total_blocks)?;
+        let qfunc =
+            dev.get_or_load_custom_func("quantize_q8_1_rows", "iq_dequant", IQ_DEQUANT_PTX)?;
+        let total_blocks_i32 = total_blocks as i32;
+        const QUANT_THREADS: u32 = 256;
+        let qcfg = LaunchConfig {
+            grid_dim: ((total_blocks as u32).div_ceil(QUANT_THREADS), 1, 1),
+            block_dim: (QUANT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qfunc.builder();
+        qb.arg(&x);
+        qb.arg(&aq);
+        qb.arg(&ad);
+        qb.arg(&total_blocks_i32);
+        unsafe { qb.launch(qcfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("quantize_q8_1 launch: {e}")))?;
+
+        // Step 2: MMVQ — one warp per output row, IQ_GEMV_ROWS_PER_BLOCK (=4)
+        // rows per CUDA block. Must match kernels/iq_dequant.cu.
         let output = dev.alloc_zeros::<f32>(self.m * self.n_out)?;
         let func =
-            dev.get_or_load_custom_func(self.iq.gemv_kernel(), "iq_dequant", IQ_DEQUANT_PTX)?;
-
-        // One warp per output row, IQ_GEMV_ROWS_PER_BLOCK (=4) rows per block.
-        // Must match kernels/iq_dequant.cu.
+            dev.get_or_load_custom_func(self.iq.mmvq_kernel(), "iq_dequant", IQ_DEQUANT_PTX)?;
         const THREADS: u32 = 128;
         const ROWS_PER_BLOCK: u32 = 4;
         let cfg = LaunchConfig {
@@ -563,7 +833,8 @@ impl CustomOp1 for IqMatmulOp {
         let m_i32 = self.m as i32;
         let mut builder = func.builder();
         builder.arg(w);
-        builder.arg(&x);
+        builder.arg(&aq);
+        builder.arg(&ad);
         builder.arg(&output);
         builder.arg(&n_out_i32);
         builder.arg(&n_in_i32);
@@ -580,12 +851,14 @@ impl CustomOp1 for IqMatmulOp {
     }
 }
 
-/// Fused `Y = X @ Wᵀ` for an I-quant weight, GEMV-style (decode path).
+/// Fused `Y = X @ Wᵀ` for an I-quant weight via q8_1 MMVQ (decode path).
 ///
 /// * `w_bytes` — raw GGUF block bytes of the weight `[n_out, n_in]`, U8.
 /// * `x` — activation `[m, n_in]`, f32, contiguous; `m <= IQ_GEMV_MAX_M`.
 ///
-/// Returns `Y` `[m, n_out]` f32. Never materializes the dense weight.
+/// Returns `Y` `[m, n_out]` f32. The activation is quantized to q8_1 and
+/// dotted against the I-quant weight with integer arithmetic; the dense weight
+/// is never materialized.
 pub fn iq_matmul(
     w_bytes: &Tensor,
     x: &Tensor,
@@ -698,11 +971,12 @@ mod tests {
         assert_eq!(IqType::from_ggml_type_id(12), None); // Q4_K is candle's
     }
 
-    /// The fused `iq_matmul` (the GEMV CUDA kernel on a CUDA device, the
-    /// scalar reference on CPU) must equal `dequantize_iq` + a plain matmul
-    /// over the same weight. The IQ3_XXS fixture (1536 vals) is treated as a
-    /// `[6, 256]` weight; X is `[m, 256]`. On CUDA this is the correctness
-    /// gate for the `gemv_*` kernels.
+    /// The fused `iq_matmul` (q8_1 MMVQ — the CUDA kernel on a CUDA device,
+    /// the CPU port otherwise) must *approximate* `dequantize_iq` + a plain
+    /// f32 matmul over the same weight. Both dequantize the SAME I-quant
+    /// weight identically, so the only divergence is the int8 quantization of
+    /// the activation — bounded by a few percent relative error. The IQ3_XXS
+    /// fixture (1536 vals) is treated as a `[6, 256]` weight; X is `[m, 256]`.
     #[test]
     fn iq_matmul_matches_dequant_then_matmul() {
         use candle_core::{Device, Tensor};
@@ -712,41 +986,116 @@ mod tests {
         };
         let f: Fixture = serde_json::from_str(include_str!("testdata/iq3_xxs.json")).unwrap();
         let iq = IqType::from_ggml_type_id(f.ggml_type_id).unwrap();
-        let (n_out, n_in) = (6usize, 256usize);
-        assert_eq!(f.n_blocks * f.block_size, n_out * n_in);
+        let raw0 = hex_to_bytes(&f.raw_hex);
+        let ts = iq.type_size();
+        // Repeat valid IQ3_XXS blocks to reach the model's real widths.
+        let tile = |n_blocks: usize| -> Vec<u8> {
+            (0..n_blocks)
+                .flat_map(|i| raw0[(i % f.n_blocks) * ts..(i % f.n_blocks + 1) * ts].to_vec())
+                .collect()
+        };
 
-        let raw = hex_to_bytes(&f.raw_hex);
-        let nb = raw.len();
-        let w_bytes = Tensor::from_vec(raw, (nb,), &dev).unwrap();
-
-        // Reference dense weight [out, in] via the verified dequant path.
-        let w = dequantize_iq(&w_bytes, iq, n_out * n_in)
-            .unwrap()
-            .reshape((n_out, n_in))
-            .unwrap();
-
-        for m in [1usize, 4, IQ_GEMV_MAX_M] {
-            let xv: Vec<f32> = (0..m * n_in)
-                .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
-                .collect();
-            let x = Tensor::from_vec(xv, (m, n_in), &dev).unwrap();
-
-            let fused = iq_matmul(&w_bytes, &x, iq, n_out, n_in, m).unwrap();
-            assert_eq!(fused.dims(), &[m, n_out]);
-            let reference = x.matmul(&w.t().unwrap()).unwrap();
-
-            let diff = (fused - reference)
+        // Single- and multi-super-block rows incl. the model's real n_in
+        // (2048/4096 → nblk32 64/128) so the q8_1 MMVQ math is pinned to a
+        // full-precision matmul at production sizes, not just one super-block.
+        for &(n_out, n_in) in &[(6usize, 256usize), (3, 512), (2, 768), (1, 2048), (1, 4096)] {
+            let raw = tile(n_out * n_in / QK_K);
+            let nb = raw.len();
+            let w_bytes = Tensor::from_vec(raw.clone(), (nb,), &dev).unwrap();
+            let w = dequantize_iq(&w_bytes, iq, n_out * n_in)
                 .unwrap()
-                .abs()
-                .unwrap()
-                .max_all()
-                .unwrap()
-                .to_scalar::<f32>()
+                .reshape((n_out, n_in))
                 .unwrap();
-            assert!(
-                diff <= 1e-3,
-                "m={m}: fused iq_matmul vs dequant+matmul: {diff}"
-            );
+
+            for m in [1usize, 4, IQ_GEMV_MAX_M] {
+                let xv: Vec<f32> = (0..m * n_in)
+                    .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+                    .collect();
+                let x = Tensor::from_vec(xv, (m, n_in), &dev).unwrap();
+
+                let fused = iq_matmul(&w_bytes, &x, iq, n_out, n_in, m)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let reference = x
+                    .matmul(&w.t().unwrap())
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                assert_eq!(fused.len(), m * n_out);
+
+                // Relative L2 error: int8 activation quant, not exact equality.
+                let mut num = 0f64;
+                let mut den = 0f64;
+                for (a, b) in fused.iter().zip(&reference) {
+                    num += ((a - b) as f64).powi(2);
+                    den += (*b as f64).powi(2);
+                }
+                let rel = (num / den.max(1e-12)).sqrt();
+                assert!(den > 1e-6, "n_in={n_in} m={m}: reference ~zero, vacuous");
+                assert!(
+                    rel <= 0.05,
+                    "n_in={n_in} m={m}: q8_1 MMVQ vs f32 matmul rel L2 {rel} > 5%"
+                );
+            }
         }
+    }
+
+    /// Per-32-block int8 (q8_1) activation quant must stay accurate even with
+    /// Gemma-style outliers (a few huge values dwarfing the rest within a
+    /// block): the per-block scale absorbs the outlier and the dot is
+    /// dominated by it, so the relative error stays small (≤ a few %). Guards
+    /// against the assumption that outliers would force a fallback to f32.
+    #[test]
+    fn q8_1_outlier_activation_diagnostic() {
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let f: Fixture = serde_json::from_str(include_str!("testdata/iq3_xxs.json")).unwrap();
+        let iq = IqType::from_ggml_type_id(f.ggml_type_id).unwrap();
+        let raw = hex_to_bytes(&f.raw_hex);
+        let (n_out, n_in) = (1usize, 1536usize);
+        let w = dequantize_iq(
+            &Tensor::from_vec(raw.clone(), (raw.len(),), &dev).unwrap(),
+            iq,
+            n_out * n_in,
+        )
+        .unwrap()
+        .reshape((n_out, n_in))
+        .unwrap();
+
+        // One outlier per 32-block (~100×) over a small background — mimics
+        // Gemma's massive-activation channels.
+        let xv: Vec<f32> = (0..n_in)
+            .map(|i| {
+                if i % 32 == 0 {
+                    120.0
+                } else {
+                    ((i % 7) as f32 - 3.0) * 0.2
+                }
+            })
+            .collect();
+        let x = Tensor::from_vec(xv.clone(), (1, n_in), &dev).unwrap();
+        let fused = q8_1_mmvq_cpu(&raw, &xv, iq, n_out, n_in, 1);
+        let reference = x
+            .matmul(&w.t().unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let (mut num, mut den) = (0f64, 0f64);
+        for (a, b) in fused.iter().zip(&reference) {
+            num += ((a - b) as f64).powi(2);
+            den += (*b as f64).powi(2);
+        }
+        let rel = (num / den.max(1e-12)).sqrt();
+        assert!(
+            rel <= 0.05,
+            "q8_1 outlier-activation rel L2 {rel} > 5% (fused={fused:?} ref={reference:?})"
+        );
     }
 }
