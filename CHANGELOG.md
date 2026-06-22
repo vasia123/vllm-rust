@@ -9,6 +9,8 @@ HTTP API, CLI flags, or on-disk formats; see [docs/RELEASING.md](docs/RELEASING.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-23
+
 First tagged release. The version was previously pinned at `0.1.0` with no
 tags; the first `scripts/release.sh` run starts the real release history.
 Highlights:
@@ -41,4 +43,5 @@ Highlights:
 - Generation is capped at the effective context length — no single-sequence
   KV-cache wedge.
 
-[Unreleased]: https://github.com/vasia123/vllm-rust/commits/main
+[Unreleased]: https://github.com/vasia123/vllm-rust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vasia123/vllm-rust/releases/tag/v0.2.0

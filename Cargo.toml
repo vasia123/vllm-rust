@@ -41,7 +41,7 @@ tempfile = "3"
 # inherits this via `version.workspace = true`. Bump it through
 # `scripts/release.sh` (see docs/RELEASING.md), never by hand.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [workspace.dependencies]
