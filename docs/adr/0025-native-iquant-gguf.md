@@ -96,13 +96,19 @@ Every layer is pinned against an independent reference:
 - The UD Gemma-4-12B IQ3_XXS checkpoint (and any IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/
   IQ4_XS GGUF) loads and runs on 8 GB at full source-file fidelity — no
   re-quantization, weights stay I-quant-resident (4.6 GB).
-- `IqLinear` uses the **dequant-then-matmul** path: it materializes the whole
-  weight to a dense f32 scratch each forward (O(out·in) per token, like the
-  old pre-`QMatMul` GGUF path the `gguf_qmatmul_bench` documents). This is
-  correct and fits memory, but slower than a fused kernel. A **fused MMVQ-style
-  IQ kernel** (dot-product against the I-quant blocks without materializing the
-  dense weight) is the planned optimisation — `benches/iq_dequant_bench.rs`
-  records the current baseline for that before/after.
+- `IqLinear` is two-path, mirroring candle's `QMatMul` (vec-kernel for small M,
+  GEMM otherwise):
+  - **Decode (M ≤ `IQ_GEMV_MAX_M` = 16): fused GEMV** (`gemv_*` in
+    `kernels/iq_dequant.cu`). One CUDA block per output row dequantizes the
+    row's blocks on the fly and dots them against the activation — a **single
+    pass over the I-quant bytes, no dense weight materialized**. This is the
+    hot path (one launch per decode step) and runs at memory bandwidth.
+  - **Prefill (M > 16) / CPU: dequant-then-matmul** — dequantize the whole
+    weight to dense f32 once, then a single cuBLAS/candle GEMM amortizes it
+    over all rows. One-shot, so the materialization cost is paid once per
+    prompt, not per token.
+  Both paths are pinned to the same reference (`iq_matmul_matches_dequant_then_matmul`).
+  `benches/iq_dequant_bench.rs` covers both.
 - candle stays at vanilla 0.10.2; no `[patch.crates-io]`.
 - Regenerating the tables requires `reference/llama.cpp` present; the script
   is the single source of truth for both the Rust and CUDA tables.

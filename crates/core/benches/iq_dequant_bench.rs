@@ -1,35 +1,40 @@
-//! Tier 1 — native I-quant (IQ) dequant + linear forward baseline.
+//! Tier 1 — native I-quant (IQ) matmul: dequant-then-matmul vs the fused GEMV.
 //!
 //! candle has no I-quant path, so the Unsloth "UD" GGUFs (IQ2_XS / IQ2_S /
-//! IQ3_XXS / IQ3_S / IQ4_XS) run through our own `IqLinear`: the weight stays
-//! I-quant-resident on the device and the forward dequantizes it to a dense
-//! f32 matrix (`kernels/iq_dequant.cu` on CUDA, the scalar port on CPU) then
-//! matmuls — O(out·in) dequant work per forward, like the OLD GGUF dense path.
+//! IQ3_XXS / IQ3_S / IQ4_XS) run through our own `IqLinear`. This bench is the
+//! BEFORE/AFTER the CLAUDE.md perf rule requires for the fused decode kernel:
 //!
-//! This records the BEFORE the CLAUDE.md perf rule requires: the current
-//! dequant-then-matmul `IqLinear`. The planned fused-MMVQ kernel (skip
-//! materializing the dense weight; see the DEFERRED task) adds its AFTER
-//! variant here for an honest diff.
+//! - `decode_dequant_matmul` (BEFORE): dequantize the whole weight to dense f32
+//!   each forward, then matmul — O(out·in) work per token (the old path).
+//! - `decode_fused_gemv` (AFTER): `iq_matmul` — one pass over the I-quant bytes,
+//!   dotting blocks against the activation, no dense weight materialized.
+//! - `prefill_dequant_matmul` (M=32): the dequant + GEMM path both decode and
+//!   prefill share for large M (amortized over the prompt).
 //!
-//! Byte VALUES don't affect dequant cost (per-block work is data-independent
-//! bar cheap sign flips), so a zero-filled block buffer is a faithful perf
-//! proxy without a real IQ encoder.
+//! Byte VALUES don't affect cost (per-block work is data-independent bar cheap
+//! sign flips), so a zero-filled block buffer is a faithful perf proxy without
+//! a real IQ encoder.
 //!
 //! IQ3_XXS is the dominant type in the Gemma-4-12B UD checkpoint (187 of 372
-//! quantized tensors). Shapes mirror q/o_proj (square) and a wide FFN
-//! projection; decode (M=1) and prefill (M=32).
+//! quantized tensors). Shapes mirror q/o_proj (square) and a wide FFN proj.
 
 use candle_core::{DType, Device, Tensor};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use vllm_core::quantization::gguf::iq::{dequantize_iq, IqType};
-use vllm_core::quantization::gguf::IqLinear;
-use vllm_core::quantization::QuantizedLinear;
+use vllm_core::quantization::gguf::iq::{dequantize_iq, iq_matmul, IqType};
 
 // (out_features, in_features) — `[out, in]` row layout; `in % 256 == 0`.
 const SHAPES: &[(usize, usize, &str)] = &[(4096, 4096, "4096x4096"), (14336, 4096, "14336x4096")];
-const TOKENS: &[usize] = &[1, 32];
 
 const IQ: IqType = IqType::Iq3Xxs;
+
+/// BEFORE path: dequantize the whole weight to dense f32, then matmul.
+fn dequant_then_matmul(bytes: &Tensor, x: &Tensor, out: usize, inn: usize) -> Tensor {
+    let w = dequantize_iq(bytes, IQ, out * inn)
+        .unwrap()
+        .reshape((out, inn))
+        .unwrap();
+    x.matmul(&w.t().unwrap().contiguous().unwrap()).unwrap()
+}
 
 /// Zero-filled IQ block bytes for an `[out, in]` weight (perf-faithful).
 fn make_iq_bytes(out: usize, inn: usize, device: &Device) -> Tensor {
@@ -62,43 +67,54 @@ fn run_suite(c: &mut Criterion, device: &Device, tag: &str) {
 
     for &(out, inn, shape_name) in SHAPES {
         let bytes = make_iq_bytes(out, inn, device);
-        let n_elem = out * inn;
-        let lin = IqLinear::new(bytes.clone(), IQ, out, inn, None);
 
-        // Dequant-only cost (the per-forward weight expansion).
+        // ── Decode (M=1): BEFORE (dequant+matmul) vs AFTER (fused GEMV) ──
+        let x1 = make_input(1, inn, device);
         for _ in 0..3 {
-            let _ = dequantize_iq(&bytes, IQ, n_elem).unwrap();
+            let _ = dequant_then_matmul(&bytes, &x1, out, inn);
+            let _ = iq_matmul(&bytes, &x1, IQ, out, inn, 1).unwrap();
         }
         sync(device);
         group.bench_with_input(
-            BenchmarkId::new("dequant_only", shape_name),
+            BenchmarkId::new("decode_dequant_matmul", shape_name),
             &out,
             |bn, _| {
                 bn.iter(|| {
-                    let y = dequantize_iq(black_box(&bytes), IQ, n_elem).unwrap();
+                    let y = dequant_then_matmul(black_box(&bytes), black_box(&x1), out, inn);
+                    let _ = y.dim(0).unwrap();
+                    sync(device);
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("decode_fused_gemv", shape_name),
+            &out,
+            |bn, _| {
+                bn.iter(|| {
+                    let y = iq_matmul(black_box(&bytes), black_box(&x1), IQ, out, inn, 1).unwrap();
                     let _ = y.dim(0).unwrap();
                     sync(device);
                 });
             },
         );
 
-        // Full IqLinear forward (dequant + matmul) at decode/prefill.
-        for &m in TOKENS {
-            let x = make_input(m, inn, device);
-            let mode = if m == 1 { "decode" } else { "prefill" };
-            let id = format!("{shape_name}/{mode}_m{m}");
-            for _ in 0..3 {
-                let _ = lin.forward(&x).unwrap();
-            }
-            sync(device);
-            group.bench_with_input(BenchmarkId::new("iqlinear_forward", &id), &m, |bn, _| {
+        // ── Prefill (M=32): the shared dequant+GEMM path ──
+        let x32 = make_input(32, inn, device);
+        for _ in 0..3 {
+            let _ = dequant_then_matmul(&bytes, &x32, out, inn);
+        }
+        sync(device);
+        group.bench_with_input(
+            BenchmarkId::new("prefill_dequant_matmul", shape_name),
+            &out,
+            |bn, _| {
                 bn.iter(|| {
-                    let y = lin.forward(black_box(&x)).unwrap();
+                    let y = dequant_then_matmul(black_box(&bytes), black_box(&x32), out, inn);
                     let _ = y.dim(0).unwrap();
                     sync(device);
                 });
-            });
-        }
+            },
+        );
     }
     group.finish();
 }

@@ -327,19 +327,9 @@ impl IqLinear {
     }
 
     fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
-        // TODO(perf, ADR 0025): this materializes the whole weight to a dense
-        // f32 scratch every forward (O(out·in)/token). A fused MMVQ-style IQ
-        // kernel (dot-product over the I-quant blocks, no dense weight) is the
-        // planned optimisation — see the DEFERRED task and
-        // `benches/iq_dequant_bench.rs` for the baseline before/after.
-        // Dequantize the weight to a dense f32 [out, in] matrix.
-        let n = self.out_features * self.in_features;
-        let w = iq::dequantize_iq(&self.bytes, self.iq, n)?
-            .reshape((self.out_features, self.in_features))?;
-
         // y = x @ Wᵀ. candle's quantized kernels are f32; match that here so
-        // the dequant→matmul is numerically consistent with the GgufLinear
-        // path. Collapse leading dims to a 2-D [M, in] matmul, then restore.
+        // the result is numerically consistent with the GgufLinear path.
+        // Collapse leading dims to a 2-D [M, in] matmul, then restore.
         let orig_dtype = x.dtype();
         let x_f32 = x.to_dtype(DType::F32)?.contiguous()?;
         let dims = x_f32.dims().to_vec();
@@ -351,9 +341,28 @@ impl IqLinear {
             );
         }
         let m: usize = dims[..dims.len().saturating_sub(1)].iter().product();
-        let y = x_f32
-            .reshape((m, self.in_features))?
-            .matmul(&w.t()?.contiguous()?)?;
+        let x_2d = x_f32.reshape((m, self.in_features))?;
+
+        let y = if x_2d.device().is_cuda() && m <= iq::IQ_GEMV_MAX_M {
+            // Decode (small M): fused GEMV — dot the I-quant blocks against the
+            // activation directly, no dense weight materialized. One pass over
+            // the weight bytes.
+            iq::iq_matmul(
+                &self.bytes,
+                &x_2d,
+                self.iq,
+                self.out_features,
+                self.in_features,
+                m,
+            )?
+        } else {
+            // Prefill (large M) / CPU: dequantize the whole weight to dense f32
+            // once, then a single cuBLAS/candle GEMM amortizes it over all rows.
+            let n = self.out_features * self.in_features;
+            let w = iq::dequantize_iq(&self.bytes, self.iq, n)?
+                .reshape((self.out_features, self.in_features))?;
+            x_2d.matmul(&w.t()?.contiguous()?)?
+        };
 
         let mut out_dims = dims;
         if let Some(last) = out_dims.last_mut() {

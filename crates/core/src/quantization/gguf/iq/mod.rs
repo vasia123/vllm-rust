@@ -446,6 +446,163 @@ pub fn dequantize_iq(bytes: &Tensor, iq: IqType, n_elements: usize) -> Result<Te
     bytes.apply_op1_no_bwd(&DequantIqOp { iq, n_elements })
 }
 
+/// Largest activation-row count the fused GEMV kernel handles in one launch
+/// (matches `IQ_GEMV_MAX_M` in `kernels/iq_dequant.cu`). Decode batches are
+/// far smaller; larger M (prefill) takes the dequant + cuBLAS path.
+pub const IQ_GEMV_MAX_M: usize = 16;
+
+#[cfg(feature = "cuda-kernels")]
+impl IqType {
+    /// The `kernels/iq_dequant.cu` fused GEMV entry point for this type.
+    fn gemv_kernel(self) -> &'static str {
+        match self {
+            IqType::Iq2Xs => "gemv_iq2_xs_f32",
+            IqType::Iq2S => "gemv_iq2_s_f32",
+            IqType::Iq3Xxs => "gemv_iq3_xxs_f32",
+            IqType::Iq3S => "gemv_iq3_s_f32",
+            IqType::Iq4Xs => "gemv_iq4_xs_f32",
+        }
+    }
+}
+
+/// Fused `Y = X @ Wᵀ` over an I-quant weight, GEMV-style — for small M
+/// (decode). The weight stays I-quant-resident; the kernel dequantizes each
+/// block on the fly and dots it against the activation, never materializing
+/// the dense weight (one pass over the I-quant bytes vs the
+/// dequant-to-f32-then-matmul round-trip). `m` must be `<= IQ_GEMV_MAX_M`.
+struct IqMatmulOp {
+    /// Activation `[m, n_in]`, f32, contiguous, same device as the weight.
+    x: Tensor,
+    iq: IqType,
+    n_out: usize,
+    n_in: usize,
+    m: usize,
+}
+
+impl CustomOp1 for IqMatmulOp {
+    fn name(&self) -> &'static str {
+        "iq_matmul"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, _layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        // Reference path (CPU device / tests): dequantize the weight and do a
+        // plain matmul. Mirrors the fused kernel's math exactly.
+        let bytes = match storage {
+            CpuStorage::U8(b) => b,
+            _ => candle_core::bail!("iq_matmul: weight bytes must be U8"),
+        };
+        let mut w = vec![0f32; self.n_out * self.n_in];
+        dequantize(self.iq, bytes, &mut w)?;
+        let x = self.x.flatten_all()?.to_vec1::<f32>()?;
+        let mut y = vec![0f32; self.m * self.n_out];
+        for mi in 0..self.m {
+            let xr = &x[mi * self.n_in..(mi + 1) * self.n_in];
+            for o in 0..self.n_out {
+                let wr = &w[o * self.n_in..(o + 1) * self.n_in];
+                let mut s = 0f32;
+                for k in 0..self.n_in {
+                    s += xr[k] * wr[k];
+                }
+                y[mi * self.n_out + o] = s;
+            }
+        }
+        Ok((CpuStorage::F32(y), Shape::from_dims(&[self.m, self.n_out])))
+    }
+
+    #[cfg(feature = "cuda-kernels")]
+    fn cuda_fwd(
+        &self,
+        storage: &candle_core::CudaStorage,
+        _layout: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda::CudaStorageSlice;
+        use candle_core::Storage;
+
+        if self.m > IQ_GEMV_MAX_M {
+            candle_core::bail!("iq_matmul: m {} exceeds IQ_GEMV_MAX_M", self.m);
+        }
+        if !self.n_in.is_multiple_of(QK_K) {
+            candle_core::bail!("iq_matmul: n_in {} not a multiple of {QK_K}", self.n_in);
+        }
+
+        let dev = &storage.device;
+        let w = match &storage.slice {
+            CudaStorageSlice::U8(s) => s,
+            _ => candle_core::bail!("iq_matmul: weight bytes must be U8"),
+        };
+
+        let (x_guard, x_layout) = self.x.storage_and_layout();
+        let x = match &*x_guard {
+            Storage::Cuda(cs) => match &cs.slice {
+                CudaStorageSlice::F32(s) => s,
+                _ => candle_core::bail!("iq_matmul: activation must be F32"),
+            },
+            _ => candle_core::bail!("iq_matmul: activation must be on CUDA"),
+        };
+        let x = match x_layout.contiguous_offsets() {
+            Some((o1, o2)) => x.slice(o1..o2),
+            None => candle_core::bail!("iq_matmul: activation must be contiguous"),
+        };
+
+        let output = dev.alloc_zeros::<f32>(self.m * self.n_out)?;
+        let func =
+            dev.get_or_load_custom_func(self.iq.gemv_kernel(), "iq_dequant", IQ_DEQUANT_PTX)?;
+
+        // One warp per output row, IQ_GEMV_ROWS_PER_BLOCK (=4) rows per block.
+        // Must match kernels/iq_dequant.cu.
+        const THREADS: u32 = 128;
+        const ROWS_PER_BLOCK: u32 = 4;
+        let cfg = LaunchConfig {
+            grid_dim: ((self.n_out as u32).div_ceil(ROWS_PER_BLOCK), 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_out_i32 = self.n_out as i32;
+        let n_in_i32 = self.n_in as i32;
+        let m_i32 = self.m as i32;
+        let mut builder = func.builder();
+        builder.arg(w);
+        builder.arg(&x);
+        builder.arg(&output);
+        builder.arg(&n_out_i32);
+        builder.arg(&n_in_i32);
+        builder.arg(&m_i32);
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| candle_core::Error::Msg(format!("iq_matmul launch: {e}")))?;
+
+        drop(x_guard);
+        let output_storage = candle_core::CudaStorage {
+            slice: CudaStorageSlice::F32(output),
+            device: dev.clone(),
+        };
+        Ok((output_storage, Shape::from_dims(&[self.m, self.n_out])))
+    }
+}
+
+/// Fused `Y = X @ Wᵀ` for an I-quant weight, GEMV-style (decode path).
+///
+/// * `w_bytes` — raw GGUF block bytes of the weight `[n_out, n_in]`, U8.
+/// * `x` — activation `[m, n_in]`, f32, contiguous; `m <= IQ_GEMV_MAX_M`.
+///
+/// Returns `Y` `[m, n_out]` f32. Never materializes the dense weight.
+pub fn iq_matmul(
+    w_bytes: &Tensor,
+    x: &Tensor,
+    iq: IqType,
+    n_out: usize,
+    n_in: usize,
+    m: usize,
+) -> Result<Tensor> {
+    w_bytes.apply_op1_no_bwd(&IqMatmulOp {
+        x: x.clone(),
+        iq,
+        n_out,
+        n_in,
+        m,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +696,57 @@ mod tests {
             assert_eq!(IqType::from_ggml_type_id(iq.ggml_type_id()), Some(iq));
         }
         assert_eq!(IqType::from_ggml_type_id(12), None); // Q4_K is candle's
+    }
+
+    /// The fused `iq_matmul` (the GEMV CUDA kernel on a CUDA device, the
+    /// scalar reference on CPU) must equal `dequantize_iq` + a plain matmul
+    /// over the same weight. The IQ3_XXS fixture (1536 vals) is treated as a
+    /// `[6, 256]` weight; X is `[m, 256]`. On CUDA this is the correctness
+    /// gate for the `gemv_*` kernels.
+    #[test]
+    fn iq_matmul_matches_dequant_then_matmul() {
+        use candle_core::{Device, Tensor};
+        let dev = match Device::cuda_if_available(0) {
+            Ok(d) => d,
+            Err(_) => Device::Cpu,
+        };
+        let f: Fixture = serde_json::from_str(include_str!("testdata/iq3_xxs.json")).unwrap();
+        let iq = IqType::from_ggml_type_id(f.ggml_type_id).unwrap();
+        let (n_out, n_in) = (6usize, 256usize);
+        assert_eq!(f.n_blocks * f.block_size, n_out * n_in);
+
+        let raw = hex_to_bytes(&f.raw_hex);
+        let nb = raw.len();
+        let w_bytes = Tensor::from_vec(raw, (nb,), &dev).unwrap();
+
+        // Reference dense weight [out, in] via the verified dequant path.
+        let w = dequantize_iq(&w_bytes, iq, n_out * n_in)
+            .unwrap()
+            .reshape((n_out, n_in))
+            .unwrap();
+
+        for m in [1usize, 4, IQ_GEMV_MAX_M] {
+            let xv: Vec<f32> = (0..m * n_in)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+                .collect();
+            let x = Tensor::from_vec(xv, (m, n_in), &dev).unwrap();
+
+            let fused = iq_matmul(&w_bytes, &x, iq, n_out, n_in, m).unwrap();
+            assert_eq!(fused.dims(), &[m, n_out]);
+            let reference = x.matmul(&w.t().unwrap()).unwrap();
+
+            let diff = (fused - reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff <= 1e-3,
+                "m={m}: fused iq_matmul vs dequant+matmul: {diff}"
+            );
+        }
     }
 }

@@ -183,3 +183,60 @@ IQ_DEQUANT_KERNEL(dequantize_iq2_s_f32, 82, deq_block_iq2_s)
 IQ_DEQUANT_KERNEL(dequantize_iq3_xxs_f32, 98, deq_block_iq3_xxs)
 IQ_DEQUANT_KERNEL(dequantize_iq3_s_f32, 110, deq_block_iq3_s)
 IQ_DEQUANT_KERNEL(dequantize_iq4_xs_f32, 136, deq_block_iq4_xs)
+
+// ---- Fused IQ × dense activation (decode GEMV) ----------------------------
+//
+// Computes Y = X @ Wᵀ where W is the I-quant weight `[n_out, n_in]` (block
+// bytes) and X is f32 `[M, n_in]`, producing Y f32 `[M, n_out]`. One CUDA
+// block per output row `o`: its threads split the row's QK_K sub-blocks,
+// dequantize each in place (reusing the verified deq_block_*), accumulate the
+// dot against every one of the M activation rows, then block-reduce. The
+// dense weight is NEVER materialized — a single pass over the I-quant bytes,
+// unlike the dequant-then-matmul path. For decode M is tiny (≤ batch); larger
+// M (prefill) uses the dequant+cuBLAS path on the Rust side.
+//
+// X must be contiguous `[M, n_in]` and M <= IQ_GEMV_MAX_M.
+//
+// One WARP per output row (warp-shuffle reduction, no shared mem / no
+// __syncthreads); IQ_GEMV_ROWS_PER_BLOCK rows per CUDA block. A warp's 32
+// lanes stride over the row's QK_K sub-blocks, each lane dequantizing its
+// sub-blocks and dotting them against every activation row.
+#define IQ_GEMV_MAX_M 16
+#define IQ_GEMV_ROWS_PER_BLOCK 4
+#define IQ_GEMV_THREADS (32 * IQ_GEMV_ROWS_PER_BLOCK)
+
+#define IQ_GEMV_KERNEL(NAME, TYPE_SIZE, DEQ_FN)                                          \
+    extern "C" __global__ void NAME(const uint8_t* __restrict__ W,                       \
+                                    const float* __restrict__ X, float* __restrict__ Y,  \
+                                    int n_out, int n_in, int M) {                         \
+        const int lane = threadIdx.x & 31;                                               \
+        const int warp = threadIdx.x >> 5;                                               \
+        const int o = blockIdx.x * IQ_GEMV_ROWS_PER_BLOCK + warp;                        \
+        if (o >= n_out) return;                                                          \
+        const int nb = n_in / QK_K;                                                      \
+        float deq[QK_K];                                                                 \
+        float acc[IQ_GEMV_MAX_M];                                                        \
+        for (int m = 0; m < M; ++m) acc[m] = 0.0f;                                       \
+        for (int blk = lane; blk < nb; blk += 32) {                                      \
+            DEQ_FN(W + ((long)o * nb + blk) * (TYPE_SIZE), deq);                         \
+            const int base = blk * QK_K;                                                 \
+            for (int m = 0; m < M; ++m) {                                                 \
+                const float* __restrict__ xm = X + (long)m * n_in + base;                \
+                float s = 0.0f;                                                          \
+                for (int j = 0; j < QK_K; ++j) s += deq[j] * xm[j];                      \
+                acc[m] += s;                                                             \
+            }                                                                            \
+        }                                                                                \
+        for (int m = 0; m < M; ++m) {                                                     \
+            float v = acc[m];                                                            \
+            for (int off = 16; off > 0; off >>= 1)                                       \
+                v += __shfl_down_sync(0xffffffff, v, off);                               \
+            if (lane == 0) Y[(long)m * n_out + o] = v;                                   \
+        }                                                                                \
+    }
+
+IQ_GEMV_KERNEL(gemv_iq2_xs_f32, 74, deq_block_iq2_xs)
+IQ_GEMV_KERNEL(gemv_iq2_s_f32, 82, deq_block_iq2_s)
+IQ_GEMV_KERNEL(gemv_iq3_xxs_f32, 98, deq_block_iq3_xxs)
+IQ_GEMV_KERNEL(gemv_iq3_s_f32, 110, deq_block_iq3_s)
+IQ_GEMV_KERNEL(gemv_iq4_xs_f32, 136, deq_block_iq4_xs)
