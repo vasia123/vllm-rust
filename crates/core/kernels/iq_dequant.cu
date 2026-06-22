@@ -1,0 +1,185 @@
+// I-quant (IQ) dequantization kernels.
+//
+// candle 0.10 has no I-quant support, so GGUF checkpoints that use the
+// Unsloth "UD" dynamic quants (IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS)
+// cannot run through candle's quantized path. These kernels dequantize an
+// I-quant weight (resident on-device as raw GGUF block bytes) to a dense
+// f32 matrix; `IqLinear` then matmuls it. The math is a one-to-one port of
+// ggml's `dequantize_row_iq*` (reference/llama.cpp/ggml/src/ggml-quants.c),
+// pinned bit-for-bit against the CPU port (crates/core/.../iq/mod.rs), which
+// is itself pinned against gguf-py golden vectors from the real model.
+//
+// Parallelism: one CUDA thread per GGML super-block (QK_K = 256 elements).
+// A weight has millions of elements → hundreds of thousands of blocks, so
+// block-level parallelism saturates the GPU. The per-thread inner loops
+// mirror the CPU reference exactly for auditability; this is the simple,
+// correct dequant-then-matmul path (a fused MMVQ kernel is a later perf
+// optimisation, tracked separately).
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#include "iq_tables.cuh"
+
+#define QK_K 256
+
+// Sign multiplier for output lane j given a packed sign byte (kmask bit j).
+__device__ __forceinline__ float iq_sign(uint8_t signs, int j) {
+    return (signs & kmask_iq2xs[j]) ? -1.0f : 1.0f;
+}
+
+// ---- IQ2_XS: block = d(f16) + qs[u16 x32] + scales[u8 x8] = 74 bytes ----
+__device__ void deq_block_iq2_xs(const uint8_t* __restrict__ b, float* __restrict__ y) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const uint16_t* qs = reinterpret_cast<const uint16_t*>(b + 2);
+    const uint8_t* scales = b + 66;
+    int yi = 0;
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        const float db0 = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+        const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const uint16_t q = qs[4 * ib32 + l];
+            const uint64_t grid = iq2xs_grid[q & 511];
+            const uint8_t signs = ksigns_iq2xs[q >> 9];
+            const float dl = (l / 2 == 0) ? db0 : db1;
+            const uint8_t* g = reinterpret_cast<const uint8_t*>(&grid);
+            for (int j = 0; j < 8; ++j) {
+                y[yi + j] = dl * (float)g[j] * iq_sign(signs, j);
+            }
+            yi += 8;
+        }
+    }
+}
+
+// ---- IQ2_S: block = d + qs[u8 x64] + qh[u8 x8] + scales[u8 x8] = 82 bytes ----
+__device__ void deq_block_iq2_s(const uint8_t* __restrict__ b, float* __restrict__ y) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const uint8_t* qs = b + 2;
+    const uint8_t* signs = b + 2 + QK_K / 8; // qs + 32
+    const uint8_t* qh = b + 66;
+    const uint8_t* scales = b + 74;
+    int yi = 0, qs_off = 0, signs_off = 0;
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        const float db0 = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+        const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const float dl = (l / 2 == 0) ? db0 : db1;
+            const int idx = qs[qs_off + l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+            const uint64_t grid = iq2s_grid[idx];
+            const uint8_t sgn = signs[signs_off + l];
+            const uint8_t* g = reinterpret_cast<const uint8_t*>(&grid);
+            for (int j = 0; j < 8; ++j) {
+                y[yi + j] = dl * (float)g[j] * iq_sign(sgn, j);
+            }
+            yi += 8;
+        }
+        qs_off += 4;
+        signs_off += 4;
+    }
+}
+
+// ---- IQ3_XXS: block = d + qs[u8 x96] (last 32 B are scales+signs) = 98 B ----
+__device__ void deq_block_iq3_xxs(const uint8_t* __restrict__ b, float* __restrict__ y) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const uint8_t* qs = b + 2;
+    const uint8_t* sas = b + 66; // qs + QK_K/4
+    int yi = 0, qs_off = 0;
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        uint32_t aux32;
+        memcpy(&aux32, sas + 4 * ib32, sizeof(uint32_t));
+        const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+            const uint32_t grid1 = iq3xxs_grid[qs[qs_off + 2 * l]];
+            const uint32_t grid2 = iq3xxs_grid[qs[qs_off + 2 * l + 1]];
+            const uint8_t* g1 = reinterpret_cast<const uint8_t*>(&grid1);
+            const uint8_t* g2 = reinterpret_cast<const uint8_t*>(&grid2);
+            for (int j = 0; j < 4; ++j) {
+                y[yi + j] = db * (float)g1[j] * iq_sign(signs, j);
+                y[yi + j + 4] = db * (float)g2[j] * iq_sign(signs, j + 4);
+            }
+            yi += 8;
+        }
+        qs_off += 8;
+    }
+}
+
+// ---- IQ3_S: d + qs[u8 x64] + qh[u8 x8] + signs[u8 x32] + scales[u8 x4] = 110 B ----
+__device__ void deq_block_iq3_s(const uint8_t* __restrict__ b, float* __restrict__ y) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const uint8_t* qs = b + 2;
+    const uint8_t* qh = b + 66;
+    const uint8_t* signs = b + 74;
+    const uint8_t* scales = b + 106;
+    int yi = 0, qs_off = 0, signs_off = 0, qh_off = 0;
+    for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+        const uint8_t sc = scales[ib32 / 2];
+        const float db1 = d * (1 + 2 * (sc & 0xf));
+        const float db2 = d * (1 + 2 * (sc >> 4));
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t grid1 = iq3s_grid[qs[qs_off + 2 * l] | ((qh[qh_off] << (8 - 2 * l)) & 256)];
+            const uint32_t grid2 = iq3s_grid[qs[qs_off + 2 * l + 1] | ((qh[qh_off] << (7 - 2 * l)) & 256)];
+            const uint8_t sgn = signs[signs_off + l];
+            const uint8_t* g1 = reinterpret_cast<const uint8_t*>(&grid1);
+            const uint8_t* g2 = reinterpret_cast<const uint8_t*>(&grid2);
+            for (int j = 0; j < 4; ++j) {
+                y[yi + j] = db1 * (float)g1[j] * iq_sign(sgn, j);
+                y[yi + j + 4] = db1 * (float)g2[j] * iq_sign(sgn, j + 4);
+            }
+            yi += 8;
+        }
+        qs_off += 8;
+        signs_off += 4;
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t grid1 = iq3s_grid[qs[qs_off + 2 * l] | ((qh[qh_off + 1] << (8 - 2 * l)) & 256)];
+            const uint32_t grid2 = iq3s_grid[qs[qs_off + 2 * l + 1] | ((qh[qh_off + 1] << (7 - 2 * l)) & 256)];
+            const uint8_t sgn = signs[signs_off + l];
+            const uint8_t* g1 = reinterpret_cast<const uint8_t*>(&grid1);
+            const uint8_t* g2 = reinterpret_cast<const uint8_t*>(&grid2);
+            for (int j = 0; j < 4; ++j) {
+                y[yi + j] = db2 * (float)g1[j] * iq_sign(sgn, j);
+                y[yi + j + 4] = db2 * (float)g2[j] * iq_sign(sgn, j + 4);
+            }
+            yi += 8;
+        }
+        qh_off += 2;
+        qs_off += 8;
+        signs_off += 4;
+    }
+}
+
+// ---- IQ4_XS: d + scales_h(u16) + scales_l[u8 x4] + qs[u8 x128] = 136 B ----
+__device__ void deq_block_iq4_xs(const uint8_t* __restrict__ b, float* __restrict__ y) {
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    uint16_t scales_h;
+    memcpy(&scales_h, b + 2, sizeof(uint16_t));
+    const uint8_t* scales_l = b + 4;
+    const uint8_t* qs = b + 8;
+    int yi = 0;
+    for (int ib = 0; ib < QK_K / 32; ++ib) {
+        const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
+        const float dl = d * (ls - 32);
+        const uint8_t* q = qs + 16 * ib;
+        for (int j = 0; j < 16; ++j) {
+            y[yi + j] = dl * (float)kvalues_iq4nl[q[j] & 0xf];
+            y[yi + 16 + j] = dl * (float)kvalues_iq4nl[q[j] >> 4];
+        }
+        yi += 32;
+    }
+}
+
+// One thread per super-block. grid.x * blockDim.x >= n_blocks.
+#define IQ_DEQUANT_KERNEL(NAME, TYPE_SIZE, DEQ_FN)                                    \
+    extern "C" __global__ void NAME(const uint8_t* __restrict__ blocks,              \
+                                    float* __restrict__ out, int n_blocks) {         \
+        int blk = blockIdx.x * blockDim.x + threadIdx.x;                             \
+        if (blk >= n_blocks) return;                                                 \
+        DEQ_FN(blocks + (long)blk * (TYPE_SIZE), out + (long)blk * QK_K);            \
+    }
+
+IQ_DEQUANT_KERNEL(dequantize_iq2_xs_f32, 74, deq_block_iq2_xs)
+IQ_DEQUANT_KERNEL(dequantize_iq2_s_f32, 82, deq_block_iq2_s)
+IQ_DEQUANT_KERNEL(dequantize_iq3_xxs_f32, 98, deq_block_iq3_xxs)
+IQ_DEQUANT_KERNEL(dequantize_iq3_s_f32, 110, deq_block_iq3_s)
+IQ_DEQUANT_KERNEL(dequantize_iq4_xs_f32, 136, deq_block_iq4_xs)

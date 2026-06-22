@@ -8,10 +8,7 @@ scripts/__pycache__/
 
 # Local Python virtualenv for benchmark scripts.
 .venv/
-
-# Local Python virtualenv for the Python-vLLM side-by-side comparison
-# server. Separate from .venv/ so the lightweight client (httpx only)
-# isn't bloated with the ~5 GB of vLLM + torch + flashinfer wheels.
+.venv-iq/
 .venv-vllm/
 
 

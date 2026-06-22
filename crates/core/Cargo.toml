@@ -133,6 +133,12 @@ harness = false
 name = "gguf_qmatmul_bench"
 harness = false
 
+# Native I-quant (IQ) dequant + IqLinear forward baseline (no candle path).
+# Records the BEFORE for the planned fused-MMVQ IQ kernel.
+[[bench]]
+name = "iq_dequant_bench"
+harness = false
+
 [[bench]]
 name = "moe_routing_bench"
 harness = false

@@ -29,11 +29,17 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod header;
+pub mod iq;
+
+use candle_core::quantized::gguf_file;
 #[cfg(feature = "cuda-kernels")]
 use candle_core::quantized::GgmlDType;
-use candle_core::quantized::{gguf_file, QMatMul, QStorage, QTensor};
+use candle_core::quantized::{QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 
+use self::header::{GgufHeader, GgufTensorDtype};
+use self::iq::IqType;
 use super::config::{QuantizationConfig, QuantizationMethod, QuantizedLinear};
 use super::weight_loader::QuantizedWeightLoader;
 
@@ -251,6 +257,164 @@ impl QuantizedLinear for GgufLinear {
     }
 }
 
+/// A GGUF weight tensor loaded onto the device, kept quantized-resident.
+///
+/// candle-native types ride candle's [`QTensor`]; the I-quants candle lacks
+/// (`IQ*`) keep their raw GGUF block bytes as a U8 [`Tensor`] plus the
+/// [`IqType`] needed to dequantize them (see [`iq`]).
+#[derive(Clone)]
+pub enum GgufTensor {
+    /// A candle-native quantized/dense tensor.
+    Candle(Arc<QTensor>),
+    /// An I-quant weight: raw block bytes (U8) + type + logical shape
+    /// `[out, in]`.
+    Iq {
+        bytes: Tensor,
+        iq: IqType,
+        shape: Vec<usize>,
+    },
+}
+
+impl GgufTensor {
+    /// Dequantize the whole tensor to a dense f32 [`Tensor`] in its logical
+    /// shape. Used for non-linear weights pulled through the VarBuilder and
+    /// for bias tensors.
+    fn dequantize_dense(&self, device: &Device) -> Result<Tensor> {
+        match self {
+            GgufTensor::Candle(qt) => qt.dequantize(device),
+            GgufTensor::Iq { bytes, iq, shape } => {
+                let n: usize = shape.iter().product();
+                iq::dequantize_iq(bytes, *iq, n)?.reshape(shape.clone())
+            }
+        }
+    }
+}
+
+/// GGUF linear layer over an I-quant weight (candle has no I-quant matmul).
+///
+/// The weight stays I-quant-resident on the device as raw block bytes; the
+/// forward dequantizes it to a dense f32 matrix (`kernels/iq_dequant.cu` on
+/// CUDA, the scalar port on CPU) and matmuls. This is the simple, correct
+/// dequant-then-matmul path — a fused MMVQ kernel that skips materializing
+/// the dense weight is a later perf optimisation (tracked separately).
+pub struct IqLinear {
+    /// Raw I-quant block bytes (U8) on the compute device.
+    bytes: Tensor,
+    iq: IqType,
+    /// Bias, dense f32 (added after the matmul); `None` for most GGUF models.
+    bias: Option<Tensor>,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl IqLinear {
+    /// Build from the device-resident I-quant bytes + logical shape
+    /// `[out, in]`.
+    pub fn new(
+        bytes: Tensor,
+        iq: IqType,
+        out_features: usize,
+        in_features: usize,
+        bias: Option<Tensor>,
+    ) -> Self {
+        Self {
+            bytes,
+            iq,
+            bias,
+            in_features,
+            out_features,
+        }
+    }
+
+    fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
+        // TODO(perf, ADR 0025): this materializes the whole weight to a dense
+        // f32 scratch every forward (O(out·in)/token). A fused MMVQ-style IQ
+        // kernel (dot-product over the I-quant blocks, no dense weight) is the
+        // planned optimisation — see the DEFERRED task and
+        // `benches/iq_dequant_bench.rs` for the baseline before/after.
+        // Dequantize the weight to a dense f32 [out, in] matrix.
+        let n = self.out_features * self.in_features;
+        let w = iq::dequantize_iq(&self.bytes, self.iq, n)?
+            .reshape((self.out_features, self.in_features))?;
+
+        // y = x @ Wᵀ. candle's quantized kernels are f32; match that here so
+        // the dequant→matmul is numerically consistent with the GgufLinear
+        // path. Collapse leading dims to a 2-D [M, in] matmul, then restore.
+        let orig_dtype = x.dtype();
+        let x_f32 = x.to_dtype(DType::F32)?.contiguous()?;
+        let dims = x_f32.dims().to_vec();
+        let in_f = *dims.last().unwrap_or(&0);
+        if in_f != self.in_features {
+            candle_core::bail!(
+                "IqLinear: input dim {in_f} != in_features {}",
+                self.in_features
+            );
+        }
+        let m: usize = dims[..dims.len().saturating_sub(1)].iter().product();
+        let y = x_f32
+            .reshape((m, self.in_features))?
+            .matmul(&w.t()?.contiguous()?)?;
+
+        let mut out_dims = dims;
+        if let Some(last) = out_dims.last_mut() {
+            *last = self.out_features;
+        }
+        let y = y.reshape(out_dims)?;
+        let y = match &self.bias {
+            Some(b) => y.broadcast_add(b)?,
+            None => y,
+        };
+        y.to_dtype(orig_dtype)
+    }
+}
+
+impl QuantizedLinear for IqLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x)
+    }
+
+    fn forward_pooled(
+        &self,
+        x: &crate::engine::output_pool::PooledTensor,
+    ) -> Result<crate::engine::output_pool::PooledTensor> {
+        // Like GgufLinear: the dequant + matmul allocates fresh buffers (not
+        // pool-backed), sound only OUTSIDE CUDA Graph capture. GGUF forces
+        // enforce_eager, so capture never wraps this; guard loudly otherwise.
+        if crate::engine::output_pool::is_capturing() {
+            candle_core::bail!(
+                "IqLinear::forward_pooled invoked under CUDA Graph capture; \
+                 GGUF must run eager (enforce_eager)"
+            );
+        }
+        let out = self.forward_inner(x.as_tensor())?;
+        // SAFETY: not under capture (guarded above), so the fresh-alloc
+        // pointer is never recorded/replayed by a captured graph.
+        Ok(unsafe { crate::engine::output_pool::PooledTensor::from_pool_unchecked(out) })
+    }
+
+    fn load_weights(&mut self, _weights: &HashMap<String, Tensor>) -> Result<()> {
+        // I-quant weights are installed by the GGUF loader, not via a state
+        // dict — no-op here (mirrors GgufLinear).
+        Ok(())
+    }
+
+    fn weight_dtype(&self) -> DType {
+        DType::F32
+    }
+
+    fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    fn has_bias(&self) -> bool {
+        self.bias.is_some()
+    }
+}
+
 /// Warn once if `CANDLE_DEQUANTIZE_ALL` is set: candle's
 /// `QMatMul::from_arc` then silently dequantizes every weight to dense
 /// f32, which defeats quantized residency and can OOM an 8 GB GPU on a
@@ -445,19 +609,20 @@ impl QuantizedEmbedding {
 
 /// Weight loader for GGUF files.
 ///
-/// Holds the parsed candle [`Content`](gguf_file::Content) (metadata +
-/// tensor table) and a one-shot map of every tensor loaded onto the
-/// target device as a [`QTensor`]. Linear layers wrap their `QTensor` in
-/// a [`QMatMul`]; norm/embedding tensors are dequantized on demand by
+/// Holds the parsed [`GgufHeader`] (metadata + tensor table — our own
+/// parser, since candle's cannot read I-quant files) and a one-shot map of
+/// every tensor loaded onto the target device. candle-native linears wrap a
+/// `QTensor` in a [`QMatMul`]; I-quant linears use [`IqLinear`];
+/// norm/embedding tensors are dequantized on demand by
 /// [`GgufVarBuilderBackend`].
 pub struct GgufWeightLoader {
-    /// Parsed GGUF header (metadata + tensor infos).
-    content: Arc<gguf_file::Content>,
+    /// Parsed GGUF header (metadata + tensor infos, I-quant-aware).
+    header: Arc<GgufHeader>,
     /// Every tensor, loaded once onto `device`, kept quantized-resident.
     /// Large embedding tables routed to a [`QuantizedEmbedding`] (see
     /// [`EMBED_TABLES`]) are NOT in here — they would waste VRAM as unused
-    /// QTensors; they are read from the file on demand instead.
-    tensors: Arc<HashMap<String, Arc<QTensor>>>,
+    /// tensors; they are read from the file on demand instead.
+    tensors: Arc<HashMap<String, GgufTensor>>,
     /// Path to the GGUF file, for on-demand reads of skipped embedding
     /// tables.
     path: std::path::PathBuf,
@@ -478,33 +643,65 @@ const EMBED_TABLES: &[&str] = &["per_layer_token_embd.weight"];
 
 impl GgufWeightLoader {
     /// Open a GGUF file, parse its header, and load every tensor onto
-    /// `device` as a quantized-resident `QTensor`.
+    /// `device` — candle-native types as a quantized-resident `QTensor`,
+    /// I-quants as raw block bytes (see [`GgufTensor`]).
     pub fn from_path(path: &Path, device: Device, dtype: DType) -> Result<Self> {
         warn_if_dequantize_all();
 
-        let mut reader = std::fs::File::open(path)
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to open GGUF file: {e}")))?;
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to parse GGUF header: {e}")))?;
+        let header = {
+            let f = std::fs::File::open(path)
+                .map_err(|e| candle_core::Error::Msg(format!("Failed to open GGUF file: {e}")))?;
+            GgufHeader::read(std::io::BufReader::new(f))
+                .map_err(|e| candle_core::Error::Msg(format!("Failed to parse GGUF header: {e}")))?
+        };
 
         // Single pass: load each tensor onto the device, quantized. Large
         // embedding tables (EMBED_TABLES) are skipped — they are served by
         // a `QuantizedEmbedding` that reads them from the file on demand,
-        // so a dense QTensor copy here would only waste memory.
-        let names: Vec<String> = content.tensor_infos.keys().cloned().collect();
-        let mut tensors: HashMap<String, Arc<QTensor>> = HashMap::with_capacity(names.len());
-        for name in names {
+        // so a dense copy here would only waste memory.
+        let mut reader = std::io::BufReader::new(
+            std::fs::File::open(path)
+                .map_err(|e| candle_core::Error::Msg(format!("reopen GGUF: {e}")))?,
+        );
+        let mut tensors: HashMap<String, GgufTensor> =
+            HashMap::with_capacity(header.tensor_infos.len());
+        for (name, info) in &header.tensor_infos {
             if EMBED_TABLES.contains(&name.as_str()) {
                 continue;
             }
-            let qt = content.tensor(&mut reader, &name, &device).map_err(|e| {
-                candle_core::Error::Msg(format!("Failed to load tensor {name}: {e}"))
+            let bytes = header.read_tensor_bytes(&mut reader, name).map_err(|e| {
+                candle_core::Error::Msg(format!("Failed to read tensor {name}: {e}"))
             })?;
-            tensors.insert(name, Arc::new(qt));
+            let tensor = match info.dtype {
+                GgufTensorDtype::Candle(d) => {
+                    // `Cow::Borrowed`, NOT `Cow::Owned`: candle's internal
+                    // `as_t_slice` takes the `Cow` by value and returns a
+                    // `&[Block]` into it via `from_raw_parts`; with
+                    // `Cow::Owned` the buffer drops when that helper returns
+                    // and `load_quantized` then reads freed memory (SIGSEGV).
+                    // Borrowing keeps `bytes` (this scope's local) alive
+                    // across the upload. Same hazard as `QuantizedEmbedding`.
+                    let storage = QStorage::from_data(Cow::Borrowed(&bytes), &device, d)?;
+                    let qt = QTensor::new(storage, info.shape.clone()).map_err(|e| {
+                        candle_core::Error::Msg(format!("Failed to load tensor {name}: {e}"))
+                    })?;
+                    GgufTensor::Candle(Arc::new(qt))
+                }
+                GgufTensorDtype::Iq(iq) => {
+                    let n_bytes = bytes.len();
+                    let bytes_t = Tensor::from_vec(bytes, (n_bytes,), &device)?;
+                    GgufTensor::Iq {
+                        bytes: bytes_t,
+                        iq,
+                        shape: info.shape.clone(),
+                    }
+                }
+            };
+            tensors.insert(name.clone(), tensor);
         }
 
         Ok(Self {
-            content: Arc::new(content),
+            header: Arc::new(header),
             tensors: Arc::new(tensors),
             path: path.to_path_buf(),
             device,
@@ -514,44 +711,25 @@ impl GgufWeightLoader {
     }
 
     /// Read a tensor's raw quantized bytes straight from the GGUF file
-    /// (used for embedding tables skipped during the bulk load). candle's
-    /// `TensorInfo` is not `Clone`, so this returns only the bytes; the
-    /// caller reads dtype/shape from the borrowed `tensor_infos` entry.
+    /// (used for embedding tables skipped during the bulk load).
     fn read_tensor_bytes(&self, gguf_name: &str) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let info = self.content.tensor_infos.get(gguf_name).ok_or_else(|| {
-            candle_core::Error::Msg(format!("GGUF tensor '{gguf_name}' not found in header"))
-        })?;
-        let elem_count = info.shape.elem_count();
-        let block_size = info.ggml_dtype.block_size();
-        let n_bytes = elem_count / block_size * info.ggml_dtype.type_size();
-
-        let mut f = std::fs::File::open(&self.path)
-            .map_err(|e| candle_core::Error::Msg(format!("reopen GGUF: {e}")))?;
-        f.seek(SeekFrom::Start(
-            self.content.tensor_data_offset + info.offset,
-        ))
-        .map_err(|e| candle_core::Error::Msg(format!("seek GGUF tensor: {e}")))?;
-        let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf)
-            .map_err(|e| candle_core::Error::Msg(format!("read GGUF tensor: {e}")))?;
-        Ok(buf)
+        let mut f = std::io::BufReader::new(
+            std::fs::File::open(&self.path)
+                .map_err(|e| candle_core::Error::Msg(format!("reopen GGUF: {e}")))?,
+        );
+        self.header.read_tensor_bytes(&mut f, gguf_name)
     }
 
-    /// Shared handle to the parsed content, so a `VarBuilder` backend can
-    /// resolve non-quantized (dense) tensors against the same file.
-    pub fn content(&self) -> Arc<gguf_file::Content> {
-        Arc::clone(&self.content)
-    }
-
-    /// Shared handle to the device-resident quantized tensor map.
-    pub fn shared_tensors(&self) -> Arc<HashMap<String, Arc<QTensor>>> {
+    /// Shared handle to the device-resident tensor map, so a `VarBuilder`
+    /// backend can resolve non-quantized (dense) tensors against the same
+    /// data.
+    pub fn shared_tensors(&self) -> Arc<HashMap<String, GgufTensor>> {
         Arc::clone(&self.tensors)
     }
 
     /// Look up a metadata string value.
     fn meta_str(&self, key: &str) -> Option<String> {
-        self.content
+        self.header
             .metadata
             .get(key)
             .and_then(|v| v.to_string().ok())
@@ -560,7 +738,7 @@ impl GgufWeightLoader {
 
     /// Look up a metadata integer (upcasts U8/U16/U32 → u64).
     fn meta_u64(&self, key: &str) -> Option<u64> {
-        self.content.metadata.get(key).and_then(|v| v.to_u64().ok())
+        self.header.metadata.get(key).and_then(|v| v.to_u64().ok())
     }
 
     /// End-of-generation token ids: the metadata `eos_token_id` plus any
@@ -582,7 +760,7 @@ impl GgufWeightLoader {
             ids.push(eos as u32);
         }
         let tokens = self
-            .content
+            .header
             .metadata
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.to_vec().ok());
@@ -614,7 +792,7 @@ impl GgufWeightLoader {
 
     /// Look up a metadata float (F32 or F64).
     fn meta_f64(&self, key: &str) -> Option<f64> {
-        self.content
+        self.header
             .metadata
             .get(key)
             .and_then(|v| v.to_f32().ok().map(f64::from).or_else(|| v.to_f64().ok()))
@@ -688,7 +866,7 @@ impl GgufWeightLoader {
             .unwrap_or(10000.0);
 
         let vocab_size = self
-            .content
+            .header
             .metadata
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.to_vec().ok())
@@ -717,6 +895,23 @@ impl GgufWeightLoader {
                     hidden_size
                 }
             });
+
+        // Gemma 4 stores the GLOBAL (full-attention) attention params in
+        // metadata (`head_count_kv`, `key_length`); sliding layers can carry a
+        // DIFFERENT kv-head count (12B: sliding 8 × 256, full 1 × 512). Derive
+        // the sliding kv-head count from layer 0's k_proj (a sliding layer):
+        // kv = k_out / head_dim. The metadata `head_count_kv` is the GLOBAL
+        // value, surfaced as `num_global_key_value_heads` in
+        // `gemma4_config_extras`. E4B is non-heterogeneous in kv heads, so this
+        // derivation yields the same value the metadata would.
+        let num_key_value_heads = if arch_name == "gemma4" && head_dim > 0 {
+            self.qtensor_out_dim("model.layers.0.self_attn.k_proj")
+                .map(|k_out| k_out / head_dim)
+                .filter(|&kv| kv > 0)
+                .unwrap_or(num_key_value_heads)
+        } else {
+            num_key_value_heads
+        };
 
         let architectures = self
             .vllm_architecture()
@@ -751,7 +946,7 @@ impl GgufWeightLoader {
         // tokenizer doesn't add them, so the embedding path applies them from
         // these flags. Mirrors `tokenizer.ggml.add_{bos,eos}_token`.
         if let Some(add_bos) = self
-            .content
+            .header
             .metadata
             .get("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.to_bool().ok())
@@ -759,7 +954,7 @@ impl GgufWeightLoader {
             extra.insert("add_bos_token".to_string(), serde_json::json!(add_bos));
         }
         if let Some(add_eos) = self
-            .content
+            .header
             .metadata
             .get("tokenizer.ggml.add_eos_token")
             .and_then(|v| v.to_bool().ok())
@@ -777,7 +972,7 @@ impl GgufWeightLoader {
             extra.insert("chat_template".to_string(), serde_json::json!(tmpl));
         }
         if let Some(tokens) = self
-            .content
+            .header
             .metadata
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.to_vec().ok())
@@ -842,8 +1037,8 @@ impl GgufWeightLoader {
         }
         names
             .iter()
-            .find_map(|n| self.content.tensor_infos.get(n))
-            .and_then(|info| info.shape.dims().first().copied())
+            .find_map(|n| self.header.tensor_infos.get(n))
+            .and_then(|info| info.shape.first().copied())
     }
 
     /// Populate the Gemma-4-specific `ModelConfig.extra` keys from GGUF
@@ -880,6 +1075,41 @@ impl GgufWeightLoader {
             extra.insert("global_head_dim".into(), json!(full_hd));
         }
 
+        // Heterogeneous kv-head count: in the 12B `head_count_kv` is a
+        // PER-LAYER array (`[8,8,8,8,8,1,…]` — sliding 8, full 1), not a
+        // scalar, so `meta_u64` can't read it. Read the array and surface the
+        // full-attention (global) kv-head count — the smaller value, since
+        // full/global attention uses no more kv heads than sliding. The model
+        // applies it to full layers via `num_global_key_value_heads`; sliding
+        // layers use the derived `num_key_value_heads`. A scalar `head_count_kv`
+        // (non-heterogeneous models) is handled by `num_key_value_heads` alone.
+        if let Some(gguf_file::Value::Array(arr)) = self
+            .header
+            .metadata
+            .get(&format!("{arch}.attention.head_count_kv"))
+        {
+            // The array elements are I32 here; candle's `to_i64`/`to_u64` are
+            // strict (I64 / unsigned only) and reject I32, so match the
+            // integer variants explicitly.
+            let as_int = |v: &gguf_file::Value| -> Option<i64> {
+                match v {
+                    gguf_file::Value::U8(x) => Some(*x as i64),
+                    gguf_file::Value::I8(x) => Some(*x as i64),
+                    gguf_file::Value::U16(x) => Some(*x as i64),
+                    gguf_file::Value::I16(x) => Some(*x as i64),
+                    gguf_file::Value::U32(x) => Some(*x as i64),
+                    gguf_file::Value::I32(x) => Some(*x as i64),
+                    gguf_file::Value::U64(x) => Some(*x as i64),
+                    gguf_file::Value::I64(x) => Some(*x),
+                    _ => None,
+                }
+            };
+            let global_kv = arr.iter().filter_map(as_int).filter(|&x| x > 0).min();
+            if let Some(g) = global_kv {
+                extra.insert("num_global_key_value_heads".into(), json!(g));
+            }
+        }
+
         // Soft-capping.
         if let Some(cap) = self.meta_f64(&format!("{arch}.final_logit_softcapping")) {
             extra.insert("final_logit_softcapping".into(), json!(cap));
@@ -892,7 +1122,7 @@ impl GgufWeightLoader {
         // (true → sliding_attention, false → full_attention). Mirrors the
         // HF `layer_types` array the model consumes directly.
         if let Some(gguf_file::Value::Array(pat)) = self
-            .content
+            .header
             .metadata
             .get(&format!("{arch}.attention.sliding_window_pattern"))
         {
@@ -920,6 +1150,26 @@ impl GgufWeightLoader {
                 layer_types.len()
             );
             extra.insert("layer_types".into(), Value::Array(layer_types));
+
+            // K-as-V: some Gemma 4 checkpoints (e.g. the 12B) omit `attn_v`
+            // on full-attention layers — there V is the K projection output
+            // (llama.cpp `gemma4.cpp`: `Vcur = wv ? wv@x : Kcur`). Detect a
+            // full-attention layer with no `attn_v.weight` and flip the flag
+            // that activates the model's existing K-as-V path; otherwise the
+            // loader requests a v_proj that does not exist and load fails.
+            let k_eq_v = pat.iter().enumerate().any(|(i, v)| {
+                let full = !v.to_bool().unwrap_or(true);
+                full && !self
+                    .header
+                    .tensor_infos
+                    .contains_key(&format!("blk.{i}.attn_v.weight"))
+            });
+            if k_eq_v {
+                extra.insert("attention_k_eq_v".into(), json!(true));
+                tracing::info!(
+                    "Gemma 4 GGUF: full-attention layers omit attn_v → V = K projection"
+                );
+            }
         }
 
         // Per-attention-type RoPE. Full-attention layers use a PARTIAL,
@@ -992,7 +1242,7 @@ impl GgufWeightLoader {
         // GGUF stores a per-layer bool array (true = sliding); index it
         // directly rather than guessing a stride.
         if let Some(gguf_file::Value::Array(pat)) = self
-            .content
+            .header
             .metadata
             .get(&format!("{arch}.attention.sliding_window_pattern"))
         {
@@ -1021,7 +1271,7 @@ impl GgufWeightLoader {
         // ── EmbeddingGemma detection ──────────────────────────────────────
         // Bidirectional encoder: `causal == false`.
         let causal = self
-            .content
+            .header
             .metadata
             .get(&format!("{arch}.attention.causal"))
             .and_then(|v| v.to_bool().ok())
@@ -1046,12 +1296,12 @@ impl GgufWeightLoader {
         // Sentence-transformers projector: presence of `dense.0`/`dense.1`
         // (BF16, no bias) signals the Matryoshka head applied after pooling.
         if let (Some(d0), Some(d1)) = (
-            self.content.tensor_infos.get("dense.0.weight"),
-            self.content.tensor_infos.get("dense.1.weight"),
+            self.header.tensor_infos.get("dense.0.weight"),
+            self.header.tensor_infos.get("dense.1.weight"),
         ) {
             // candle reverses on-disk dims → stored `[out, in]`; dims()[0] is out.
-            let mid = d0.shape.dims().first().copied();
-            let out = d1.shape.dims().first().copied();
+            let mid = d0.shape.first().copied();
+            let out = d1.shape.first().copied();
             if let (Some(mid), Some(out)) = (mid, out) {
                 extra.insert("has_st_projector".into(), json!(true));
                 extra.insert("st_projector_mid".into(), json!(mid));
@@ -1094,18 +1344,16 @@ impl GgufWeightLoader {
         self.tensors.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Resolve a vLLM-style prefix to a device-resident `QTensor`,
+    /// Resolve a vLLM-style prefix to a device-resident [`GgufTensor`],
     /// trying the literal name, the bare prefix, then the llama.cpp
     /// `blk.N.*` mapping.
-    fn resolve_qtensor(&self, prefix: &str) -> Option<Arc<QTensor>> {
+    fn resolve_tensor(&self, prefix: &str) -> Option<&GgufTensor> {
         let mut candidates: Vec<String> = vec![format!("{prefix}.weight"), prefix.to_string()];
         if let Some(mapped) = to_llama_cpp_prefix(prefix) {
             candidates.push(format!("{mapped}.weight"));
             candidates.push(mapped);
         }
-        candidates
-            .iter()
-            .find_map(|name| self.tensors.get(name).cloned())
+        candidates.iter().find_map(|name| self.tensors.get(name))
     }
 
     /// Resolve an optional bias tensor for a linear layer, dequantized to
@@ -1116,8 +1364,8 @@ impl GgufWeightLoader {
             candidates.push(format!("{mapped}.bias"));
         }
         for name in &candidates {
-            if let Some(qt) = self.tensors.get(name) {
-                if let Ok(dense) = qt.dequantize(&self.device) {
+            if let Some(t) = self.tensors.get(name) {
+                if let Ok(dense) = t.dequantize_dense(&self.device) {
                     return dense.to_dtype(DType::F32).ok();
                 }
             }
@@ -1243,19 +1491,19 @@ fn to_llama_cpp_top_level(name: &str) -> Option<&'static str> {
 /// 2. `{to_llama_cpp_prefix(name)}` — standard llama.cpp shorthand
 ///    (`blk.N.attn_norm`, `output_norm`, …).
 pub struct GgufVarBuilderBackend {
-    tensors: Arc<HashMap<String, Arc<QTensor>>>,
+    tensors: Arc<HashMap<String, GgufTensor>>,
     device: Device,
 }
 
 impl GgufVarBuilderBackend {
     /// Wrap the shared device-resident tensor map so the same data serves
     /// both the quantized loader and the VarBuilder backend.
-    pub fn new(tensors: Arc<HashMap<String, Arc<QTensor>>>, device: Device) -> Self {
+    pub fn new(tensors: Arc<HashMap<String, GgufTensor>>, device: Device) -> Self {
         Self { tensors, device }
     }
 
     /// Resolve `name` using the same fallback chain as
-    /// `GgufWeightLoader::resolve_qtensor` — literal path, then
+    /// `GgufWeightLoader::resolve_tensor` — literal path, then
     /// `blk.N.*`-style mapping, then the bare top-level name — and
     /// dequantize the matched `QTensor` to a dense tensor.
     fn try_load(&self, name: &str, target: DType) -> Result<Tensor> {
@@ -1283,15 +1531,15 @@ impl GgufVarBuilderBackend {
         }
 
         for candidate in candidates {
-            let qt = match self.tensors.get(&candidate) {
-                Some(qt) => qt,
+            let t = match self.tensors.get(&candidate) {
+                Some(t) => t,
                 None => continue,
             };
-            // candle's `Content` reverses the on-disk dims, so a 2-D
-            // weight comes back with candle's logical shape (e.g.
-            // token_embd as `[vocab, hidden]`); `dequantize` yields a
-            // dense tensor in that shape directly — no manual reshape.
-            let dense = qt.dequantize(&self.device)?;
+            // The header reverses the on-disk dims, so a 2-D weight comes
+            // back with candle's logical shape (e.g. token_embd as
+            // `[vocab, hidden]`); `dequantize_dense` yields a dense tensor in
+            // that shape directly — no manual reshape.
+            let dense = t.dequantize_dense(&self.device)?;
             return dense.to_dtype(target);
         }
         Err(candle_core::Error::Msg(format!(
@@ -1355,24 +1603,48 @@ impl QuantizedWeightLoader for GgufWeightLoader {
         out_features: usize,
         bias: bool,
     ) -> Result<Box<dyn QuantizedLinear>> {
-        let qt = self.resolve_qtensor(prefix).ok_or_else(|| {
+        let tensor = self.resolve_tensor(prefix).ok_or_else(|| {
             candle_core::Error::Msg(format!(
                 "GGUF: no quantized weight found for '{prefix}' \
                  (tried literal + llama.cpp mapping)"
             ))
         })?;
-        let qmm = Arc::new(QMatMul::from_arc(qt)?);
         let bias_tensor = if bias {
             self.resolve_bias(prefix)
         } else {
             None
         };
-        Ok(Box::new(GgufLinear::from_qmatmul(
-            qmm,
-            bias_tensor,
-            in_features,
-            out_features,
-        )))
+        match tensor {
+            GgufTensor::Candle(qt) => {
+                let qmm = Arc::new(QMatMul::from_arc(Arc::clone(qt))?);
+                Ok(Box::new(GgufLinear::from_qmatmul(
+                    qmm,
+                    bias_tensor,
+                    in_features,
+                    out_features,
+                )))
+            }
+            GgufTensor::Iq { bytes, iq, shape } => {
+                // Size the linear from the tensor's ACTUAL shape, not the
+                // caller's declared in/out. The Gemma 4 K-as-V fallback loads
+                // `k_proj`'s bytes under the `v_proj` name, so the real dims
+                // (K's) are what the dequant + matmul must use — using the
+                // declared V dims mis-sizes the dequant (have/need mismatch).
+                let (out, inn) = match shape.as_slice() {
+                    [o, i] => (*o, *i),
+                    other => candle_core::bail!(
+                        "IqLinear expects a 2-D weight for '{prefix}', got {other:?}"
+                    ),
+                };
+                Ok(Box::new(IqLinear::new(
+                    bytes.clone(),
+                    *iq,
+                    out,
+                    inn,
+                    bias_tensor,
+                )))
+            }
+        }
     }
 
     fn load_quantized_embedding(
@@ -1386,15 +1658,23 @@ impl QuantizedWeightLoader for GgufWeightLoader {
             Some(mapped) => format!("{mapped}.weight"),
             None => return Ok(None),
         };
-        let info = match self.content.tensor_infos.get(&gguf_name) {
+        let info = match self.header.tensor_infos.get(&gguf_name) {
             Some(info) => info,
             None => return Ok(None),
         };
-        let dims = info.shape.dims().to_vec();
+        let dims = info.shape.clone();
         if dims.len() != 2 {
             return Ok(None); // not a 2-D embedding table
         }
-        let ggml_dtype = info.ggml_dtype;
+        // The quantized-embedding gather paths (GPU Q6_K kernel, CPU QTensor
+        // slice) are candle-native only. I-quant embedding tables would need
+        // an I-quant gather; none of the supported checkpoints use one
+        // (Gemma 4 PLE is Q6_K, token_embd is a K-quant), so fall back to the
+        // dense VarBuilder load for the unlikely IQ embedding.
+        let ggml_dtype = match info.dtype {
+            GgufTensorDtype::Candle(d) => d,
+            GgufTensorDtype::Iq(_) => return Ok(None),
+        };
 
         // Fast GPU path: Q6_K table + CUDA device + the gather kernel —
         // keep the quantized bytes resident in VRAM and gather per-row via
@@ -1464,6 +1744,137 @@ impl QuantizedWeightLoader for GgufWeightLoader {
 
     fn dtype(&self) -> DType {
         self.dtype
+    }
+}
+
+#[cfg(test)]
+mod iq_linear_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        raw_hex: String,
+        golden_f32: Vec<f32>,
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// `IqLinear::forward` must equal a dense `x @ Wᵀ` over the SAME
+    /// dequantized weight. Uses the IQ3_XXS golden fixture (1536 values) as a
+    /// `[6, 256]` weight; exercises the full dequant→matmul path on CPU.
+    #[test]
+    fn iq_linear_forward_matches_dense_matmul() {
+        let f: Fixture = serde_json::from_str(include_str!("iq/testdata/iq3_xxs.json")).unwrap();
+        let (out_features, in_features) = (6usize, 256usize);
+        assert_eq!(f.golden_f32.len(), out_features * in_features);
+
+        let dev = Device::Cpu;
+        let bytes = hex_to_bytes(&f.raw_hex);
+        let n_bytes = bytes.len();
+        let bytes_t = Tensor::from_vec(bytes, (n_bytes,), &dev).unwrap();
+        let lin = IqLinear::new(bytes_t, IqType::Iq3Xxs, out_features, in_features, None);
+
+        // Reference dense weight from the golden values.
+        let w = Tensor::from_vec(f.golden_f32.clone(), (out_features, in_features), &dev).unwrap();
+
+        // Deterministic input [M, in].
+        let m = 3usize;
+        let xv: Vec<f32> = (0..m * in_features)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let x = Tensor::from_vec(xv, (m, in_features), &dev).unwrap();
+
+        let y = lin.forward(&x).unwrap();
+        assert_eq!(y.dims(), &[m, out_features]);
+        let reference = x.matmul(&w.t().unwrap()).unwrap();
+
+        let diff = (y - reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff <= 1e-4, "IqLinear vs dense matmul diverged: {diff}");
+    }
+
+    /// `from_path` must round-trip candle-native tensors: write a tiny GGUF,
+    /// load it back, and check the dequantized values match. Guards the
+    /// `Cow::Owned` freed-memory hazard in the candle-native load arm — with
+    /// `Cow::Owned`, candle's `as_t_slice` returns a slice into a temporary
+    /// that drops before `load_quantized` copies it, so the CUDA upload reads
+    /// freed memory (garbage weights / SIGSEGV). Only the CUDA path exercises
+    /// that hazard, so the assertion is meaningful there; on CPU it still
+    /// checks the loader end-to-end.
+    #[test]
+    fn from_path_roundtrips_candle_tensors() {
+        use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+
+        let dev = match Device::cuda_if_available(0) {
+            Ok(d) => d, // prefer CUDA (where the freed-memory bug bites)
+            Err(_) => Device::Cpu,
+        };
+        let cpu = Device::Cpu;
+
+        // [out, in] with in % 256 == 0 for the K-quant block size.
+        let w = Tensor::randn(0f32, 1.0, (32usize, 256usize), &cpu).unwrap();
+        let q = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+        let reference = q.dequantize(&cpu).unwrap();
+
+        let path = std::env::temp_dir().join("vllm_iq_from_path_roundtrip.gguf");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let arch = gguf_file::Value::String("llama".to_string());
+            gguf_file::write(
+                &mut f,
+                &[("general.architecture", &arch)],
+                &[("blk.0.attn_q.weight", &q)],
+            )
+            .unwrap();
+        }
+
+        let loader = GgufWeightLoader::from_path(&path, dev.clone(), DType::F32).unwrap();
+        let tensors = loader.shared_tensors();
+        let loaded = tensors.get("blk.0.attn_q.weight").expect("tensor loaded");
+        let dense = loaded
+            .dequantize_dense(&dev)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+
+        let diff = (dense - reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            diff <= 1e-5,
+            "from_path candle-tensor round-trip diverged (freed-memory bug?): {diff}"
+        );
+    }
+
+    #[test]
+    fn iq_linear_trait_metadata() {
+        let dev = Device::Cpu;
+        // 1 block (256 elems) of zero IQ3_XXS bytes → weight [1, 256].
+        let bytes = vec![0u8; IqType::Iq3Xxs.type_size()];
+        let n = bytes.len();
+        let bytes_t = Tensor::from_vec(bytes, (n,), &dev).unwrap();
+        let lin = IqLinear::new(bytes_t, IqType::Iq3Xxs, 1, 256, None);
+        assert_eq!(lin.in_features(), 256);
+        assert_eq!(lin.out_features(), 1);
+        assert!(!lin.has_bias());
+        assert_eq!(lin.weight_dtype(), DType::F32);
     }
 }
 

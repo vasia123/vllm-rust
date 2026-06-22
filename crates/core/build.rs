@@ -42,6 +42,14 @@ const KERNELS: &[KernelDef] = &[
         output: "kernels/gather_dequant.ptx",
         min_sm: 75,
     },
+    // I-quant (IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS) dequant to dense f32 —
+    // candle has no I-quant path, so the Unsloth UD GGUFs need this. Integer
+    // table lookups + f16→f32, works on sm_75+.
+    KernelDef {
+        source: "kernels/iq_dequant.cu",
+        output: "kernels/iq_dequant.ptx",
+        min_sm: 75,
+    },
     // MoE kernels use bf16
     KernelDef {
         source: "kernels/fused_moe_align.cu",
