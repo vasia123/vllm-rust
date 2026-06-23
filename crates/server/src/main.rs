@@ -2408,93 +2408,122 @@ async fn run_server(cfg: ServerLaunchConfig) -> anyhow::Result<()> {
     };
 
     let handle = if let Some(ref draft_id) = draft_model_id {
-        eprintln!("Loading draft model: {draft_id}");
-        let draft_files =
-            loader::fetch_model_with_auth(draft_id, "main", hf_token.as_deref(), cache_dir)?;
-
-        eprintln!("Loading draft weights to GPU (bf16)...");
-        let draft_vb = loader::load_weights(&draft_files.weights, dtype, &device)?;
-
-        let draft_arch = draft_files
-            .config
-            .architectures
-            .first()
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        if draft_arch == "MLPSpeculatorPreTrainedModel" {
-            // MLP Speculator: stateless proposer backed by hidden-state MLP heads.
-            // No draft KV cache required — uses target model's hidden states directly.
-            eprintln!("Building MLP Speculator draft model...");
-            let mlp_model = models::mlp_speculator_from_config(&draft_files.config, draft_vb)?;
-            let proposer = MLPSpeculatorDraftProposer::new(mlp_model);
-
+        if draft_id.ends_with(".gguf") && model.as_gemma4_mtp().is_some() {
+            // Gemma 4 MTP: a `.gguf` `gemma4_assistant` drafter shares the
+            // target's KV cache + hidden state — no separate draft KV cache,
+            // no safetensors draft load.
+            eprintln!("Loading Gemma 4 MTP assistant drafter: {draft_id}");
+            // Cap the drafter's RoPE table; positions beyond it fall back to
+            // plain decode (see `Gemma4MtpExecution`).
+            let assistant_max_pos = max_model_len_override.unwrap_or(8192).clamp(512, 32768);
+            let assistant = vllm_core::models::Gemma4Assistant::load(
+                std::path::Path::new(draft_id.as_str()),
+                assistant_max_pos,
+                dtype,
+                &device,
+            )?;
             let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
                 .enable_prefix_caching(enable_prefix_caching)
                 .cuda_graph_config(cuda_graph_config.clone())
                 .build();
-
-            eprintln!("Starting engine (MLP Speculator, K={num_speculative_tokens})...");
-            start_engine_with_proposer(
+            eprintln!("Starting engine (Gemma 4 MTP, K={num_speculative_tokens})...");
+            vllm_core::engine::start_engine_gemma4_mtp(
                 model,
-                Box::new(proposer),
+                assistant,
                 engine_tokenizer,
                 kv_cache_mgr,
                 engine_config,
                 engine_limits,
             )
         } else {
-            eprintln!(
-                "Building draft model ({} layers)...",
-                draft_files.config.num_hidden_layers
-            );
-            // Quant-aware dispatch for the draft model too so paired
-            // speculative decoding with quantized drafts works.
-            let draft_model = models::from_config_with_quant(
-                &draft_files.config,
-                draft_vb,
-                &draft_files.quantization,
-            )?;
+            eprintln!("Loading draft model: {draft_id}");
+            let draft_files =
+                loader::fetch_model_with_auth(draft_id, "main", hf_token.as_deref(), cache_dir)?;
 
-            let draft_num_blocks = compute_draft_kv_blocks(
-                num_blocks,
-                block_size,
-                &draft_files.config,
-                dtype,
-                parsed_kv_cache_dtype,
-            )?;
-            let draft_cache_config = CacheConfig {
-                block_size,
-                num_blocks: draft_num_blocks,
-                num_layers: draft_files.config.num_hidden_layers,
-                num_kv_heads: draft_files.config.kv_cache_num_kv_heads(),
-                head_dim: draft_files.config.kv_cache_head_dim(),
-                dtype,
-                device: device.clone(),
-                kv_cache_dtype: KVCacheDtype::Auto,
-                cpu_offload: None,
-            };
-            eprintln!(
-                "Allocating draft KV cache ({} blocks)...",
-                draft_cache_config.num_blocks
-            );
-            let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
+            eprintln!("Loading draft weights to GPU (bf16)...");
+            let draft_vb = loader::load_weights(&draft_files.weights, dtype, &device)?;
 
-            let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
-                .enable_prefix_caching(enable_prefix_caching)
-                .cuda_graph_config(cuda_graph_config.clone())
-                .build();
+            let draft_arch = draft_files
+                .config
+                .architectures
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("");
 
-            eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
-            start_engine_with_draft(
-                model,
-                draft_model,
-                engine_tokenizer,
-                kv_cache_mgr,
-                draft_kv_cache,
-                engine_config,
-                engine_limits,
-            )
+            if draft_arch == "MLPSpeculatorPreTrainedModel" {
+                // MLP Speculator: stateless proposer backed by hidden-state MLP heads.
+                // No draft KV cache required — uses target model's hidden states directly.
+                eprintln!("Building MLP Speculator draft model...");
+                let mlp_model = models::mlp_speculator_from_config(&draft_files.config, draft_vb)?;
+                let proposer = MLPSpeculatorDraftProposer::new(mlp_model);
+
+                let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
+                    .enable_prefix_caching(enable_prefix_caching)
+                    .cuda_graph_config(cuda_graph_config.clone())
+                    .build();
+
+                eprintln!("Starting engine (MLP Speculator, K={num_speculative_tokens})...");
+                start_engine_with_proposer(
+                    model,
+                    Box::new(proposer),
+                    engine_tokenizer,
+                    kv_cache_mgr,
+                    engine_config,
+                    engine_limits,
+                )
+            } else {
+                eprintln!(
+                    "Building draft model ({} layers)...",
+                    draft_files.config.num_hidden_layers
+                );
+                // Quant-aware dispatch for the draft model too so paired
+                // speculative decoding with quantized drafts works.
+                let draft_model = models::from_config_with_quant(
+                    &draft_files.config,
+                    draft_vb,
+                    &draft_files.quantization,
+                )?;
+
+                let draft_num_blocks = compute_draft_kv_blocks(
+                    num_blocks,
+                    block_size,
+                    &draft_files.config,
+                    dtype,
+                    parsed_kv_cache_dtype,
+                )?;
+                let draft_cache_config = CacheConfig {
+                    block_size,
+                    num_blocks: draft_num_blocks,
+                    num_layers: draft_files.config.num_hidden_layers,
+                    num_kv_heads: draft_files.config.kv_cache_num_kv_heads(),
+                    head_dim: draft_files.config.kv_cache_head_dim(),
+                    dtype,
+                    device: device.clone(),
+                    kv_cache_dtype: KVCacheDtype::Auto,
+                    cpu_offload: None,
+                };
+                eprintln!(
+                    "Allocating draft KV cache ({} blocks)...",
+                    draft_cache_config.num_blocks
+                );
+                let draft_kv_cache = KVCacheManager::new(&draft_cache_config)?;
+
+                let engine_config = EngineConfig::builder(scheduler_config, Some(spec_config_base))
+                    .enable_prefix_caching(enable_prefix_caching)
+                    .cuda_graph_config(cuda_graph_config.clone())
+                    .build();
+
+                eprintln!("Starting engine (speculative, K={num_speculative_tokens})...");
+                start_engine_with_draft(
+                    model,
+                    draft_model,
+                    engine_tokenizer,
+                    kv_cache_mgr,
+                    draft_kv_cache,
+                    engine_config,
+                    engine_limits,
+                )
+            }
         }
     } else if let Some(max_n) = ngram_prompt_lookup_max {
         // N-gram prompt-lookup speculative decoding (no draft model required)

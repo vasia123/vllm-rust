@@ -30,6 +30,8 @@ mod embedding_forward;
 mod encoder_decoder;
 pub mod engine_limits;
 pub use engine_limits::{EngineLimits, EngineLimitsBuilder};
+mod gemma4_mtp;
+pub use gemma4_mtp::Gemma4MtpExecution;
 mod handle;
 mod helpers;
 pub mod layer_dump;
@@ -168,6 +170,40 @@ pub fn start_engine_with_proposer<M: ModelForward>(
         .map(|c| c.acceptance_method)
         .unwrap_or_default();
     let strategy = SpeculativeExecution::with_acceptance(target_model, proposer, acceptance_method);
+
+    tokio::spawn(strategy::run_engine_loop(
+        strategy,
+        state,
+        target_kv_cache,
+        config,
+        tokenizer,
+        cmd_rx,
+    ));
+
+    EngineHandle { cmd_tx }
+}
+
+/// Start the inference engine with Gemma 4 MTP speculative decoding.
+///
+/// The `gemma4_assistant` drafter shares the target's KV cache and hidden
+/// state, so unlike [`start_engine_with_proposer`] this takes the concrete
+/// target + assistant (no separate draft KV cache).
+pub fn start_engine_gemma4_mtp(
+    target: Box<dyn ModelForward>,
+    assistant: crate::models::Gemma4Assistant,
+    tokenizer: TokenizerWrapper,
+    target_kv_cache: KVCacheManager,
+    config: EngineConfig,
+    _limits: EngineLimits,
+) -> EngineHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel(256);
+    let state = OwnedExecutionState::new(&config);
+    let num_speculative_tokens = config
+        .speculative_config
+        .as_ref()
+        .map(|c| c.num_speculative_tokens)
+        .unwrap_or(3);
+    let strategy = Gemma4MtpExecution::new(target, assistant, num_speculative_tokens);
 
     tokio::spawn(strategy::run_engine_loop(
         strategy,

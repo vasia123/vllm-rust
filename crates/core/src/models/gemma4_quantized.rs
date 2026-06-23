@@ -184,6 +184,14 @@ struct Gemma4ExtraConfig {
     /// KV heads on full-attention layers (released 12B/31B use fewer than
     /// sliding layers; 12B: 1 vs 8). `None` → homogeneous E2B case.
     num_global_key_value_heads: Option<usize>,
+    /// Per-dimension RoPE frequency factors for FULL-attention layers, from the
+    /// GGUF `rope_freqs.weight` (length `full_head_dim/2`). llama.cpp's
+    /// `gemma4.cpp` applies these to both Q and K on full layers (`is_swa ?
+    /// nullptr : rope_freqs`); for E4B they are `[1.0×128, 1e30×128]` — a
+    /// partial/proportional rope that rotates only the first half of the head
+    /// dim. `None` for safetensors checkpoints (rope is then analytic). Set
+    /// after construction by the model loader, which has the tensor access.
+    rope_freqs: Option<Vec<f32>>,
 }
 
 impl Gemma4ExtraConfig {
@@ -354,6 +362,8 @@ impl Gemma4ExtraConfig {
             use_double_wide_mlp,
             global_head_dim,
             num_global_key_value_heads,
+            // Loaded from the GGUF after construction (needs tensor access).
+            rope_freqs: None,
         }
     }
 
@@ -378,6 +388,24 @@ impl Gemma4ExtraConfig {
                 dtype,
                 device,
             );
+        }
+        // Full-attention layer. When the GGUF ships explicit `rope_freqs`
+        // (llama.cpp's `gemma4.cpp` applies them to full-layer Q AND K), honour
+        // them exactly. This keeps the backbone's full-layer K phase-aligned
+        // with the Gemma 4 MTP drafter's Q (which uses the same factors), and
+        // matches the reference rope byte-for-byte. Falls through to the
+        // analytic rope when absent (safetensors) or shape-mismatched.
+        if let Some(ref freqs) = self.rope_freqs {
+            if freqs.len() == head_dim / 2 {
+                return RotaryEmbedding::new_with_freq_factors(
+                    head_dim,
+                    max_position_embeddings,
+                    self.rope_theta_full,
+                    freqs,
+                    dtype,
+                    device,
+                );
+            }
         }
         match self.rope_type_full.as_str() {
             "proportional" => RotaryEmbedding::new_gemma4_proportional(
@@ -1848,6 +1876,10 @@ pub struct QuantizedGemma4ForCausalLM {
     lm_head: Box<dyn QuantizedLinear>,
     hidden_size: usize,
     num_hidden_layers: usize,
+    /// Per-layer sliding vs full attention pattern, kept for the Gemma 4 MTP
+    /// drafter's KV sharing (it reads the backbone's last sliding / last full
+    /// layer cache).
+    layer_is_sliding: Vec<bool>,
     hidden_size_per_layer_input: usize,
     final_logit_softcap: Option<f64>,
     /// RoPE tables are precomputed to this many positions; prefill
@@ -1893,7 +1925,31 @@ impl QuantizedGemma4ForCausalLM {
         vb_m: VarBuilder<'static>,
         weight_loader: &dyn QuantizedWeightLoader,
     ) -> Result<Self> {
-        let extra_cfg = Gemma4ExtraConfig::from_model_config(cfg);
+        let mut extra_cfg = Gemma4ExtraConfig::from_model_config(cfg);
+
+        // Load the GGUF `rope_freqs.weight` (full-attention partial-rotary
+        // factors) if the checkpoint ships it. llama.cpp's `gemma4.cpp` applies
+        // these to full-layer Q and K; honouring them keeps our full-layer rope
+        // byte-aligned with the reference and with the Gemma 4 MTP drafter.
+        // Absent on safetensors (rope stays analytic).
+        if let Some(full_layer) =
+            (0..cfg.num_hidden_layers).find(|&i| extra_cfg.is_full_attention_layer(i))
+        {
+            let full_head_dim = extra_cfg.head_dim_for_layer(full_layer, cfg.head_dim);
+            if full_head_dim >= 2 {
+                if let Ok(t) = vb_m.get((full_head_dim / 2,), "rope_freqs.weight") {
+                    if let Ok(v) = t.to_dtype(DType::F32).and_then(|t| t.to_vec1::<f32>()) {
+                        // Real Gemma 4 rope_freqs are all finite and strictly
+                        // positive (1.0 .. 1e30). Reject zero-filled / invalid
+                        // factors (e.g. a dummy `VarBuilder::zeros`) so the
+                        // analytic rope is used instead of dividing by zero.
+                        if v.iter().all(|&f| f.is_finite() && f > 0.0) {
+                            extra_cfg.rope_freqs = Some(v);
+                        }
+                    }
+                }
+            }
+        }
 
         // Main token embedding. GGUF ships it quantized (Q6_K); dequantized
         // dense it is ~1.34 GB (plus a ~2.68 GB F32 transient on load) — on
@@ -2037,11 +2093,47 @@ impl QuantizedGemma4ForCausalLM {
             lm_head,
             hidden_size: cfg.hidden_size,
             num_hidden_layers: cfg.num_hidden_layers,
+            layer_is_sliding: (0..cfg.num_hidden_layers)
+                .map(|i| extra_cfg.is_sliding_layer(i))
+                .collect(),
             hidden_size_per_layer_input: extra_cfg.hidden_size_per_layer_input,
             final_logit_softcap: extra_cfg.final_logit_softcap,
             max_position_embeddings: cfg.max_position_embeddings,
             device: vb_m.device().clone(),
         })
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    pub fn num_hidden_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+
+    /// Backbone layer indices whose KV cache the Gemma 4 MTP assistant reads:
+    /// `(last_sliding_layer, last_full_layer)`. Mirrors `gemma4-assistant.cpp`
+    /// `share()`: assistant sliding layers attend the backbone's last sliding
+    /// layer, the full layer attends the last full layer.
+    pub fn mtp_shared_kv_layers(&self) -> (usize, usize) {
+        let last = self.num_hidden_layers.saturating_sub(1);
+        let last_swa = self
+            .layer_is_sliding
+            .iter()
+            .rposition(|&s| s)
+            .unwrap_or(last.saturating_sub(1));
+        let last_full = self
+            .layer_is_sliding
+            .iter()
+            .rposition(|&s| !s)
+            .unwrap_or(last);
+        (last_swa, last_full)
+    }
+
+    /// Embed token ids through the target's table with Gemma 4's
+    /// `sqrt(hidden_size)` scaling — the input the MTP assistant fuses.
+    pub fn embed_for_mtp(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_text(input_ids)
     }
 
     /// Compute PLE per-layer inputs from input_ids and hidden_states.
@@ -2230,6 +2322,54 @@ impl QuantizedGemma4ForCausalLM {
         xs.squeeze(0)
     }
 
+    /// Forward for Gemma 4 MTP speculative verification.
+    ///
+    /// Returns `(logits, hidden)` for ALL positions (no last-token slice and no
+    /// prefill bucketing — the verify sequence is short), where:
+    /// - `logits`: `[1, seq, vocab]` — used to accept/reject draft tokens.
+    /// - `hidden`: `[1, seq, hidden]` — the POST-final-norm hidden (the lm_head
+    ///   input feature, `t_h_nextn` in llama.cpp `gemma4.cpp`, which the comment
+    ///   there confirms is taken AFTER `output_norm` to match transformers/vLLM),
+    ///   fed to the assistant drafter as the fixed backbone context.
+    pub fn forward_verify(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        kv_cache_mgr: &mut KVCacheManager,
+        block_table: &BlockTable,
+        slot_mapping: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        let normalizer = (self.hidden_size as f64).sqrt();
+        let xs = (self.embed_tokens.forward(input_ids)? * normalizer)?;
+        let per_layer_inputs = self.compute_per_layer_inputs(input_ids, &xs)?;
+        let real_len = xs.dim(1)?;
+
+        let mut xs = xs;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let pli = Self::extract_per_layer_input(&per_layer_inputs, layer_idx)?;
+            xs = layer.forward(
+                &xs,
+                pli.as_ref(),
+                real_len,
+                seqlen_offset,
+                kv_cache_mgr,
+                layer_idx,
+                block_table,
+                slot_mapping,
+            )?;
+        }
+
+        // Post-final-norm hidden = the lm_head input feature; the Gemma 4
+        // assistant fuses THIS (llama.cpp `t_h_nextn`, taken after output_norm).
+        let normed = self.norm.forward(&xs)?;
+        let hidden = normed.clone();
+        let mut logits = self.lm_head.forward(&normed)?;
+        if let Some(cap) = self.final_logit_softcap {
+            logits = soft_cap(&logits, cap)?;
+        }
+        Ok((logits, hidden))
+    }
+
     /// Embed text tokens (for VLM use — embed only, no layers).
     /// Applies Gemma 4's sqrt(hidden_size) normalisation.
     pub(crate) fn embed_text(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -2412,6 +2552,10 @@ impl crate::engine::ModelForward for QuantizedGemma4ForCausalLM {
 
     fn device(&self) -> &Device {
         &self.device
+    }
+
+    fn as_gemma4_mtp(&self) -> Option<&QuantizedGemma4ForCausalLM> {
+        Some(self)
     }
 }
 

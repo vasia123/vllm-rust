@@ -214,6 +214,14 @@ pub trait ModelForward: Send + 'static {
         ))
     }
 
+    /// Downcast to the concrete Gemma 4 quantized model, if this is one.
+    /// Lets the Gemma 4 MTP strategy call its specialised methods
+    /// (`forward_verify`, `embed_for_mtp`, `mtp_shared_kv_layers`) through a
+    /// `Box<dyn ModelForward>`. Default `None`; only Gemma 4 overrides it.
+    fn as_gemma4_mtp(&self) -> Option<&crate::models::QuantizedGemma4ForCausalLM> {
+        None
+    }
+
     /// Native pooling strategy for this model's embeddings, if it has a fixed
     /// one (e.g. mean for a bidirectional encoder embedder). `None` lets the
     /// caller pick (causal LMs default to last-token).
@@ -349,6 +357,10 @@ impl ModelForward for Box<dyn ModelForward> {
             block_table,
             slot_mapping,
         )
+    }
+
+    fn as_gemma4_mtp(&self) -> Option<&crate::models::QuantizedGemma4ForCausalLM> {
+        (**self).as_gemma4_mtp()
     }
 
     fn embedding_pooling(&self) -> Option<crate::engine::PoolingStrategy> {

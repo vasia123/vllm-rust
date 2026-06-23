@@ -705,6 +705,10 @@ impl GgufWeightLoader {
                         shape: info.shape.clone(),
                     }
                 }
+                // Plain integer tables (e.g. the Gemma 4 assistant's
+                // `mtp.token_ordering` masked-embedder index) are not weights.
+                // TODO(phase4): load these for the masked-embedder fast path.
+                GgufTensorDtype::Int(_) => continue,
             };
             tensors.insert(name.clone(), tensor);
         }
@@ -1481,6 +1485,7 @@ fn to_llama_cpp_top_level(name: &str) -> Option<&'static str> {
     match name {
         "model.embed_tokens" => Some("token_embd"),
         "model.norm" => Some("output_norm"),
+        "model.rope_freqs" => Some("rope_freqs"),
         "lm_head" => Some("output"),
         "model.embed_tokens_per_layer" => Some("per_layer_token_embd"),
         "model.per_layer_model_projection" => Some("per_layer_model_proj"),
@@ -1683,6 +1688,7 @@ impl QuantizedWeightLoader for GgufWeightLoader {
         let ggml_dtype = match info.dtype {
             GgufTensorDtype::Candle(d) => d,
             GgufTensorDtype::Iq(_) => return Ok(None),
+            GgufTensorDtype::Int(_) => return Ok(None),
         };
 
         // Fast GPU path: Q6_K table + CUDA device + the gather kernel —

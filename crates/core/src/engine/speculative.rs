@@ -27,7 +27,7 @@ use super::types::{EngineError, SpecDecodingStats};
 /// Sample a token from logits applying the request's sampling params, penalties,
 /// and optional constraint masking. Falls back to greedy argmax when the request
 /// uses greedy sampling with no penalties and no constraints.
-fn sample_speculative(
+pub(crate) fn sample_speculative(
     logits: &Tensor,
     state: &mut SequenceState,
     tokenizer: &TokenizerWrapper,
@@ -81,7 +81,7 @@ fn sample_speculative(
 ///
 /// Applies all penalties, constraints, temperature scaling, and softmax to produce
 /// a valid probability distribution. Used in the random-sampling rejection path.
-fn compute_target_probs(
+pub(crate) fn compute_target_probs(
     logits: &Tensor,
     state: &mut SequenceState,
     tokenizer: &TokenizerWrapper,
@@ -168,7 +168,7 @@ fn compute_target_probs(
 /// When draft probabilities aren't available (ngram/suffix proposers), draft_prob is
 /// effectively 1 for the draft token and 0 for others, so the adjusted distribution
 /// is target_prob with the draft token zeroed out.
-fn sample_recovered_token(
+pub(crate) fn sample_recovered_token(
     target_probs: &[f32],
     draft_token: u32,
     state: &mut SequenceState,

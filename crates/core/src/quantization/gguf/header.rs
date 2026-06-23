@@ -24,8 +24,31 @@ use super::iq::IqType;
 /// `general.alignment`); mirrors candle's `DEFAULT_ALIGNMENT`.
 const DEFAULT_ALIGNMENT: u64 = 32;
 
-/// How a tensor's blocks are encoded: a candle-native GGML type, or one of
-/// the I-quants candle lacks.
+/// A plain (non-quantized) integer tensor type GGUF can carry but candle's
+/// `GgmlDType` does not model — e.g. an ordering/index table. Never a matmul
+/// weight; we classify it so the header parses, then load it lazily.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufIntType {
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+impl GgufIntType {
+    /// Bytes per element (block size is always 1 for plain integers).
+    fn type_size(self) -> usize {
+        match self {
+            GgufIntType::I8 => 1,
+            GgufIntType::I16 => 2,
+            GgufIntType::I32 => 4,
+            GgufIntType::I64 => 8,
+        }
+    }
+}
+
+/// How a tensor's blocks are encoded: a candle-native GGML type, one of the
+/// I-quants candle lacks, or a plain integer table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufTensorDtype {
     /// A type candle's `GgmlDType` handles (F32/F16/BF16, legacy quants,
@@ -33,6 +56,10 @@ pub enum GgufTensorDtype {
     Candle(GgmlDType),
     /// An I-quant handled by [`crate::quantization::gguf::iq`].
     Iq(IqType),
+    /// A plain integer table (GGML `I8`/`I16`/`I32`/`I64`). Not a weight —
+    /// e.g. the `mtp.token_ordering` index of the Gemma 4 assistant's masked
+    /// embedder. Carried so the header parses; the eager loader skips it.
+    Int(GgufIntType),
 }
 
 impl GgufTensorDtype {
@@ -42,6 +69,7 @@ impl GgufTensorDtype {
         match self {
             GgufTensorDtype::Candle(d) => d.block_size(),
             GgufTensorDtype::Iq(iq) => iq.block_size(),
+            GgufTensorDtype::Int(_) => 1,
         }
     }
 
@@ -50,6 +78,7 @@ impl GgufTensorDtype {
         match self {
             GgufTensorDtype::Candle(d) => d.type_size(),
             GgufTensorDtype::Iq(iq) => iq.type_size(),
+            GgufTensorDtype::Int(i) => i.type_size(),
         }
     }
 
@@ -316,6 +345,19 @@ fn classify_dtype(id: u32) -> Option<GgufTensorDtype> {
     if let Some(d) = candle {
         return Some(GgufTensorDtype::Candle(d));
     }
+    // GGML plain-integer ids (24=I8, 25=I16, 26=I32, 27=I64). Not weights, but
+    // some checkpoints (e.g. the Gemma 4 assistant's masked-embedder ordering)
+    // carry them, so classify rather than bail.
+    let int = match id {
+        24 => Some(GgufIntType::I8),
+        25 => Some(GgufIntType::I16),
+        26 => Some(GgufIntType::I32),
+        27 => Some(GgufIntType::I64),
+        _ => None,
+    };
+    if let Some(i) = int {
+        return Some(GgufTensorDtype::Int(i));
+    }
     IqType::from_ggml_type_id(id).map(GgufTensorDtype::Iq)
 }
 
@@ -369,5 +411,81 @@ mod tests {
         // Histogram of IQ types must match the known mix.
         let n_iq = h.tensor_infos.values().filter(|t| t.dtype.is_iq()).count();
         assert_eq!(n_iq, 187 + 76 + 50 + 10 + 5);
+    }
+
+    const ASSISTANT: &str =
+        "/home/vasis/gguf-models/gemma-4-E4B-assistant/gemma-4-E4B-it-assistant.F16.gguf";
+
+    #[test]
+    fn classifies_plain_integer_types() {
+        // GGML plain-integer ids must classify (so headers carrying index
+        // tables — e.g. the Gemma 4 assistant masked-embedder ordering —
+        // parse instead of bailing). 26 = I32 is the one that appears in the
+        // wild; the siblings round out the family.
+        assert_eq!(
+            classify_dtype(24),
+            Some(GgufTensorDtype::Int(GgufIntType::I8))
+        );
+        assert_eq!(
+            classify_dtype(25),
+            Some(GgufTensorDtype::Int(GgufIntType::I16))
+        );
+        assert_eq!(
+            classify_dtype(26),
+            Some(GgufTensorDtype::Int(GgufIntType::I32))
+        );
+        assert_eq!(
+            classify_dtype(27),
+            Some(GgufTensorDtype::Int(GgufIntType::I64))
+        );
+        // An I32 table is 4 bytes/elem, block size 1.
+        let d = GgufTensorDtype::Int(GgufIntType::I32);
+        assert_eq!(d.block_size(), 1);
+        assert_eq!(d.type_size(), 4);
+        assert!(!d.is_iq());
+        // Still nothing for a genuinely unknown id.
+        assert_eq!(classify_dtype(9999), None);
+    }
+
+    #[test]
+    fn parses_gemma4_assistant_header() {
+        if !std::path::Path::new(ASSISTANT).exists() {
+            eprintln!("skip: assistant model file not present");
+            return;
+        }
+        let f = std::fs::File::open(ASSISTANT).unwrap();
+        let h = GgufHeader::read(std::io::BufReader::new(f)).unwrap();
+
+        // Whole point of the I32 fix: the header parses despite the masked-
+        // embedder `mtp.token_ordering` index tensor (GGML I32 / id 26).
+        assert_eq!(h.tensor_infos.len(), 51);
+        assert_eq!(
+            h.metadata
+                .get("general.architecture")
+                .and_then(|v| v.to_string().ok())
+                .map(String::as_str),
+            Some("gemma4_assistant")
+        );
+        assert_eq!(
+            h.tensor_infos["mtp.token_ordering.weight"].dtype,
+            GgufTensorDtype::Int(GgufIntType::I32)
+        );
+
+        // Q-only attention: a Q projection exists, K/V projections do not.
+        assert!(h.tensor_infos.contains_key("blk.0.attn_q.weight"));
+        assert!(!h.tensor_infos.contains_key("blk.0.attn_k.weight"));
+        assert!(!h.tensor_infos.contains_key("blk.0.attn_v.weight"));
+
+        // Hidden-state fusion projections, candle orientation [out, in].
+        // pre:  fuse [target_embd | backbone_hidden] (2*2560) → assistant 256.
+        assert_eq!(
+            h.tensor_infos["mtp.pre_projection.weight"].shape,
+            vec![256, 5120]
+        );
+        // post: assistant 256 → backbone 2560 (feedback hidden).
+        assert_eq!(
+            h.tensor_infos["mtp.post_projection.weight"].shape,
+            vec![2560, 256]
+        );
     }
 }

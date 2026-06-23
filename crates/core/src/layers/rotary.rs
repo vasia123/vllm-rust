@@ -173,6 +173,55 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Rotary embedding with explicit per-dimension frequency factors, used
+    /// by the Gemma 4 MTP assistant's full-attention layer. The GGUF ships a
+    /// `rope_freqs` vector of length `head_dim/2`; ggml's `ggml_rope_ext`
+    /// divides each pair's base inverse-frequency by the matching factor:
+    ///   `inv_freq[j] = rope_theta^(-2j/head_dim) / freq_factors[j]`.
+    /// This is full (neox) rotation over `head_dim` — the assistant's
+    /// `rope.dimension_count` equals `head_dim`, so there is no partial pass-
+    /// through. Mirrors `ggml_rope_ext(..., freq_factors, ...)` byte-for-byte.
+    pub fn new_with_freq_factors(
+        head_dim: usize,
+        max_seq_len: usize,
+        rope_theta: f64,
+        freq_factors: &[f32],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let rotary_dim = head_dim;
+        let half = rotary_dim / 2;
+        if freq_factors.len() != half {
+            return Err(candle_core::Error::Msg(format!(
+                "rope freq_factors length ({}) must equal head_dim/2 ({half})",
+                freq_factors.len()
+            )));
+        }
+        let inv_freq: Vec<f32> = (0..rotary_dim)
+            .step_by(2)
+            .enumerate()
+            .map(|(j, i)| {
+                (1.0 / (rope_theta as f32).powf(i as f32 / rotary_dim as f32)) / freq_factors[j]
+            })
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq =
+            Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(DType::F32)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        Ok(Self {
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+            rotary_dim,
+            head_dim,
+            is_neox_style: true,
+            #[cfg(feature = "cuda-kernels")]
+            cos_sin_cache: OnceLock::new(),
+        })
+    }
+
     /// Create a su-scaled (LongRoPE) rotary embedding used by Phi-3 long-context models.
     ///
     /// Per-dimension scaling factors are applied to the inverse frequencies. The model
@@ -1953,5 +2002,74 @@ mod mrope_interleaved_tests {
         let k = Tensor::ones((1, 4, head_dim), DType::F32, &Device::Cpu).unwrap();
         let (q_rot, _) = rope.apply_scalar(&q, &k, 0).unwrap();
         assert_eq!(q_rot.dims(), &[1, 4, head_dim]);
+    }
+
+    #[test]
+    fn freq_factors_all_ones_matches_plain_rope() {
+        // freq_factors all 1.0 ⇒ identical cos/sin tables to a plain (full)
+        // rotary embedding (both use the head_dim denominator at full rotation).
+        let head_dim = 8;
+        let ones = vec![1.0f32; head_dim / 2];
+        let a = RotaryEmbedding::new_with_freq_factors(
+            head_dim,
+            16,
+            1e6,
+            &ones,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let b = RotaryEmbedding::new(head_dim, 16, 1e6, DType::F32, &Device::Cpu).unwrap();
+        let ac: Vec<f32> = a.cos.flatten_all().unwrap().to_vec1().unwrap();
+        let bc: Vec<f32> = b.cos.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(ac.len(), bc.len());
+        for (x, y) in ac.iter().zip(bc.iter()) {
+            assert!((x - y).abs() < 1e-5, "cos mismatch {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn freq_factors_partial_pattern_passes_second_half_through() {
+        // Gemma 4 full-attention rope_freqs = [1.0×(n/2), 1e30×(n/2)]: the 1e30
+        // factors drive inv_freq→0 so those dims get cos=1, sin=0 (no rotation),
+        // i.e. the partial-rotary pattern that rotates only the first half.
+        let head_dim = 8; // 4 freq pairs
+        let freqs = vec![1.0f32, 1.0, 1e30, 1e30];
+        let rope = RotaryEmbedding::new_with_freq_factors(
+            head_dim,
+            16,
+            1e6,
+            &freqs,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let cos5: Vec<f32> = rope
+            .cos
+            .narrow(0, 5, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let sin5: Vec<f32> = rope
+            .sin
+            .narrow(0, 5, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        // Columns 2,3 (the 1e30 factors) are identity.
+        assert!(
+            (cos5[2] - 1.0).abs() < 1e-5 && sin5[2].abs() < 1e-5,
+            "col2 not identity"
+        );
+        assert!(
+            (cos5[3] - 1.0).abs() < 1e-5 && sin5[3].abs() < 1e-5,
+            "col3 not identity"
+        );
+        // Column 0 (factor 1.0) genuinely rotates at position 5.
+        assert!(sin5[0].abs() > 1e-6, "col0 should rotate, sin={}", sin5[0]);
     }
 }
